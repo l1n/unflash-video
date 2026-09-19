@@ -44,8 +44,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: wasm-bindgen
-        run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+      - name: wasm-bindgen (prebuilt, falling back to cargo install)
+        run: |
+          set -e
+          V=0.2.128
+          if curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/$V/wasm-bindgen-$V-x86_64-unknown-linux-musl.tar.gz" | tar xz; then
+            sudo install -m 755 "wasm-bindgen-$V-x86_64-unknown-linux-musl/wasm-bindgen" /usr/local/bin/
+          else
+            cargo install wasm-bindgen-cli --version "$V" --locked
+          fi
+          wasm-bindgen --version
       - name: Build
         run: ./build.sh release
       - name: System packages (ffmpeg, numpy, playwright)

@@ -1,5 +1,9 @@
-# Publish web/ to GitHub Pages (enable Pages with the "GitHub Actions" source
-# in the repository settings first).
+# Build the WebAssembly module and publish web/ to GitHub Pages.
+#
+# Runs on every push to main and on demand (Actions tab -> Pages -> Run
+# workflow, from any branch). The first run enables Pages for the repository
+# with the "GitHub Actions" source; if that step is refused, enable it once
+# under Settings -> Pages -> Build and deployment -> Source: GitHub Actions.
 name: Pages
 
 on:
@@ -16,6 +20,10 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+env:
+  WASM_BINDGEN_VERSION: "0.2.128"   # must match Cargo.lock
+  BINARYEN_VERSION: version_123
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -25,8 +33,30 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
-      - run: ./build.sh release
+      - name: wasm-bindgen (prebuilt, falling back to cargo install)
+        run: |
+          set -e
+          V="$WASM_BINDGEN_VERSION"
+          if curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/$V/wasm-bindgen-$V-x86_64-unknown-linux-musl.tar.gz" | tar xz; then
+            sudo install -m 755 "wasm-bindgen-$V-x86_64-unknown-linux-musl/wasm-bindgen" /usr/local/bin/
+          else
+            cargo install wasm-bindgen-cli --version "$V" --locked
+          fi
+          wasm-bindgen --version
+      - name: wasm-opt (optional)
+        run: |
+          V="$BINARYEN_VERSION"
+          if curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/$V/binaryen-$V-x86_64-linux.tar.gz" | tar xz; then
+            sudo install -m 755 "binaryen-$V/bin/wasm-opt" /usr/local/bin/
+            wasm-opt --version
+          else
+            echo "binaryen not available; shipping the unoptimised module"
+          fi
+      - name: Build
+        run: ./build.sh release
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web/

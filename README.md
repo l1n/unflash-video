@@ -26,8 +26,12 @@ port is tested against, bit for bit where the arithmetic allows.
 
 ## Using it
 
-Open `web/` from any static web server over `http://localhost` or `https://`
-(WebGPU and WebCodecs need a secure context):
+**Hosted:** https://l1n.github.io/unflash-video/ — built and published from
+`main` by the [Pages workflow](.github/workflows/pages.yml). It is a static
+site: the video never leaves your machine.
+
+**Locally:** open `web/` from any static web server over `http://localhost`
+or `https://` (WebGPU and WebCodecs need a secure context):
 
 ```
 ./build.sh                     # needs Rust + the wasm32 target + wasm-bindgen (see Building)
@@ -168,6 +172,16 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 | `crates/unflash-wasm` | the `wasm-bindgen` API |
 | `web/` | the app (plain ES modules, no build step beyond the WASM) |
 | `unflash/` | the Python reference implementation |
+
+## Deploying
+
+`.github/workflows/pages.yml` builds the WASM on every push to `main` and
+publishes `web/` to GitHub Pages; it can also be run by hand from any branch
+(Actions → Pages → Run workflow). The first run enables Pages with the
+"GitHub Actions" source; if the repository refuses that, enable it once under
+Settings → Pages → Build and deployment → Source: GitHub Actions.
+`.github/workflows/ci.yml` runs the Rust tests (on lavapipe), builds the
+WASM and runs the browser test on every push.
 
 ## Testing
 
