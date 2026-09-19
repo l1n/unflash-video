@@ -30,17 +30,17 @@ pub const MODE_HELD: u32 = 2;
 pub const MODE_SATURATE: u32 = 4;
 
 // `flags` word layout. dir / pol: 0 = flat / none, 1 = up (+1), 2 = down (-1).
-const LUM_DIR_SHIFT: u32 = 0;
-const RED_DIR_SHIFT: u32 = 2;
-const RED_AUX_BASE: u32 = 1 << 4;
-const RED_AUX_EXT: u32 = 1 << 5;
-const GEN_PEND_SHIFT: u32 = 6;
-const RED_PEND_SHIFT: u32 = 8;
-const POOL_GEN_SHIFT: u32 = 10;
-const POOL_RED_SHIFT: u32 = 12;
-const DIR_MASK: u32 = 3;
-const UP: u32 = 1;
-const DN: u32 = 2;
+pub(crate) const LUM_DIR_SHIFT: u32 = 0;
+pub(crate) const RED_DIR_SHIFT: u32 = 2;
+pub(crate) const RED_AUX_BASE: u32 = 1 << 4;
+pub(crate) const RED_AUX_EXT: u32 = 1 << 5;
+pub(crate) const GEN_PEND_SHIFT: u32 = 6;
+pub(crate) const RED_PEND_SHIFT: u32 = 8;
+pub(crate) const POOL_GEN_SHIFT: u32 = 10;
+pub(crate) const POOL_RED_SHIFT: u32 = 12;
+pub(crate) const DIR_MASK: u32 = 3;
+pub(crate) const UP: u32 = 1;
+pub(crate) const DN: u32 = 2;
 
 /// Everything the kernels need per frame, `repr(C)` so it doubles as the
 /// GPU uniform block (80 bytes).
@@ -434,6 +434,19 @@ pub fn run_frame_scalar(
     p: &KernelParams,
     out: &mut PixelOutputs,
 ) {
+    run_range_scalar(st, planes, p, out, 0, st.n)
+}
+
+/// The scalar kernel over pixels `lo..hi` (the SIMD kernel uses it for the
+/// tail of a frame).
+pub(crate) fn run_range_scalar(
+    st: &mut PixelState,
+    planes: &FramePlanes,
+    p: &KernelParams,
+    out: &mut PixelOutputs,
+    lo: usize,
+    hi: usize,
+) {
     let n = st.n;
     let k = st.k;
     debug_assert_eq!(k, p.ring_len());
@@ -441,7 +454,7 @@ pub fn run_frame_scalar(
 
     if p.first() {
         let nv = never(now);
-        for i in 0..n {
+        for i in lo..hi {
             let l = planes.l[i];
             let v = planes.v[i];
             let sat = planes.sat[i] != 0;
@@ -473,7 +486,7 @@ pub fn run_frame_scalar(
     }
 
     if p.saturate() {
-        for i in 0..n {
+        for i in lo..hi {
             st.lum_t[i] = saturate(now, st.lum_t[i]);
             st.red_t[i] = saturate(now, st.red_t[i]);
             for s in 0..k {
@@ -494,7 +507,7 @@ pub fn run_frame_scalar(
     if p.held() {
         // nothing moved, so there is nothing to track -- but time passed,
         // and the cap is measured in time
-        for i in 0..n {
+        for i in lo..hi {
             if age(now, st.lum_t[i]) > p.max_run {
                 st.lum_base[i] = st.lum_ext[i];
                 st.lum_t[i] = now;
@@ -515,7 +528,7 @@ pub fn run_frame_scalar(
 
     let kf = p.k_fail as usize - 1;
     let ke = p.k_ext as usize - 1;
-    for i in 0..n {
+    for i in lo..hi {
         let l = planes.l[i];
         let v = planes.v[i];
         let sat = planes.sat[i] != 0;

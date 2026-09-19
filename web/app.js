@@ -86,6 +86,11 @@ function profileConfig(name) {
   return wasm.profile_config(name);
 }
 
+/** `?cpu=1` forces the WebAssembly detector (for comparison and tests). */
+function preferGpuSetting() {
+  return !new URLSearchParams(location.search).has('cpu');
+}
+
 // ---- boot ---------------------------------------------------------------------
 
 async function boot() {
@@ -185,7 +190,7 @@ async function createFeeders(progress) {
   const movie = state.movie;
   if (state.env && state.env.feeder) state.env.feeder.det.free();
   if (state.liveFeeder) state.liveFeeder.det.free();
-  const preferGpu = !new URLSearchParams(location.search).has('cpu');
+  const preferGpu = preferGpuSetting();
   const feeder = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu });
   state.env = { wasm, config: state.config, feeder };
   const live = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu });
@@ -303,6 +308,7 @@ function startLiveLoop() {
     const det = feeder.det;
     det.poll();
     if (det.can_submit()) {
+      const t0 = performance.now();
       try {
         if (feeder.gpu) det.feed_video_element(player, meta.mediaTime, false);
         else {
@@ -310,6 +316,8 @@ function startLiveLoop() {
           const img = feeder.ctx.getImageData(0, 0, feeder.aw, feeder.ah);
           det.feed_rgba(img.data, feeder.aw, feeder.ah, meta.mediaTime, false);
         }
+        feeder.fed++;
+        feeder.busyNs += (performance.now() - t0) * 1e6;
       } catch (e) {
         console.warn(e);
       }
@@ -1130,7 +1138,7 @@ async function verifyExport() {
   $('exportModal').classList.add('hidden');
   const res = await runJob('Verifying the exported file', async (progress, cancelled) => {
     const m = await Movie.open(state.exportBlob, wasm);
-    const feeder = await createDetector(wasm, state.config, m.width, m.height);
+    const feeder = await createDetector(wasm, state.config, m.width, m.height, { preferGpu: preferGpuSetting() });
     try {
       return await scanMovie({ wasm, config: state.config, feeder }, m, { cancel: cancelled, onProgress: (p, _t, count, ms) => progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`) });
     } finally {

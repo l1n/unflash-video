@@ -14,3 +14,6 @@ Cargo.lock.bak
 /tests/e2e/out/
 /tests/fixtures/*.mp4
 
+/tests/media/*.mp4
+/tests/media/*.json
+/tests/media/e2e/
