@@ -3,7 +3,7 @@
 // The long editing flow runs on the CPU detector (SwiftShader's WebGPU is a
 // software emulation and slow); a GPU scan of the same file must then find
 // the same violations.
-import { chromium } from '/opt/node22/lib/node_modules/playwright/index.mjs';
+import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
 import fs from 'node:fs';
 import { serve } from './server.mjs';
@@ -31,6 +31,7 @@ const noBanner = async (page) => {
 };
 const verdictReady = (page, timeout = 120000) => page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout });
 
+const { chromium } = await loadPlaywright();
 const { srv, port } = await serve(WEB);
 const browser = await chromium.launch({
   headless: !process.argv.includes('--headed'),

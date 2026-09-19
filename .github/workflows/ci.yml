@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust tests (native, software Vulkan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: System packages (lavapipe, ffmpeg, numpy)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools ffmpeg python3-numpy
+      - name: Test media
+        run: bash tests/media/gen.sh
+      - name: Reference fixtures are up to date
+        continue-on-error: true
+        run: |
+          python3 tests/gen_fixtures.py
+          git diff --exit-code -- tests/fixtures
+      - name: cargo test
+        env:
+          UNFLASH_REQUIRE_GPU: "1"
+        run: cargo test --workspace --release
+      - name: Benchmark (informational)
+        run: cargo run --release -p unflash-gpu --example bench -- 1920x1080 0.25 200
+
+  web:
+    name: WASM build and browser test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: wasm-bindgen
+        run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+      - name: Build
+        run: ./build.sh release
+      - name: System packages (ffmpeg, numpy, playwright)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-numpy
+          npm install -g playwright@1.56.1
+          npx playwright@1.56.1 install --with-deps chromium
+      - name: Synthetic videos
+        run: python3 tests/media/gen_e2e.py
+      - name: End-to-end (headless Chromium, WebGPU on SwiftShader)
+        run: node tests/e2e/run.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-output
+          path: tests/e2e/out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web
+          path: web/

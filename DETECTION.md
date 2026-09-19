@@ -22,6 +22,7 @@ passes when you re-scan the exported file.
 - [Awkward source files](#awkward-source-files)
 - [Things that are inherent, not bugs](#things-that-are-inherent-not-bugs)
 - [Command line](#command-line)
+- [The WebGPU implementation](#the-webgpu-implementation)
 
 ## What counts as a transition
 
@@ -405,3 +406,57 @@ sensitivity for everything.
 python -m unflash.cli analyze VIDEO [--start S --duration D] [--wcag]
 python -m unflash.cli scan VIDEO [--wcag]
 ```
+
+## The WebGPU implementation
+
+The Rust/WebAssembly rebuild keeps this detector exactly, with the per-pixel
+work on the GPU. Where the arithmetic had to change to get there, this is
+what changed and why it does not change a verdict.
+
+**Time is integer microseconds on the GPU.** The rule above that every
+per-pixel time is float64 exists because ages are compared against 0.125 s
+and 1 s windows to the millisecond, and a float32 loses that precision after
+an hour. GPUs have no float64. The kernels keep every per-pixel time as an
+unsigned 32-bit count of microseconds on the same internal clock, with ages
+computed by wrapping subtraction: an age is then an exact integer at second
+4 and at second 4259 alike, which is the property the float64 rule was
+protecting. Wrap-around after 71 minutes is handled by periodically pulling
+every stored time forward to an age of 2^30 µs (about 18 minutes); nothing
+the detector keeps is relevant past a few seconds, so a saturated time
+behaves exactly like the reference's `-1e12` "never". The window-mean
+trackers, the clock and everything after the per-pixel reduction still run
+in float64 on the CPU. A frame time is rounded to the microsecond once, on
+the clock, so the section check and the whole-video scan see the same
+integers.
+
+**One kernel, three renderings.** The per-pixel state machine is written
+once as a plain Rust function, and restated as a WGSL compute shader and as
+an 8-lane SIMD kernel. Tests hold all three bit-for-bit identical: masks,
+onsets and the entire 120-byte pixel record after every frame. The
+reference cross-check (`tests/gen_fixtures.py`) then compares the Rust
+detector with this Python one on synthetic sequences and requires identical
+hazard areas, held frames, events, violations and verdicts.
+
+**Downscaling is an area average.** ffmpeg's `scale=...:flags=area` is a box
+filter; the GPU ingest pass computes the same thing with fractional overlap
+weights in sRGB code space, rounding back to 8 bits before linearising
+through the same 256-entry table the CPU uses. The CPU path in the browser
+takes WebCodecs' RGBA copy of the frame through the identical box filter in
+WASM. The colour conversion from the codec's YUV is the browser's; scans on
+the two paths agree to the frame.
+
+**Chart areas are grid-only.** The pooled transition areas drawn in the
+section chart (`up_area`, `down_area`, `red_area`; statistics, not part of
+any verdict) are the best of the grid of window positions rather than of
+every position, so they can read slightly lower than the reference's. The
+hazard tests themselves always used the grid.
+
+**Held frames are luminance-only, as before.** A frame whose luminance moves
+in fewer than a tenth of the area a flash needs is a re-show, and a red
+flash with no luminance change at all is invisible to that test — in the
+reference too.
+
+**Sections follow the flashing.** The reference snaps sections outward to
+keyframes for the sake of its stream-copy export. The browser export
+re-encodes everything, so sections are padded from the violation's onset
+and not extended to keyframes.

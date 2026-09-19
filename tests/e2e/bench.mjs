@@ -1,8 +1,9 @@
 // Run web/bench.html in headless Chromium and print the numbers.
-import { chromium } from '/opt/node22/lib/node_modules/playwright/index.mjs';
+import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
 import { serve } from './server.mjs';
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
+const { chromium } = await loadPlaywright();
 const { srv, port } = await serve(path.join(ROOT, 'web'));
 const browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader'] });
 const page = await browser.newPage();

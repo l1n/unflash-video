@@ -1,228 +1,189 @@
 # Unflash
 
 Unflash finds the flashing in a video that can trigger photosensitive
-seizures, and helps you take it out without wrecking the footage.
+seizures, and helps you take it out without wrecking the footage. It removes
+individual frames and holds a neighbouring frame in their place, so the
+picture stays sharp, the audio stays in sync and the running time doesn't
+change.
 
-Most "flash removal" just dims or blurs the whole video. Unflash removes
-individual frames instead and holds the neighboring frame in their place,
-so the picture stays sharp, the audio stays in sync and the running time
-doesn't change. If a frame you need to remove has something important on it,
-you can hold it on screen for a second instead, with the sound muted.
+This is the **WebAssembly + WebGPU** implementation: the detector is written
+in Rust, the per-pixel work runs as WebGPU compute shaders (or an 8-lane SIMD
+kernel where there is no WebGPU), frames come straight out of WebCodecs, and
+everything happens in the browser tab with nothing uploaded anywhere.
 
-Everything happens on your own computer. Nothing is uploaded anywhere.
+There is no render–analyze cycle any more. A scan runs as fast as the GPU can
+take frames (hundreds to thousands of frames a second at the default analysis
+size), the **live monitor** runs the same detector on whatever the player is
+showing and meters the flashing as it happens, and once a section is
+prepared **every mark you make is re-checked the instant you make it**.
 
-**This reduces risk. It is not a guarantee.** Please read
-[Limitations](#limitations) at the bottom before you rely on it.
+The original Python/ffmpeg tool this was rebuilt from is still in
+[`unflash/`](unflash/README.md); its detector is the reference the Rust
+port is tested against, bit for bit where the arithmetic allows.
 
-If you want to know exactly how the flash detection works, that's in
-[DETECTION.md](DETECTION.md).
+**This reduces risk. It is not a guarantee.** See
+[Limitations](#limitations).
 
-## Installing
+## Using it
 
-You need Python, and ffmpeg with `ffmpeg` and `ffprobe` on your PATH.
+Open `web/` from any static web server over `http://localhost` or `https://`
+(WebGPU and WebCodecs need a secure context):
 
 ```
-pip install -r requirements.txt
+./build.sh                     # needs Rust + the wasm32 target + wasm-bindgen (see Building)
+npx http-server web -p 8765    # or python3 -m http.server -d web 8765
 ```
 
-## Running
+then open http://127.0.0.1:8765/.
+
+Browser support:
+
+| | scan / prepare / export | live monitor | detector |
+|---|---|---|---|
+| Chrome, Edge, Opera 113+ | WebCodecs (H.264, HEVC*, VP9, AV1) | any file the `<video>` element plays | WebGPU |
+| Safari 26+ | WebCodecs | yes | WebGPU |
+| Firefox 141+ (Windows), other Firefox | WebCodecs where available | yes | WebGPU where enabled, otherwise the SIMD CPU kernel |
+
+\* platform dependent. Files are MP4/MOV (ISO base media); the demuxer
+handles fragmented files and edit lists. A file whose codec the browser
+cannot decode can still be watched with the live monitor.
+
+### The short version
+
+1. **Open video.** The file's index is read (only its headers; nothing is
+   uploaded), the detector starts on WebGPU or, failing that, on the CPU, and
+   the project is restored from the browser's storage if you have opened this
+   file before.
+2. **Scan for flashes.** Every frame is decoded with WebCodecs and pushed
+   through the detector. A numbered *section* is put around each problem and
+   the timeline shows where the flashing is. Or tick **live monitor** and
+   press play: the meter above the video shows how much of the picture is
+   flashing right now, and the verdict flips the moment a violation lands.
+3. **Prepare** a section. Its frames, plus a run-up and run-out, are decoded
+   into memory at analysis resolution.
+4. **Edit.** Mark frames (**R** remove and show the previous frame, **F**
+   remove and show the next, **E** hold for a second muted, **U** unmark), or
+   let **Suggest** do it. The section is re-checked automatically after every
+   change, in well under a second.
+5. **Export**: the video is re-encoded in the browser with the edits applied
+   and the audio copied through untouched. **Verify** re-scans the exported
+   file with the same detector.
+
+Profiles (**Exact WCAG + flag extended flashes**, **Exact WCAG only**,
+**Stricter than WCAG**), the suggesters, the safe frame-rate bound and the
+run-up/run-out logic are the reference's; see [DETECTION.md](DETECTION.md)
+for what counts as a flash and why the check of a section agrees with a scan
+of the export.
+
+`?cpu=1` in the URL forces the CPU detector (for comparison);
+`web/bench.html` measures both on your machine.
+
+## How it works
 
 ```
-run_unflash.bat
+   WebCodecs VideoFrame ─┐            ┌── GridStats (a few KB / frame) ──┐
+   <video> element ──────┼─► GPU ─────┤                                  ├─► temporal stage ─► violations, sections
+   cached RGBA frames ───┘   stage    └── per-pixel state stays on the GPU ┘   (Rust, on the CPU)
 ```
 
-A browser tab opens at http://127.0.0.1:8765/.
+The detector is split in two.
 
-When you're finished, press **Quit** in the header rather than just closing
-the tab. Closing the tab leaves Unflash running in the background, and the
-next launch will find that copy and reopen the tab on it. This matters after
-an update: a running copy keeps the code it started with, so a new version
-does nothing until the old one has really stopped. The header shows the date
-of the code it's running, and a red banner appears if the files on disk are
-newer than that.
+The **pixel stage** owns the per-pixel state machine of the reference
+(`_ExtremaTracker`, `_FlashCounter`, `_Pool`): a monotonic-run tracker for
+luminance and one for the red value, flash pairing, a ring of the last K flash
+times and their opening times, and the pooling timers, about 120 bytes per
+pixel. It is written once, as a plain per-pixel function in Rust
+(`crates/unflash-core/src/pixel.rs`), and restated twice: as a WGSL compute
+shader and as an 8-lane SIMD kernel. All three are held bit-for-bit
+identical by tests. Per frame the stage reads and partially writes that
+record for every analysis pixel and reduces the frame to one 48-byte cell
+per sliding-window position: window sums of luminance and red value, the
+count of pixels in each of eight mask classes (strobing at the failure rate,
+strobing at the permitted rate, pooled transitions), and the age of the
+oldest transition still feeding a failure window. That is the whole
+bandwidth story: **one pass over the pixel state per frame**, no
+intermediate images, nothing per pixel read back.
 
-## The short version
+The GPU version runs four dispatches per frame — an ingest pass that area-
+averages the source (any size, straight from a `VideoFrame`) into the
+analysis model and linearises it through the same sRGB table the CPU uses,
+the update pass, a row pass and a gather pass — and copies the few-kilobyte
+result into one of a ring of staging buffers, so several frames are in
+flight while the CPU handles the rest. The reduction passes use no
+workgroup barriers: on a real GPU they are latency-bound and take tens of
+microseconds; on a software implementation (SwiftShader, lavapipe) they are
+merely slow rather than pathological.
 
-1. **Open video.** A folder called `<name>.unflash` appears next to it, and
-   everything you do is saved there as you go. You can close the tab and
-   come back later.
-2. **Scan for flashes.** Unflash checks the whole video and puts a numbered
-   *section* around each problem. The timeline shows where the flashing is.
-3. **Prepare** a section (or **prepare all** in the sidebar). This pulls out
-   the frames so you can work on them.
-4. **Edit.** Mark the frames you want gone, or let **Suggest** do it.
-5. **Check safety.** An instant verdict with nothing to render. Green means
-   this section passes now.
-6. **Render full-res.** Every section needs this before you can export.
-7. **Export**, then **Verify exported file** to re-scan the finished video.
+The **temporal stage** (`crates/unflash-core/src/temporal.rs`) is the rest
+of the reference `FlashDetector`, unchanged in logic: the window-mean
+coherence gate, the concurrent-area test, events, per-frame statistics,
+violations, extended flashes. It runs on the CPU in float64 on a few hundred
+numbers per frame, whichever pixel stage produced them.
 
-You can also make your own sections: drag on the timeline, or type a start
-and end time next to it.
+### Time on the GPU
 
-## Editing a section
+The reference keeps every per-pixel time in float64 because a float32 loses
+the millisecond precision the 0.125 s and 1 s windows need after an hour of
+video. GPUs have no float64, so the kernels keep time as **unsigned 32-bit
+microseconds**: integer subtraction is exact, an age measured at second 4259
+is the same number it would be at second 4, and wrap-around is handled by
+computing ages with wrapping arithmetic and periodically saturating every
+stored time at 2^30 µs (about 18 minutes), which is the reference's "never"
+sentinel in a different coat. See [DETECTION.md](DETECTION.md#the-webgpu-implementation).
 
-Click a frame in the grid to select it. Shift-click selects everything
-between two clicks, ctrl-click adds or removes one, and Esc clears the
-selection. With **Caps Lock on**, shift-click selects a rectangle in the
-grid instead, which is handy for taking out a whole run of rows.
+### What it costs
 
-Then press a key, or use the buttons under the grid:
+Per frame at the default analysis size (a 16:9 source becomes 256×144, the
+model of a 1024×768 screen at scale 0.25; `analysis_scale = 1.0` gives the
+full 1024×576):
 
-| key | what it does |
+| stage | per frame | on this machine (4-core VM, software GPU) |
+|---|---|---|
+| CPU scalar kernel | 27 ns/px | 1.0 ms, ≈1000 fps |
+| CPU SIMD kernel (AVX2 natively, simd128 in WASM) | 16 ns/px | 0.6 ms native, 1.0 ms in the browser |
+| GPU stage | ≈130 B/px of state traffic | limited by the GPU's memory bandwidth on real hardware |
+
+At full analysis scale the state is 71 MB and the CPU kernel is memory-bound
+at ≈5 GB/s; that is where the GPU pays for itself, at a few hundred GB/s
+on a discrete card. The whole-video scan is then bounded by the decoder.
+
+`cargo run --release -p unflash-gpu --example bench` prints these numbers
+for your hardware; `web/bench.html` does the same in the browser.
+
+## Building
+
+```
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate version in Cargo.lock
+./build.sh            # -> web/pkg/
+```
+
+`wasm-opt` (binaryen) is used if present. The workspace:
+
+| crate | what |
 |---|---|
-| **R** | remove, and show the frame *before* it instead |
-| **F** | remove, and show the frame *after* it instead |
-| **E** | hold this frame on screen for 1 second, muted |
-| **U** | unmark |
+| `crates/unflash-core` | the detector: config and profiles, the per-pixel kernel (scalar and SIMD), grid reduction, temporal stage, violations, sections, editing helpers. No I/O. |
+| `crates/unflash-gpu` | the WGSL pipeline on `wgpu` (native backends and the browser's WebGPU) |
+| `crates/unflash-mp4` | a byte-range MP4 demuxer for WebCodecs (codec strings, decoder descriptions, sample tables, fragmented files, edit lists) and a muxer for the export |
+| `crates/unflash-wasm` | the `wasm-bindgen` API |
+| `web/` | the app (plain ES modules, no build step beyond the WASM) |
+| `unflash/` | the Python reference implementation |
 
-Removed frames go red either way. The little badge on each one tells you
-which frame will be showing in its place, so you can see at a glance what
-you're actually going to get.
+## Testing
 
-R and F usually look identical, but not always: on a cut, filling from the
-wrong side drags a frame of the old shot across the join. If something looks
-smeared in the preview, try the other one.
+```
+cargo test --workspace                    # unit tests, the reference cross-check, GPU-vs-CPU (needs any Vulkan/Metal/DX12 adapter; lavapipe is enough)
+python3 tests/gen_fixtures.py             # regenerate the reference fixtures from unflash/analysis.py (needs numpy)
+bash tests/media/gen.sh                   # demuxer/muxer test files (needs ffmpeg)
+python3 tests/media/gen_e2e.py            # synthetic flashing videos for the browser test
+node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
+```
 
-### Letting it pick for you
-
-**Suggest: keep light** and **Suggest: keep dark** work out a set of
-removals, run them past the detector, and keep going until the section
-passes. Keep-light holds the brighter frames, keep-dark the darker ones.
-Try both and see which looks better; whichever you run last replaces the
-one before it, so there's nothing to undo in between.
-
-**Suggest: reduce FPS** is the fallback for flashing the other two can't
-budge, like a strobe with no steady bright or dark phase to hold on to. It
-thins the section down to a frame rate that simply can't flash fast enough
-to fail, working from the frame timings alone. It never looks at the
-pictures, so it works on anything. The result is choppier, and the button
-tells you what rate it's about to use.
-
-That rate is a worst case, and most footage passes at a lot more frames than
-it allows. The **▾** next to the button lets you type your own rate, with
-*safe rate* to put it back. A good way to use it: run it at the safe rate to
-see the section go green, then raise the rate until it goes red again and
-step back one.
-
-Check **selection only** on any of the three to confine it to the frames
-you've selected.
-
-## When a check fails
-
-**Check safety** tells you what's still wrong and roughly where. Press
-**select unsafe frames** and it highlights the exact frames inside the
-failing moment, so you can remove more of them.
-
-Two things it might tell you that aren't about this section:
-
-- **"just over the line"** means the flashing is sitting almost exactly on
-  the threshold. Re-encoding a video moves the measurement by a couple of
-  percent all by itself, so content this close can pass here and fail in the
-  finished file. Trim a bit more than looks necessary and it settles down.
-- **"past the end of this section"** means your edits left flashing just
-  after the last frame you can reach. Drag the section's end out past it, or
-  edit the next section.
-
-Previews are slightly less sensitive than full renders, because they're
-analyzed at a lower resolution. Where the two disagree, believe the
-full-resolution one.
-
-## Exporting
-
-Every section has to be rendered at full resolution first. **render all** in
-the sidebar does them all and skips any that are already up to date. If you
-edit a section after rendering it, it gets a *render stale* badge and you'll
-need to render it again.
-
-The export dialog offers three ways of putting the video back together:
-
-- **Re-encode spans, stream-copy join** (the default). Rebuilds the parts,
-  then joins them without re-encoding. Fastest, and no quality loss at the
-  joins.
-- **Re-encode spans, filter join.** Decodes and re-joins everything in one
-  pass, rebuilding every timestamp along the way. Costs one more encode
-  (invisible in practice) and is the one to reach for if a join ever comes
-  out wrong.
-- **Smart-cut.** Copies the untouched parts as they are instead of
-  re-encoding them. Much faster, h264 sources only.
-
-Then press **Verify exported file** to re-scan the finished video. Verifying
-reads the file that's already there; it doesn't export again.
-
-## Picking a profile
-
-The **Profile** dropdown in the header decides what counts as a problem.
-Every check, render and verification uses whichever one is selected.
-
-| Profile | What it flags |
-|---|---|
-| **Exact WCAG + flag extended flashes** (default) | WCAG failures, plus sustained flashing that sits right at the legal limit |
-| **Exact WCAG only** | WCAG failures and nothing else |
-| **Stricter than WCAG** | A tighter threshold, for extra margin |
-
-**Extended flashes** are the middle one's specialty: flashing that meets
-every WCAG failure condition except the rate, running *at* the permitted
-speed rather than above it, for 5 seconds or more. WCAG lets that through.
-UK broadcast guidance doesn't, and it does affect some viewers, so the
-default profile treats them as work sections you can edit like any other.
-They're labeled *extended flash* so you can tell them apart.
-
-**Stricter than WCAG** is for photosensitive migraine and similar, where the
-WCAG line is drawn in the wrong place. It doesn't list extended flashes
-separately because it already fails outright at that speed.
-
-If you change profile partway through a project, use the sidebar's **all
-sections ▾** menu to re-prepare, re-check and refresh labels under the new
-one. Your frame marks are kept.
-
-## Resuming, moving and recovering
-
-Everything lives in the `<video name>.unflash` folder next to the video, so
-reopening that video picks the work up again, even if you've since moved or
-renamed both.
-
-If it isn't picked up automatically, or you moved the folder away from its
-video, use **Open project folder…** and point it at the `.unflash` folder
-itself. The paths saved inside get repaired, and anything genuinely missing
-is listed at the top of the window.
-
-If the folder still has section folders in it that the project file doesn't
-know about, a **recover sections** button appears. It rebuilds them from
-what's on disk and keeps the full-res renders, so a project whose project
-file got lost can still be exported. The frame marks are gone for good
-though, so recovered sections show as *unprepared*: re-rendering one would
-give you an unedited version. Verify the export when you're done.
-
-## Sharing a PC
-
-Each Windows account gets its own copy, on its own port (8765, then 8766,
-and so on), and a copy only answers its own account. Anyone else's browser
-gets a short "this server is not yours" page. The access token is kept in
-your own profile folder (`%LOCALAPPDATA%\Unflash`) and printed when Unflash
-starts, so if you ever land on that page you can paste the printed address
-to get back in.
-
-Two accounts opening the *same* video still share the one `.unflash` folder
-beside it, and would overwrite each other's edits.
-
-Command-line flags, if you need them:
-
-| flag | effect |
-|---|---|
-| `--port N` | use this exact port |
-| `--new` | start another copy even if this account has one |
-| `--no-token` | turn the access check off, so every account on the PC can use this copy, its projects and its file dialogs |
-| `--no-browser` | don't open a browser |
-| `--video FILE` | open this video on startup |
-
-## Other bits
-
-The 🔔 box in the header takes a number of minutes. Any job that runs longer
-than that beeps and posts a desktop notification when it finishes, so you
-can go do something else during a long render.
-
-The video player is dimmed by default, and says whether what you're about to
-watch has passed the detector. The dimming is a courtesy, not a safeguard.
+`crates/unflash-core/tests/reference_fixtures.rs` regenerates the frames the
+Python detector was run on (CRC-checked) and asserts identical per-frame
+hazard areas, events, violations and verdicts on all fixtures.
+`crates/unflash-gpu/tests/gpu_vs_cpu.rs` compares the entire per-pixel state
+of the GPU stage with the CPU kernel after every frame.
 
 ## Limitations
 
@@ -231,9 +192,9 @@ watch has passed the detector. The dimming is a courtesy, not a safeguard.
   for every person.
 - Static patterns like fine stripes and gratings can also trigger
   photosensitive responses, and Unflash does **not** detect those.
+- The export re-encodes the whole video (no smart-cut) and copies the audio;
+  after an **E** hold the audio runs ahead of the picture by the length of
+  the hold. Removals (R/F) do not change timing and need no audio work.
+- Sections and marks are stored in the browser's IndexedDB per file; frame
+  caches live in memory and are rebuilt when a section is prepared again.
 - Review the flagged sections yourself before you share anything.
-
-If you want the detail: [DETECTION.md](DETECTION.md) covers what counts as a
-flash, how the thresholds are applied, why the safe frame rate is what it
-is, and why a section that passes its own check also passes in the finished
-file.
