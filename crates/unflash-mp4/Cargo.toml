@@ -1,0 +1,9 @@
+[package]
+name = "unflash-mp4"
+description = "Minimal ISO-BMFF (MP4) demuxer/muxer for WebCodecs pipelines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

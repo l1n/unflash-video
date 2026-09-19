@@ -1,0 +1,13 @@
+[package]
+name = "unflash-wasm"
+description = "wasm-bindgen bindings for Unflash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+unflash-core = { path = "../unflash-core" }

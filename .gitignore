@@ -1,0 +1,16 @@
+# python reference
+__pycache__/
+*.pyc
+*.unflash/
+
+# rust
+/target/
+Cargo.lock.bak
+
+# web build output (rebuilt by build.sh)
+/web/pkg/
+/web/node_modules/
+/node_modules/
+/tests/e2e/out/
+/tests/fixtures/*.mp4
+

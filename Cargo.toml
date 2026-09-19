@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/unflash-core",
+    "crates/unflash-gpu",
+    "crates/unflash-mp4",
+    "crates/unflash-wasm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/l1n/unflash-video"
+
+[workspace.dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+wgpu = { version = "30", default-features = false, features = ["wgsl"] }
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+# Fast-ish tests for the GPU crate on a software Vulkan driver.
+[profile.dev.package."*"]
+opt-level = 2

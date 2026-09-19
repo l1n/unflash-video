@@ -1,0 +1,11 @@
+[package]
+name = "unflash-gpu"
+description = "WebGPU (wgpu) compute pipeline for the Unflash flash detector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+unflash-core = { path = "../unflash-core" }
+bytemuck.workspace = true
