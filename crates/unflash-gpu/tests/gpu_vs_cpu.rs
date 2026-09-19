@@ -116,9 +116,21 @@ fn compare(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframe
             0
         };
         let frame = gen(i, t, aw as usize, ah as usize);
-        gpu.submit(p, FrameSource::Rgb8 { data: &frame, width: aw, height: ah }).expect("submit");
+        let capture = i % 5 == 0;
+        gpu.submit(p, FrameSource::Rgb8 { data: &frame, width: aw, height: ah }, capture).expect("submit");
         gpu.wait_idle();
-        let gs = gpu.poll().expect("a result").expect("no error");
+        let gf = gpu.poll().expect("a result").expect("no error");
+        let gs = gf.stats;
+        if capture {
+            // at analysis resolution the capture is the frame itself
+            let rgba = gf.rgba.expect("captured picture");
+            for j in 0..n {
+                assert_eq!(&rgba[j * 4..j * 4 + 3], &frame[j * 3..j * 3 + 3], "f{i} px{j}: captured rgb");
+                assert_eq!(rgba[j * 4 + 3], 255);
+            }
+        } else {
+            assert!(gf.rgba.is_none());
+        }
         let (l, v, sat) = gpu.debug_inputs();
 
         // the GPU's own ingest must match the CPU's ingest of the same bytes
@@ -217,13 +229,13 @@ fn pipelined_submissions_arrive_in_order() {
             p.now = secs_to_us(i as f64 / 30.0);
             p.mode = if i == 0 { MODE_FIRST } else { 0 };
             expected.push(cpu.run(p, FrameInput::rgb(&frames[i])));
-            gpu.submit(p, FrameSource::Rgb8 { data: &frames[i], width: aw, height: ah }).unwrap();
+            gpu.submit(p, FrameSource::Rgb8 { data: &frames[i], width: aw, height: ah }, i % 2 == 0).unwrap();
             i += 1;
         }
         assert!(gpu.in_flight() <= gpu.capacity());
         gpu.wait_idle();
         while let Some(r) = gpu.poll() {
-            got.push(r.unwrap());
+            got.push(r.unwrap().stats);
         }
     }
     for (k, (g, e)) in got.iter().zip(&expected).enumerate() {

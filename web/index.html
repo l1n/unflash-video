@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unflash</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand" title="Unflash — WebGPU / WebAssembly">⚡̶ Unflash</div>
+  <button id="btnHome" title="Back to the start screen">Guide</button>
+  <label class="filebtn primary"><input type="file" id="fileInput" accept="video/mp4,video/quicktime,.mp4,.m4v,.mov">Open video…</label>
+  <div id="videoInfo" class="video-info"></div>
+  <div class="spacer"></div>
+  <label class="profile-label">Profile
+    <select id="profileSel" title="What counts as a problem. Extended flashes are not WCAG failures, but they still affect some viewers.">
+      <option value="wcag_ext">Exact WCAG + flag extended flashes (default)</option>
+      <option value="wcag">Exact WCAG only</option>
+      <option value="strict">Stricter than WCAG</option>
+    </select>
+  </label>
+  <button id="btnScan" disabled title="Decode every frame with WebCodecs and run the detector over it, as fast as the GPU goes">Scan for flashes</button>
+  <label class="toggle" title="Run the detector live on whatever the player is showing"><input type="checkbox" id="liveToggle" disabled> live monitor</label>
+  <button id="btnExport" disabled>Export…</button>
+</header>
+
+<div id="banner" class="banner hidden"><div id="bannerText"></div><button id="btnCloseBanner" class="small">dismiss</button></div>
+
+<div id="jobbar" class="jobbar hidden">
+  <div class="jobname" id="jobName"></div>
+  <div class="progress"><div class="bar" id="jobBar"></div></div>
+  <div id="jobMsg" class="jobmsg"></div>
+  <button id="btnCancelJob" class="small danger">cancel</button>
+</div>
+
+<div id="timelineWrap" class="timeline-wrap hidden">
+  <canvas id="timeline" height="64"></canvas>
+  <div class="timeline-row">
+    <div class="timeline-hint">Flashing across the whole video: orange for general flashes, magenta for red ones, the thin trace is what the live monitor saw. Numbered boxes are sections; click one to open it. Drag on an empty stretch to add a section, or type times:</div>
+    <span class="addsec">
+      <input type="text" id="addStart" placeholder="start (e.g. 1:23.5)" size="12">
+      <input type="text" id="addEnd" placeholder="end" size="12">
+      <button id="btnAddSection" class="small">add section</button>
+    </span>
+  </div>
+</div>
+
+<main>
+  <aside id="sections" class="hidden">
+    <div class="side-head">
+      <h2>Sections</h2>
+      <button id="btnPrepareAll" class="small" title="Prepare every section that isn't prepared yet">prepare all</button>
+      <button id="btnCheckAll" class="small" title="Re-run the instant check on every prepared section">check all</button>
+      <button id="btnDeleteAll" class="small danger" title="Delete every section, including their marks">delete all</button>
+    </div>
+    <div id="sectionList" class="section-list"></div>
+  </aside>
+
+  <section id="stage" class="hidden">
+    <div class="players">
+      <div class="player-box">
+        <div class="player-head">
+          <span id="playerLabel">source</span>
+          <label class="dim-toggle" title="The dimming is a courtesy, not a safeguard"><input type="checkbox" id="dimToggle" checked> dim player</label>
+          <span class="spacer"></span>
+          <span id="liveVerdict" class="live-verdict idle">monitor off</span>
+        </div>
+        <div class="player-wrap">
+          <video id="player" controls preload="metadata" playsinline></video>
+          <div id="hud" class="hud hidden">
+            <div class="hud-row"><span class="hud-label">flash area</span><div class="hud-bar"><div id="hudHaz" class="hud-fill"></div><div class="hud-mark" title="area threshold"></div></div><span id="hudHazText" class="hud-val">0%</span></div>
+            <div class="hud-row"><span class="hud-label">red flash</span><div class="hud-bar"><div id="hudRed" class="hud-fill red"></div><div class="hud-mark"></div></div><span id="hudRedText" class="hud-val">0%</span></div>
+            <div class="hud-row small"><span id="hudInfo"></span></div>
+          </div>
+        </div>
+      </div>
+      <div class="chart-box">
+        <canvas id="chart" height="200"></canvas>
+        <div class="chart-hint" id="chartHint">Open a section to see its brightness and flash area per frame. Click a frame in the chart to jump to it.</div>
+      </div>
+    </div>
+
+    <section id="workspace" class="hidden">
+      <div class="ws-head">
+        <h2 id="wsTitle"></h2>
+        <span id="wsVerdict" class="verdict"></span>
+        <div class="spacer"></div>
+        <span class="range-edit">
+          <input type="text" id="secStart" size="10" title="section start">
+          –
+          <input type="text" id="secEnd" size="10" title="section end">
+          <button id="btnApplyRange" class="small" title="Change this section's time range (resets preparation and marks)">apply range</button>
+        </span>
+        <button id="btnReprepare" class="small" title="Decode this section again under the current profile. Your marks are kept.">re-prepare</button>
+        <button id="btnDeleteSection" class="small danger">delete section</button>
+      </div>
+      <div id="wsWarnings" class="ws-warnings hidden"></div>
+      <div id="wsUnprepared" class="panel hidden">
+        <p>This section isn't prepared yet. Preparing decodes its frames (plus a run-up and run-out) into memory so every edit can be checked instantly.</p>
+        <button id="btnPrepare" class="primary">Prepare section</button>
+      </div>
+      <div id="wsBody" class="hidden">
+        <div class="toolbar">
+          <span class="group">
+            <button id="btnSuggestLight" title="Propose removals that hold the brighter frames">Suggest: keep light</button>
+            <button id="btnSuggestDark" title="Propose removals that hold the darker frames">Suggest: keep dark</button>
+            <span class="split">
+              <button id="btnSuggestFps">Suggest: reduce FPS <span id="fpsShown" class="rate"></span></button>
+              <button id="btnFpsMenu" class="split-arrow" title="Change the rate to thin to">▾</button>
+              <div id="fpsMenu" class="menu fps-menu hidden">
+                <label for="fpsInput">Thin to</label>
+                <div class="fps-row">
+                  <input type="text" id="fpsInput" inputmode="decimal" autocomplete="off" spellcheck="false">
+                  <span class="fps-unit">pictures/s</span>
+                  <button id="btnFpsSafe" class="small" title="Back to the fastest rate this profile cannot fail">safe rate</button>
+                </div>
+                <p id="fpsNote" class="fps-note"></p>
+              </div>
+            </span>
+            <label class="sel-only" title="Only let the suggestion touch the frames you have selected"><input type="checkbox" id="suggestSelOnly"> selection only</label>
+          </span>
+          <span class="group">
+            <button id="btnCheck" class="accent" title="Check the current marks now. Every edit is re-checked automatically as well.">Check safety</button>
+            <label class="toggle" title="Re-check the section after every mark change"><input type="checkbox" id="autoCheck" checked> auto-check</label>
+          </span>
+          <span class="group">
+            <button id="btnClearEdits" class="small">clear all marks</button>
+          </span>
+        </div>
+        <div class="grid-head">
+          <h3>Frames <span id="frameCount"></span></h3>
+          <div class="legend">
+            <span class="chip removed" title="Removed. The badge says which frame shows in its place.">removed</span>
+            <span class="chip extended" title="Held on screen for 1 second with the sound muted">held 1s</span>
+            <span class="chip flagged">in flash event</span>
+            <span class="chip flagged-red">in red-flash event</span>
+            <span class="chip selected">selected</span>
+          </div>
+          <div class="grid-actions">
+            <button id="btnMarkRemoved" class="small" title="Remove the selected frames and show the kept frame before them instead">R: remove, show previous</button>
+            <button id="btnMarkRemovedNext" class="small" title="Remove the selected frames and show the kept frame after them instead">F: remove, show next</button>
+            <button id="btnMarkExtended" class="small">E: hold for 1 second</button>
+            <button id="btnUnmark" class="small">U: unmark</button>
+            <button id="btnSelectUnsafe" class="small danger hidden" title="Select the frames inside whatever is still failing">select unsafe frames</button>
+          </div>
+        </div>
+        <div class="grid-hint">Click to select · shift-click for everything in between · ctrl-click adds or removes one · Esc clears. <b>R</b> removes a frame and shows the one before it, <b>F</b> shows the one after, <b>E</b> holds a frame for a second, <b>U</b> unmarks. Every change is checked as you make it.</div>
+        <div id="frameGrid" class="frame-grid" tabindex="0"></div>
+      </div>
+    </section>
+  </section>
+
+  <section id="welcome">
+    <h1>Unflash</h1>
+    <p>Find the flashing in a video that can trigger photosensitive seizures, and take it out without wrecking the footage. Everything runs in your browser, on your GPU; nothing is uploaded anywhere.</p>
+    <ol>
+      <li><b>Open a video</b> (an MP4), then <b>Scan</b> it. Every frame is decoded with WebCodecs and pushed through the detector as fast as your GPU allows. Unflash puts a numbered <i>section</i> around every problem it finds.</li>
+      <li>Or just <b>play</b> it with <b>live monitor</b> on: the detector runs on every frame the player shows and the meter above the video tells you, as it happens, how much of the picture is flashing.</li>
+      <li><b>Prepare</b> a section to pull out its frames, then <b>mark the frames</b> you want gone (<b>R</b>/<b>F</b>) or held (<b>E</b>). The section is re-checked the instant you change anything, with nothing to render.</li>
+      <li>Or let <b>Suggest</b> do it: keep-light and keep-dark work out a set of removals, <b>reduce FPS</b> thins the section down to a rate that cannot flash fast enough to fail.</li>
+      <li><b>Export</b> re-encodes the edited video in the browser and <b>Verify</b> re-scans the result.</li>
+    </ol>
+    <p class="note-extended"><b>Extended flashes</b> are 5 seconds or more of flashing that meets every WCAG failure condition except the rate: it runs <i>at</i> the permitted speed (3 flashes/s) instead of above it. WCAG lets that through, but UK broadcast guidance doesn't and it does affect some viewers, so the default profile flags them as ordinary sections. Pick <i>Exact WCAG only</i> to ignore them. <i>Stricter than WCAG</i> already fails at that speed.</p>
+    <p class="disclaimer">This reduces risk. It can't guarantee safety. It doesn't detect hazardous static patterns such as fine stripes, and individual sensitivity varies, so review the flagged sections yourself before you share anything.</p>
+    <p id="support" class="support"></p>
+  </section>
+</main>
+
+<div id="exportModal" class="modal hidden">
+  <div class="modal-box">
+    <h2>Export edited video</h2>
+    <div id="exportSummary" class="scrollbox"></div>
+    <label>Video codec
+      <select id="exportCodec"></select>
+    </label>
+    <label>Quality <input type="range" id="exportQuality" min="1" max="10" value="7"> <span id="exportQualityText">7</span></label>
+    <p id="exportPlan" class="hint"></p>
+    <div class="modal-actions">
+      <button id="btnDoExport" class="primary">Export</button>
+      <button id="btnVerifyExport" disabled>Verify exported file</button>
+      <a id="exportDownload" class="button hidden" download>Download</a>
+      <button id="btnCloseExport" class="small">close</button>
+    </div>
+    <div id="exportResult" class="scrollbox"></div>
+  </div>
+</div>
+
+<footer id="status" class="status"></footer>
+<div id="toast" class="toast hidden"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

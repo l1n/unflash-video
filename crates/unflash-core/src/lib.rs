@@ -29,6 +29,7 @@ pub mod editing;
 pub mod grid;
 pub mod lut;
 pub mod pixel;
+pub mod resample;
 pub mod sections;
 pub mod temporal;
 pub mod time;

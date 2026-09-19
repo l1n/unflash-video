@@ -14,6 +14,7 @@
 @group(0) @binding(4) var<storage, read_write> inputs: array<u32>;
 @group(0) @binding(5) var<storage, read> state: array<u32>;
 @group(0) @binding(6) var<storage, read_write> globals: array<atomic<u32>>;
+@group(0) @binding(7) var<storage, read_write> rgba: array<u32>;
 
 var<workgroup> wg_moved: atomic<u32>;
 
@@ -66,6 +67,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
         let sat = total > 1e-5 && r >= params.red_saturation * total;
         let v = max(r - g - b, 0.0) * 320.0;
         let i = y * aw + x;
+        rgba[i] = u32(code.r) | (u32(code.g) << 8u) | (u32(code.b) << 16u) | 0xff000000u;
         inputs[i] = bitcast<u32>(l);
         inputs[n + i] = bitcast<u32>(v);
         inputs[2u * n + i] = u32(sat);

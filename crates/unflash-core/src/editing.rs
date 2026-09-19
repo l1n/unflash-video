@@ -318,9 +318,8 @@ pub enum SuggestStep {
 
 /// Keep-light / keep-dark: propose removals so the section passes.
 /// Iterates propose -> simulate -> escalate, up to 5 rounds.
-pub struct Suggester<'a> {
-    frames: &'a dyn FrameSource,
-    rel_pts: &'a [f64],
+pub struct Suggester {
+    rel_pts: Vec<f64>,
     prefer: Prefer,
     only: Option<BTreeSet<usize>>,
     base_edits: Edits,
@@ -329,23 +328,16 @@ pub struct Suggester<'a> {
     last_proposal: Edits,
 }
 
-impl<'a> Suggester<'a> {
+impl Suggester {
     /// `existing` are the section's current marks; with `only` set, marks
     /// outside the selection stay in force and are included in every
     /// simulation.
-    pub fn new(
-        frames: &'a dyn FrameSource,
-        rel_pts: &'a [f64],
-        existing: &Edits,
-        prefer: Prefer,
-        only: Option<BTreeSet<usize>>,
-    ) -> Self {
+    pub fn new(rel_pts: Vec<f64>, existing: &Edits, prefer: Prefer, only: Option<BTreeSet<usize>>) -> Self {
         let base_edits: Edits = match &only {
             Some(o) => existing.iter().filter(|(k, _)| !o.contains(k)).map(|(k, v)| (*k, *v)).collect(),
             None => Edits::new(),
         };
         Suggester {
-            frames,
             rel_pts,
             prefer,
             only,
@@ -368,15 +360,15 @@ impl<'a> Suggester<'a> {
         self.rel_pts.iter().enumerate().filter(|(_, &t)| t >= s && t <= e).map(|(i, _)| i).collect()
     }
 
-    fn apply_percentile_pass(&mut self, result: &AnalysisResult, tight: bool) {
-        let (aw, ah) = (self.frames.width(), self.frames.height());
+    fn apply_percentile_pass(&mut self, frames: &dyn FrameSource, result: &AnalysisResult, tight: bool) {
+        let (aw, ah) = (frames.width(), frames.height());
         for (s, e) in violation_spans(result, 0.3) {
             let idxs = self.indices_in(s, e);
             if idxs.len() < 2 {
                 continue;
             }
             let bbox = span_bbox(result, s, e, aw, ah);
-            let m = region_metric(self.frames, &idxs, bbox);
+            let m = region_metric(frames, &idxs, bbox);
             let hi = percentile(&m, 85.0);
             let lo = percentile(&m, 15.0);
             if hi - lo < 1e-4 {
@@ -399,8 +391,8 @@ impl<'a> Suggester<'a> {
         }
     }
 
-    fn apply_hold_all(&mut self, result: &AnalysisResult) {
-        let (aw, ah) = (self.frames.width(), self.frames.height());
+    fn apply_hold_all(&mut self, frames: &dyn FrameSource, result: &AnalysisResult) {
+        let (aw, ah) = (frames.width(), frames.height());
         for (s, e) in violation_spans(result, 0.3) {
             let idxs = self.indices_in(s, e);
             if idxs.is_empty() {
@@ -411,7 +403,7 @@ impl<'a> Suggester<'a> {
             if kept.is_empty() {
                 continue;
             }
-            let m = region_metric(self.frames, &kept, bbox);
+            let m = region_metric(frames, &kept, bbox);
             let anchor = {
                 let mut best = 0;
                 for k in 1..m.len() {
@@ -443,8 +435,9 @@ impl<'a> Suggester<'a> {
     }
 
     /// Drive the suggester. Call first with `None`, then with the simulated
-    /// result of the last [`SuggestStep::Simulate`].
-    pub fn step(&mut self, result: Option<&AnalysisResult>) -> SuggestStep {
+    /// result of the last [`SuggestStep::Simulate`]. `frames` is the
+    /// section's frame cache.
+    pub fn step(&mut self, frames: &dyn FrameSource, result: Option<&AnalysisResult>) -> SuggestStep {
         let Some(result) = result else {
             // round 0: does the section already pass with the base edits?
             self.last_proposal = self.base_edits.clone();
@@ -487,9 +480,9 @@ impl<'a> Suggester<'a> {
             });
         }
         match self.attempt {
-            0 => self.apply_percentile_pass(result, false),
-            1 => self.apply_percentile_pass(result, true),
-            _ => self.apply_hold_all(result),
+            0 => self.apply_percentile_pass(frames, result, false),
+            1 => self.apply_percentile_pass(frames, result, true),
+            _ => self.apply_hold_all(frames, result),
         }
         self.attempt += 1;
         self.last_proposal = self.proposal();

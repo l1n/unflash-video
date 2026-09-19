@@ -91,14 +91,24 @@ pub enum FrameSource<'a> {
 
 enum SlotState {
     Idle,
-    Pending,
-    Ready(Result<(), String>),
+    /// Maps still outstanding, and the first error seen.
+    Pending { remaining: u32, err: Option<String> },
 }
 
 struct Slot {
     staging: wgpu::Buffer,
+    rgba_staging: Option<wgpu::Buffer>,
+    captured: bool,
     state: Arc<Mutex<SlotState>>,
     params: KernelParams,
+}
+
+/// One completed frame.
+#[derive(Clone, Debug)]
+pub struct GpuFrame {
+    pub stats: GridStats,
+    /// The analysis-resolution picture as RGBA8, when capture was requested.
+    pub rgba: Option<Vec<u8>>,
 }
 
 /// The GPU pixel stage. Create one per (config, analysis size).
@@ -116,6 +126,7 @@ pub struct GpuStage {
     inputs_buf: wgpu::Buffer,
     state_buf: wgpu::Buffer,
     pixout_buf: wgpu::Buffer,
+    rgba_buf: wgpu::Buffer,
     globals_buf: wgpu::Buffer,
     rowwin_buf: wgpu::Buffer,
     rowtot_buf: wgpu::Buffer,
@@ -220,6 +231,7 @@ impl GpuStage {
         let inputs_buf = mk("inputs", 3 * npix * 4, st);
         let state_buf = mk("state", layout.fields() * npix * 4, st);
         let pixout_buf = mk("pixout", 3 * npix * 4, st);
+        let rgba_buf = mk("rgba", npix * 4, st);
         let globals_buf = mk("globals", 16, st);
         let rowwin_buf = mk("rowwin", geom.ah as usize * geom.gxs.len() * CELL_WORDS * 4, st);
         let rowtot_buf = mk("rowtot", geom.ah as usize * 4, st);
@@ -262,7 +274,7 @@ impl GpuStage {
         };
         let ingest_bgl = bgl(
             "ingest",
-            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), texture_entry(3), storage_entry(4, false), storage_entry(5, true), storage_entry(6, false)],
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), texture_entry(3), storage_entry(4, false), storage_entry(5, true), storage_entry(6, false), storage_entry(7, false)],
         );
         let update_bgl = bgl("update", &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false), storage_entry(3, false), storage_entry(4, true)]);
         let rows_bgl = bgl("rows", &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, true), storage_entry(4, false), storage_entry(5, false)]);
@@ -308,6 +320,8 @@ impl GpuStage {
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }),
+                rgba_staging: None,
+                captured: false,
                 state: Arc::new(Mutex::new(SlotState::Idle)),
                 params: KernelParams::default(),
             })
@@ -327,6 +341,7 @@ impl GpuStage {
             inputs_buf,
             state_buf,
             pixout_buf,
+            rgba_buf,
             globals_buf,
             rowwin_buf,
             rowtot_buf,
@@ -412,6 +427,7 @@ impl GpuStage {
                     buf_entry(4, &self.inputs_buf),
                     buf_entry(5, &self.state_buf),
                     buf_entry(6, &self.globals_buf),
+                    buf_entry(7, &self.rgba_buf),
                 ],
             }));
             let mut geo = [0u32; 2];
@@ -424,8 +440,9 @@ impl GpuStage {
     }
 
     /// Submit one frame. Fails (without side effects) when every readback
-    /// slot is in flight; call [`poll`](Self::poll) first.
-    pub fn submit(&mut self, params: KernelParams, source: FrameSource<'_>) -> Result<(), String> {
+    /// slot is in flight; call [`poll`](Self::poll) first. With `capture`,
+    /// the analysis-resolution RGBA picture comes back with the result.
+    pub fn submit(&mut self, params: KernelParams, source: FrameSource<'_>, capture: bool) -> Result<(), String> {
         let Some(slot_idx) = self.free.pop() else {
             return Err("all readback slots are in flight".into());
         };
@@ -480,16 +497,40 @@ impl GpuStage {
             pass.set_bind_group(0, &self.gather_bg, &[]);
             pass.dispatch_workgroups(self.geom.ncells() as u32, 1, 1);
         }
+        let npix = self.geom.npix();
         let slot = &mut self.slots[slot_idx];
         enc.copy_buffer_to_buffer(&self.out_buf, 0, &slot.staging, 0, (self.out_words * 4) as u64);
+        if capture {
+            let rs = slot.rgba_staging.get_or_insert_with(|| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("rgba staging"),
+                    size: (npix * 4) as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
+            enc.copy_buffer_to_buffer(&self.rgba_buf, 0, rs, 0, (npix * 4) as u64);
+        }
         self.queue.submit(Some(enc.finish()));
         // 4. async readback
         slot.params = params;
-        *slot.state.lock().unwrap() = SlotState::Pending;
+        slot.captured = capture;
+        *slot.state.lock().unwrap() = SlotState::Pending { remaining: if capture { 2 } else { 1 }, err: None };
+        let done = |st: &Arc<Mutex<SlotState>>, r: Result<(), wgpu::BufferAsyncError>| {
+            let mut g = st.lock().unwrap();
+            if let SlotState::Pending { remaining, err } = &mut *g {
+                *remaining = remaining.saturating_sub(1);
+                if let Err(e) = r {
+                    err.get_or_insert(e.to_string());
+                }
+            }
+        };
         let st = slot.state.clone();
-        slot.staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            *st.lock().unwrap() = SlotState::Ready(r.map_err(|e| e.to_string()));
-        });
+        slot.staging.slice(..).map_async(wgpu::MapMode::Read, move |r| done(&st, r));
+        if capture {
+            let st = slot.state.clone();
+            slot.rgba_staging.as_ref().unwrap().slice(..).map_async(wgpu::MapMode::Read, move |r| done(&st, r));
+        }
         self.in_flight.push_back(slot_idx);
         self.frames_submitted += 1;
         Ok(())
@@ -507,22 +548,26 @@ impl GpuStage {
     /// The oldest in-flight frame's result, if it has arrived. Call
     /// repeatedly (each browser animation frame, or after `device.poll` on
     /// native).
-    pub fn poll(&mut self) -> Option<Result<GridStats, String>> {
+    pub fn poll(&mut self) -> Option<Result<GpuFrame, String>> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = self.device.poll(wgpu::PollType::Poll);
         }
         let &slot_idx = self.in_flight.front()?;
-        let ready = {
+        let ready: Option<Result<(), String>> = {
             let st = self.slots[slot_idx].state.lock().unwrap();
             match &*st {
-                SlotState::Ready(r) => Some(r.clone()),
+                SlotState::Pending { remaining: 0, err } => Some(match err {
+                    Some(e) => Err(e.clone()),
+                    None => Ok(()),
+                }),
                 _ => None,
             }
         };
         let r = ready?;
         self.in_flight.pop_front();
         let params = self.slots[slot_idx].params;
+        let captured = self.slots[slot_idx].captured;
         let out = match r {
             Ok(()) => {
                 let words: Vec<u32> = {
@@ -531,9 +576,27 @@ impl GpuStage {
                     cast_slice::<u8, u32>(&view).to_vec()
                 };
                 self.slots[slot_idx].staging.unmap();
-                Ok(self.parse(&words, params))
+                let rgba = if captured {
+                    let rs = self.slots[slot_idx].rgba_staging.as_ref().unwrap();
+                    let bytes = rs.slice(..).get_mapped_range().expect("mapped rgba").to_vec();
+                    rs.unmap();
+                    Some(bytes)
+                } else {
+                    None
+                };
+                Ok(GpuFrame { stats: self.parse(&words, params), rgba })
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // leave the buffers unmapped for reuse
+                let slot = &self.slots[slot_idx];
+                slot.staging.unmap();
+                if captured {
+                    if let Some(rs) = &slot.rgba_staging {
+                        rs.unmap();
+                    }
+                }
+                Err(e)
+            }
         };
         *self.slots[slot_idx].state.lock().unwrap() = SlotState::Idle;
         self.free.push(slot_idx);
