@@ -126,6 +126,8 @@ pub struct GpuStage {
     lut_buf: wgpu::Buffer,
     inputs_buf: wgpu::Buffer,
     state_buf: wgpu::Buffer,
+    /// Read back only by the native debug helpers.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pixout_buf: wgpu::Buffer,
     rgba_buf: wgpu::Buffer,
     globals_buf: wgpu::Buffer,

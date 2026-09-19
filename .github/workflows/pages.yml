@@ -31,7 +31,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -57,9 +57,15 @@ jobs:
           fi
       - name: Build
         run: ./build.sh release
-      - uses: actions/configure-pages@v5
+      - id: pages
+        uses: actions/configure-pages@v5
         with:
           enablement: true
+      - name: How to enable Pages
+        if: failure() && steps.pages.outcome == 'failure'
+        run: |
+          echo "::error::GitHub Pages is not enabled for this repository and the workflow token may not enable it."
+          echo "::error::Enable it once: Settings -> Pages -> Build and deployment -> Source: 'GitHub Actions', then re-run this workflow."
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web/
