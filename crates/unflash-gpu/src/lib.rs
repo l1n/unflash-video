@@ -120,7 +120,6 @@ pub struct GpuStage {
     cfg: DetectorConfig,
     geom: GridGeometry,
     layout: StateLayout,
-    elems_per_thread: u32,
     // buffers
     params_buf: wgpu::Buffer,
     geo_buf: wgpu::Buffer,
@@ -214,7 +213,6 @@ impl GpuStage {
         let k = cfg.k_fail() as usize;
         let layout = StateLayout { k };
         let npix = geom.npix();
-        let elems_per_thread = geom.aw.div_ceil(256);
         let ncells = geom.ncells();
         let out_words = OUT_HEADER + ncells * CELL_WORDS;
 
@@ -261,7 +259,7 @@ impl GpuStage {
         let assemble = |src: &str| -> String {
             let mut s = String::from(PRELUDE);
             s.push_str(src);
-            s.replace("{{K}}", &format!("{k}u")).replace("{{E}}", &format!("{elems_per_thread}u"))
+            s.replace("{{K}}", &format!("{k}u"))
         };
         let module = |label: &str, src: String| {
             device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)) })
@@ -336,7 +334,6 @@ impl GpuStage {
             cfg: cfg.clone(),
             geom,
             layout,
-            elems_per_thread,
             params_buf,
             geo_buf,
             lut_buf,
@@ -680,8 +677,9 @@ impl GpuStage {
     pub fn state_layout(&self) -> StateLayout {
         self.layout
     }
-    pub fn elems_per_thread(&self) -> u32 {
-        self.elems_per_thread
+    /// Sizes of the intermediate buffers (bytes): (row windows, row totals).
+    pub fn intermediate_bytes(&self) -> (u64, u64) {
+        (self.rowwin_buf.size(), self.rowtot_buf.size())
     }
     pub fn frames_submitted(&self) -> u64 {
         self.frames_submitted

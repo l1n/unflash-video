@@ -765,6 +765,8 @@ function describeFailure(c) {
 // ---- frame grid ---------------------------------------------------------------------
 
 let tileObserver = null;
+let scratch = null; // one analysis-size canvas; tiles are drawn at thumbnail size
+const THUMB_W = 160;
 function renderGrid(sec) {
   const grid = $('frameGrid');
   grid.innerHTML = '';
@@ -772,6 +774,12 @@ function renderGrid(sec) {
   const shown = shownPts(wasm, sec);
   const aw = sec.cache.width();
   const ah = sec.cache.height();
+  const tw = THUMB_W;
+  const th = Math.max(1, Math.round((THUMB_W * ah) / aw));
+  if (!scratch || scratch.width !== aw || scratch.height !== ah) {
+    scratch = new OffscreenCanvas(aw, ah);
+  }
+  const sctx = scratch.getContext('2d');
   tileObserver = new IntersectionObserver(
     (entries) => {
       for (const en of entries) {
@@ -784,7 +792,8 @@ function renderGrid(sec) {
         try {
           const rgba = sec.cache.frame(i);
           const img = new ImageData(new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength), aw, ah);
-          canvas.getContext('2d').putImageData(img, 0, 0);
+          sctx.putImageData(img, 0, 0);
+          canvas.getContext('2d').drawImage(scratch, 0, 0, tw, th);
         } catch (e) {
           /* cache gone */
         }
@@ -799,8 +808,8 @@ function renderGrid(sec) {
     tile.className = 'frame';
     tile.dataset.i = i;
     const canvas = document.createElement('canvas');
-    canvas.width = aw;
-    canvas.height = ah;
+    canvas.width = tw;
+    canvas.height = th;
     tile.appendChild(canvas);
     const no = document.createElement('span');
     no.className = 'fno';
