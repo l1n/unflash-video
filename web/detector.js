@@ -57,9 +57,32 @@ export class Feeder {
       if (this.gpu) {
         this.det.feed_video_frame(frame, t, capture);
       } else {
-        this.ctx.drawImage(frame, 0, 0, this.aw, this.ah);
-        const img = this.ctx.getImageData(0, 0, this.aw, this.ah);
-        this.det.feed_rgba(img.data, this.aw, this.ah, t, capture);
+        // WebCodecs' own RGBA conversion plus the same box filter the GPU
+        // applies (in WASM); the canvas is the fallback for browsers whose
+        // copyTo cannot convert
+        let fed = false;
+        if (this.rgbaCopy !== false && typeof frame.allocationSize === 'function') {
+          try {
+            const opts = { format: 'RGBA' };
+            const size = frame.allocationSize(opts);
+            if (!this.rgbaBuf || this.rgbaBuf.byteLength < size) this.rgbaBuf = new Uint8Array(size);
+            const layout = await frame.copyTo(this.rgbaBuf, opts);
+            const w = frame.visibleRect ? frame.visibleRect.width : frame.codedWidth;
+            const h = frame.visibleRect ? frame.visibleRect.height : frame.codedHeight;
+            if (layout && layout[0] && layout[0].stride === w * 4) {
+              this.det.feed_rgba(this.rgbaBuf.subarray(0, w * h * 4), w, h, t, capture);
+              fed = true;
+              this.rgbaCopy = true;
+            }
+          } catch (e) {
+            this.rgbaCopy = false;
+          }
+        }
+        if (!fed) {
+          this.ctx.drawImage(frame, 0, 0, this.aw, this.ah);
+          const img = this.ctx.getImageData(0, 0, this.aw, this.ah);
+          this.det.feed_rgba(img.data, this.aw, this.ah, t, capture);
+        }
       }
     } finally {
       frame.close();

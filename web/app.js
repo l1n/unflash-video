@@ -185,9 +185,10 @@ async function createFeeders(progress) {
   const movie = state.movie;
   if (state.env && state.env.feeder) state.env.feeder.det.free();
   if (state.liveFeeder) state.liveFeeder.det.free();
-  const feeder = await createDetector(wasm, state.config, movie.width, movie.height);
+  const preferGpu = !new URLSearchParams(location.search).has('cpu');
+  const feeder = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu });
   state.env = { wasm, config: state.config, feeder };
-  const live = await createDetector(wasm, state.config, movie.width, movie.height);
+  const live = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu });
   state.liveFeeder = live;
   if (feeder.note) banner(feeder.note, 'info');
   if (progress) progress(0.8, `${feeder.backend} detector at ${feeder.aw}×${feeder.ah}`);
@@ -1145,6 +1146,17 @@ async function verifyExport() {
   if (ext.length && res.result.flag_extended) msg += ` ${ext.length} extended flash${ext.length === 1 ? '' : 'es'} remain${ext.length === 1 ? 's' : ''}: ` + ext.slice(0, 8).map((x) => `${fmt(x.start)}–${fmt(x.end)}`).join(', ');
   $('exportResult').innerHTML += `<p>${msg} (${res.frames} frames re-scanned in ${(res.elapsedMs / 1000).toFixed(1)} s)</p>`;
 }
+
+// a small surface for tests and debugging
+window.__unflash = {
+  get state() {
+    return state;
+  },
+  get lastScan() {
+    return state.lastScan;
+  },
+  currentSection,
+};
 
 boot().catch((e) => {
   console.error(e);

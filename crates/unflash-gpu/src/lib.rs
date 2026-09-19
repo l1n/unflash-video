@@ -8,7 +8,9 @@
 //!    count the pixels that moved since the last new picture;
 //! 2. **update** — the per-pixel state machine
 //!    (`unflash_core::pixel::run_frame_scalar`, restated in WGSL);
-//! 3. **rows** — per-row prefix scans and window sums / onset maxima;
+//! 3. **rows** — per-row window sums and onset maxima, one thread per window
+//!    position (no workgroup barriers: cheap on real GPUs and not
+//!    pathological on software ones);
 //! 4. **gather** — one grid cell per window position.
 //!
 //! The output is a few kilobytes per frame, copied into a staging buffer and
@@ -495,7 +497,7 @@ impl GpuStage {
             pass.dispatch_workgroups(self.geom.ah, 1, 1);
             pass.set_pipeline(&self.gather_pipe);
             pass.set_bind_group(0, &self.gather_bg, &[]);
-            pass.dispatch_workgroups(self.geom.ncells() as u32, 1, 1);
+            pass.dispatch_workgroups((self.geom.ncells() as u32).div_ceil(64), 1, 1);
         }
         let npix = self.geom.npix();
         let slot = &mut self.slots[slot_idx];

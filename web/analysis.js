@@ -38,7 +38,9 @@ export async function scanMovie(env, movie, { onProgress, cancel } = {}) {
   const elapsed = performance.now() - started;
   const result = feeder.finish(false);
   const vjson = JSON.stringify(result.violations);
-  const sections = JSON.parse(wasm.violations_to_sections(vjson, config, movie.tsMin, movie.tsMax, Float64Array.from(movie.keyframes)));
+  // no keyframe snapping: the export re-encodes, so sections can follow the
+  // flashing exactly instead of growing to the nearest keyframes
+  const sections = JSON.parse(wasm.violations_to_sections(vjson, config, movie.tsMin, movie.tsMax, new Float64Array()));
   const summary = JSON.parse(wasm.timeline_summary(JSON.stringify(result), movie.tsMin, movie.tsMax, 1.0));
   return { result, sections, summary, trace, frames: count, elapsedMs: elapsed };
 }

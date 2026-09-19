@@ -264,12 +264,15 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
 
 export async function pickSaveSink(suggestedName) {
   if (!window.showSaveFilePicker) return null;
+  const t0 = performance.now();
   try {
     const handle = await window.showSaveFilePicker({ suggestedName, types: [{ description: 'MP4 video', accept: { 'video/mp4': ['.mp4'] } }] });
     const writable = await handle.createWritable();
     return { sink: new FileSink(writable), handle };
   } catch (e) {
-    if (e && e.name === 'AbortError') return { cancelled: true };
+    // a real cancel takes the user a moment; an instant AbortError means the
+    // picker could not be shown at all, so fall back to an in-memory file
+    if (e && e.name === 'AbortError' && performance.now() - t0 > 400) return { cancelled: true };
     return null;
   }
 }

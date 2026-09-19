@@ -16,14 +16,8 @@
 @group(0) @binding(6) var<storage, read_write> globals: array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read_write> rgba: array<u32>;
 
-var<workgroup> wg_moved: atomic<u32>;
-
 @compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-    if (li == 0u) {
-        atomicStore(&wg_moved, 0u);
-    }
-    workgroupBarrier();
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let aw = geo[GEO_AW];
     let ah = geo[GEO_AH];
     let x = gid.x;
@@ -77,13 +71,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
         }
     }
     if (moved != 0u) {
-        atomicAdd(&wg_moved, 1u);
-    }
-    workgroupBarrier();
-    if (li == 0u) {
-        let m = atomicLoad(&wg_moved);
-        if (m != 0u) {
-            atomicAdd(&globals[0], m);
-        }
+        atomicAdd(&globals[0], 1u);
     }
 }
