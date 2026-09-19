@@ -17,7 +17,7 @@ repository = "https://github.com/l1n/unflash-video"
 bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-wgpu = { version = "30", default-features = false, features = ["wgsl"] }
+wgpu = { version = "30", default-features = false, features = ["wgsl", "std"] }
 log = "0.4"
 
 [profile.release]

@@ -160,6 +160,11 @@ impl CpuStage {
     pub fn planes(&self) -> &FramePlanes {
         &self.planes
     }
+    /// Direct access to the input planes, so a caller can run the kernel on
+    /// planes produced elsewhere (the GPU cross-check does this).
+    pub fn planes_mut(&mut self) -> &mut FramePlanes {
+        &mut self.planes
+    }
     pub fn outputs(&self) -> &PixelOutputs {
         &self.out
     }

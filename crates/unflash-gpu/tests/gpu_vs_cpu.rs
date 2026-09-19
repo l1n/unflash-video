@@ -1,0 +1,236 @@
+//! The GPU stage must agree with the CPU kernel bit for bit on everything
+//! integer (masks, onsets, the whole per-pixel state) and to float tolerance
+//! on the window sums. Runs on whatever adapter wgpu finds (a software
+//! Vulkan driver such as lavapipe is enough); skips when there is none unless
+//! UNFLASH_REQUIRE_GPU is set.
+
+use unflash_core::config::{DetectorConfig, Profile};
+use unflash_core::detector::{CpuStage, PixelStage};
+use unflash_core::grid::{FrameInput, GridGeometry};
+use unflash_core::pixel::{KernelParams, MODE_FIRST, MODE_SATURATE};
+use unflash_core::time::secs_to_us;
+use unflash_gpu::{FrameSource, GpuContext, GpuStage};
+
+fn context() -> Option<GpuContext> {
+    match pollster::block_on(GpuContext::new()) {
+        Ok(c) => {
+            eprintln!("adapter: {:?}", c.info());
+            Some(c)
+        }
+        Err(e) => {
+            if std::env::var("UNFLASH_REQUIRE_GPU").is_ok() {
+                panic!("{e}");
+            }
+            eprintln!("skipping GPU test: {e}");
+            None
+        }
+    }
+}
+
+fn hash_noise(i: usize, y: usize, x: usize, amp: i32) -> i32 {
+    let mut h = (i as u32)
+        .wrapping_mul(2654435761)
+        .wrapping_add((y as u32).wrapping_mul(2246822519))
+        .wrapping_add((x as u32).wrapping_mul(3266489917));
+    h ^= h >> 15;
+    h = h.wrapping_mul(2246822519);
+    h ^= h >> 13;
+    h >>= 24;
+    (h % (2 * amp as u32 + 1)) as i32 - amp
+}
+
+/// A busy synthetic frame: noisy background with a slow drift, a 4 Hz
+/// flashing rectangle, a red/grey flashing rectangle, a moving bright bar,
+/// and every seventh frame a repeat of the previous picture.
+fn gen(i: usize, t: f64, aw: usize, ah: usize) -> Vec<u8> {
+    let src_i = if i % 7 == 6 { i - 1 } else { i };
+    let t = if i % 7 == 6 { t - 1001.0 / 30000.0 } else { t };
+    let mut f = vec![0u8; aw * ah * 3];
+    let base = 40 + ((src_i * 120) / 200) as i32;
+    for y in 0..ah {
+        for x in 0..aw {
+            let c = (base + hash_noise(src_i, y, x, 10)).clamp(0, 255) as u8;
+            let k = (y * aw + x) * 3;
+            f[k] = c;
+            f[k + 1] = c;
+            f[k + 2] = c;
+        }
+    }
+    let phase = ((t * 8.0).floor() as i64).rem_euclid(2);
+    // flashing rectangle top-left, 45% of the window's area or so
+    let (x0, y0, x1, y1) = (aw / 10, ah / 10, aw / 10 + aw * 4 / 10, ah / 10 + ah * 4 / 10);
+    let c = if phase == 0 { 25 } else { 210 };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let k = (y * aw + x) * 3;
+            f[k] = c;
+            f[k + 1] = c;
+            f[k + 2] = c;
+        }
+    }
+    // red flashing rectangle bottom-right
+    let (x0, y0, x1, y1) = (aw / 2, ah / 2, aw / 2 + aw * 4 / 10, ah / 2 + ah * 4 / 10);
+    let rgb = if phase == 0 { [255u8, 0, 0] } else { [144u8, 144, 144] };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let k = (y * aw + x) * 3;
+            f[k..k + 3].copy_from_slice(&rgb);
+        }
+    }
+    // moving bar
+    let bx = ((t * aw as f64).floor() as usize) % aw;
+    for y in 0..ah {
+        for k in 0..(aw / 12).max(1) {
+            let x = (bx + k) % aw;
+            let idx = (y * aw + x) * 3;
+            f[idx] = 235;
+            f[idx + 1] = 235;
+            f[idx + 2] = 235;
+        }
+    }
+    f
+}
+
+fn compare(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframes: usize) {
+    let (aw, ah) = cfg.analysis_dims(src_w, src_h);
+    let geom = GridGeometry::new(&cfg, aw, ah);
+    eprintln!("analysis {}x{} window {}x{} cells {} E={}", aw, ah, geom.ww, geom.wh, geom.ncells(), aw.div_ceil(256));
+    let mut gpu = GpuStage::new(ctx, &cfg, geom.clone()).expect("stage");
+    let mut cpu = CpuStage::new(&cfg, geom.clone());
+    cpu.use_simd = false;
+    let mut cpu_own = CpuStage::new(&cfg, geom.clone());
+    cpu_own.use_simd = false;
+    let tmpl = KernelParams::template(&cfg, &geom);
+    let n = geom.npix();
+    let mut held_frames = 0;
+    let mut strobe_frames = 0;
+    for i in 0..nframes {
+        let t = i as f64 * 1001.0 / 30000.0;
+        let mut p = tmpl;
+        p.now = secs_to_us(t);
+        p.mode = if i == 0 {
+            MODE_FIRST
+        } else if i % 37 == 0 {
+            MODE_SATURATE
+        } else {
+            0
+        };
+        let frame = gen(i, t, aw as usize, ah as usize);
+        gpu.submit(p, FrameSource::Rgb8 { data: &frame, width: aw, height: ah }).expect("submit");
+        gpu.wait_idle();
+        let gs = gpu.poll().expect("a result").expect("no error");
+        let (l, v, sat) = gpu.debug_inputs();
+
+        // the GPU's own ingest must match the CPU's ingest of the same bytes
+        let _ = cpu_own.run(p, FrameInput::rgb(&frame));
+        let own = cpu_own.planes();
+        for j in 0..n {
+            assert!((l[j] - own.l[j]).abs() <= 2e-6, "f{i} px{j}: L {} vs {}", l[j], own.l[j]);
+            assert!((v[j] - own.v[j]).abs() <= 1e-3, "f{i} px{j}: V {} vs {}", v[j], own.v[j]);
+            assert_eq!(sat[j], own.sat[j], "f{i} px{j}: sat");
+        }
+
+        // the kernel, run on the GPU's planes, must match exactly
+        {
+            let pm = cpu.planes_mut();
+            pm.l = l;
+            pm.v = v;
+            pm.sat = sat;
+        }
+        let cs = cpu.run_planes(p);
+        assert_eq!(gs.held_count, cs.held_count, "f{i}: moved-pixel count");
+        assert_eq!(gs.held, cs.held, "f{i}: held");
+        if gs.held {
+            held_frames += 1;
+        }
+        assert!((gs.sum_l - cs.sum_l).abs() <= 1e-3 * n as f64, "f{i}: frame luminance {} vs {}", gs.sum_l, cs.sum_l);
+        assert_eq!(gs.cells.len(), cs.cells.len(), "f{i}: cell count");
+        for (c, (a, b)) in gs.cells.iter().zip(&cs.cells).enumerate() {
+            assert_eq!(a.cnt, b.cnt, "f{i} cell {c}: counts");
+            assert_eq!(a.onset_gen, b.onset_gen, "f{i} cell {c}: onset_gen");
+            assert_eq!(a.onset_red, b.onset_red, "f{i} cell {c}: onset_red");
+            let wp = geom.window_pixels() as f32;
+            assert!((a.sum_l - b.sum_l).abs() <= 2e-4 * wp, "f{i} cell {c}: sum_l {} vs {}", a.sum_l, b.sum_l);
+            assert!((a.sum_v - b.sum_v).abs() <= 0.05 * wp, "f{i} cell {c}: sum_v {} vs {}", a.sum_v, b.sum_v);
+            if a.cnt[0] > 0 {
+                strobe_frames += 1;
+            }
+        }
+        let (mask, og, or) = gpu.debug_pixout();
+        let out = cpu.outputs();
+        for j in 0..n {
+            assert_eq!(mask[j], out.mask[j], "f{i} px{j}: mask");
+            assert_eq!(og[j], out.onset_gen[j], "f{i} px{j}: onset_gen");
+            assert_eq!(or[j], out.onset_red[j], "f{i} px{j}: onset_red");
+        }
+        let gstate = gpu.debug_state();
+        let cstate = cpu.state().to_flat();
+        assert_eq!(gstate.len(), cstate.len());
+        for (j, (a, b)) in gstate.iter().zip(&cstate).enumerate() {
+            assert_eq!(a, b, "f{i}: state word {j} (field {}, pixel {})", j / n, j % n);
+        }
+    }
+    eprintln!("ok: {nframes} frames, {held_frames} held, {strobe_frames} strobing cells");
+    assert!(held_frames > 0, "the generator repeats frames, some must be held");
+    if nframes >= 40 {
+        // a failure needs four flashes inside a second, so short runs cannot strobe
+        assert!(strobe_frames > 0, "the generator flashes, some cells must strobe");
+    }
+}
+
+#[test]
+fn gpu_matches_cpu_default_scale() {
+    let Some(ctx) = context() else { return };
+    compare(&ctx, Profile::WcagExt.config(), 640, 480, 90);
+}
+
+#[test]
+fn gpu_matches_cpu_strict_small_odd() {
+    let Some(ctx) = context() else { return };
+    let cfg = DetectorConfig { analysis_scale: 0.1, ..Profile::Strict.config() };
+    compare(&ctx, cfg, 100, 60, 60);
+}
+
+#[test]
+fn gpu_matches_cpu_full_width() {
+    let Some(ctx) = context() else { return };
+    let cfg = DetectorConfig { analysis_scale: 1.0, ..Profile::Wcag.config() };
+    compare(&ctx, cfg, 1000, 600, 14);
+}
+
+#[test]
+fn pipelined_submissions_arrive_in_order() {
+    let Some(ctx) = context() else { return };
+    let cfg = Profile::Wcag.config();
+    let (aw, ah) = cfg.analysis_dims(640, 480);
+    let geom = GridGeometry::new(&cfg, aw, ah);
+    let mut gpu = GpuStage::new(&ctx, &cfg, geom.clone()).unwrap();
+    let mut cpu = CpuStage::new(&cfg, geom.clone());
+    let tmpl = KernelParams::template(&cfg, &geom);
+    let frames: Vec<Vec<u8>> = (0..12).map(|i| gen(i, i as f64 / 30.0, aw as usize, ah as usize)).collect();
+    let mut expected = Vec::new();
+    let mut got = Vec::new();
+    let mut i = 0;
+    while got.len() < frames.len() {
+        while i < frames.len() && gpu.can_submit() {
+            let mut p = tmpl;
+            p.now = secs_to_us(i as f64 / 30.0);
+            p.mode = if i == 0 { MODE_FIRST } else { 0 };
+            expected.push(cpu.run(p, FrameInput::rgb(&frames[i])));
+            gpu.submit(p, FrameSource::Rgb8 { data: &frames[i], width: aw, height: ah }).unwrap();
+            i += 1;
+        }
+        assert!(gpu.in_flight() <= gpu.capacity());
+        gpu.wait_idle();
+        while let Some(r) = gpu.poll() {
+            got.push(r.unwrap());
+        }
+    }
+    for (k, (g, e)) in got.iter().zip(&expected).enumerate() {
+        assert_eq!(g.held, e.held, "frame {k}");
+        assert_eq!(g.held_count, e.held_count, "frame {k}");
+        for (c, (a, b)) in g.cells.iter().zip(&e.cells).enumerate() {
+            assert_eq!(a.cnt, b.cnt, "frame {k} cell {c}");
+        }
+    }
+}
