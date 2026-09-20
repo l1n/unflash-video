@@ -73,6 +73,9 @@ pub struct SliceHeader {
     pub slice_type: SliceType,
     pub pps_id: u32,
     pub frame_num: u32,
+    /// field_pic_flag / bottom_field_flag: the slice belongs to a field picture.
+    pub field_pic: bool,
+    pub bottom_field: bool,
     pub idr_pic_id: u32,
     pub poc_lsb: u32,
     pub delta_poc_bottom: i32,
@@ -103,6 +106,16 @@ impl SliceHeader {
     }
     pub fn has_mmco5(&self) -> bool {
         matches!(&self.mmco, Some(ops) if ops.contains(&Mmco::UnmarkAll))
+    }
+    /// The picture structure: 1 top field, 2 bottom field, 3 frame.
+    pub fn structure(&self) -> u8 {
+        if !self.field_pic {
+            3
+        } else if self.bottom_field {
+            2
+        } else {
+            1
+        }
     }
 }
 
@@ -158,10 +171,19 @@ pub fn parse_slice_header(r: &mut BitReader, nal_unit_type: u8, nal_ref_idc: u8,
     let pps_id = r.ue_max(255, "pic_parameter_set_id")?;
     let pps = ppss.get(pps_id as usize).and_then(|p| p.as_ref()).ok_or(Error::Bitstream("slice refers to a missing PPS"))?;
     let sps = spss.get(pps.sps_id as usize).and_then(|s| s.as_ref()).ok_or(Error::Bitstream("PPS refers to a missing SPS"))?;
-    if first_mb >= sps.width_mbs * sps.height_mbs {
+    let mb_units = if sps.frame_mbs_only { sps.width_mbs * sps.height_mbs } else { sps.width_mbs * sps.height_mbs / 2 };
+    if first_mb >= mb_units && first_mb >= sps.width_mbs * sps.height_mbs {
         return Err(Error::Bitstream("first_mb_in_slice outside the picture"));
     }
     let frame_num = r.u(sps.log2_max_frame_num)?;
+    let mut field_pic = false;
+    let mut bottom_field = false;
+    if !sps.frame_mbs_only {
+        field_pic = r.flag()?;
+        if field_pic {
+            bottom_field = r.flag()?;
+        }
+    }
     let is_idr = nal_unit_type == 5;
     let idr_pic_id = if is_idr { r.ue_max(65535, "idr_pic_id")? } else { 0 };
     let mut poc_lsb = 0;
@@ -169,12 +191,12 @@ pub fn parse_slice_header(r: &mut BitReader, nal_unit_type: u8, nal_ref_idc: u8,
     let mut delta_poc = [0i32; 2];
     if sps.poc_type == 0 {
         poc_lsb = r.u(sps.log2_max_poc_lsb)?;
-        if pps.bottom_field_pic_order_in_frame_present {
+        if pps.bottom_field_pic_order_in_frame_present && !field_pic {
             delta_poc_bottom = r.se()?;
         }
     } else if sps.poc_type == 1 && !sps.delta_pic_order_always_zero {
         delta_poc[0] = r.se()?;
-        if pps.bottom_field_pic_order_in_frame_present {
+        if pps.bottom_field_pic_order_in_frame_present && !field_pic {
             delta_poc[1] = r.se()?;
         }
     }
@@ -276,6 +298,8 @@ pub fn parse_slice_header(r: &mut BitReader, nal_unit_type: u8, nal_ref_idc: u8,
         slice_type,
         pps_id,
         frame_num,
+        field_pic,
+        bottom_field,
         idr_pic_id,
         poc_lsb,
         delta_poc_bottom,

@@ -430,18 +430,20 @@ impl<'a> Cabac<'a> {
     /// coefficients (16, 15, 16, 4, 15, 64). Levels are written to
     /// `coeffs[start + i]` in scan order (`start` = 1 for AC blocks).
     /// Returns the number of non-zero levels.
-    pub fn residual_block(&mut self, cat: usize, max: usize, start: usize, coeffs: &mut [i32]) -> Result<u32> {
+    pub fn residual_block(&mut self, cat: usize, max: usize, start: usize, coeffs: &mut [i32], field: bool) -> Result<u32> {
+        // Table 9-34: field macroblocks use their own significance contexts
+        let (sig0, last0) = if field { (277, 338) } else { (105, 166) };
         let (sig_base, last_base, abs_base) = match cat {
-            0 => (105, 166, 227),
-            1 => (105 + 15, 166 + 15, 227 + 10),
-            2 => (105 + 29, 166 + 29, 227 + 20),
-            3 => (105 + 44, 166 + 44, 227 + 30),
-            4 => (105 + 47, 166 + 47, 227 + 39),
-            _ => (402, 417, 426),
+            0 => (sig0, last0, 227),
+            1 => (sig0 + 15, last0 + 15, 227 + 10),
+            2 => (sig0 + 29, last0 + 29, 227 + 20),
+            3 => (sig0 + 44, last0 + 44, 227 + 30),
+            4 => (sig0 + 47, last0 + 47, 227 + 39),
+            _ => (if field { 436 } else { 402 }, if field { 451 } else { 417 }, 426),
         };
         let (sig_tab, last_tab): (&[u8], &[u8]) = match cat {
             3 => (&CTX_CHROMA_DC, &CTX_CHROMA_DC),
-            5 => (&crate::tables::SIG_COEFF_8X8, &crate::tables::LAST_COEFF_8X8),
+            5 => (if field { &crate::tables::SIG_COEFF_8X8_FIELD } else { &crate::tables::SIG_COEFF_8X8 }, &crate::tables::LAST_COEFF_8X8),
             _ => (&CTX_IDENTITY, &CTX_IDENTITY),
         };
         // positions of the significant coefficients, in scan order

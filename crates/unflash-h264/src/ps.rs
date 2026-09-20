@@ -32,7 +32,11 @@ pub struct Sps {
     pub max_num_ref_frames: u32,
     pub gaps_in_frame_num_allowed: bool,
     pub width_mbs: u32,
+    /// Frame height in macroblocks (twice the map units of an interlaced sequence).
     pub height_mbs: u32,
+    pub frame_mbs_only: bool,
+    /// mb_adaptive_frame_field_flag: frames may mix frame and field macroblock pairs.
+    pub mbaff: bool,
     pub direct_8x8_inference: bool,
     /// left, right, top, bottom, in luma samples
     pub crop: (u32, u32, u32, u32),
@@ -301,14 +305,13 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     let width_mbs = r.ue_max(1023, "pic_width_in_mbs_minus1")? + 1;
     let height_map_units = r.ue_max(1023, "pic_height_in_map_units_minus1")? + 1;
     let frame_mbs_only = r.flag()?;
-    if !frame_mbs_only {
-        return Err(Error::Unsupported("interlaced (field or MBAFF) coding"));
-    }
+    let mbaff = if frame_mbs_only { false } else { r.flag()? };
     let direct_8x8_inference = r.flag()?;
     let mut crop = (0, 0, 0, 0);
     if r.flag()? {
-        // frame_cropping_flag; CropUnitX = CropUnitY = 2 for 4:2:0 frames
-        crop = (r.ue()? * 2, r.ue()? * 2, r.ue()? * 2, r.ue()? * 2);
+        // frame_cropping_flag; CropUnitX = 2, CropUnitY = 2 * (2 - frame_mbs_only_flag) for 4:2:0
+        let cy = if frame_mbs_only { 2 } else { 4 };
+        crop = (r.ue()? * 2, r.ue()? * 2, r.ue()? * cy, r.ue()? * cy);
     }
     let vui = if r.flag()? { parse_vui(&mut r).ok() } else { None };
     let sps = Sps {
@@ -326,7 +329,9 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         max_num_ref_frames,
         gaps_in_frame_num_allowed,
         width_mbs,
-        height_mbs: height_map_units,
+        height_mbs: height_map_units * if frame_mbs_only { 1 } else { 2 },
+        frame_mbs_only,
+        mbaff,
         direct_8x8_inference,
         crop,
         scaling_present,
@@ -541,6 +546,8 @@ mod tests {
             gaps_in_frame_num_allowed: false,
             width_mbs: 4,
             height_mbs: 3,
+            frame_mbs_only: true,
+            mbaff: false,
             direct_8x8_inference: true,
             crop: (0, 0, 0, 0),
             scaling_present: false,

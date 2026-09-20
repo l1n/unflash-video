@@ -1,5 +1,6 @@
 //! Decoded pictures, the decoded picture buffer, picture order counts,
-//! reference picture lists and reference marking (8.2.1, 8.2.4, 8.2.5).
+//! reference picture lists and reference marking (8.2.1, 8.2.4, 8.2.5),
+//! for frames and for field pictures.
 
 use std::rc::Rc;
 
@@ -7,7 +8,14 @@ use crate::ps::Sps;
 use crate::slice::{Mmco, RefListMod, SliceHeader, SliceType};
 use crate::{Error, Result};
 
-/// A decoded frame with the motion data later pictures may refer to.
+/// Picture structures: a top field, a bottom field, or a frame (both).
+pub const TOP: u8 = 1;
+pub const BOTTOM: u8 = 2;
+pub const FRAME: u8 = 3;
+
+/// A decoded frame with the motion data later pictures may refer to. A
+/// frame coded as two field pictures shares this buffer between them.
+#[derive(Clone)]
 pub struct Picture {
     /// Unique within a decoder instance.
     pub id: u32,
@@ -17,19 +25,32 @@ pub struct Picture {
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
+    /// TopFieldOrderCnt / BottomFieldOrderCnt (`i32::MAX` while that field
+    /// is not decoded) and PicOrderCnt (their minimum).
+    pub poc_top: i32,
+    pub poc_bot: i32,
     pub poc: i32,
     pub frame_num: u32,
     pub is_idr: bool,
     pub is_ref: bool,
     /// Inserted for a gap in frame_num: no samples of its own.
     pub non_existing: bool,
-    /// Per 4x4 block (raster over the picture), per list: motion vector,
-    /// reference index (-1 = none) and the referenced picture's id.
+    /// The fields holding decoded samples (TOP | BOTTOM).
+    pub decoded: u8,
+    /// Coded as field pictures / as an MBAFF frame.
+    pub coded_fields: bool,
+    pub mbaff: bool,
+    /// Per 4x4 block, per list: motion vector, reference index (-1 = none)
+    /// and the referenced picture as `4 * id + structure`. Blocks are in
+    /// macroblock-row raster order; the macroblocks of a field picture
+    /// occupy the frame's macroblock rows of their parity (row 2r + parity
+    /// for field row r), so a frame coded either way has the same layout.
     pub mv: [Vec<[i16; 2]>; 2],
     pub ref_idx: [Vec<i8>; 2],
     pub ref_id: [Vec<i32>; 2],
-    /// Per macroblock.
+    /// Per macroblock (the same raster): intra, and a field macroblock.
     pub mb_intra: Vec<bool>,
+    pub mb_field: Vec<bool>,
     /// The caller's timestamp for this picture.
     pub pts: f64,
 }
@@ -45,15 +66,21 @@ impl Picture {
             y: vec![0; w * h],
             u: vec![128; w * h / 4],
             v: vec![128; w * h / 4],
+            poc_top: i32::MAX,
+            poc_bot: i32::MAX,
             poc: 0,
             frame_num: 0,
             is_idr: false,
             is_ref: false,
             non_existing: false,
+            decoded: 0,
+            coded_fields: false,
+            mbaff: false,
             mv: [vec![[0; 2]; n4], vec![[0; 2]; n4]],
             ref_idx: [vec![-1; n4], vec![-1; n4]],
             ref_id: [vec![-1; n4], vec![-1; n4]],
             mb_intra: vec![false; width_mbs * height_mbs],
+            mb_field: vec![false; width_mbs * height_mbs],
             pts: 0.0,
         }
     }
@@ -62,12 +89,38 @@ impl Picture {
     /// are left as they were; every decoded macroblock overwrites its own).
     pub fn reset(&mut self, id: u32) {
         self.id = id;
+        self.poc_top = i32::MAX;
+        self.poc_bot = i32::MAX;
         self.poc = 0;
         self.frame_num = 0;
         self.is_idr = false;
         self.is_ref = false;
         self.non_existing = false;
+        self.decoded = 0;
+        self.coded_fields = false;
+        self.mbaff = false;
         self.pts = 0.0;
+    }
+
+    /// PicOrderCnt of one field, or of the frame.
+    pub fn field_poc(&self, structure: u8) -> i32 {
+        match structure {
+            TOP => self.poc_top,
+            BOTTOM => self.poc_bot,
+            _ => self.poc,
+        }
+    }
+
+    /// Record the order count of a decoded field / frame.
+    pub fn set_poc(&mut self, structure: u8, top: i32, bottom: i32) {
+        if structure & TOP != 0 {
+            self.poc_top = top;
+        }
+        if structure & BOTTOM != 0 {
+            self.poc_bot = bottom;
+        }
+        self.decoded |= structure;
+        self.poc = self.poc_top.min(self.poc_bot);
     }
 
     pub fn chroma_width(&self) -> usize {
@@ -78,14 +131,28 @@ impl Picture {
     }
 }
 
-/// A reference picture as seen from the current slice.
+/// A reference picture as seen from the current slice: a frame, or one
+/// field of a frame.
 #[derive(Clone)]
 pub struct RefPic {
     pub pic: Rc<Picture>,
+    /// TOP, BOTTOM or FRAME.
+    pub structure: u8,
     pub long_term: bool,
+    /// PicOrderCnt of the field / frame.
     pub poc: i32,
     /// PicNum (short-term) or LongTermPicNum.
     pub pic_num: i32,
+}
+
+impl RefPic {
+    /// Identifies the referenced field / frame in the motion field.
+    pub fn key(&self) -> i32 {
+        self.pic.id as i32 * 4 + self.structure as i32
+    }
+    fn same(&self, other: &RefPic) -> bool {
+        self.pic.id == other.pic.id && self.structure == other.structure && self.long_term == other.long_term
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +165,8 @@ pub struct DpbEntry {
     pub pic: Rc<Picture>,
     pub kind: RefKind,
     pub long_term_frame_idx: u32,
+    /// The fields marked as used for reference (TOP | BOTTOM).
+    pub reference: u8,
     /// The frame_num and POC the picture is referenced by (a memory
     /// management control operation 5 renumbers a picture after the fact).
     pub frame_num: u32,
@@ -130,10 +199,13 @@ impl Default for Dpb {
     }
 }
 
-/// The picture order count of a picture and the state to carry forward.
+/// The picture order counts of a picture and the state to carry forward.
 #[derive(Clone, Copy, Debug)]
 pub struct PocState {
+    /// PicOrderCnt of the picture (the field's, or the frame's minimum).
     pub poc: i32,
+    pub top: i32,
+    pub bottom: i32,
     poc_msb: i32,
     poc_lsb: i32,
     frame_num_offset: i32,
@@ -180,17 +252,29 @@ impl Dpb {
         }
     }
 
+    /// Unmark the fields in `mask` of the entries matching `pred`; entries
+    /// with no field left are removed.
+    fn unmark_where(&mut self, mask: u8, pred: impl Fn(&DpbEntry) -> bool) {
+        for e in self.entries.iter_mut() {
+            if pred(e) {
+                e.reference &= !mask;
+            }
+        }
+        self.remove_where(|e| e.reference == 0);
+    }
+
     pub fn prev_ref_frame_num(&self) -> u32 {
         self.prev_ref_frame_num
     }
 
-    /// 8.2.1: the picture order count of the picture a slice header starts.
+    /// 8.2.1: the picture order counts of the picture a slice header starts.
     pub fn compute_poc(&self, sps: &Sps, hdr: &SliceHeader) -> PocState {
         let max_frame_num = sps.max_frame_num() as i32;
-        match sps.poc_type {
+        let structure = hdr.structure();
+        let (top, bottom, poc_msb, poc_lsb, frame_num_offset) = match sps.poc_type {
             0 => {
                 let max_lsb = 1i32 << sps.log2_max_poc_lsb;
-                let (prev_msb, prev_lsb) = if hdr.is_idr() { (0, 0) } else if self.prev_had_mmco5 { (0, 0) } else { (self.prev_poc_msb, self.prev_poc_lsb) };
+                let (prev_msb, prev_lsb) = if hdr.is_idr() { (0, 0) } else { (self.prev_poc_msb, self.prev_poc_lsb) };
                 let lsb = hdr.poc_lsb as i32;
                 let msb = if lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2 {
                     prev_msb + max_lsb
@@ -200,8 +284,8 @@ impl Dpb {
                     prev_msb
                 };
                 let top = msb + lsb;
-                let bottom = top + hdr.delta_poc_bottom;
-                PocState { poc: top.min(bottom), poc_msb: msb, poc_lsb: lsb, frame_num_offset: 0 }
+                let bottom = if structure == FRAME { top + hdr.delta_poc_bottom } else { top };
+                (top, bottom, msb, lsb, 0)
             }
             1 => {
                 let prev_offset = if self.prev_had_mmco5 { 0 } else { self.prev_frame_num_offset };
@@ -231,8 +315,8 @@ impl Dpb {
                     expected += sps.offset_for_non_ref_pic;
                 }
                 let top = expected + hdr.delta_poc[0];
-                let bottom = top + sps.offset_for_top_to_bottom_field + hdr.delta_poc[1];
-                PocState { poc: top.min(bottom), poc_msb: 0, poc_lsb: 0, frame_num_offset }
+                let bottom = top + sps.offset_for_top_to_bottom_field + if structure == FRAME { hdr.delta_poc[1] } else { 0 };
+                (top, bottom, 0, 0, frame_num_offset)
             }
             _ => {
                 let prev_offset = if self.prev_had_mmco5 { 0 } else { self.prev_frame_num_offset };
@@ -250,13 +334,19 @@ impl Dpb {
                 } else {
                     2 * (frame_num_offset + hdr.frame_num as i32)
                 };
-                PocState { poc, poc_msb: 0, poc_lsb: 0, frame_num_offset }
+                (poc, poc, 0, 0, frame_num_offset)
             }
-        }
+        };
+        let poc = match structure {
+            TOP => top,
+            BOTTOM => bottom,
+            _ => top.min(bottom),
+        };
+        PocState { poc, top, bottom, poc_msb, poc_lsb, frame_num_offset }
     }
 
-    /// The PicNum of a short-term entry relative to the current frame_num.
-    fn frame_num_wrap(&self, sps: &Sps, entry_frame_num: u32, cur_frame_num: u32) -> i32 {
+    /// FrameNumWrap of a short-term entry relative to the current frame_num.
+    fn frame_num_wrap(sps: &Sps, entry_frame_num: u32, cur_frame_num: u32) -> i32 {
         if entry_frame_num > cur_frame_num {
             entry_frame_num as i32 - sps.max_frame_num() as i32
         } else {
@@ -264,54 +354,88 @@ impl Dpb {
         }
     }
 
-    fn ref_pics(&self, sps: &Sps, cur_frame_num: u32) -> Vec<RefPic> {
-        self.entries
-            .iter()
-            .map(|e| RefPic {
-                pic: e.pic.clone(),
-                long_term: e.kind == RefKind::Long,
-                poc: e.poc,
-                pic_num: if e.kind == RefKind::Long { e.long_term_frame_idx as i32 } else { self.frame_num_wrap(sps, e.frame_num, cur_frame_num) },
-            })
-            .collect()
+    /// The reference picture a DPB entry provides for the current picture
+    /// structure: the whole frame, or one of its fields.
+    fn ref_pic(sps: &Sps, e: &DpbEntry, structure: u8, cur_structure: u8, cur_frame_num: u32) -> RefPic {
+        let long_term = e.kind == RefKind::Long;
+        let (poc, pic_num) = if structure == FRAME {
+            (e.poc, if long_term { e.long_term_frame_idx as i32 } else { Self::frame_num_wrap(sps, e.frame_num, cur_frame_num) })
+        } else {
+            let base = if long_term { e.long_term_frame_idx as i32 } else { Self::frame_num_wrap(sps, e.frame_num, cur_frame_num) };
+            (e.pic.field_poc(structure), 2 * base + (structure == cur_structure) as i32)
+        };
+        RefPic { pic: e.pic.clone(), structure, long_term, poc, pic_num }
+    }
+
+    /// 8.2.4.2.5: the fields of an ordered list of frames, alternating in
+    /// parity starting with the current field's.
+    fn alternate_fields(sps: &Sps, frames: &[&DpbEntry], cur_structure: u8, cur_frame_num: u32) -> Vec<RefPic> {
+        let mut out = Vec::new();
+        let mut i = [0usize; 2];
+        let parity = [cur_structure, cur_structure ^ 3];
+        while i[0] < frames.len() || i[1] < frames.len() {
+            for p in 0..2 {
+                while i[p] < frames.len() && frames[i[p]].reference & parity[p] == 0 {
+                    i[p] += 1;
+                }
+                if i[p] < frames.len() {
+                    out.push(Self::ref_pic(sps, frames[i[p]], parity[p], cur_structure, cur_frame_num));
+                    i[p] += 1;
+                }
+            }
+        }
+        out
     }
 
     /// 8.2.4.2 + 8.2.4.3: the reference picture lists of a slice.
     pub fn ref_lists(&self, sps: &Sps, hdr: &SliceHeader, cur_poc: i32) -> Result<[Vec<RefPic>; 2]> {
-        let all = self.ref_pics(sps, hdr.frame_num);
+        let structure = hdr.structure();
+        let field = structure != FRAME;
+        let cur_frame_num = hdr.frame_num;
         let mut lists: [Vec<RefPic>; 2] = [Vec::new(), Vec::new()];
+        if hdr.slice_type == SliceType::I {
+            return Ok(lists);
+        }
+        // the frames with a usable reference field / both fields
+        let usable = |e: &&DpbEntry| if field { e.reference != 0 } else { e.reference == FRAME };
+        let mut short: Vec<&DpbEntry> = self.entries.iter().filter(|e| e.kind == RefKind::Short).filter(usable).collect();
+        let mut long: Vec<&DpbEntry> = self.entries.iter().filter(|e| e.kind == RefKind::Long).filter(usable).collect();
+        long.sort_by_key(|e| e.long_term_frame_idx);
+        let frames_to_refs = |frames: &[&DpbEntry]| -> Vec<RefPic> {
+            if field {
+                Self::alternate_fields(sps, frames, structure, cur_frame_num)
+            } else {
+                frames.iter().map(|e| Self::ref_pic(sps, e, FRAME, FRAME, cur_frame_num)).collect()
+            }
+        };
         match hdr.slice_type {
-            SliceType::I => return Ok(lists),
             SliceType::P => {
-                let mut short: Vec<RefPic> = all.iter().filter(|r| !r.long_term).cloned().collect();
-                short.sort_by(|a, b| b.pic_num.cmp(&a.pic_num));
-                let mut long: Vec<RefPic> = all.iter().filter(|r| r.long_term).cloned().collect();
-                long.sort_by(|a, b| a.pic_num.cmp(&b.pic_num));
-                lists[0] = short;
-                lists[0].extend(long);
+                short.sort_by(|a, b| Self::frame_num_wrap(sps, b.frame_num, cur_frame_num).cmp(&Self::frame_num_wrap(sps, a.frame_num, cur_frame_num)));
+                lists[0] = frames_to_refs(&short);
+                lists[0].extend(frames_to_refs(&long));
             }
             SliceType::B => {
-                let mut before: Vec<RefPic> = all.iter().filter(|r| !r.long_term && r.poc <= cur_poc).cloned().collect();
+                let mut before: Vec<&DpbEntry> = short.iter().copied().filter(|e| e.poc <= cur_poc).collect();
                 before.sort_by(|a, b| b.poc.cmp(&a.poc));
-                let mut after: Vec<RefPic> = all.iter().filter(|r| !r.long_term && r.poc > cur_poc).cloned().collect();
+                let mut after: Vec<&DpbEntry> = short.iter().copied().filter(|e| e.poc > cur_poc).collect();
                 after.sort_by(|a, b| a.poc.cmp(&b.poc));
-                let mut long: Vec<RefPic> = all.iter().filter(|r| r.long_term).cloned().collect();
-                long.sort_by(|a, b| a.pic_num.cmp(&b.pic_num));
                 let mut l0 = before.clone();
-                l0.extend(after.iter().cloned());
-                l0.extend(long.iter().cloned());
+                l0.extend(after.iter().copied());
                 let mut l1 = after;
                 l1.extend(before);
-                l1.extend(long);
-                if l1.len() > 1 && l1.len() == l0.len() && l1.iter().zip(&l0).all(|(a, b)| a.pic.id == b.pic.id) {
-                    l1.swap(0, 1);
+                let long_refs = frames_to_refs(&long);
+                lists[0] = frames_to_refs(&l0);
+                lists[0].extend(long_refs.iter().cloned());
+                lists[1] = frames_to_refs(&l1);
+                lists[1].extend(long_refs);
+                if lists[1].len() > 1 && lists[1].len() == lists[0].len() && lists[1].iter().zip(&lists[0]).all(|(a, b)| a.same(b)) {
+                    lists[1].swap(0, 1);
                 }
-                lists[0] = l0;
-                lists[1] = l1;
             }
+            SliceType::I => unreachable!(),
         }
-        let max_pic_num = sps.max_frame_num() as i32;
-        let cur_pic_num = hdr.frame_num as i32;
+        let max_pic_num = if field { 2 * sps.max_frame_num() as i32 } else { sps.max_frame_num() as i32 };
+        let cur_pic_num = if field { 2 * hdr.frame_num as i32 + 1 } else { hdr.frame_num as i32 };
         for l in 0..2 {
             let n = hdr.num_ref_idx_active[l] as usize;
             if n == 0 {
@@ -335,10 +459,14 @@ impl Dpb {
                                 no_wrap -= max_pic_num;
                             }
                             pred = no_wrap;
-                            let pic_num = if no_wrap > cur_pic_num { no_wrap - max_pic_num } else { no_wrap };
-                            all.iter().find(|r| !r.long_term && r.pic_num == pic_num).cloned()
+                            // the field / frame with this picture number
+                            let (frame_num, want) = if field { (no_wrap >> 1, if no_wrap & 1 != 0 { structure } else { structure ^ 3 }) } else { (no_wrap, FRAME) };
+                            self.entries.iter().find(|e| e.kind == RefKind::Short && e.frame_num as i32 == frame_num && e.reference & want == want).map(|e| Self::ref_pic(sps, e, want, structure, cur_frame_num))
                         }
-                        RefListMod::LongTerm(num) => all.iter().find(|r| r.long_term && r.pic_num == num as i32).cloned(),
+                        RefListMod::LongTerm(num) => {
+                            let (idx_lt, want) = if field { (num >> 1, if num & 1 != 0 { structure } else { structure ^ 3 }) } else { (num, FRAME) };
+                            self.entries.iter().find(|e| e.kind == RefKind::Long && e.long_term_frame_idx == idx_lt && e.reference & want == want).map(|e| Self::ref_pic(sps, e, want, structure, cur_frame_num))
+                        }
                     };
                     let Some(entry) = entry else {
                         return Err(Error::Bitstream("reference list modification names a missing picture"));
@@ -347,7 +475,7 @@ impl Dpb {
                     list.insert(idx.min(list.len()), entry.clone());
                     let mut k = idx + 1;
                     while k < list.len() {
-                        if list[k].pic.id == entry.pic.id && list[k].long_term == entry.long_term {
+                        if list[k].same(&entry) {
                             list.remove(k);
                         } else {
                             k += 1;
@@ -390,25 +518,25 @@ impl Dpb {
             pic.frame_num = num;
             pic.non_existing = true;
             pic.is_ref = true;
-            self.sliding_window(sps);
-            self.entries.push(DpbEntry { frame_num: pic.frame_num, poc: pic.poc, pic: Rc::new(pic), kind: RefKind::Short, long_term_frame_idx: 0 });
+            pic.decoded = FRAME;
+            self.sliding_window(sps, num);
+            self.entries.push(DpbEntry { frame_num: num, poc: pic.poc, pic: Rc::new(pic), kind: RefKind::Short, long_term_frame_idx: 0, reference: FRAME });
             self.prev_ref_frame_num = num;
             num = (num + 1) % max;
             guard += 1;
         }
     }
 
-    fn sliding_window(&mut self, sps: &Sps) {
-        let num_ref = self.entries.len();
-        if num_ref >= sps.max_num_ref_frames.max(1) as usize {
-            // remove the short-term reference with the smallest FrameNumWrap
-            let cur = self.prev_ref_frame_num;
+    /// 8.2.5.3: make room for the current picture by dropping the oldest
+    /// short-term frame when the buffer is full.
+    fn sliding_window(&mut self, sps: &Sps, cur_frame_num: u32) {
+        if self.entries.len() >= sps.max_num_ref_frames.max(1) as usize {
             let mut worst: Option<(usize, i32)> = None;
             for (i, e) in self.entries.iter().enumerate() {
                 if e.kind != RefKind::Short {
                     continue;
                 }
-                let fnw = self.frame_num_wrap(sps, e.frame_num, cur);
+                let fnw = Self::frame_num_wrap(sps, e.frame_num, cur_frame_num);
                 if worst.map_or(true, |(_, w)| fnw < w) {
                     worst = Some((i, fnw));
                 }
@@ -420,43 +548,60 @@ impl Dpb {
         }
     }
 
-    /// 8.2.5: reference marking after decoding a picture, and the state
-    /// updates for the next one. Returns the (possibly reset) POC.
-    pub fn mark(&mut self, sps: &Sps, hdr: &SliceHeader, pic: Rc<Picture>, poc: PocState) -> Result<()> {
+    /// The field / frame a picture number in a marking operation names:
+    /// (frame_num, fields).
+    fn pic_num_fields(no_wrap: i32, structure: u8) -> (u32, u8) {
+        if structure == FRAME {
+            (no_wrap as u32, FRAME)
+        } else {
+            (no_wrap as u32 >> 1, if no_wrap & 1 != 0 { structure } else { structure ^ 3 })
+        }
+    }
+
+    /// 8.2.5: reference marking after decoding a picture (a frame, or one
+    /// field), and the state updates for the next one. `pic` is the buffer
+    /// later pictures reference; for the second field of a frame it
+    /// replaces the first field's.
+    pub fn mark(&mut self, sps: &Sps, hdr: &SliceHeader, pic: Rc<Picture>, poc: PocState, structure: u8) -> Result<()> {
         let mut had_mmco5 = false;
+        let field = structure != FRAME;
+        let cur_pic_num = if field { 2 * hdr.frame_num as i32 + 1 } else { hdr.frame_num as i32 };
+        let max_pic_num = if field { 2 * sps.max_frame_num() as i32 } else { sps.max_frame_num() as i32 };
         if hdr.is_ref() {
             if hdr.is_idr() {
                 self.clear();
-                if hdr.long_term_reference {
-                    self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Long, long_term_frame_idx: 0, frame_num: pic.frame_num, poc: pic.poc });
-                    self.max_long_term_frame_idx = Some(0);
-                } else {
-                    self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Short, long_term_frame_idx: 0, frame_num: pic.frame_num, poc: pic.poc });
-                    self.max_long_term_frame_idx = None;
-                }
+                let kind = if hdr.long_term_reference { RefKind::Long } else { RefKind::Short };
+                self.max_long_term_frame_idx = if hdr.long_term_reference { Some(0) } else { None };
+                self.entries.push(DpbEntry { pic: pic.clone(), kind, long_term_frame_idx: 0, reference: structure, frame_num: hdr.frame_num, poc: poc.poc });
             } else {
+                // the second field of a frame whose first field is a reference joins its entry
+                let existing = self.entries.iter().position(|e| e.pic.id == pic.id);
                 let mut current_long: Option<u32> = None;
                 match &hdr.mmco {
-                    None => self.sliding_window(sps),
+                    None => {
+                        if existing.is_none() {
+                            self.sliding_window(sps, hdr.frame_num);
+                        }
+                    }
                     Some(ops) => {
-                        let cur_pic_num = hdr.frame_num as i32;
                         for op in ops {
                             match *op {
                                 Mmco::UnmarkShortTerm(d) => {
-                                    let pic_num = cur_pic_num - d as i32;
-                                    let cur = hdr.frame_num;
-                                    self.remove_where(|e| e.kind == RefKind::Short && frame_num_wrap_static(sps, e.frame_num, cur) == pic_num);
+                                    let no_wrap = (cur_pic_num - d as i32).rem_euclid(max_pic_num);
+                                    let (frame_num, fields) = Self::pic_num_fields(no_wrap, structure);
+                                    self.unmark_where(fields, |e| e.kind == RefKind::Short && e.frame_num == frame_num);
                                 }
                                 Mmco::UnmarkLongTerm(num) => {
-                                    self.remove_where(|e| e.kind == RefKind::Long && e.long_term_frame_idx == num);
+                                    let (idx, fields) = Self::pic_num_fields(num as i32, structure);
+                                    self.unmark_where(fields, |e| e.kind == RefKind::Long && e.long_term_frame_idx == idx);
                                 }
                                 Mmco::ShortToLong(d, idx) => {
-                                    let pic_num = cur_pic_num - d as i32;
-                                    let cur = hdr.frame_num;
-                                    // a long-term picture already holding this index is unmarked
-                                    self.remove_where(|e| e.kind == RefKind::Long && e.long_term_frame_idx == idx);
+                                    let no_wrap = (cur_pic_num - d as i32).rem_euclid(max_pic_num);
+                                    let (frame_num, _) = Self::pic_num_fields(no_wrap, structure);
+                                    // another frame holding this index is unmarked
+                                    self.remove_where(|e| e.kind == RefKind::Long && e.long_term_frame_idx == idx && e.frame_num != frame_num);
                                     for e in self.entries.iter_mut() {
-                                        if e.kind == RefKind::Short && frame_num_wrap_static(sps, e.frame_num, cur) == pic_num {
+                                        if e.kind == RefKind::Short && e.frame_num == frame_num {
                                             e.kind = RefKind::Long;
                                             e.long_term_frame_idx = idx;
                                         }
@@ -472,24 +617,42 @@ impl Dpb {
                                     had_mmco5 = true;
                                 }
                                 Mmco::CurrentToLong(idx) => {
-                                    self.remove_where(|e| e.kind == RefKind::Long && e.long_term_frame_idx == idx);
+                                    let id = pic.id;
+                                    self.remove_where(|e| e.kind == RefKind::Long && e.long_term_frame_idx == idx && e.pic.id != id);
                                     current_long = Some(idx);
                                 }
                             }
                         }
-                        if current_long.is_none() && self.entries.len() >= sps.max_num_ref_frames.max(1) as usize {
+                        if current_long.is_none() && existing.is_none() && self.entries.len() >= sps.max_num_ref_frames.max(1) as usize {
                             // a stream that forgot to make room: behave like the sliding window
-                            self.sliding_window(sps);
+                            self.sliding_window(sps, hdr.frame_num);
                         }
                     }
                 }
                 // after a memory_management_control_operation 5 the picture counts as frame_num 0 with POC 0
-                let (frame_num, poc_after) = if had_mmco5 { (0, 0) } else { (pic.frame_num, pic.poc) };
-                match current_long {
-                    Some(idx) => self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Long, long_term_frame_idx: idx, frame_num, poc: poc_after }),
-                    None => self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Short, long_term_frame_idx: 0, frame_num, poc: poc_after }),
+                let (frame_num, poc_after) = if had_mmco5 { (0, 0) } else { (hdr.frame_num, poc.poc) };
+                match self.entries.iter().position(|e| e.pic.id == pic.id) {
+                    Some(i) => {
+                        let e = &mut self.entries[i];
+                        e.reference |= structure;
+                        e.poc = e.poc.min(poc_after);
+                        if let Some(idx) = current_long {
+                            e.kind = RefKind::Long;
+                            e.long_term_frame_idx = idx;
+                        }
+                        let old = std::mem::replace(&mut e.pic, pic.clone());
+                        self.graveyard.push(old);
+                    }
+                    None => match current_long {
+                        Some(idx) => self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Long, long_term_frame_idx: idx, reference: structure, frame_num, poc: poc_after }),
+                        None => self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Short, long_term_frame_idx: 0, reference: structure, frame_num, poc: poc_after }),
+                    },
                 }
             }
+        } else if let Some(i) = self.entries.iter().position(|e| e.pic.id == pic.id) {
+            // a non-reference second field: the frame buffer still gains its samples
+            let old = std::mem::replace(&mut self.entries[i].pic, pic.clone());
+            self.graveyard.push(old);
         }
         // state for the next picture
         let frame_num_after = if had_mmco5 { 0 } else { hdr.frame_num };
@@ -497,9 +660,9 @@ impl Dpb {
             self.started = true;
             self.prev_ref_frame_num = frame_num_after;
             if had_mmco5 {
-                // 8.2.1: after mmco 5 the picture's POC counts from zero
+                // 8.2.1: after mmco 5 the picture's order counts restart from zero
                 self.prev_poc_msb = 0;
-                self.prev_poc_lsb = 0;
+                self.prev_poc_lsb = if structure == BOTTOM { 0 } else { poc.top - poc.poc };
             } else {
                 self.prev_poc_msb = poc.poc_msb;
                 self.prev_poc_lsb = poc.poc_lsb;
@@ -509,14 +672,5 @@ impl Dpb {
         self.prev_frame_num_offset = if had_mmco5 { 0 } else { poc.frame_num_offset };
         self.prev_had_mmco5 = had_mmco5;
         Ok(())
-    }
-
-}
-
-fn frame_num_wrap_static(sps: &Sps, entry_frame_num: u32, cur: u32) -> i32 {
-    if entry_frame_num > cur {
-        entry_frame_num as i32 - sps.max_frame_num() as i32
-    } else {
-        entry_frame_num as i32
     }
 }

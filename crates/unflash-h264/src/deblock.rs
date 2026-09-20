@@ -1,6 +1,6 @@
 //! The deblocking filter (8.7), run over a whole decoded picture.
 
-use crate::picture::Picture;
+use crate::picture::{Picture, BOTTOM, FRAME};
 use crate::tables::{ALPHA, BETA, TC0};
 
 /// What the filter needs to know about each macroblock.
@@ -30,7 +30,7 @@ fn clip(v: i32) -> u8 {
 /// 8.7.2.1: the boundary strength between two inter 4x4 blocks without
 /// coefficients (the intra and coefficient cases are decided by the caller).
 #[inline]
-fn motion_bs(pic: &Picture, pb: usize, qb: usize) -> u8 {
+fn motion_bs(pic: &Picture, pb: usize, qb: usize, mvy_limit: i32) -> u8 {
     let rp = [pic.ref_id[0][pb], pic.ref_id[1][pb]];
     let rq = [pic.ref_id[0][qb], pic.ref_id[1][qb]];
     let mp = [pic.mv[0][pb], pic.mv[1][pb]];
@@ -40,7 +40,7 @@ fn motion_bs(pic: &Picture, pb: usize, qb: usize) -> u8 {
     if np != nq {
         return 1;
     }
-    let far = |a: [i16; 2], b: [i16; 2]| (a[0] as i32 - b[0] as i32).abs() >= 4 || (a[1] as i32 - b[1] as i32).abs() >= 4;
+    let far = |a: [i16; 2], b: [i16; 2]| (a[0] as i32 - b[0] as i32).abs() >= 4 || (a[1] as i32 - b[1] as i32).abs() >= mvy_limit;
     if np == 1 {
         let (ip, vp) = if rp[0] >= 0 { (rp[0], mp[0]) } else { (rp[1], mp[1]) };
         let (iq, vq) = if rq[0] >= 0 { (rq[0], mq[0]) } else { (rq[1], mq[1]) };
@@ -66,15 +66,19 @@ fn motion_bs(pic: &Picture, pb: usize, qb: usize) -> u8 {
 
 /// The boundary strength of the edge between blocks `pb` (in MB `p`) and
 /// `qb` (in MB `q`); `p_bit` / `q_bit` select their coefficient flags.
+/// `strong` says an intra macroblock edge gets bS 4 (a frame macroblock
+/// edge, or a vertical one in a field); vertical motion differs at
+/// `mvy_limit` quarter samples (2 for field macroblocks).
 #[inline]
-fn boundary_strength(pic: &Picture, p: &MbDeblockInfo, q: &MbDeblockInfo, pb: usize, qb: usize, p_bit: u16, q_bit: u16, mb_edge: bool) -> u8 {
+#[allow(clippy::too_many_arguments)]
+fn boundary_strength(pic: &Picture, p: &MbDeblockInfo, q: &MbDeblockInfo, pb: usize, qb: usize, p_bit: u16, q_bit: u16, strong: bool, mvy_limit: i32) -> u8 {
     if p.intra || q.intra {
-        return if mb_edge { 4 } else { 3 };
+        return if strong { 4 } else { 3 };
     }
     if p.nonzero & p_bit != 0 || q.nonzero & q_bit != 0 {
         return 2;
     }
-    motion_bs(pic, pb, qb)
+    motion_bs(pic, pb, qb, mvy_limit)
 }
 
 /// Whether all sixteen 4x4 blocks of the macroblock at (`bx0`, `by0`) (in
@@ -267,19 +271,27 @@ fn thresholds(qp_p: i32, qp_q: i32, cur: &MbDeblockInfo) -> (i32, i32, [u8; 3]) 
     (ALPHA[index_a] as i32, BETA[index_b] as i32, TC0[index_a])
 }
 
-/// Deblock the whole picture in macroblock order.
-pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize, height_mbs: usize) {
+/// Deblock the picture (a frame, or the field `structure` of it) in
+/// macroblock order.
+pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize, height_mbs: usize, structure: u8) {
     let w4 = pic.width / 4;
-    let lw = pic.width;
-    let cw = pic.width / 2;
-    for my in 0..height_mbs {
+    let field = structure != FRAME;
+    let parity = (structure == BOTTOM) as usize;
+    let mvy_limit = if field { 2 } else { 4 };
+    // strides and macroblock rows of the field / frame being filtered
+    let lw = if field { 2 * pic.width } else { pic.width };
+    let cw = if field { pic.width } else { pic.width / 2 };
+    let rows = if field { height_mbs / 2 } else { height_mbs };
+    let row_step = if field { 2 } else { 1 };
+    for row in 0..rows {
+        let my = if field { 2 * row + parity } else { row };
         for mx in 0..width_mbs {
             let cur = mbs[my * width_mbs + mx];
             if !cur.decoded || cur.filter_idc == 1 {
                 continue;
             }
             let left = if mx > 0 { Some(mbs[my * width_mbs + mx - 1]) } else { None };
-            let above = if my > 0 { Some(mbs[(my - 1) * width_mbs + mx]) } else { None };
+            let above = if row > 0 { Some(mbs[(my - row_step) * width_mbs + mx]) } else { None };
             let across = |n: &Option<MbDeblockInfo>| n.map_or(false, |n| n.decoded && !(cur.filter_idc == 2 && n.slice != cur.slice));
             let do_left = across(&left);
             let do_above = across(&above);
@@ -292,14 +304,16 @@ pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize
                 let l = left.unwrap();
                 for k in 0..4 {
                     let qb = (by0 + k) * w4 + bx0;
-                    bs_v[0][k] = boundary_strength(pic, &l, &cur, qb - 1, qb, 1 << (k * 4 + 3), 1 << (k * 4), true);
+                    bs_v[0][k] = boundary_strength(pic, &l, &cur, qb - 1, qb, 1 << (k * 4 + 3), 1 << (k * 4), true, mvy_limit);
                 }
             }
             if do_above {
                 let a = above.unwrap();
+                // the last block row of the macroblock above (of the same field)
+                let above_off = (4 * row_step - 3) * w4;
                 for k in 0..4 {
                     let qb = by0 * w4 + bx0 + k;
-                    bs_h[0][k] = boundary_strength(pic, &a, &cur, qb - w4, qb, 1 << (12 + k), 1 << k, true);
+                    bs_h[0][k] = boundary_strength(pic, &a, &cur, qb - above_off, qb, 1 << (12 + k), 1 << k, !field, mvy_limit);
                 }
             }
             // internal edges
@@ -319,15 +333,21 @@ pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize
                     for k in 0..4 {
                         // vertical edge e (x = 4e), segment k (rows 4k..)
                         let pb = (by0 + k) * w4 + bx0 + e - 1;
-                        bs_v[e][k] = boundary_strength(pic, &cur, &cur, pb, pb + 1, 1 << (k * 4 + e - 1), 1 << (k * 4 + e), false);
+                        bs_v[e][k] = boundary_strength(pic, &cur, &cur, pb, pb + 1, 1 << (k * 4 + e - 1), 1 << (k * 4 + e), false, mvy_limit);
                         // horizontal edge e (y = 4e), segment k (columns 4k..)
                         let pb = (by0 + e - 1) * w4 + bx0 + k;
-                        bs_h[e][k] = boundary_strength(pic, &cur, &cur, pb, pb + w4, 1 << ((e - 1) * 4 + k), 1 << (e * 4 + k), false);
+                        bs_h[e][k] = boundary_strength(pic, &cur, &cur, pb, pb + w4, 1 << ((e - 1) * 4 + k), 1 << (e * 4 + k), false, mvy_limit);
                     }
                 }
             }
+            if std::env::var("H264_DBG_MB").map_or(false, |v| v == format!("{mx},{row},{structure}")) {
+                eprintln!("deblock mb ({mx},{row}) struct {structure}: intra {} t8 {} qp {} qpc {:?} nz {:#x} slice {} idc {} a/b {}/{} left {:?} above {:?} bs_v {:?} bs_h {:?}", cur.intra, cur.transform8x8, cur.qp, cur.qpc, cur.nonzero, cur.slice, cur.filter_idc, cur.alpha_offset, cur.beta_offset, left.map(|l| (l.qp, l.slice, l.intra)), above.map(|a| (a.qp, a.slice, a.intra)), bs_v, bs_h);
+            }
             let x0 = mx * 16;
-            let y0 = my * 16;
+            // the first luma / chroma line of the macroblock, in lines of the frame
+            let y0 = if field { 32 * row + parity } else { 16 * my };
+            let ybase = y0 * pic.width + x0;
+            let cybase = (if field { 16 * row + parity } else { 8 * my }) * (pic.width / 2) + mx * 8;
             // luma, vertical edges then horizontal edges
             for e in 0..4 {
                 if (e == 0 && !do_left) || (cur.transform8x8 && e % 2 == 1) || bs_v[e] == [0; 4] {
@@ -341,7 +361,7 @@ pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize
                         continue;
                     }
                     let tc0 = if bs < 4 { tc0s[bs as usize - 1] as i32 } else { 0 };
-                    let base = (y0 + k * 4) * lw + x0 + e * 4 - 4;
+                    let base = ybase + k * 4 * lw + e * 4 - 4;
                     for r in 0..4 {
                         let o = base + r * lw;
                         let s: &mut [u8; 8] = (&mut pic.y[o..o + 8]).try_into().unwrap();
@@ -362,11 +382,9 @@ pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize
                     bs16[k * 4..k * 4 + 4].fill(bs);
                     tc16[k * 4..k * 4 + 4].fill(if bs != 0 && bs < 4 { tc0s[bs as usize - 1] as i32 } else { 0 });
                 }
-                luma_edge_h::<16>(&mut pic.y, (y0 + e * 4) * lw + x0, lw, &bs16, &tc16, bs_h[e][0] == 4, alpha, beta);
+                luma_edge_h::<16>(&mut pic.y, ybase + e * 4 * lw, lw, &bs16, &tc16, bs_h[e][0] == 4, alpha, beta);
             }
             // chroma: edges 0 and 4 of each 8x8 component, using the luma edges 0 and 2
-            let cx0 = mx * 8;
-            let cy0 = my * 8;
             for comp in 0..2 {
                 for &(e, luma_e) in &[(0usize, 0usize), (4, 2)] {
                     if (e == 0 && !do_left) || bs_v[luma_e] == [0; 4] {
@@ -381,7 +399,7 @@ pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize
                             continue;
                         }
                         let tc0 = if bs < 4 { tc0s[bs as usize - 1] as i32 } else { 0 };
-                        let o = (cy0 + r) * cw + cx0 + e - 2;
+                        let o = cybase + r * cw + e - 2;
                         let s: &mut [u8; 4] = (&mut plane[o..o + 4]).try_into().unwrap();
                         chroma_line(s, bs, alpha, beta, tc0);
                     }
@@ -400,7 +418,7 @@ pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize
                         bs8[k * 2..k * 2 + 2].fill(bs);
                         tc8[k * 2..k * 2 + 2].fill(if bs != 0 && bs < 4 { tc0s[bs as usize - 1] as i32 } else { 0 });
                     }
-                    chroma_edge_h::<8>(plane, (cy0 + e) * cw + cx0, cw, &bs8, &tc8, bs_h[luma_e][0] == 4, alpha, beta);
+                    chroma_edge_h::<8>(plane, cybase + e * cw, cw, &bs8, &tc8, bs_h[luma_e][0] == 4, alpha, beta);
                 }
             }
         }

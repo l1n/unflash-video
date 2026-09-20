@@ -178,18 +178,18 @@ fn luma_block<const W: usize>(src: &[u8], base: usize, ss: usize, xf: i32, yf: i
 /// quarter samples, written to `dst` (stride `ds`); with `avg` the
 /// prediction is averaged into `dst` (the default bi-prediction).
 #[allow(clippy::too_many_arguments)]
-pub fn mc_luma(plane: &[u8], pw: usize, ph: usize, x: i32, y: i32, mvx: i32, mvy: i32, w: usize, h: usize, dst: &mut [u8], ds: usize, avg: bool) {
+pub fn mc_luma(plane: &[u8], ps: usize, pw: usize, ph: usize, x: i32, y: i32, mvx: i32, mvy: i32, w: usize, h: usize, dst: &mut [u8], ds: usize, avg: bool) {
     let xi = x + (mvx >> 2);
     let yi = y + (mvy >> 2);
     let xf = mvx & 3;
     let yf = mvy & 3;
     let inside = xi >= 2 && yi >= 2 && xi + w as i32 + 3 <= pw as i32 && yi + h as i32 + 3 <= ph as i32;
     if inside {
-        let base = yi as usize * pw + xi as usize;
+        let base = yi as usize * ps + xi as usize;
         match w {
-            16 => luma_block::<16>(plane, base, pw, xf, yf, h, dst, ds, avg),
-            8 => luma_block::<8>(plane, base, pw, xf, yf, h, dst, ds, avg),
-            _ => luma_block::<4>(plane, base, pw, xf, yf, h, dst, ds, avg),
+            16 => luma_block::<16>(plane, base, ps, xf, yf, h, dst, ds, avg),
+            8 => luma_block::<8>(plane, base, ps, xf, yf, h, dst, ds, avg),
+            _ => luma_block::<4>(plane, base, ps, xf, yf, h, dst, ds, avg),
         }
         return;
     }
@@ -198,7 +198,7 @@ pub fn mc_luma(plane: &[u8], pw: usize, ph: usize, x: i32, y: i32, mvx: i32, mvy
     let mut win = [0u8; WIN * WIN];
     for j in 0..h + 5 {
         let sy = (yi + j as i32 - 2).clamp(0, ph as i32 - 1) as usize;
-        let row = &plane[sy * pw..sy * pw + pw];
+        let row = &plane[sy * ps..sy * ps + pw];
         let o = &mut win[j * ww..j * ww + ww];
         let x0 = xi - 2;
         if x0 >= 0 && x0 as usize + ww <= pw {
@@ -251,20 +251,21 @@ fn chroma_block<const W: usize>(src: &[u8], base: usize, ss: usize, xf: i32, yf:
 
 /// Eighth-sample chroma prediction (4:2:0): block at chroma position
 /// (`x`, `y`) of size `w`×`h`, motion vector in eighth chroma samples,
-/// into `dst` with stride `ds` (averaged in when `avg`).
+/// into `dst` with stride `ds` (averaged in when `avg`). The plane has
+/// stride `ps` and `pw`×`ph` samples.
 #[allow(clippy::too_many_arguments)]
-pub fn mc_chroma(plane: &[u8], pw: usize, ph: usize, x: i32, y: i32, mvx: i32, mvy: i32, w: usize, h: usize, dst: &mut [u8], ds: usize, avg: bool) {
+pub fn mc_chroma(plane: &[u8], ps: usize, pw: usize, ph: usize, x: i32, y: i32, mvx: i32, mvy: i32, w: usize, h: usize, dst: &mut [u8], ds: usize, avg: bool) {
     let xi = x + (mvx >> 3);
     let yi = y + (mvy >> 3);
     let xf = mvx & 7;
     let yf = mvy & 7;
-    let inside = xi >= 0 && yi >= 0 && xi + w as i32 + 1 <= pw as i32 && yi + h as i32 + 1 <= ph as i32;
+    let inside = xi >= 0 && yi >= 0 && (xi + w as i32) < pw as i32 && (yi + h as i32) < ph as i32;
     if inside {
-        let base = yi as usize * pw + xi as usize;
+        let base = yi as usize * ps + xi as usize;
         match w {
-            8 => chroma_block::<8>(plane, base, pw, xf, yf, h, dst, ds, avg),
-            4 => chroma_block::<4>(plane, base, pw, xf, yf, h, dst, ds, avg),
-            _ => chroma_block::<2>(plane, base, pw, xf, yf, h, dst, ds, avg),
+            8 => chroma_block::<8>(plane, base, ps, xf, yf, h, dst, ds, avg),
+            4 => chroma_block::<4>(plane, base, ps, xf, yf, h, dst, ds, avg),
+            _ => chroma_block::<2>(plane, base, ps, xf, yf, h, dst, ds, avg),
         }
         return;
     }
@@ -272,7 +273,7 @@ pub fn mc_chroma(plane: &[u8], pw: usize, ph: usize, x: i32, y: i32, mvx: i32, m
     let mut win = [0u8; 9 * 9];
     for j in 0..h + 1 {
         let sy = (yi + j as i32).clamp(0, ph as i32 - 1) as usize;
-        let row = &plane[sy * pw..sy * pw + pw];
+        let row = &plane[sy * ps..sy * ps + pw];
         for i in 0..ww {
             win[j * ww + i] = row[(xi + i as i32).clamp(0, pw as i32 - 1) as usize];
         }
@@ -403,7 +404,7 @@ mod tests {
             for &(x, y) in &[(16i32, 16i32), (0, 0), (-9, 5), (40, 30), (3, -7), (47, 39)] {
                 for mvx in -11..12 {
                     for mvy in -9..10 {
-                        mc_luma(&plane, pw, ph, x, y, mvx, mvy, w, h, &mut dst, 32, false);
+                        mc_luma(&plane, pw, pw, ph, x, y, mvx, mvy, w, h, &mut dst, 32, false);
                         for j in 0..h {
                             for i in 0..w {
                                 let want = reference_luma(&plane, pw, ph, x + i as i32, y + j as i32, mvx, mvy);
@@ -417,10 +418,10 @@ mod tests {
         // averaging into the destination
         let mut a = vec![0u8; 256];
         let mut b = vec![0u8; 256];
-        mc_luma(&plane, pw, ph, 5, 6, 3, -5, 16, 16, &mut a, 16, false);
-        mc_luma(&plane, pw, ph, 9, 2, -7, 1, 16, 16, &mut b, 16, false);
+        mc_luma(&plane, pw, pw, ph, 5, 6, 3, -5, 16, 16, &mut a, 16, false);
+        mc_luma(&plane, pw, pw, ph, 9, 2, -7, 1, 16, 16, &mut b, 16, false);
         let mut c = a.clone();
-        mc_luma(&plane, pw, ph, 9, 2, -7, 1, 16, 16, &mut c, 16, true);
+        mc_luma(&plane, pw, pw, ph, 9, 2, -7, 1, 16, 16, &mut c, 16, true);
         for i in 0..256 {
             assert_eq!(c[i] as u32, (a[i] as u32 + b[i] as u32 + 1) >> 1);
         }
@@ -437,7 +438,7 @@ mod tests {
             for &(x, y) in &[(8i32, 8i32), (0, 0), (-5, 3), (20, 15), (2, -4)] {
                 for mvx in -19..20 {
                     for mvy in -17..18 {
-                        mc_chroma(&plane, pw, ph, x, y, mvx, mvy, w, h, &mut dst, 16, false);
+                        mc_chroma(&plane, pw, pw, ph, x, y, mvx, mvy, w, h, &mut dst, 16, false);
                         let xi = x + (mvx >> 3);
                         let yi = y + (mvy >> 3);
                         let (xf, yf) = (mvx & 7, mvy & 7);
