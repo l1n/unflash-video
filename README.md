@@ -58,10 +58,10 @@ is decoded by Unflash itself when the browser cannot.
 
 ### The short version
 
-1. **Open video.** The file's index is read (only its headers; nothing is
-   uploaded), the detector starts on WebGPU or, failing that, on the CPU, and
-   the project is restored from the browser's storage if you have opened this
-   file before.
+1. **Open video**, or drop one anywhere on the page. The file's index is
+   read (only its headers; nothing is uploaded), the detector starts on
+   WebGPU or, failing that, on the CPU, and the project is restored from the
+   browser's storage if you have opened this file before.
 2. **Wait.** With **auto-fix** on (the default) the rest happens by itself,
    and the strip under the toolbar shows where it is: *scan* decodes every
    frame and puts a numbered *section* around each problem; *fix* prepares

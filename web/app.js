@@ -136,6 +136,19 @@ async function boot() {
     const f = e.target.files && e.target.files[0];
     if (f) openFile(f);
   });
+  // a file dropped anywhere on the page opens like one picked with the button
+  document.addEventListener('dragover', (e) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  });
+  document.addEventListener('drop', (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!f) return;
+    e.preventDefault();
+    openFile(f);
+  });
   $('btnHome').addEventListener('click', () => {
     $('welcome').classList.remove('hidden');
     $('stage').classList.add('hidden');

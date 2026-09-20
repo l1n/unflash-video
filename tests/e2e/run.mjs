@@ -549,6 +549,21 @@ try {
   assert(await page.$eval('#auto', (e) => e.classList.contains('hidden')), 'with auto-fix off, opening a file starts nothing');
   assert(await page.evaluate(() => !window.__unflash.auto), 'no run was started');
   await page.check('#autoToggle');
+  await page.waitForFunction(() => window.__unflash.auto && !window.__unflash.auto.running, null, { timeout: 120000 });
+
+  // a file dropped on the page opens, and the run starts
+  const droppedFile = fs.readFileSync(path.join(MEDIA, 'redflash.mp4')).toString('base64');
+  const dt = await page.evaluateHandle((b64) => {
+    const t = new DataTransfer();
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    t.items.add(new File([bytes], 'redflash.mp4', { type: 'video/mp4' }));
+    return t;
+  }, droppedFile);
+  await page.dispatchEvent('body', 'drop', { dataTransfer: dt });
+  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('redflash.mp4'), null, { timeout: 60000 });
+  results.autoDropped = await autoDone();
+  console.log('auto-fix dropped redflash.mp4:', JSON.stringify(results.autoDropped));
+  assert(results.autoDropped.steps.fix.status === 'done' && /keep dark|keep light|frame rate/.test(results.autoDropped.steps.fix.text) && results.autoDropped.steps.verify.status === 'done' && /Passes WCAG/.test(results.autoDropped.steps.verify.text), 'the dropped red-flash clip is fixed and checked: ' + JSON.stringify(results.autoDropped.steps));
 } finally {
   fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 2));
   if (errors.length) console.log('BROWSER ERRORS:\n' + errors.join('\n'));
