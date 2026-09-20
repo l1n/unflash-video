@@ -190,6 +190,11 @@ async function openFile(file) {
     $('sections').classList.remove('hidden');
     $('timelineWrap').classList.remove('hidden');
     if (!state.decode.supported) banner(`This browser cannot decode ${movie.video.codec} with WebCodecs (${state.decode.reason}). The live monitor still works while the player plays; scanning and section editing need a decodable file (H.264 in most browsers).`, 'info');
+    else if (state.decode.software) {
+      const info = movie.softwareInfo || {};
+      banner(`This browser cannot decode ${movie.video.codec} with WebCodecs, so Unflash uses its built-in H.264 decoder (profile ${info.profile_idc}, level ${info.level_idc}) for scanning, sections and export. It is slower than a hardware decoder, and the player cannot play this file here, so the live monitor is off.`, 'info');
+    }
+    $('liveToggle').disabled = !!state.decode.software;
     state.current = null;
     renderAll();
     updateStatus();
@@ -241,6 +246,7 @@ function updateStatus() {
   if (state.env) {
     const f = state.env.feeder;
     parts.push(`detector: <b>${f.backend === 'webgpu' ? 'WebGPU' : 'CPU (WASM)'}</b> at ${f.aw}×${f.ah} (window ${f.det.window_width()}×${f.det.window_height()}, area ≥ ${f.det.area_thresh()} px)`);
+    if (state.decode.software) parts.push('decoder: <b>built-in H.264</b> (no WebCodecs decoder for this codec)');
     if (state.lastScan) {
       const s = state.lastScan;
       const fps = (s.frames / (s.elapsedMs / 1000)).toFixed(0);

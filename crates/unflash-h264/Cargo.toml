@@ -1,0 +1,12 @@
+[package]
+name = "unflash-h264"
+version = "0.1.0"
+edition = "2021"
+description = "A small H.264 / AVC decoder (Constrained Baseline, Main and High, progressive 4:2:0 8-bit) for browsers without one"
+license = "MIT"
+
+[dependencies]
+
+[dev-dependencies]
+unflash-mp4 = { path = "../unflash-mp4" }
+md5 = "0.7"

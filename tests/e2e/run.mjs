@@ -25,14 +25,19 @@ function assert(cond, msg) {
 const jobDone = (page, timeout = 300000) => page.waitForFunction(() => document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout });
 // jobs can finish before a poll sees the job bar: wait for the toast to change instead
 const toastBefore = (page) => page.evaluate(() => (window.__toastSeq = (window.__toastSeq || 0), document.querySelector('#toast').textContent));
+// an error banner (info banners, such as the built-in decoder notice, are fine)
+const errorBanner = (page) => page.evaluate(() => {
+  const b = document.querySelector('#banner');
+  return b.classList.contains('hidden') || b.classList.contains('info') ? '' : document.querySelector('#bannerText').textContent;
+});
 const jobStarted = async (page) => {
-  await page.waitForFunction(() => !document.querySelector('#jobbar').classList.contains('hidden') || !document.querySelector('#banner').classList.contains('hidden'), null, { timeout: 30000 }).catch(() => {});
-  const banner = await page.evaluate(() => (document.querySelector('#banner').classList.contains('hidden') ? '' : document.querySelector('#bannerText').textContent));
+  await page.waitForFunction(() => !document.querySelector('#jobbar').classList.contains('hidden') || (!document.querySelector('#banner').classList.contains('hidden') && !document.querySelector('#banner').classList.contains('info')), null, { timeout: 30000 }).catch(() => {});
+  const banner = await errorBanner(page);
   if (banner) throw new Error('banner: ' + banner);
 };
 const noBanner = async (page) => {
-  const banner = await page.evaluate(() => (document.querySelector('#banner').classList.contains('hidden') ? '' : document.querySelector('#bannerText').textContent));
-  if (banner && !/using the CPU detector|cannot decode/.test(banner)) throw new Error('banner: ' + banner);
+  const banner = await errorBanner(page);
+  if (banner) throw new Error('banner: ' + banner);
 };
 const verdictReady = (page, timeout = 120000) => page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout });
 
@@ -302,12 +307,35 @@ try {
   assert(results.stripesVerify.includes('Passes WCAG') && results.stripesVerify.includes('No hazardous stripe patterns'), 'the softened export has no stripes left: ' + results.stripesVerify);
   await page.click('#btnCloseExport');
 
-  // --- H.264 in a browser without H.264: the app says so ---------------------
+  // --- H.264 in a browser without H.264: the built-in decoder takes over ------
   await openFile('flash_h264.mp4');
-  results.h264 = { scanDisabled: await page.$eval('#btnScan', (b) => b.disabled), banner: await page.textContent('#bannerText') };
+  results.h264 = { scanDisabled: await page.$eval('#btnScan', (b) => b.disabled), banner: await page.textContent('#bannerText'), status: await page.textContent('#status') };
   console.log('h264:', results.h264);
   const h264Decodable = await page.evaluate(() => VideoDecoder.isConfigSupported({ codec: 'avc1.42C01E', codedWidth: 64, codedHeight: 64 }).then((r) => r.supported));
-  if (!h264Decodable) assert(results.h264.scanDisabled && results.h264.banner.includes('cannot decode'), 'without an H.264 decoder the app must explain');
+  if (!h264Decodable) {
+    assert(!results.h264.scanDisabled && results.h264.banner.includes('built-in H.264 decoder') && results.h264.status.includes('built-in H.264'), 'without an H.264 decoder the built-in one is used: ' + JSON.stringify(results.h264));
+    assert(await page.$eval('#liveToggle', (b) => b.disabled), 'the live monitor is off when the player cannot play the file');
+  }
+  scan = await scanCurrent();
+  results.h264Scan = scan;
+  results.h264Violations = await page.evaluate(() => window.__unflash.lastScan.result.violations);
+  console.log('h264 scan:', scan.ms, 'ms |', scan.toast, '|', JSON.stringify(results.h264Violations));
+  assert(results.h264Violations.length === results.cpuViolations.length, 'the H.264 copy of the flash clip has the same violations as the VP9 one');
+  for (let i = 0; i < results.h264Violations.length; i++) {
+    const a = results.h264Violations[i];
+    const b = results.cpuViolations[i];
+    // a different encoder, so the edges of the flashing may land a frame apart
+    assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.15 && Math.abs(a.end - b.end) < 0.15, `H.264 violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
+  }
+  // sections work through the built-in decoder too: prepare and check the flash
+  await page.click('#sectionList .sec-item');
+  await page.waitForSelector('#btnPrepare', { state: 'visible' });
+  await page.click('#btnPrepare');
+  await page.waitForFunction(() => !document.querySelector('#wsBody').classList.contains('hidden'), null, { timeout: 180000 });
+  await verdictReady(page);
+  results.h264Verdict = await page.textContent('#wsVerdict');
+  console.log('h264 section verdict:', results.h264Verdict);
+  assert(results.h264Verdict.startsWith('fails'), 'the H.264 section fails before editing: ' + results.h264Verdict);
 
   // ======== the same scans on the GPU must agree ==============================
   await page.goto(`http://127.0.0.1:${port}/`);

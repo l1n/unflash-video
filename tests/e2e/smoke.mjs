@@ -54,6 +54,11 @@ try {
   await page.setInputFiles('#fileInput', path.join(ROOT, 'tests/media/e2e/flash.mp4'));
   await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash.mp4'), null, { timeout: 60000 });
   await scan(/2 violations found/);
+  // the published H.264 clip: WebCodecs where the browser has H.264, the built-in decoder otherwise
+  await page.evaluate(() => window.__unflash.openClip('flash_h264.mp4'));
+  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash_h264.mp4') || !document.querySelector('#banner').classList.contains('hidden'), null, { timeout: 120000 });
+  console.log('h264 status:', await page.textContent('#status'));
+  await scan(/2 violations found/);
   console.log('SMOKE OK');
 } finally {
   if (errors.length) console.log('page errors:', errors);

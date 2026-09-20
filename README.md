@@ -49,10 +49,12 @@ Browser support:
 | Chrome, Edge, Opera 113+ | WebCodecs (H.264, HEVC*, VP9, AV1) | any file the `<video>` element plays | WebGPU |
 | Safari 26+ | WebCodecs | yes | WebGPU |
 | Firefox 141+ (Windows), other Firefox | WebCodecs where available | yes | WebGPU where enabled, otherwise the SIMD CPU kernel |
+| any of these without an H.264 decoder (Chromium builds without proprietary codecs, some Linux browsers) | the **built-in H.264 decoder** (Constrained Baseline, Main and High, progressive) | no: the player cannot play the file | as above |
 
 \* platform dependent. Files are MP4/MOV (ISO base media); the demuxer
 handles fragmented files and edit lists. A file whose codec the browser
-cannot decode can still be watched with the live monitor.
+cannot decode can still be watched with the live monitor; an H.264 file
+is decoded by Unflash itself when the browser cannot.
 
 ### The short version
 
@@ -155,6 +157,34 @@ pixels; a quarter of the screen for half a second is a violation of kind
 identical mask (it is integer and fixed-point throughout), and the mean
 stripe spacing they measure sizes the blur that **soften stripes** applies.
 
+### The built-in H.264 decoder
+
+WebCodecs is only as good as the codecs the browser ships, and H.264, the
+codec of nearly every camera and phone, is missing from Chromium builds
+without proprietary codecs and from some Linux browsers. So
+`crates/unflash-h264` is a complete H.264 decoder in plain Rust, used
+whenever `VideoDecoder.isConfigSupported` says no to an `avc1`/`avc3`
+track: the Constrained Baseline, Baseline (without FMO/ASO), Main and High
+profiles for progressive 4:2:0 8-bit video, with CAVLC and CABAC, I/P/B
+slices and every partition size, multiple and long-term references,
+memory management control operations, explicit and implicit weighted
+prediction, spatial and temporal direct prediction, the 8x8 transform,
+scaling matrices, I_PCM and the deblocking filter. Interlaced coding
+(field pictures, MBAFF), 4:2:2/4:4:4, high bit depths, slice groups and
+data partitioning are reported as unsupported rather than decoded wrongly.
+
+It is written to the standard and tested bit-exact against ffmpeg's
+decoder on x264 streams that exercise those tools
+(`crates/unflash-h264/tests`, media in `tests/media/h264`). Pictures come
+back in decode order with the container's timestamps; `web/media.js`
+re-orders them for presentation and wraps them as `VideoFrame`s, so the
+rest of the app (scan, sections, export, verify) does not know which
+decoder it is on. It is single-threaded and unoptimised: about 250 fps at
+640×360 and 30 fps at 1080p natively, a few times slower in WebAssembly,
+which is still well above real time for the analysis but slower than a
+hardware decoder. The player itself still cannot play such a file, so the
+live monitor is off for it.
+
 The **temporal stage** (`crates/unflash-core/src/temporal.rs`) is the rest
 of the reference `FlashDetector`, unchanged in logic: the window-mean
 coherence gate, the concurrent-area test, events, per-frame statistics,
@@ -206,6 +236,7 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 | `crates/unflash-core` | the detector: config and profiles, the per-pixel kernel (scalar and SIMD), grid reduction, temporal stage, violations, sections, editing helpers. No I/O. |
 | `crates/unflash-gpu` | the WGSL pipeline on `wgpu` (native backends and the browser's WebGPU) |
 | `crates/unflash-mp4` | a byte-range MP4 demuxer for WebCodecs (codec strings, decoder descriptions, sample tables, fragmented files, edit lists) and a muxer for the export |
+| `crates/unflash-h264` | the built-in H.264 decoder, for browsers whose WebCodecs has none |
 | `crates/unflash-wasm` | the `wasm-bindgen` API |
 | `web/` | the app (plain ES modules, no build step beyond the WASM) |
 | `unflash/` | the Python reference implementation |
@@ -226,6 +257,8 @@ WASM and runs the browser test on every push.
 cargo test --workspace                    # unit tests, the reference cross-check, GPU-vs-CPU (needs any Vulkan/Metal/DX12 adapter; lavapipe is enough)
 python3 tests/gen_fixtures.py             # regenerate the reference fixtures from unflash/analysis.py (needs numpy)
 bash tests/media/gen.sh                   # demuxer/muxer test files (needs ffmpeg)
+bash tests/media/h264/gen.sh              # H.264 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libx264)
+cargo run --release -p unflash-h264 --example compare -- file.mp4   # decode any MP4 and diff every frame against ffmpeg
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
 ```
@@ -235,8 +268,11 @@ Python detector was run on (CRC-checked) and asserts identical per-frame
 hazard areas, events, violations and verdicts on all fixtures.
 `crates/unflash-gpu/tests/gpu_vs_cpu.rs` compares the entire per-pixel state
 of the GPU stage with the CPU kernel after every frame, and the pattern mask
-and statistics on striped frames. `tests/e2e/run.mjs` scans, edits, softens,
-exports and verifies the synthetic clips in headless Chromium.
+and statistics on striped frames. `crates/unflash-h264/tests/streams.rs`
+decodes the x264 test streams and requires ffmpeg's MD5 of every frame.
+`tests/e2e/run.mjs` scans, edits, softens, exports and verifies the
+synthetic clips in headless Chromium, including the H.264 clip through the
+built-in decoder (the test browser has no H.264).
 
 ## Limitations
 
@@ -250,6 +286,9 @@ exports and verifies the synthetic clips in headless Chromium.
   claim to catch every texture that could affect someone. Softening blurs
   the frames that carry the pattern; the result is verified by the same
   detector, and it is still a blur.
+- The built-in H.264 decoder does not do interlaced video (field pictures
+  or MBAFF), 4:2:2/4:4:4 or 10-bit; such files need a browser with its own
+  H.264 decoder. HEVC has no built-in decoder at all.
 - The export re-encodes the whole video (no smart-cut) and copies the audio;
   after an **E** hold the audio runs ahead of the picture by the length of
   the hold. Removals (R/F) do not change timing and need no audio work.

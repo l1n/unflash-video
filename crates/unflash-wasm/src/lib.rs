@@ -13,6 +13,7 @@ use unflash_core::pixel::MODE_FIRST;
 use unflash_core::temporal::{AnalysisResult, FrameRecord, Violation};
 use unflash_core::{sections, timeline};
 use unflash_gpu::{FrameSource as GpuSource, GpuContext, GpuStage};
+use unflash_h264::yuv::{matrix_for, to_rgba};
 use unflash_mp4::demux::TrackKind;
 use wasm_bindgen::prelude::*;
 
@@ -883,5 +884,88 @@ impl Detector {
 
     pub fn is_first_pending(&self) -> bool {
         self.det.submitted() == 0 || (self.det.params_template().mode & MODE_FIRST) != 0
+    }
+}
+
+// ---- built-in H.264 decoder --------------------------------------------------
+
+/// What the built-in decoder makes of an `avcC` record: JSON with the
+/// profile, level and cropped size, or an error saying why the stream
+/// cannot be decoded (interlaced, high bit depth, ...).
+#[wasm_bindgen]
+pub fn h264_probe(avcc: &[u8]) -> Result<String, JsValue> {
+    let mut d = unflash_h264::Decoder::new();
+    d.configure_avcc(avcc).map_err(js_err)?;
+    let sps = d.first_sps().ok_or_else(|| js_err("no sequence parameter set in the file"))?;
+    let (w, h) = sps.cropped_size();
+    Ok(serde_json::json!({
+        "profile_idc": sps.profile_idc,
+        "level_idc": sps.level_idc,
+        "width": w,
+        "height": h,
+        "cabac": true,
+    })
+    .to_string())
+}
+
+/// A software H.264 decoder for one track: samples in decode order in,
+/// RGBA pictures (at the cropped size) out, one per sample.
+#[wasm_bindgen]
+pub struct H264Decoder {
+    inner: unflash_h264::Decoder,
+    frame: Vec<u8>,
+    pts: f64,
+    damaged: bool,
+    width: u32,
+    height: u32,
+}
+
+#[wasm_bindgen]
+impl H264Decoder {
+    #[wasm_bindgen(constructor)]
+    pub fn new(avcc: &[u8]) -> Result<H264Decoder, JsValue> {
+        let mut inner = unflash_h264::Decoder::new();
+        inner.configure_avcc(avcc).map_err(js_err)?;
+        let (width, height) = inner.first_sps().map(|s| s.cropped_size()).ok_or_else(|| js_err("no sequence parameter set in the file"))?;
+        Ok(H264Decoder { inner, frame: Vec::new(), pts: 0.0, damaged: false, width, height })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Decode one sample; returns true when its picture is ready.
+    pub fn decode(&mut self, sample: &[u8], pts: f64) -> Result<bool, JsValue> {
+        match self.inner.decode_sample(sample, pts).map_err(js_err)? {
+            None => Ok(false),
+            Some(f) => {
+                let sps = self.inner.sps().ok_or_else(|| js_err("no active sequence"))?;
+                let (w, h) = sps.cropped_size();
+                let (matrix, full) = match &sps.vui {
+                    Some(v) => (matrix_for(Some(v.matrix_coefficients), h), v.video_full_range),
+                    None => (matrix_for(None, h), false),
+                };
+                to_rgba(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), matrix, full, &mut self.frame);
+                self.width = w;
+                self.height = h;
+                self.pts = f.pic.pts;
+                self.damaged = f.damaged;
+                Ok(true)
+            }
+        }
+    }
+
+    /// The last decoded picture as RGBA8, `width() * height() * 4` bytes.
+    pub fn frame_rgba(&self) -> Vec<u8> {
+        self.frame.clone()
+    }
+    pub fn frame_pts(&self) -> f64 {
+        self.pts
+    }
+    pub fn frame_damaged(&self) -> bool {
+        self.damaged
     }
 }

@@ -49,6 +49,8 @@ export class Movie {
     const m = new Movie();
     m.file = file;
     m.name = file.name;
+    m.wasm = wasm;
+    m.software = false;
     m.dx = dx;
     m.info = info;
     m.video = vt;
@@ -97,14 +99,33 @@ export class Movie {
     return cfg;
   }
 
+  /**
+   * Whether the file can be decoded: by WebCodecs, or, for H.264 in a
+   * browser without an H.264 decoder, by the built-in software decoder
+   * (`software: true`). VideoFrame itself has to exist either way.
+   */
   async decoderSupport() {
-    if (typeof VideoDecoder === 'undefined') return { supported: false, reason: 'WebCodecs is not available in this browser' };
+    this.software = false;
+    if (typeof VideoDecoder === 'undefined' || typeof VideoFrame === 'undefined') return { supported: false, software: false, reason: 'WebCodecs is not available in this browser' };
+    let reason = '';
     try {
       const r = await VideoDecoder.isConfigSupported(this.decoderConfig());
-      return { supported: !!r.supported, reason: r.supported ? '' : `this browser cannot decode ${this.video.codec}` };
+      if (r.supported) return { supported: true, software: false, reason: '' };
+      reason = `this browser cannot decode ${this.video.codec}`;
     } catch (e) {
-      return { supported: false, reason: String(e) };
+      reason = String(e);
     }
+    if (/^avc[13]/.test(this.video.codec)) {
+      try {
+        const info = JSON.parse(this.wasm.h264_probe(this.dx.track_description(this.video.index)));
+        this.software = true;
+        this.softwareInfo = info;
+        return { supported: true, software: true, reason: '' };
+      } catch (e) {
+        reason += `, and the built-in H.264 decoder cannot read it: ${e && e.message ? e.message : e}`;
+      }
+    }
+    return { supported: false, software: false, reason };
   }
 }
 
@@ -114,6 +135,7 @@ export class Movie {
  * arrive in presentation order.
  */
 export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress } = {}) {
+  if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress });
   const cfg = movie.decoderConfig();
   const reader = new ChunkReader(movie.file);
   const { pts, dts, offset, size, sync, dur } = movie.v;
@@ -174,5 +196,79 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
     }
   }
   if (error) throw error instanceof Error ? error : new Error(String(error));
+  return frames;
+}
+
+/**
+ * The same as decodeRange, through the built-in H.264 decoder in WASM.
+ * Samples are decoded in file (decode) order and the pictures handed out in
+ * presentation order once every earlier picture has been decoded.
+ */
+async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress } = {}) {
+  const reader = new ChunkReader(movie.file);
+  const { pts, dts, offset, size } = movie.v;
+  const n = pts.length;
+  const startIdx = movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
+  const endUs = endSec * 1e6;
+  const dec = new movie.wasm.H264Decoder(movie.dx.track_description(movie.video.index));
+  // presentation order of the samples this pass will decode
+  const ptsSorted = [];
+  for (let i = startIdx; i < n; i++) {
+    if (dts[i] >= endUs && pts[i] >= endUs) break;
+    ptsSorted.push(pts[i]);
+  }
+  ptsSorted.sort((a, b) => a - b);
+  const ready = new Map(); // pts -> VideoFrame
+  let next = 0;
+  let frames = 0;
+  let damaged = 0;
+  const release = async () => {
+    while (next < ptsSorted.length && ready.has(ptsSorted[next])) {
+      const f = ready.get(ptsSorted[next]);
+      ready.delete(ptsSorted[next]);
+      next++;
+      const t = f.timestamp / 1e6;
+      if (t < startSec - 1e-6 || t >= endSec - 1e-9) {
+        f.close();
+        continue;
+      }
+      await onFrame(f, t);
+      frames++;
+    }
+  };
+  let i = startIdx;
+  try {
+    while (i < n && !(cancel && cancel())) {
+      if (dts[i] >= endUs && pts[i] >= endUs) break;
+      const data = await reader.read(offset[i], size[i]);
+      let got = false;
+      try {
+        got = dec.decode(data, pts[i] / 1e6);
+      } catch (e) {
+        console.warn('built-in H.264 decoder:', e);
+        damaged++;
+      }
+      if (got) {
+        if (dec.frame_damaged()) damaged++;
+        const w = dec.width();
+        const h = dec.height();
+        const rgba = dec.frame_rgba();
+        ready.set(pts[i], new VideoFrame(rgba, { format: 'RGBA', codedWidth: w, codedHeight: h, timestamp: pts[i] }));
+      } else {
+        // no picture for this sample: do not wait for it
+        const k = ptsSorted.indexOf(pts[i]);
+        if (k >= 0) ptsSorted.splice(k, 1);
+      }
+      i++;
+      await release();
+      if (onProgress && i % 30 === 0) onProgress((i - startIdx) / Math.max(1, n - startIdx));
+      if (i % 4 === 0) await tick();
+    }
+    await release();
+  } finally {
+    for (const f of ready.values()) f.close();
+    dec.free();
+  }
+  if (damaged) console.warn(`built-in H.264 decoder: ${damaged} damaged pictures`);
   return frames;
 }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/unflash-core",
     "crates/unflash-gpu",
+    "crates/unflash-h264",
     "crates/unflash-mp4",
     "crates/unflash-wasm",
 ]
