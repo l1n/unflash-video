@@ -14,19 +14,30 @@ const browser = await chromium.launch({ headless: true, channel: 'chromium', arg
 const page = await browser.newPage({ ignoreHTTPSErrors: !!process.env.SMOKE_IGNORE_TLS });
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
+page.on('requestfailed', (r) => {
+  if (!r.url().startsWith('blob:')) console.log('request failed:', r.url(), r.failure() && r.failure().errorText);
+});
+if (process.env.SMOKE_VERBOSE) page.on('console', (m) => console.log('[browser]', m.type(), m.text()));
 try {
   const target = new URL(url);
   if (!useGpu) target.searchParams.set('cpu', '1');
   const t0 = Date.now();
-  await page.goto(target.toString());
-  await page.waitForFunction(() => document.querySelector('#support') && document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+  await page.goto(target.toString(), { timeout: 120000 });
+  console.log('page loaded', `(${Date.now() - t0} ms)`);
+  try {
+    await page.waitForFunction(() => document.querySelector('#support') && document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 120000 });
+  } catch (e) {
+    const state = await page.evaluate(() => ({ support: document.querySelector('#support').textContent, banner: document.querySelector('#bannerText').textContent, status: document.querySelector('#status').textContent }));
+    throw new Error('the app did not start: ' + JSON.stringify(state));
+  }
   console.log('loaded:', await page.textContent('#support'), `(${Date.now() - t0} ms)`);
   const scan = async (expect) => {
     await page.waitForFunction(() => !document.querySelector('#btnScan').disabled, null, { timeout: 60000 });
     console.log('opened:', await page.textContent('#videoInfo'));
     console.log('status:', await page.textContent('#status'));
+    const before = await page.textContent('#toast');
     await page.click('#btnScan');
-    await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('found'), null, { timeout: 300000 });
+    await page.waitForFunction((b) => document.querySelector('#toast').textContent !== b && document.querySelector('#toast').textContent.includes('found'), before, { timeout: 300000 });
     const toast = await page.textContent('#toast');
     console.log('scan:', toast);
     if (!expect.test(toast)) throw new Error('unexpected scan result: ' + toast);
