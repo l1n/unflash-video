@@ -49,7 +49,7 @@ Browser support:
 | Chrome, Edge, Opera 113+ | WebCodecs (H.264, HEVC*, VP9, AV1) | any file the `<video>` element plays | WebGPU |
 | Safari 26+ | WebCodecs | yes | WebGPU |
 | Firefox 141+ (Windows), 142+ (macOS), other Firefox | WebCodecs where available | yes | WebGPU where enabled (its WebGPU takes no `VideoFrame` or `<video>` as a copy source, so pictures reach it through a canvas), otherwise the SIMD CPU kernel |
-| any of these without an H.264 decoder (Chromium builds without proprietary codecs, some Linux browsers) | the **built-in H.264 decoder** (Constrained Baseline, Main and High, progressive) | no: the player cannot play the file | as above |
+| any of these without an H.264 decoder (Chromium builds without proprietary codecs, some Linux browsers) | the **built-in H.264 decoder** (Constrained Baseline, Main and High, progressive or interlaced) | no: the player cannot play the file | as above |
 
 \* platform dependent. Files are MP4/MOV (ISO base media); the demuxer
 handles fragmented files and edit lists. A file whose codec the browser
@@ -185,13 +185,18 @@ without proprietary codecs and from some Linux browsers. So
 `crates/unflash-h264` is a complete H.264 decoder in plain Rust, used
 whenever `VideoDecoder.isConfigSupported` says no to an `avc1`/`avc3`
 track: the Constrained Baseline, Baseline (without FMO/ASO), Main and High
-profiles for progressive 4:2:0 8-bit video, with CAVLC and CABAC, I/P/B
-slices and every partition size, multiple and long-term references,
-memory management control operations, explicit and implicit weighted
-prediction, spatial and temporal direct prediction, the 8x8 transform,
-scaling matrices, I_PCM and the deblocking filter. Interlaced coding
-(field pictures, MBAFF), 4:2:2/4:4:4, high bit depths, slice groups and
-data partitioning are reported as unsupported rather than decoded wrongly.
+profiles for 4:2:0 8-bit video, progressive or interlaced (field pictures
+and MBAFF frames), with CAVLC and CABAC, I/P/B slices and every partition
+size, multiple and long-term references, memory management control
+operations, explicit and implicit weighted prediction, spatial and temporal
+direct prediction, the 8x8 transform, scaling matrices, I_PCM and the
+deblocking filter. 4:2:2/4:4:4, high bit depths, slice groups, SP/SI
+slices and data partitioning are reported as unsupported rather than
+decoded wrongly. Besides the x264 streams below it is checked against the
+JVT conformance suite (`cargo run --release -p unflash-h264 --example
+conformance -- <dir>` over the streams from
+https://fate-suite.ffmpeg.org/h264-conformance/ with ffmpeg's per-frame
+MD5s): every stream within those limits decodes bit-exact, 169 of them.
 
 It is written to the standard and tested bit-exact against ffmpeg's
 decoder on x264 streams that exercise those tools
@@ -292,6 +297,7 @@ python3 tests/gen_fixtures.py             # regenerate the reference fixtures fr
 bash tests/media/gen.sh                   # demuxer/muxer test files (needs ffmpeg)
 bash tests/media/h264/gen.sh              # H.264 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libx264)
 cargo run --release -p unflash-h264 --example compare -- file.mp4   # decode any MP4 and diff every frame against ffmpeg
+cargo run --release -p unflash-h264 --example conformance -- dir [filter]   # the JVT conformance streams (Annex B) against ffmpeg's framemd5 (dir/NAME.framemd5)
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
 ```
@@ -319,9 +325,9 @@ built-in decoder (the test browser has no H.264).
   claim to catch every texture that could affect someone. Softening blurs
   the frames that carry the pattern; the result is verified by the same
   detector, and it is still a blur.
-- The built-in H.264 decoder does not do interlaced video (field pictures
-  or MBAFF), 4:2:2/4:4:4 or 10-bit; such files need a browser with its own
-  H.264 decoder. HEVC has no built-in decoder at all.
+- The built-in H.264 decoder does not do 4:2:2/4:4:4, 10-bit, slice groups
+  or SP/SI slices; such files need a browser with its own H.264 decoder.
+  HEVC has no built-in decoder at all.
 - The export re-encodes the whole video (no smart-cut) and copies the audio;
   after an **E** hold the audio runs ahead of the picture by the length of
   the hold. Removals (R/F) do not change timing and need no audio work.

@@ -14,6 +14,8 @@ stripes.mp4  the scene, then fine vertical stripes (16 px period, 40 pairs)
              a hazardous regular pattern.
 *_h264.mp4   the same clips as H.264 (what most browsers decode; also the
              unsupported-codec path in a Chromium without H.264).
+flash_h264i.mp4  the flash clip as interlaced H.264 (MBAFF), for the
+             built-in decoder's field / frame macroblock pairs.
 """
 import os
 import subprocess
@@ -38,6 +40,9 @@ def encode(name, frames, codec, secs, bitrate="1200k"):
     path = os.path.join(OUT, name)
     if codec == "vp9":
         vcodec = ["-c:v", "libvpx-vp9", "-b:v", bitrate, "-deadline", "realtime", "-cpu-used", "8", "-pix_fmt", "yuv420p"]
+    elif codec == "h264i":
+        # interlaced (x264 codes MBAFF frames): the built-in decoder's field / frame macroblock pairs
+        vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-g", "30", "-flags", "+ildct+ilme", "-x264-params", "interlaced=1"]
     else:
         vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-g", "30"]
     cmd = ["ffmpeg", "-y", "-v", "error",
@@ -117,3 +122,4 @@ if __name__ == "__main__":
     encode("steady_h264.mp4", steady_frames(), "h264", 6)
     encode("extended_h264.mp4", extended_frames(), "h264", 10)
     encode("stripes_h264.mp4", stripes_frames(), "h264", 10)
+    encode("flash_h264i.mp4", flash_frames(), "h264i", 10)

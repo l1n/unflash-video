@@ -274,6 +274,9 @@ fn thresholds(qp_p: i32, qp_q: i32, cur: &MbDeblockInfo) -> (i32, i32, [u8; 3]) 
 /// Deblock the picture (a frame, or the field `structure` of it) in
 /// macroblock order.
 pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize, height_mbs: usize, structure: u8) {
+    if pic.mbaff && structure == FRAME {
+        return filter_picture_mbaff(pic, mbs, width_mbs, height_mbs);
+    }
     let w4 = pic.width / 4;
     let field = structure != FRAME;
     let parity = (structure == BOTTOM) as usize;
@@ -419,6 +422,282 @@ pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize
                         tc8[k * 2..k * 2 + 2].fill(if bs != 0 && bs < 4 { tc0s[bs as usize - 1] as i32 } else { 0 });
                     }
                     chroma_edge_h::<8>(plane, cybase + e * cw, cw, &bs8, &tc8, bs_h[luma_e][0] == 4, alpha, beta);
+                }
+            }
+        }
+    }
+}
+
+/// Deblock an MBAFF frame (8.7 with MbaffFrameFlag = 1): pair by pair, top
+/// then bottom macroblock, each along its own kind of rows. An edge between
+/// a frame macroblock and a field pair is "mixed": the left one is filtered
+/// row by row against whichever macroblock of the left pair owns the row
+/// (eight strengths, two quantiser averages), the top edge of a frame
+/// macroblock under a field pair is filtered twice in field mode (once per
+/// field macroblock above), and the top edge of a field macroblock over a
+/// frame pair in field mode against the frame macroblock's interleaved rows;
+/// mixed edges get bS 1 (2 with coefficients) instead of a motion test.
+fn filter_picture_mbaff(pic: &mut Picture, mbs: &[MbDeblockInfo], wm: usize, hm: usize) {
+    let width = pic.width;
+    let cwidth = width / 2;
+    let w4 = width / 4;
+    for pr in 0..hm / 2 {
+        for mx in 0..wm {
+            for b in 0..2 {
+                let my = 2 * pr + b;
+                let addr = my * wm + mx;
+                let cur = mbs[addr];
+                if !cur.decoded || cur.filter_idc == 1 {
+                    continue;
+                }
+                let field = pic.mb_field[addr];
+                let mvy_limit = if field { 2 } else { 4 };
+                let (lw, cw) = if field { (2 * width, 2 * cwidth) } else { (width, cwidth) };
+                let ybase = if field { (32 * pr + b) * width } else { 16 * my * width } + 16 * mx;
+                let cybase = if field { (16 * pr + b) * cwidth } else { 8 * my * cwidth } + 8 * mx;
+                let (bx0, by0) = (mx * 4, my * 4);
+                let avail = |n: &MbDeblockInfo| n.decoded && !(cur.filter_idc == 2 && n.slice != cur.slice);
+                let mut bs_v = [[0u8; 4]; 4];
+                let mut bs_h = [[0u8; 4]; 4];
+                // ---- the left edge: the left pair's macroblock of this row, or both of them
+                let left_top = 2 * pr * wm + mx.wrapping_sub(1);
+                let do_left = mx > 0 && avail(&mbs[left_top]);
+                let mixed_left = do_left && pic.mb_field[left_top] != field;
+                let mut bs_left8 = [0u8; 8];
+                if do_left && !mixed_left {
+                    let l = mbs[addr - 1];
+                    for k in 0..4 {
+                        let qb = (by0 + k) * w4 + bx0;
+                        bs_v[0][k] = boundary_strength(pic, &l, &cur, qb - 1, qb, 1 << (k * 4 + 3), 1 << (k * 4), true, mvy_limit);
+                    }
+                } else if mixed_left {
+                    let lt = mbs[left_top];
+                    let lb = mbs[left_top + wm];
+                    for (i, bs) in bs_left8.iter_mut().enumerate() {
+                        // segment i is two rows of this macroblock (block row i / 2); the
+                        // left macroblock owning them and its block row there:
+                        let (nb, nb_row) = if field {
+                            // a field macroblock's rows 0..7 lie in the left pair's top frame
+                            // macroblock, 8..15 in its bottom one
+                            (if i < 4 { lt } else { lb }, i & 3)
+                        } else {
+                            // a frame macroblock's even rows belong to the left top field
+                            // macroblock, its odd rows to the bottom one
+                            (if i & 1 == 0 { lt } else { lb }, 2 * b + (i >> 2))
+                        };
+                        *bs = if cur.intra || nb.intra {
+                            4
+                        } else {
+                            let cur_nz = cur.nonzero & (1 << ((i >> 1) * 4)) != 0;
+                            let nb_nz = nb.nonzero & (1 << (nb_row * 4 + 3)) != 0;
+                            1 + (cur_nz || nb_nz) as u8
+                        };
+                    }
+                }
+                // ---- the top edge: the macroblock above in this macroblock's kind of rows
+                let above_field_pair = pr > 0 && pic.mb_field[(2 * pr - 2) * wm + mx];
+                // a frame macroblock under a field pair: filtered once per field
+                let double_top = !field && b == 0 && above_field_pair && avail(&mbs[(2 * pr - 1) * wm + mx]);
+                let above_addr: Option<usize> = if !field {
+                    if my > 0 {
+                        Some(addr - wm)
+                    } else {
+                        None
+                    }
+                } else if pr == 0 {
+                    None
+                } else if b == 0 {
+                    Some(if above_field_pair { (2 * pr - 2) * wm + mx } else { (2 * pr - 1) * wm + mx })
+                } else {
+                    Some((2 * pr - 1) * wm + mx)
+                };
+                let above_addr = above_addr.filter(|&a| avail(&mbs[a]) && !double_top);
+                if let Some(a_addr) = above_addr {
+                    let a = mbs[a_addr];
+                    let a_field = pic.mb_field[a_addr];
+                    let mixed = a_field != field;
+                    let strong = !field && !a_field;
+                    let a_row3 = ((a_addr / wm) * 4 + 3) * w4 + bx0;
+                    for k in 0..4 {
+                        let qb = by0 * w4 + bx0 + k;
+                        bs_h[0][k] = if mixed {
+                            if cur.intra || a.intra {
+                                3
+                            } else {
+                                1 + ((cur.nonzero >> k) & 1 != 0 || (a.nonzero >> (12 + k)) & 1 != 0) as u8
+                            }
+                        } else {
+                            boundary_strength(pic, &a, &cur, a_row3 + k, qb, 1 << (12 + k), 1 << k, strong, mvy_limit)
+                        };
+                    }
+                }
+                // ---- internal edges
+                if cur.intra {
+                    for e in 1..4 {
+                        if cur.transform8x8 && e % 2 == 1 {
+                            continue;
+                        }
+                        bs_v[e] = [3; 4];
+                        bs_h[e] = [3; 4];
+                    }
+                } else if cur.nonzero != 0 || !uniform_motion(pic, bx0, by0, w4) {
+                    for e in 1..4 {
+                        if cur.transform8x8 && e % 2 == 1 {
+                            continue;
+                        }
+                        for k in 0..4 {
+                            let pb = (by0 + k) * w4 + bx0 + e - 1;
+                            bs_v[e][k] = boundary_strength(pic, &cur, &cur, pb, pb + 1, 1 << (k * 4 + e - 1), 1 << (k * 4 + e), false, mvy_limit);
+                            let pb = (by0 + e - 1) * w4 + bx0 + k;
+                            bs_h[e][k] = boundary_strength(pic, &cur, &cur, pb, pb + w4, 1 << ((e - 1) * 4 + k), 1 << (e * 4 + k), false, mvy_limit);
+                        }
+                    }
+                }
+                if std::env::var("H264_DBG_MB").map_or(false, |v| v == format!("{mx},{my},4")) {
+                    eprintln!("deblock mbaff mb ({mx},{my}) field {field}: intra {} t8 {} qp {} nz {:#x} mixed_left {mixed_left} double_top {double_top} above {:?} bs_left8 {:?} bs_v {:?} bs_h {:?}", cur.intra, cur.transform8x8, cur.qp, cur.nonzero, above_addr, bs_left8, bs_v, bs_h);
+                }
+                // ---- luma, vertical edges
+                if mixed_left {
+                    let lt = mbs[left_top];
+                    let lb = mbs[left_top + wm];
+                    let th = [thresholds(lt.qp, cur.qp, &cur), thresholds(lb.qp, cur.qp, &cur)];
+                    for r in 0..16 {
+                        let (bs, half) = if field { (bs_left8[r / 2], (r >= 8) as usize) } else { (bs_left8[2 * (r / 4) + (r & 1)], r & 1) };
+                        if bs == 0 {
+                            continue;
+                        }
+                        let (alpha, beta, tc0s) = th[half];
+                        let tc0 = if bs < 4 { tc0s[bs as usize - 1] as i32 } else { 0 };
+                        let o = ybase + r * lw - 4;
+                        let s: &mut [u8; 8] = (&mut pic.y[o..o + 8]).try_into().unwrap();
+                        luma_line(s, bs, alpha, beta, tc0);
+                    }
+                }
+                for e in 0..4 {
+                    if (e == 0 && (!do_left || mixed_left)) || (cur.transform8x8 && e % 2 == 1) || bs_v[e] == [0; 4] {
+                        continue;
+                    }
+                    let qp_p = if e == 0 { mbs[addr - 1].qp } else { cur.qp };
+                    let (alpha, beta, tc0s) = thresholds(qp_p, cur.qp, &cur);
+                    for k in 0..4 {
+                        let bs = bs_v[e][k];
+                        if bs == 0 {
+                            continue;
+                        }
+                        let tc0 = if bs < 4 { tc0s[bs as usize - 1] as i32 } else { 0 };
+                        let base = ybase + k * 4 * lw + e * 4 - 4;
+                        for r in 0..4 {
+                            let o = base + r * lw;
+                            let s: &mut [u8; 8] = (&mut pic.y[o..o + 8]).try_into().unwrap();
+                            luma_line(s, bs, alpha, beta, tc0);
+                        }
+                    }
+                }
+                // ---- luma, horizontal edges
+                let mut double_bs = [[0u8; 4]; 2];
+                if double_top {
+                    for j in 0..2 {
+                        let nb = mbs[(2 * pr - 2 + j) * wm + mx];
+                        for i in 0..4 {
+                            double_bs[j][i] = if cur.intra || nb.intra { 3 } else { 1 + ((cur.nonzero >> i) & 1 != 0 || (nb.nonzero >> (12 + i)) & 1 != 0) as u8 };
+                        }
+                        let (alpha, beta, tc0s) = thresholds(nb.qp, cur.qp, &cur);
+                        let mut bs16 = [0u8; 16];
+                        let mut tc16 = [0i32; 16];
+                        for k in 0..4 {
+                            let bs = double_bs[j][k];
+                            bs16[k * 4..k * 4 + 4].fill(bs);
+                            tc16[k * 4..k * 4 + 4].fill(tc0s[bs as usize - 1] as i32);
+                        }
+                        // the field's rows of this frame macroblock (j, j + 2, ...) against
+                        // the field macroblock above (rows -2, -4, ... from row j)
+                        luma_edge_h::<16>(&mut pic.y, ybase + j * width, 2 * width, &bs16, &tc16, false, alpha, beta);
+                    }
+                }
+                for e in 0..4 {
+                    if (e == 0 && above_addr.is_none()) || (cur.transform8x8 && e % 2 == 1) || bs_h[e] == [0; 4] {
+                        continue;
+                    }
+                    let qp_p = if e == 0 { mbs[above_addr.unwrap()].qp } else { cur.qp };
+                    let (alpha, beta, tc0s) = thresholds(qp_p, cur.qp, &cur);
+                    let mut bs16 = [0u8; 16];
+                    let mut tc16 = [0i32; 16];
+                    for k in 0..4 {
+                        let bs = bs_h[e][k];
+                        bs16[k * 4..k * 4 + 4].fill(bs);
+                        tc16[k * 4..k * 4 + 4].fill(if bs != 0 && bs < 4 { tc0s[bs as usize - 1] as i32 } else { 0 });
+                    }
+                    luma_edge_h::<16>(&mut pic.y, ybase + e * 4 * lw, lw, &bs16, &tc16, bs_h[e][0] == 4, alpha, beta);
+                }
+                // ---- chroma
+                for comp in 0..2 {
+                    if mixed_left {
+                        let lt = mbs[left_top];
+                        let lb = mbs[left_top + wm];
+                        let th = [thresholds(lt.qpc[comp], cur.qpc[comp], &cur), thresholds(lb.qpc[comp], cur.qpc[comp], &cur)];
+                        let plane = if comp == 0 { &mut pic.u } else { &mut pic.v };
+                        for r in 0..8 {
+                            let bs = bs_left8[r];
+                            let half = if field { (r >= 4) as usize } else { r & 1 };
+                            if bs == 0 {
+                                continue;
+                            }
+                            let (alpha, beta, tc0s) = th[half];
+                            let tc0 = if bs < 4 { tc0s[bs as usize - 1] as i32 } else { 0 };
+                            let o = cybase + r * cw - 2;
+                            let s: &mut [u8; 4] = (&mut plane[o..o + 4]).try_into().unwrap();
+                            chroma_line(s, bs, alpha, beta, tc0);
+                        }
+                    }
+                    for &(e, luma_e) in &[(0usize, 0usize), (4, 2)] {
+                        if (e == 0 && (!do_left || mixed_left)) || bs_v[luma_e] == [0; 4] {
+                            continue;
+                        }
+                        let qp_p = if e == 0 { mbs[addr - 1].qpc[comp] } else { cur.qpc[comp] };
+                        let (alpha, beta, tc0s) = thresholds(qp_p, cur.qpc[comp], &cur);
+                        let plane = if comp == 0 { &mut pic.u } else { &mut pic.v };
+                        for r in 0..8 {
+                            let bs = bs_v[luma_e][r / 2];
+                            if bs == 0 {
+                                continue;
+                            }
+                            let tc0 = if bs < 4 { tc0s[bs as usize - 1] as i32 } else { 0 };
+                            let o = cybase + r * cw + e - 2;
+                            let s: &mut [u8; 4] = (&mut plane[o..o + 4]).try_into().unwrap();
+                            chroma_line(s, bs, alpha, beta, tc0);
+                        }
+                    }
+                    if double_top {
+                        for j in 0..2 {
+                            let nb = mbs[(2 * pr - 2 + j) * wm + mx];
+                            let (alpha, beta, tc0s) = thresholds(nb.qpc[comp], cur.qpc[comp], &cur);
+                            let plane = if comp == 0 { &mut pic.u } else { &mut pic.v };
+                            let mut bs8 = [0u8; 8];
+                            let mut tc8 = [0i32; 8];
+                            for k in 0..4 {
+                                let bs = double_bs[j][k];
+                                bs8[k * 2..k * 2 + 2].fill(bs);
+                                tc8[k * 2..k * 2 + 2].fill(tc0s[bs as usize - 1] as i32);
+                            }
+                            chroma_edge_h::<8>(plane, cybase + j * cwidth, 2 * cwidth, &bs8, &tc8, false, alpha, beta);
+                        }
+                    }
+                    for &(e, luma_e) in &[(0usize, 0usize), (4, 2)] {
+                        if (e == 0 && above_addr.is_none()) || bs_h[luma_e] == [0; 4] {
+                            continue;
+                        }
+                        let qp_p = if e == 0 { mbs[above_addr.unwrap()].qpc[comp] } else { cur.qpc[comp] };
+                        let (alpha, beta, tc0s) = thresholds(qp_p, cur.qpc[comp], &cur);
+                        let plane = if comp == 0 { &mut pic.u } else { &mut pic.v };
+                        let mut bs8 = [0u8; 8];
+                        let mut tc8 = [0i32; 8];
+                        for k in 0..4 {
+                            let bs = bs_h[luma_e][k];
+                            bs8[k * 2..k * 2 + 2].fill(bs);
+                            tc8[k * 2..k * 2 + 2].fill(if bs != 0 && bs < 4 { tc0s[bs as usize - 1] as i32 } else { 0 });
+                        }
+                        chroma_edge_h::<8>(plane, cybase + e * cw, cw, &bs8, &tc8, bs_h[luma_e][0] == 4, alpha, beta);
+                    }
                 }
             }
         }

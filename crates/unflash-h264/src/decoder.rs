@@ -276,9 +276,6 @@ impl Decoder {
         }
         let pps = self.ppss[hdr.pps_id as usize].clone().unwrap();
         let sps = self.spss[pps.sps_id as usize].clone().unwrap();
-        if sps.mbaff && !hdr.field_pic {
-            return Err(Error::Unsupported("MBAFF (macroblock-adaptive frame/field) coding"));
-        }
         if self.new_picture_starts(&hdr, &sps) {
             self.finish_picture()?;
             self.start_picture(&sps, &hdr, pts)?;

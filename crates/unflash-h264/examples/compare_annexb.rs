@@ -189,6 +189,45 @@ fn main() {
                     }
                 }
             }
+            // the macroblock kinds (f = field macroblock)
+            println!("   kinds:");
+            for my in 0..hm {
+                let row = (0..wm)
+                    .map(|mx| {
+                        let a = my * wm + mx;
+                        let k = match kinds.get(a) {
+                            Some(k) => format!("{:?}", k),
+                            None => "?".into(),
+                        };
+                        let k: String = k.chars().take(4).collect();
+                        format!("{:>4}{}", k, if fields.get(a).copied().unwrap_or(false) { "f" } else { " " })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("   MB row {my:2}: {row}");
+            }
+            // chroma: per frame macroblock (8x8 chroma samples), both planes
+            let (cw, ch) = (w / 2, h / 2);
+            for (name, off) in [("U", w * h), ("V", w * h + cw * ch)] {
+                let mut counts = vec![0usize; wm * hm];
+                let mut shown = 0;
+                for yy in 0..ch {
+                    for xx in 0..cw {
+                        let i = off + yy * cw + xx;
+                        if i < ours.len() && i < theirs.len() && ours[i] != theirs[i] {
+                            counts[(yy / 8) * wm + xx / 8] += 1;
+                            if shown < 12 {
+                                println!("   {name} ({xx}, {yy}) = MB ({}, {}): ours {} theirs {}", xx / 8, yy / 8, ours[i], theirs[i]);
+                                shown += 1;
+                            }
+                        }
+                    }
+                }
+                println!("   {name} per frame MB:");
+                for my in 0..hm {
+                    println!("   MB row {my:2}: {}", (0..wm).map(|mx| format!("{:3}", counts[my * wm + mx])).collect::<Vec<_>>().join(" "));
+                }
+            }
         }
         println!("frame {k} (period {period}, poc {poc}, frame_num {frame_num}, damaged {damaged}): {ndiff} samples differ (max |d| {maxdiff}) in {rows_bad} luma rows ({odd} odd); first in {plane} at ({x}, {y}) = MB ({}, {}) field {field_mb} {:?}, ours {} theirs {}", x / 16, y / 16, kind, ours[i], theirs[i]);
     }

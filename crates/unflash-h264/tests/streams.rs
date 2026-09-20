@@ -93,9 +93,6 @@ fn pcm_macroblocks_cavlc() {
     check("pcm_cavlc");
 }
 #[test]
-fn interlaced_is_reported_unsupported() {
-    match decode("high_interlaced") {
-        Err(Error::Unsupported(_)) => {}
-        other => panic!("expected an unsupported error, got {:?}", other.map(|v| v.len())),
-    }
+fn high_interlaced_mbaff() {
+    check("high_interlaced");
 }

@@ -35,6 +35,6 @@ gen high_crop_cabac   "$T2" 100x60 30 -profile:v high -bf 2 -x264-params "8x8dct
 # very low QP on noise: x264 codes macroblocks as I_PCM (CABAC and CAVLC)
 gen pcm_cabac         "$NOISE" 96x64 12 -profile:v high -x264-params "qp=1"
 gen pcm_cavlc         "$NOISE" 96x64 12 -profile:v high -x264-params "qp=1:cabac=0"
-# interlaced: must be rejected by the decoder, not decoded wrongly
+# interlaced (x264 codes MBAFF frames): decoded like the rest
 gen high_interlaced   "$T2" 96x64 20 -profile:v high -x264-params "interlaced=1"
 ls -la *.mp4 *.framemd5 | awk '{print $5, $9}'

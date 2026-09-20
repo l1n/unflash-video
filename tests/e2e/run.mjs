@@ -329,6 +329,25 @@ try {
     // a different encoder, so the edges of the flashing may land a frame apart
     assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.15 && Math.abs(a.end - b.end) < 0.15, `H.264 violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
   }
+  // an interlaced (MBAFF) H.264 copy of the same clip through the built-in decoder
+  if (!h264Decodable) {
+    await openFile('flash_h264i.mp4');
+    assert((await page.textContent('#status')).includes('built-in H.264'), 'the interlaced clip is decoded by the built-in decoder');
+    scan = await scanCurrent();
+    results.h264iViolations = await page.evaluate(() => window.__unflash.lastScan.result.violations);
+    console.log('h264 interlaced scan:', scan.ms, 'ms |', scan.toast, '|', JSON.stringify(results.h264iViolations));
+    assert(results.h264iViolations.length === results.cpuViolations.length, 'the interlaced H.264 copy has the same violations as the VP9 one');
+    for (let i = 0; i < results.h264iViolations.length; i++) {
+      const a = results.h264iViolations[i];
+      const b = results.cpuViolations[i];
+      assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.15 && Math.abs(a.end - b.end) < 0.15, `interlaced H.264 violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
+    }
+    await openFile('flash_h264.mp4');
+    page.once('dialog', (d) => d.accept());
+    await page.click('#btnDeleteAll');
+    await page.waitForFunction(() => document.querySelectorAll('#sectionList .sec-item').length === 1);
+    scan = await scanCurrent();
+  }
   // sections work through the built-in decoder too: prepare and check the flash
   await page.click('#sectionList .sec-item');
   await page.waitForSelector('#btnPrepare', { state: 'visible' });

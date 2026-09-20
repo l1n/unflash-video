@@ -14,7 +14,12 @@ pub struct Edges<'a> {
     pub left: &'a [u8],
     pub corner: u8,
     pub avail_above: bool,
+    /// all left samples are available
     pub avail_left: bool,
+    /// the upper and the lower half of the left samples separately (chroma
+    /// DC prediction decides per 4x4 block; in an MBAFF frame the halves can
+    /// belong to different macroblocks)
+    pub avail_left_half: [bool; 2],
     pub avail_corner: bool,
 }
 
@@ -296,13 +301,14 @@ pub fn pred_chroma(mode: u32, e: &Edges, out: &mut [u8; 64]) {
         0 => {
             // DC, per 4x4 chroma block
             for by in 0..2i32 {
+                let avail_left = e.avail_left_half[by as usize];
                 for bx in 0..2i32 {
                     let sa: i32 = (0..4).map(|k| a(bx * 4 + k)).sum();
                     let sl: i32 = (0..4).map(|k| l(by * 4 + k)).sum();
                     let v = if (bx == 0 && by == 0) || (bx > 0 && by > 0) {
-                        if e.avail_above && e.avail_left {
+                        if e.avail_above && avail_left {
                             (sa + sl + 4) >> 3
-                        } else if e.avail_left {
+                        } else if avail_left {
                             (sl + 2) >> 2
                         } else if e.avail_above {
                             (sa + 2) >> 2
@@ -312,12 +318,12 @@ pub fn pred_chroma(mode: u32, e: &Edges, out: &mut [u8; 64]) {
                     } else if bx > 0 {
                         if e.avail_above {
                             (sa + 2) >> 2
-                        } else if e.avail_left {
+                        } else if avail_left {
                             (sl + 2) >> 2
                         } else {
                             128
                         }
-                    } else if e.avail_left {
+                    } else if avail_left {
                         (sl + 2) >> 2
                     } else if e.avail_above {
                         (sa + 2) >> 2
@@ -560,7 +566,7 @@ mod tests {
             let above = noise(16, &mut seed);
             let left = noise(8, &mut seed);
             let corner = noise(1, &mut seed)[0];
-            let e = Edges { above: &above, left: &left, corner, avail_above: true, avail_left: true, avail_corner: true };
+            let e = Edges { above: &above, left: &left, corner, avail_above: true, avail_left: true, avail_left_half: [true; 2], avail_corner: true };
             for mode in 0..9 {
                 let mut out = [0u8; 16];
                 pred4x4(mode, &e, &mut out);

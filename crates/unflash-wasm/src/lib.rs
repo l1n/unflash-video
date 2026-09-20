@@ -948,7 +948,7 @@ impl Detector {
 
 /// What the built-in decoder makes of an `avcC` record: JSON with the
 /// profile, level and cropped size, or an error saying why the stream
-/// cannot be decoded (interlaced, high bit depth, ...).
+/// cannot be decoded (4:2:2, high bit depth, slice groups, ...).
 #[wasm_bindgen]
 pub fn h264_probe(avcc: &[u8]) -> Result<String, JsValue> {
     let mut d = unflash_h264::Decoder::new();

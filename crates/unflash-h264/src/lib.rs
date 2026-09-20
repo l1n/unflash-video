@@ -7,9 +7,10 @@
 //! partitioning, multiple references, long-term references and memory
 //! management control operations, weighted prediction (explicit and
 //! implicit), spatial and temporal direct prediction, the 8x8 transform
-//! and scaling matrices, and the deblocking filter. Interlaced coding
-//! (field pictures, MBAFF), 4:2:2 / 4:4:4, high bit depths, data
-//! partitioning and slice groups are reported as unsupported.
+//! and scaling matrices, interlaced coding (field pictures and MBAFF
+//! frames), and the deblocking filter. 4:2:2 / 4:4:4, high bit depths,
+//! data partitioning, slice groups and SP / SI slices are reported as
+//! unsupported.
 //!
 //! The decoder is written to the standard (ITU-T H.264 / ISO/IEC 14496-10)
 //! and tested bit-exact against ffmpeg's decoder on x264 streams that
