@@ -298,7 +298,7 @@ impl Decoder {
             Entropy::Cavlc(r)
         };
         let poc = cur.poc.poc;
-        if std::env::var_os("H264_TRACE").is_some() {
+        if crate::debug_flag("H264_TRACE").is_some() {
             let show = |l: &Vec<crate::picture::RefPic>| l.iter().map(|r| format!("{}{}{}", r.poc, match r.structure { TOP => "t", BOTTOM => "b", _ => "" }, if r.long_term { "L" } else { "" })).collect::<Vec<_>>().join(" ");
             let dpb = self.dpb.entries.iter().map(|e| format!("fn{}/poc{}/r{}{}", e.frame_num, e.poc, e.reference, if e.kind == crate::picture::RefKind::Long { "L" } else { "" })).collect::<Vec<_>>().join(" ");
             eprintln!("slice pts {} type {:?} struct {} poc {} frame_num {} ref {} first_mb {} L0 [{}] L1 [{}] mods {:?} mmco {:?} dpb [{}] dbf {}/{}/{} cabac {} direct_spatial {} wp {}/{} nref {:?}", pts, hdr.slice_type, cur.structure, poc, hdr.frame_num, hdr.nal_ref_idc, hdr.first_mb, show(&lists[0]), show(&lists[1]), hdr.ref_list_mods, hdr.mmco, dpb, hdr.disable_deblocking_filter_idc, hdr.alpha_offset, hdr.beta_offset, pps.entropy_coding_mode, hdr.direct_spatial_mv_pred, pps.weighted_pred, pps.weighted_bipred_idc, hdr.num_ref_idx_active);

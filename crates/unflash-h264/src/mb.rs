@@ -561,6 +561,7 @@ impl<'a> SliceDecoder<'a> {
     /// The macroblock (dx, dy) macroblocks away in the picture being decoded
     /// (a field's rows for a field picture), when it is decoded and in this
     /// slice. Not for MBAFF frames (see `neighbour`).
+    #[inline(always)]
     fn mb_avail(&self, dx: i32, dy: i32) -> Option<usize> {
         let x = self.mx as i32 + dx;
         let y = self.my as i32 + if self.field_pic { 2 * dy } else { dy };
@@ -577,6 +578,7 @@ impl<'a> SliceDecoder<'a> {
 
     /// MBAFF: the top macroblock of the pair (dx, dy) pairs away, when that
     /// pair is decoded and in this slice.
+    #[inline(always)]
     fn pair_nb(&self, dx: i32, dy: i32) -> Option<usize> {
         let (x, y) = (self.mx as i32 + dx, self.pair_row as i32 + dy);
         if x < 0 || x >= self.width_mbs as i32 || y < 0 {
@@ -632,8 +634,8 @@ impl<'a> SliceDecoder<'a> {
     /// an MBAFF frame this is Table 6-4: which macroblock of a neighbouring
     /// pair, and which of its rows, depends on the frame / field kinds of
     /// both pairs.
+    #[inline(always)]
     fn neighbour(&self, xn: i32, yn: i32, maxw: i32, maxh: i32) -> Option<(usize, usize, usize)> {
-        let w = self.width_mbs;
         if yn >= maxh || (xn >= 0 && yn >= 0) {
             return None;
         }
@@ -644,6 +646,12 @@ impl<'a> SliceDecoder<'a> {
             let addr = self.mb_avail(dx, dy)?;
             return Some((addr, xw, ((yn + maxh) % maxh) as usize));
         }
+        self.neighbour_mbaff(xn, yn, maxw, maxh, xw)
+    }
+
+    /// The MBAFF part of `neighbour` (Table 6-4).
+    fn neighbour_mbaff(&self, xn: i32, yn: i32, maxw: i32, maxh: i32, xw: usize) -> Option<(usize, usize, usize)> {
+        let w = self.width_mbs;
         let cur_frame = !self.mb_field;
         let top = !self.mb_bottom;
         let field = |a: usize| self.mbs[a].field;
@@ -766,6 +774,7 @@ impl<'a> SliceDecoder<'a> {
 
     /// The MB info of the neighbouring 4x4 luma block at (x, y) relative
     /// to the current MB, plus its raster index there, when available.
+    #[inline(always)]
     fn nb_block(&self, x: i32, y: i32) -> Option<(&MbInfo, usize)> {
         if (0..16).contains(&x) && (0..16).contains(&y) {
             return Some((&self.cur, (y as usize / 4) * 4 + x as usize / 4));
@@ -775,6 +784,7 @@ impl<'a> SliceDecoder<'a> {
     }
 
     /// The same for a 4x4 chroma block (x, y in chroma samples, 8x8 MB).
+    #[inline(always)]
     fn nb_chroma_block(&self, x: i32, y: i32) -> Option<(&MbInfo, usize)> {
         if (0..8).contains(&x) && (0..8).contains(&y) {
             return Some((&self.cur, (y as usize / 4) * 2 + x as usize / 4));
@@ -1410,6 +1420,7 @@ impl<'a> SliceDecoder<'a> {
     /// Availability of a neighbouring sample for intra prediction: its
     /// macroblock is decoded in this slice and, with constrained intra
     /// prediction, intra. maxw / maxh: 16 luma, 8 chroma.
+    #[inline(always)]
     fn sample_avail(&self, x: i32, y: i32, maxw: i32, maxh: i32) -> bool {
         match self.neighbour(x, y, maxw, maxh) {
             None => false,
@@ -1611,7 +1622,7 @@ impl<'a> SliceDecoder<'a> {
             let corner = if avail_corner { self.chroma_at(comp, -1, -1) } else { 128 };
             let mut pred = [0u8; 64];
             intra::pred_chroma(mode, &Edges { above: &above, left: &left, corner, avail_above, avail_left, avail_left_half, avail_corner }, &mut pred);
-            if std::env::var("H264_DBG_INTRA").map_or(false, |v| v == format!("{},{},{}", self.mx, self.my, self.poc)) {
+            if crate::debug_flag("H264_DBG_INTRA").map_or(false, |v| v == format!("{},{},{}", self.mx, self.my, self.poc)) {
                 eprintln!("intra chroma comp {comp} mb ({},{}) poc {} field {} bottom {} mode {mode} above {avail_above} left {avail_left} halves {:?} corner {avail_corner}\n  above {:?}\n  left {:?}\n  pred rows {:?}", self.mx, self.my, self.poc, self.mb_field, self.mb_bottom, avail_left_half, &above[..8], &left[..8], pred.chunks(8).map(|r| r.to_vec()).collect::<Vec<_>>());
             }
             let plane = if comp == 0 { &mut self.pic.u } else { &mut self.pic.v };
@@ -1967,6 +1978,7 @@ impl<'a> SliceDecoder<'a> {
     /// partition), Some((-1, [0, 0])) when available but not predicted from
     /// that list. In an MBAFF frame a neighbour of the other kind is
     /// converted to this macroblock's units (8.4.1.3.1).
+    #[inline(always)]
     fn nb_motion(&self, list: usize, x: i32, y: i32) -> Option<(i32, [i32; 2])> {
         let w4 = self.pic.width / 4;
         if (0..16).contains(&x) && (0..16).contains(&y) {
@@ -2058,14 +2070,12 @@ impl<'a> SliceDecoder<'a> {
         let w4 = self.pic.width / 4;
         let id = if ref_idx >= 0 { self.cur_lists()[list][ref_idx as usize].key() } else { -1 };
         let mv = [mv[0].clamp(-32768, 32767) as i16, mv[1].clamp(-32768, 32767) as i16];
+        let n = w / 4;
         for by in y / 4..(y + h) / 4 {
-            let row = (self.my * 4 + by) * w4 + self.mx * 4;
-            for bx in x / 4..(x + w) / 4 {
-                let b = row + bx;
-                self.pic.ref_idx[list][b] = ref_idx as i8;
-                self.pic.mv[list][b] = mv;
-                self.pic.ref_id[list][b] = id;
-            }
+            let b = (self.my * 4 + by) * w4 + self.mx * 4 + x / 4;
+            self.pic.ref_idx[list][b..b + n].fill(ref_idx as i8);
+            self.pic.mv[list][b..b + n].fill(mv);
+            self.pic.ref_id[list][b..b + n].fill(id);
         }
     }
 

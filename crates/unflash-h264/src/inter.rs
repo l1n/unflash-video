@@ -12,6 +12,154 @@ fn clip(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
+/// Eight-lane versions of the row kernels (wasm simd128, SSE2 or NEON
+/// through `wide`), used for blocks at least eight samples wide. They
+/// compute exactly what the scalar loops compute: the 6-tap sums fit i16
+/// (at most 255 × 52), the centre position's second pass runs in i32, and
+/// the final clip is the saturating narrowing to u8.
+#[cfg(feature = "simd")]
+mod simd {
+    use wide::{i16x8, i32x8, u8x16};
+
+    /// Eight consecutive samples as i16 lanes.
+    #[inline(always)]
+    pub fn load8(s: &[u8]) -> i16x8 {
+        let mut a = [0u8; 16];
+        a[..8].copy_from_slice(&s[..8]);
+        i16x8::from_u8x16_low(u8x16::from(a))
+    }
+
+    /// Eight lanes, clipped to 0..255, into `d[..8]`.
+    #[inline(always)]
+    pub fn store8(v: i16x8, d: &mut [u8]) {
+        let p = u8x16::narrow_i16x8(v, v);
+        d[..8].copy_from_slice(&p.as_array_ref()[..8]);
+    }
+
+    #[inline(always)]
+    fn tap8(a: i16x8, b: i16x8, c: i16x8, d: i16x8, e: i16x8, f: i16x8) -> i16x8 {
+        (a + f) + (c + d) * 20 - (b + e) * 5
+    }
+
+    /// Horizontal half-sample positions of one row: `r` starts two samples
+    /// before the block and holds W + 5 samples.
+    #[inline(always)]
+    pub fn hhalf_row<const W: usize>(r: &[u8], o: &mut [u8]) {
+        let mut k = 0;
+        while k < W {
+            let v = tap8(load8(&r[k..]), load8(&r[k + 1..]), load8(&r[k + 2..]), load8(&r[k + 3..]), load8(&r[k + 4..]), load8(&r[k + 5..]));
+            store8((v + 16i16) >> 5, &mut o[k..]);
+            k += 8;
+        }
+    }
+
+    /// Vertical half-sample positions of one row from the six rows around it.
+    #[inline(always)]
+    pub fn vhalf_row<const W: usize>(r: [&[u8]; 6], o: &mut [u8]) {
+        let mut k = 0;
+        while k < W {
+            let v = tap8(load8(&r[0][k..]), load8(&r[1][k..]), load8(&r[2][k..]), load8(&r[3][k..]), load8(&r[4][k..]), load8(&r[5][k..]));
+            store8((v + 16i16) >> 5, &mut o[k..]);
+            k += 8;
+        }
+    }
+
+    /// The unclipped horizontal taps of one row (the centre position's first pass).
+    #[inline(always)]
+    pub fn center_h_row<const W: usize>(r: &[u8], t: &mut [i16]) {
+        let mut k = 0;
+        while k < W {
+            let v = tap8(load8(&r[k..]), load8(&r[k + 1..]), load8(&r[k + 2..]), load8(&r[k + 3..]), load8(&r[k + 4..]), load8(&r[k + 5..]));
+            t[k..k + 8].copy_from_slice(v.as_array_ref());
+            k += 8;
+        }
+    }
+
+    /// The vertical taps over six rows of intermediates (the centre position's second pass).
+    #[inline(always)]
+    pub fn center_v_row<const W: usize>(r: [&[i16]; 6], o: &mut [u8]) {
+        let mut k = 0;
+        while k < W {
+            let w = |x: &[i16]| i32x8::from_i16x8(i16x8::from_slice_unaligned(&x[k..k + 8]));
+            let (a, b, c, d, e, f) = (w(r[0]), w(r[1]), w(r[2]), w(r[3]), w(r[4]), w(r[5]));
+            let v = (a + f) + (c + d) * 20 - (b + e) * 5;
+            store8(i16x8::from_i32x8_saturate((v + i32x8::splat(512)) >> 10), &mut o[k..]);
+            k += 8;
+        }
+    }
+
+    /// (a + b + 1) >> 1 into `o`.
+    #[inline(always)]
+    pub fn avg_row<const W: usize>(a: &[u8], b: &[u8], o: &mut [u8]) {
+        let mut k = 0;
+        while k < W {
+            store8((load8(&a[k..]) + load8(&b[k..]) + 1i16) >> 1, &mut o[k..]);
+            k += 8;
+        }
+    }
+
+    /// d = (d + a + 1) >> 1.
+    #[inline(always)]
+    pub fn avg_into_row<const W: usize>(a: &[u8], d: &mut [u8]) {
+        let mut k = 0;
+        while k < W {
+            let v = (load8(&d[k..]) + load8(&a[k..]) + 1i16) >> 1;
+            store8(v, &mut d[k..]);
+            k += 8;
+        }
+    }
+
+    /// d = (d + ((a + b + 1) >> 1) + 1) >> 1.
+    #[inline(always)]
+    pub fn avg2_into_row<const W: usize>(a: &[u8], b: &[u8], d: &mut [u8]) {
+        let mut k = 0;
+        while k < W {
+            let v = (load8(&a[k..]) + load8(&b[k..]) + 1i16) >> 1;
+            let v = (load8(&d[k..]) + v + 1i16) >> 1;
+            store8(v, &mut d[k..]);
+            k += 8;
+        }
+    }
+
+    /// One eight-wide row of the chroma bilinear filter: `r0` / `r1` hold
+    /// nine samples of the two source rows.
+    #[inline(always)]
+    pub fn chroma_row8(r0: &[u8], r1: &[u8], w: [i16; 4], d: &mut [u8], avg: bool) {
+        let v = load8(r0) * w[0] + load8(&r0[1..]) * w[1] + load8(r1) * w[2] + load8(&r1[1..]) * w[3];
+        let v = (v + 32i16) >> 6;
+        if avg {
+            store8((load8(d) + v + 1i16) >> 1, d);
+        } else {
+            store8(v, d);
+        }
+    }
+
+    /// Explicit / implicit bi-prediction weighting of one row.
+    #[inline(always)]
+    pub fn weight_bi_row<const W: usize>(r0: &[u8], r1: &[u8], w0: i32, w1: i32, round: i32, sh: i32, o: i32, d: &mut [u8]) {
+        let mut k = 0;
+        while k < W {
+            let a = i32x8::from_i16x8(load8(&r0[k..]));
+            let b = i32x8::from_i16x8(load8(&r1[k..]));
+            let v = ((a * w0 + b * w1 + i32x8::splat(round)) >> sh) + i32x8::splat(o);
+            store8(i16x8::from_i32x8_saturate(v), &mut d[k..]);
+            k += 8;
+        }
+    }
+
+    /// Single-list weighting of one row.
+    #[inline(always)]
+    pub fn weight_uni_row<const W: usize>(r: &[u8], w0: i32, round: i32, log_wd: i32, o: i32, d: &mut [u8]) {
+        let mut k = 0;
+        while k < W {
+            let a = i32x8::from_i16x8(load8(&r[k..]));
+            let v = ((a * w0 + i32x8::splat(round)) >> log_wd) + i32x8::splat(o);
+            store8(i16x8::from_i32x8_saturate(v), &mut d[k..]);
+            k += 8;
+        }
+    }
+}
+
 #[inline(always)]
 fn tap(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
     a - 5 * b + 20 * c + 20 * d - 5 * e + f
@@ -29,6 +177,16 @@ fn emit<const W: usize>(a: &[u8], b: Option<&[u8]>, h: usize, dst: &mut [u8], ds
     for j in 0..h {
         let ra = &a[j * W..j * W + W];
         let d = &mut dst[j * ds..j * ds + W];
+        #[cfg(feature = "simd")]
+        if W >= 8 {
+            match (b, avg) {
+                (Some(b), true) => simd::avg2_into_row::<W>(ra, &b[j * W..j * W + W], d),
+                (Some(b), false) => simd::avg_row::<W>(ra, &b[j * W..j * W + W], d),
+                (None, true) => simd::avg_into_row::<W>(ra, d),
+                (None, false) => d.copy_from_slice(ra),
+            }
+            continue;
+        }
         match b {
             Some(b) => {
                 let rb = &b[j * W..j * W + W];
@@ -70,6 +228,11 @@ fn hhalf<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mut
     for j in 0..h {
         let r = &src[base + j * ss - 2..base + j * ss + W + 3];
         let o = &mut out[j * W..j * W + W];
+        #[cfg(feature = "simd")]
+        if W >= 8 {
+            simd::hhalf_row::<W>(r, o);
+            continue;
+        }
         for i in 0..W {
             o[i] = clip((tap(r[i] as i32, r[i + 1] as i32, r[i + 2] as i32, r[i + 3] as i32, r[i + 4] as i32, r[i + 5] as i32) + 16) >> 5);
         }
@@ -83,6 +246,11 @@ fn vhalf<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mut
         let p = base + j * ss;
         let (r0, r1, r2, r3, r4, r5) = (&src[p - 2 * ss..p - 2 * ss + W], &src[p - ss..p - ss + W], &src[p..p + W], &src[p + ss..p + ss + W], &src[p + 2 * ss..p + 2 * ss + W], &src[p + 3 * ss..p + 3 * ss + W]);
         let o = &mut out[j * W..j * W + W];
+        #[cfg(feature = "simd")]
+        if W >= 8 {
+            simd::vhalf_row::<W>([r0, r1, r2, r3, r4, r5], o);
+            continue;
+        }
         for i in 0..W {
             o[i] = clip((tap(r0[i] as i32, r1[i] as i32, r2[i] as i32, r3[i] as i32, r4[i] as i32, r5[i] as i32) + 16) >> 5);
         }
@@ -98,6 +266,11 @@ fn center<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mu
         let p = base + j * ss - 2 * ss - 2;
         let r = &src[p..p + W + 5];
         let o = &mut t[j * W..j * W + W];
+        #[cfg(feature = "simd")]
+        if W >= 8 {
+            simd::center_h_row::<W>(r, o);
+            continue;
+        }
         for i in 0..W {
             o[i] = tap(r[i] as i32, r[i + 1] as i32, r[i + 2] as i32, r[i + 3] as i32, r[i + 4] as i32, r[i + 5] as i32) as i16;
         }
@@ -105,6 +278,11 @@ fn center<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mu
     for j in 0..h {
         let (r0, r1, r2, r3, r4, r5) = (&t[j * W..j * W + W], &t[(j + 1) * W..(j + 1) * W + W], &t[(j + 2) * W..(j + 2) * W + W], &t[(j + 3) * W..(j + 3) * W + W], &t[(j + 4) * W..(j + 4) * W + W], &t[(j + 5) * W..(j + 5) * W + W]);
         let o = &mut out[j * W..j * W + W];
+        #[cfg(feature = "simd")]
+        if W >= 8 {
+            simd::center_v_row::<W>([r0, r1, r2, r3, r4, r5], o);
+            continue;
+        }
         for i in 0..W {
             o[i] = clip((tap(r0[i] as i32, r1[i] as i32, r2[i] as i32, r3[i] as i32, r4[i] as i32, r5[i] as i32) + 512) >> 10);
         }
@@ -125,6 +303,11 @@ fn luma_block<const W: usize>(src: &[u8], base: usize, ss: usize, xf: i32, yf: i
                 let r = &src[base + j * ss..base + j * ss + W];
                 let d = &mut dst[j * ds..j * ds + W];
                 if avg {
+                    #[cfg(feature = "simd")]
+                    if W >= 8 {
+                        simd::avg_into_row::<W>(r, d);
+                        continue;
+                    }
                     for i in 0..W {
                         d[i] = ((d[i] as u32 + r[i] as u32 + 1) >> 1) as u8;
                     }
@@ -242,6 +425,11 @@ fn chroma_block<const W: usize>(src: &[u8], base: usize, ss: usize, xf: i32, yf:
         let r0 = &src[p..p + W + 1];
         let r1 = &src[p + ss..p + ss + W + 1];
         let d = &mut dst[j * ds..j * ds + W];
+        #[cfg(feature = "simd")]
+        if W == 8 {
+            simd::chroma_row8(r0, r1, [w00 as i16, w10 as i16, w01 as i16, w11 as i16], d, avg);
+            continue;
+        }
         for i in 0..W {
             let v = (w00 * r0[i] as i32 + w10 * r0[i + 1] as i32 + w01 * r1[i] as i32 + w11 * r1[i + 1] as i32 + 32) >> 6;
             d[i] = if avg { ((d[i] as i32 + v + 1) >> 1) as u8 } else { v as u8 };
@@ -303,34 +491,60 @@ pub fn weights_are_default(w: Weights, bi: bool) -> bool {
 /// 8.4.2.3.2: explicit single-list weighting of a packed `w`×`h` block into
 /// `dst` (stride `ds`).
 pub fn weight_uni(p: &[u8], w: usize, h: usize, weights: Weights, dst: &mut [u8], ds: usize) {
+    match w {
+        16 => weight_uni_w::<16>(p, h, weights, dst, ds),
+        8 => weight_uni_w::<8>(p, h, weights, dst, ds),
+        4 => weight_uni_w::<4>(p, h, weights, dst, ds),
+        _ => weight_uni_w::<2>(p, h, weights, dst, ds),
+    }
+}
+
+#[inline(always)]
+fn weight_uni_w<const W: usize>(p: &[u8], h: usize, weights: Weights, dst: &mut [u8], ds: usize) {
     let (w0, o0, _, _, log_wd) = weights;
+    // log_wd 0 folds into the same formula with a shift of 0 and no rounding
+    let round = if log_wd >= 1 { 1 << (log_wd - 1) } else { 0 };
     for j in 0..h {
-        let r = &p[j * w..j * w + w];
-        let d = &mut dst[j * ds..j * ds + w];
-        if log_wd >= 1 {
-            let round = 1 << (log_wd - 1);
-            for i in 0..w {
-                d[i] = clip(((r[i] as i32 * w0 + round) >> log_wd) + o0);
-            }
-        } else {
-            for i in 0..w {
-                d[i] = clip(r[i] as i32 * w0 + o0);
-            }
+        let r = &p[j * W..j * W + W];
+        let d = &mut dst[j * ds..j * ds + W];
+        #[cfg(feature = "simd")]
+        if W >= 8 {
+            simd::weight_uni_row::<W>(r, w0, round, log_wd, o0, d);
+            continue;
+        }
+        for i in 0..W {
+            d[i] = clip(((r[i] as i32 * w0 + round) >> log_wd) + o0);
         }
     }
 }
 
 /// 8.4.2.3.2: weighted bi-prediction of two packed blocks into `dst`.
 pub fn weight_bi(p0: &[u8], p1: &[u8], w: usize, h: usize, weights: Weights, dst: &mut [u8], ds: usize) {
+    match w {
+        16 => weight_bi_w::<16>(p0, p1, h, weights, dst, ds),
+        8 => weight_bi_w::<8>(p0, p1, h, weights, dst, ds),
+        4 => weight_bi_w::<4>(p0, p1, h, weights, dst, ds),
+        _ => weight_bi_w::<2>(p0, p1, h, weights, dst, ds),
+    }
+}
+
+#[inline(always)]
+fn weight_bi_w<const W: usize>(p0: &[u8], p1: &[u8], h: usize, weights: Weights, dst: &mut [u8], ds: usize) {
     let (w0, o0, w1, o1, log_wd) = weights;
     let round = 1 << log_wd;
     let o = (o0 + o1 + 1) >> 1;
+    let sh = log_wd + 1;
     for j in 0..h {
-        let r0 = &p0[j * w..j * w + w];
-        let r1 = &p1[j * w..j * w + w];
-        let d = &mut dst[j * ds..j * ds + w];
-        for i in 0..w {
-            d[i] = clip(((r0[i] as i32 * w0 + r1[i] as i32 * w1 + round) >> (log_wd + 1)) + o);
+        let r0 = &p0[j * W..j * W + W];
+        let r1 = &p1[j * W..j * W + W];
+        let d = &mut dst[j * ds..j * ds + W];
+        #[cfg(feature = "simd")]
+        if W >= 8 {
+            simd::weight_bi_row::<W>(r0, r1, w0, w1, round, sh, o, d);
+            continue;
+        }
+        for i in 0..W {
+            d[i] = clip(((r0[i] as i32 * w0 + r1[i] as i32 * w1 + round) >> sh) + o);
         }
     }
 }

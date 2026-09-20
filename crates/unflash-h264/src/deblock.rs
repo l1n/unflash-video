@@ -343,7 +343,7 @@ pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize
                     }
                 }
             }
-            if std::env::var("H264_DBG_MB").map_or(false, |v| v == format!("{mx},{row},{structure}")) {
+            if crate::debug_flag("H264_DBG_MB").map_or(false, |v| v == format!("{mx},{row},{structure}")) {
                 eprintln!("deblock mb ({mx},{row}) struct {structure}: intra {} t8 {} qp {} qpc {:?} nz {:#x} slice {} idc {} a/b {}/{} left {:?} above {:?} bs_v {:?} bs_h {:?}", cur.intra, cur.transform8x8, cur.qp, cur.qpc, cur.nonzero, cur.slice, cur.filter_idc, cur.alpha_offset, cur.beta_offset, left.map(|l| (l.qp, l.slice, l.intra)), above.map(|a| (a.qp, a.slice, a.intra)), bs_v, bs_h);
             }
             let x0 = mx * 16;
@@ -553,7 +553,7 @@ fn filter_picture_mbaff(pic: &mut Picture, mbs: &[MbDeblockInfo], wm: usize, hm:
                         }
                     }
                 }
-                if std::env::var("H264_DBG_MB").map_or(false, |v| v == format!("{mx},{my},4")) {
+                if crate::debug_flag("H264_DBG_MB").map_or(false, |v| v == format!("{mx},{my},4")) {
                     eprintln!("deblock mbaff mb ({mx},{my}) field {field}: intra {} t8 {} qp {} nz {:#x} mixed_left {mixed_left} double_top {double_top} above {:?} bs_left8 {:?} bs_v {:?} bs_h {:?}", cur.intra, cur.transform8x8, cur.qp, cur.nonzero, above_addr, bs_left8, bs_v, bs_h);
                 }
                 // ---- luma, vertical edges

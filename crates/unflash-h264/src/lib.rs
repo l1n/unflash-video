@@ -55,3 +55,17 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// A debugging environment variable (`H264_TRACE`, `H264_DBG_MB`,
+/// `H264_DBG_INTRA`), read once: the decoder asks for these per macroblock.
+pub(crate) fn debug_flag(name: &str) -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static FLAGS: OnceLock<[Option<String>; 3]> = OnceLock::new();
+    let flags = FLAGS.get_or_init(|| [std::env::var("H264_TRACE").ok(), std::env::var("H264_DBG_MB").ok(), std::env::var("H264_DBG_INTRA").ok()]);
+    let i = match name {
+        "H264_TRACE" => 0,
+        "H264_DBG_MB" => 1,
+        _ => 2,
+    };
+    flags[i].as_deref()
+}
