@@ -48,7 +48,7 @@ Browser support:
 |---|---|---|---|
 | Chrome, Edge, Opera 113+ | WebCodecs (H.264, HEVC*, VP9, AV1) | any file the `<video>` element plays | WebGPU |
 | Safari 26+ | WebCodecs | yes | WebGPU |
-| Firefox 141+ (Windows), other Firefox | WebCodecs where available | yes | WebGPU where enabled, otherwise the SIMD CPU kernel |
+| Firefox 141+ (Windows), 142+ (macOS), other Firefox | WebCodecs where available | yes | WebGPU where enabled (its WebGPU takes no `VideoFrame` or `<video>` as a copy source, so pictures reach it through a canvas), otherwise the SIMD CPU kernel |
 | any of these without an H.264 decoder (Chromium builds without proprietary codecs, some Linux browsers) | the **built-in H.264 decoder** (Constrained Baseline, Main and High, progressive) | no: the player cannot play the file | as above |
 
 \* platform dependent. Files are MP4/MOV (ISO base media); the demuxer

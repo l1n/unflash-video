@@ -377,6 +377,55 @@ try {
     assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.05 && Math.abs(a.end - b.end) < 0.05, `violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
   }
   await page.screenshot({ path: path.join(OUT, '6-gpu-scan.png') });
+
+  // ======== a WebGPU that takes no VideoFrame or <video> (Firefox) ==========
+  // ?extsrc pretends the browser rejects those copy sources: pictures then go
+  // through a canvas, or (?extsrc=none) as RGBA pixels, and must give the
+  // same result as the direct route.
+  for (const [extsrc, route] of [
+    ['canvas', 'canvas'],
+    ['none', 'rgba'],
+  ]) {
+    await page.goto(`http://127.0.0.1:${port}/?extsrc=${extsrc}`);
+    await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+    await openFile('flash.mp4');
+    assert((await page.textContent('#status')).includes('WebGPU'), `the detector is still WebGPU with ?extsrc=${extsrc}`);
+    page.once('dialog', (d) => d.accept());
+    await page.click('#btnDeleteAll');
+    await page.waitForFunction(() => document.querySelectorAll('#sectionList .sec-item').length === 1);
+    scan = await scanCurrent();
+    const violations = await page.evaluate(() => window.__unflash.lastScan.result.violations);
+    const taken = await page.evaluate(() => window.__unflash.state.env.feeder.route);
+    console.log(`gpu scan, pictures via ${route}:`, scan.ms, 'ms |', scan.toast, '| route', taken, '|', JSON.stringify(violations));
+    assert(taken === route, `?extsrc=${extsrc} must feed pictures as ${route}, not ${taken}`);
+    assert(violations.length === results.cpuViolations.length, `the ${route} route must find the same violations as the CPU scan`);
+    for (let i = 0; i < violations.length; i++) {
+      const a = violations[i];
+      const b = results.cpuViolations[i];
+      assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.05 && Math.abs(a.end - b.end) < 0.05, `violation ${i} differs via ${route}: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
+    }
+    results[`gpuScan_${route}`] = { ms: scan.ms, violations };
+    // the live monitor feeds the <video> element by the same route
+    await page.check('#liveToggle');
+    await page.evaluate(() => {
+      const v = document.querySelector('#player');
+      v.muted = true;
+      v.currentTime = 2.0;
+      return v.play();
+    });
+    const liveSeen = new Set();
+    const liveUntil = Date.now() + 8000;
+    while (Date.now() < liveUntil) {
+      liveSeen.add(await page.textContent('#liveVerdict'));
+      await page.waitForTimeout(200);
+    }
+    const liveRoute = await page.evaluate(() => window.__unflash.state.liveFeeder && window.__unflash.state.liveFeeder.route);
+    console.log(`live monitor via ${route}:`, [...liveSeen], '| route', liveRoute);
+    assert([...liveSeen].some((s) => /flashing/.test(s)), `the live monitor must report the flashing via the ${route} route`);
+    assert(liveRoute === route, `the live monitor must feed the <video> as ${route}, not ${liveRoute}`);
+    await page.uncheck('#liveToggle');
+    await page.evaluate(() => document.querySelector('#player').pause());
+  }
 } finally {
   fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 2));
   if (errors.length) console.log('BROWSER ERRORS:\n' + errors.join('\n'));

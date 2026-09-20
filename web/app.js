@@ -102,6 +102,17 @@ function preferGpuSetting() {
   return !new URLSearchParams(location.search).has('cpu');
 }
 
+/**
+ * `?extsrc=canvas` (or `videoframe,video`, or `none`) pretends the browser's
+ * WebGPU accepts only those kinds of picture as copy sources, to exercise
+ * the routes other browsers need (Firefox: canvas only).
+ */
+function externalSourcesSetting() {
+  const v = new URLSearchParams(location.search).get('extsrc');
+  if (v === null) return null;
+  return v === 'none' ? [] : v.split(',');
+}
+
 // ---- boot ---------------------------------------------------------------------
 
 async function boot() {
@@ -223,9 +234,10 @@ async function createFeeders(progress) {
   if (state.env && state.env.feeder) state.env.feeder.det.free();
   if (state.liveFeeder) state.liveFeeder.det.free();
   const preferGpu = preferGpuSetting();
-  const feeder = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu });
+  const externalSources = externalSourcesSetting();
+  const feeder = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu, externalSources });
   state.env = { wasm, config: state.config, feeder };
-  const live = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu });
+  const live = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu, externalSources });
   state.liveFeeder = live;
   if (feeder.note) banner(feeder.note, 'info');
   if (progress) progress(0.8, `${feeder.backend} detector at ${feeder.aw}×${feeder.ah}`);
@@ -350,16 +362,8 @@ function startLiveLoop() {
     const det = feeder.det;
     det.poll();
     if (det.can_submit()) {
-      const t0 = performance.now();
       try {
-        if (feeder.gpu) det.feed_video_element(player, meta.mediaTime, false);
-        else {
-          feeder.ctx.drawImage(player, 0, 0, feeder.aw, feeder.ah);
-          const img = feeder.ctx.getImageData(0, 0, feeder.aw, feeder.ah);
-          det.feed_rgba(img.data, feeder.aw, feeder.ah, meta.mediaTime, false);
-        }
-        feeder.fed++;
-        feeder.busyNs += (performance.now() - t0) * 1e6;
+        feeder.videoElementNow(player, meta.mediaTime, false);
       } catch (e) {
         console.warn(e);
       }
@@ -1262,7 +1266,7 @@ async function verifyExport() {
   $('exportModal').classList.add('hidden');
   const res = await runJob('Verifying the exported file', async (progress, cancelled) => {
     const m = await Movie.open(state.exportBlob, wasm);
-    const feeder = await createDetector(wasm, state.config, m.width, m.height, { preferGpu: preferGpuSetting() });
+    const feeder = await createDetector(wasm, state.config, m.width, m.height, { preferGpu: preferGpuSetting(), externalSources: externalSourcesSetting() });
     try {
       return await scanMovie({ wasm, config: state.config, feeder }, m, { cancel: cancelled, onProgress: (p, _t, count, ms) => progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`) });
     } finally {

@@ -1,7 +1,9 @@
 // Smoke-test a deployed copy of the app: load it, open the published
 // stripes test clip with its "open" button and scan it (one pattern), then
 // open the local synthetic flashing clip and scan it (two violations).
-//   node tests/e2e/smoke.mjs https://l1n.github.io/unflash-video/ [--gpu]
+//   node tests/e2e/smoke.mjs https://l1n.github.io/unflash-video/ [--gpu] [--extsrc=canvas|none]
+// --extsrc makes the GPU detector take its pictures the way Firefox's
+// WebGPU needs them (through a canvas) or as RGBA pixels.
 import path from 'node:path';
 import { loadPlaywright } from './playwright.mjs';
 
@@ -23,6 +25,8 @@ if (process.env.SMOKE_VERBOSE) page.on('console', (m) => console.log('[browser]'
 try {
   const target = new URL(url);
   if (!useGpu) target.searchParams.set('cpu', '1');
+  const extsrc = process.argv.find((a) => a.startsWith('--extsrc='));
+  if (extsrc) target.searchParams.set('extsrc', extsrc.slice('--extsrc='.length));
   const t0 = Date.now();
   await page.goto(target.toString(), { timeout: 120000 });
   console.log('page loaded', `(${Date.now() - t0} ms)`);

@@ -798,6 +798,34 @@ impl Detector {
         self.feed_external(unflash_gpu::wgpu::ExternalImageSource::VideoFrame(handle), w, h, t, capture)
     }
 
+    /// Feed the picture of an `OffscreenCanvas` (GPU detector only). This is
+    /// the route for browsers whose WebGPU does not take `VideoFrame` or
+    /// `<video>` as a copy source (Firefox): the caller draws the frame into
+    /// the canvas first.
+    #[cfg(target_arch = "wasm32")]
+    pub fn feed_canvas(&mut self, canvas: &web_sys::OffscreenCanvas, t: f64, capture: bool) -> Result<(), JsValue> {
+        let (w, h) = (canvas.width(), canvas.height());
+        if w == 0 || h == 0 {
+            return Err(js_err("empty canvas"));
+        }
+        self.feed_external(unflash_gpu::wgpu::ExternalImageSource::OffscreenCanvas(canvas.clone()), w, h, t, capture)
+    }
+
+    /// Feed an `ImageBitmap` (GPU detector only). The caller closes it afterwards.
+    #[cfg(target_arch = "wasm32")]
+    pub fn feed_image_bitmap(&mut self, bitmap: &web_sys::ImageBitmap, t: f64, capture: bool) -> Result<(), JsValue> {
+        let (w, h) = (bitmap.width(), bitmap.height());
+        if w == 0 || h == 0 {
+            return Err(js_err("empty image bitmap"));
+        }
+        self.feed_external(unflash_gpu::wgpu::ExternalImageSource::ImageBitmap(bitmap.clone()), w, h, t, capture)
+    }
+
+    /// Note: `wgpu` unwraps the result of `copyExternalImageToTexture`, so a
+    /// source the browser's WebGPU rejects (Firefox takes neither
+    /// `VideoFrame` nor `<video>`) would abort the whole WASM instance. The
+    /// JS side (`web/detector.js`) probes every kind of source on a throwaway
+    /// device before it lets one through here.
     #[cfg(target_arch = "wasm32")]
     fn feed_external(&mut self, source: unflash_gpu::wgpu::ExternalImageSource, w: u32, h: u32, t: f64, capture: bool) -> Result<(), JsValue> {
         use unflash_gpu::wgpu;
