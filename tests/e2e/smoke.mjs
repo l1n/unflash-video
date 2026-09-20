@@ -9,7 +9,9 @@ const url = process.argv[2] || 'http://127.0.0.1:8765/';
 const useGpu = process.argv.includes('--gpu');
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
 const { chromium } = await loadPlaywright();
-const browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader'] });
+// SMOKE_CHROMIUM_ARGS adds launch flags (e.g. --disable-http2 behind a proxy that resets h2 tunnels)
+const extraArgs = (process.env.SMOKE_CHROMIUM_ARGS || '').split(/\s+/).filter(Boolean);
+const browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader', ...extraArgs] });
 // SMOKE_IGNORE_TLS=1 for sandboxes whose outbound HTTPS is intercepted by a proxy CA
 const page = await browser.newPage({ ignoreHTTPSErrors: !!process.env.SMOKE_IGNORE_TLS });
 const errors = [];
