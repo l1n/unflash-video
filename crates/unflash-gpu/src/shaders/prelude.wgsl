@@ -22,6 +22,15 @@ struct Params {
     held_bar: u32,
     height: u32,
     red_saturation: f32,
+    // regular patterns (core::pattern)
+    pat_swing: f32,
+    pat_coherence: f32,
+    pat_min_transitions: u32,
+    pat_reg_num: u32,
+    pat_reg_den: u32,
+    pat_enabled: u32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 const MODE_FIRST: u32 = 1u;
@@ -42,6 +51,8 @@ const GEO_NGY: u32 = 7u;
 const GEO_GXS: u32 = 8u;
 const GEO_GYS: u32 = 72u;
 const GEO_MAX_POS: u32 = 64u;
+// half-extent of the pattern pass's line family (core::pattern::line_radius)
+const GEO_PAT_R: u32 = 136u;
 
 // state buffer fields (each a run of npix words); see core::pixel::StateLayout
 const F_LUM_BASE: u32 = 0u;
@@ -86,7 +97,9 @@ const DIR_MASK: u32 = 3u;
 const UP: u32 = 1u;
 const DN: u32 = 2u;
 
-// output buffer: header words then 12 words per grid cell
+// output buffer: header words (frame luminance, moved pixels, now, mode,
+// pattern pixels, pattern spacing sum, pattern spacing count) then 12 words
+// per grid cell
 const OUT_HEADER: u32 = 8u;
 const CELL_WORDS: u32 = 12u;
 

@@ -8,7 +8,7 @@ import { decodeRange, tick } from './media.js';
 export async function scanMovie(env, movie, { onProgress, cancel } = {}) {
   const { wasm, config, feeder } = env;
   feeder.reset();
-  const trace = { t: [], hazard: [], hazardRed: [], ext: [], lum: [] };
+  const trace = { t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] };
   const collect = () => {
     for (const r of feeder.records()) {
       trace.t.push(r.t);
@@ -16,6 +16,7 @@ export async function scanMovie(env, movie, { onProgress, cancel } = {}) {
       trace.hazardRed.push(r.hazard_red);
       trace.ext.push(Math.max(r.ext, r.ext_red));
       trace.lum.push(r.lum);
+      trace.pattern.push(r.pattern);
     }
   };
   let count = 0;
@@ -42,7 +43,7 @@ export async function scanMovie(env, movie, { onProgress, cancel } = {}) {
   // flashing exactly instead of growing to the nearest keyframes
   const sections = JSON.parse(wasm.violations_to_sections(vjson, config, movie.tsMin, movie.tsMax, new Float64Array()));
   const summary = JSON.parse(wasm.timeline_summary(JSON.stringify(result), movie.tsMin, movie.tsMax, 1.0));
-  return { result, sections, summary, trace, frames: count, elapsedMs: elapsed };
+  return { result, sections, summary, trace, frames: count, elapsedMs: elapsed, patternThresh: feeder.det.pattern_thresh() };
 }
 
 /**
@@ -60,6 +61,8 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel } = {
   const lead = new wasm.FrameCache(aw, ah);
   const tail = new wasm.FrameCache(aw, ah);
   const rawPts = [];
+  const rawPat = []; // patterned pixels per section frame
+  const rawPer = []; // mean stripe half-period per section frame (analysis px)
   const leadPts = [];
   const tailPts = [];
   const pending = []; // [index, t]
@@ -75,6 +78,8 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel } = {
       } else if (t <= sec.end + 1e-6 && t < sec.end + 1e-6) {
         cache.push(rgba);
         rawPts.push(t - sec.start);
+        rawPat.push(r.pattern || 0);
+        rawPer.push(r.pattern_period || 0);
       } else {
         tail.push(rgba);
         tailPts.push(Math.round((t - sec.start) * 1e6) / 1e6);
@@ -111,6 +116,9 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel } = {
     warnings.push(`Re-prepared with ${relPts.length} frames where the marks were made against ${was}. They were kept, but they now sit on different frames, so check them before exporting.`);
   }
   if (sec.cache) sec.cache.clear();
+  if (sec.softCache) sec.softCache.clear();
+  sec.softCache = null;
+  sec.softKey = null;
   if (sec.ctx) {
     sec.ctx.lead.clear();
     sec.ctx.tail.clear();
@@ -118,6 +126,7 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel } = {
   sec.prepared = true;
   sec.nFrames = relPts.length;
   sec.pts = relPts;
+  sec.pattern = { counts: rawPat, periods: rawPer, thresh: feeder.det.pattern_thresh() };
   sec.cache = cache;
   sec.ctx = { lead, leadPts, tail, tailPts, seconds: need };
   sec.warnings = warnings;
@@ -128,6 +137,65 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel } = {
 
 export function shownPts(wasm, sec) {
   return Array.from(wasm.shown_pts(Float64Array.from(sec.pts), sec.start, sec.end));
+}
+
+/** Blur strength that takes a stripe pattern under the detector's swing. */
+const SOFTEN_SIGMA_PER_HALF_PERIOD = 1.0;
+/** Seconds of frames around a patterned frame that are softened with it. */
+const SOFTEN_MARGIN_S = 0.25;
+
+/**
+ * Which of a prepared section's frames the "soften stripes" option blurs,
+ * and how much: the frames where a regular pattern covered at least half
+ * the area threshold (plus a short margin either side), blurred with a
+ * Gaussian of σ = the stripes' mean half-period, which flattens them. In
+ * analysis pixels; scale by the source/analysis width for the export.
+ * Returns null when the section has no patterned frames.
+ */
+export function softenPlan(sec) {
+  const p = sec.pattern;
+  if (!p || !p.counts || !p.counts.length || !p.thresh) return null;
+  const bar = p.thresh / 2;
+  const hot = [];
+  for (let i = 0; i < p.counts.length; i++) if (p.counts[i] >= bar) hot.push(i);
+  if (!hot.length) return null;
+  const pts = sec.pts || [];
+  const at = (i) => (pts[i] === undefined ? i / 30 : pts[i]);
+  const frames = new Set();
+  for (const i of hot) {
+    frames.add(i);
+    for (let j = i - 1; j >= 0 && at(j) >= at(i) - SOFTEN_MARGIN_S; j--) frames.add(j);
+    for (let j = i + 1; j < p.counts.length && at(j) <= at(i) + SOFTEN_MARGIN_S; j++) frames.add(j);
+  }
+  let wsum = 0;
+  let psum = 0;
+  for (const i of hot) {
+    if (p.periods[i] > 0) {
+      psum += p.periods[i] * p.counts[i];
+      wsum += p.counts[i];
+    }
+  }
+  const period = wsum ? psum / wsum : 2;
+  const sigma = Math.max(1, SOFTEN_SIGMA_PER_HALF_PERIOD * period);
+  // three box passes of radius r have σ² = ((2r+1)² − 1) / 4
+  const radius = Math.max(1, Math.round((Math.sqrt(4 * sigma * sigma + 1) - 1) / 2));
+  return { frames, hot, period, sigma, radius };
+}
+
+/** The frames a check or suggestion should read: softened when asked. */
+export function sectionFrames(sec) {
+  if (!sec.soften || !sec.cache) return sec.cache;
+  const plan = softenPlan(sec);
+  if (!plan) return sec.cache;
+  const key = `${plan.radius}:${sec.preparedAt}:${[...plan.frames].join(',')}`;
+  if (sec.softCache && sec.softKey === key) return sec.softCache;
+  if (sec.softCache) sec.softCache.clear();
+  const mask = new Uint8Array(sec.cache.len());
+  for (const i of plan.frames) if (i < mask.length) mask[i] = 1;
+  sec.softCache = sec.cache.blurred(plan.radius, mask);
+  sec.softKey = key;
+  sec.softPlan = plan;
+  return sec.softCache;
 }
 
 function sectionsIn(project, sec, tLo, tHi) {
@@ -141,6 +209,7 @@ function editedEdge(wasm, o, seconds, side, extS) {
   if (!o.prepared || !o.cache || !o.pts || !o.pts.length) return null;
   const seq = JSON.parse(wasm.edited_sequence(Float64Array.from(shownPts(wasm, o)), JSON.stringify(o.edits || {}), extS));
   if (!seq.t.length) return null;
+  const cache = sectionFrames(o);
   const idx = [];
   const last = seq.t[seq.t.length - 1];
   const first = seq.t[0];
@@ -148,7 +217,7 @@ function editedEdge(wasm, o, seconds, side, extS) {
     if (side === 'lead' ? seq.t[k] > last - seconds : seq.t[k] < first + seconds) idx.push(k);
   }
   if (!idx.length) return null;
-  return { frames: idx.map((k) => ({ cache: o.cache, i: seq.src[k] })), times: idx.map((k) => seq.t[k]) };
+  return { frames: idx.map((k) => ({ cache, i: seq.src[k] })), times: idx.map((k) => seq.t[k]) };
 }
 
 function compose(wasm, project, sec, src, secStart, tLo, tHi, need, extS, side, notes) {
@@ -239,6 +308,7 @@ export async function checkSection(env, project, sec, edits, { extS = 1.0, onPro
   const ctx = sectionContext(env, project, sec, extS);
   const shown = shownPts(wasm, sec);
   const seq = JSON.parse(wasm.edited_sequence(Float64Array.from(shown), JSON.stringify(useEdits), extS));
+  const frames = sectionFrames(sec);
   feeder.reset();
   let fed = 0;
   const total = ctx.lead.frames.length + seq.t.length + ctx.tail.frames.length;
@@ -247,7 +317,7 @@ export async function checkSection(env, project, sec, edits, { extS = 1.0, onPro
     if (onProgress && ++fed % 60 === 0) onProgress(fed / total);
   }
   for (let k = 0; k < seq.t.length; k++) {
-    await feeder.cached(sec.cache, seq.src[k], seq.t[k]);
+    await feeder.cached(frames, seq.src[k], seq.t[k]);
     if (onProgress && ++fed % 60 === 0) onProgress(fed / total);
   }
   const endDisp = seq.t.length ? seq.t[seq.t.length - 1] : 0;
@@ -260,7 +330,10 @@ export async function checkSection(env, project, sec, edits, { extS = 1.0, onPro
   const cls = JSON.parse(wasm.classify(JSON.stringify(result), endDisp, ctx.nextAt === null ? undefined : ctx.nextAt));
   const violations = [...cls.inside, ...cls.after];
   const wcagSafe = !violations.some((v) => v.kind === 'flash' || v.kind === 'red');
-  const safe = wcagSafe && !(result.flag_extended && violations.some((v) => v.kind === 'extended'));
+  const extendedBad = result.flag_extended && violations.some((v) => v.kind === 'extended');
+  const patternBad = result.flag_patterns && violations.some((v) => v.kind === 'pattern');
+  const safe = wcagSafe && !extendedBad && !patternBad;
+  const soft = sec.soften && frames !== sec.cache && sec.softPlan ? sec.softPlan : null;
   const flagged = Array.from(wasm.flagged_frames(Float64Array.from(seq.t), JSON.stringify(cls.inside)));
   const spills = cls.inside.filter((v) => v.end > endDisp + 1e-6);
   // chart statistics for the section's own frames
@@ -276,11 +349,17 @@ export async function checkSection(env, project, sec, edits, { extS = 1.0, onPro
     red: slice(fs.red_area),
     hazard: slice(fs.hazard),
     hazardRed: slice(fs.hazard_red),
+    pattern: slice(fs.pattern),
   };
   return {
     safe,
     wcag_safe: wcagSafe,
     flag_extended: result.flag_extended,
+    flag_patterns: result.flag_patterns,
+    pattern_thresh: result.pattern_thresh,
+    soften: !!sec.soften,
+    soft_frames: soft ? [...soft.frames] : [],
+    soft_sigma: soft ? soft.sigma : 0,
     violations,
     inside: cls.inside,
     after: cls.after,
@@ -307,13 +386,14 @@ export async function suggestEdits(env, project, sec, prefer, only, { extS = 1.0
   const { wasm } = env;
   const shown = shownPts(wasm, sec);
   const sug = new wasm.Suggester(Float64Array.from(shown), JSON.stringify(sec.edits || {}), prefer, only ? JSON.stringify(only) : undefined);
-  let step = JSON.parse(sug.step(sec.cache, undefined));
+  const frames = sectionFrames(sec);
+  let step = JSON.parse(sug.step(frames, undefined));
   let round = 0;
   let last = null;
   while (step.simulate) {
     if (onProgress) onProgress(round);
     last = await checkSection(env, project, sec, step.simulate, { extS });
-    step = JSON.parse(sug.step(sec.cache, JSON.stringify(last.raw)));
+    step = JSON.parse(sug.step(frames, JSON.stringify(last.raw)));
     round++;
   }
   sug.free();

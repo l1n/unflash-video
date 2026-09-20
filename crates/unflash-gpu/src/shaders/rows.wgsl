@@ -1,6 +1,7 @@
 // Pass C: one workgroup per row, one thread per window position. Each
 // thread sums its window's L, V and mask counts across the row and takes the
-// window maxima of the onset ages. No workgroup memory and no barriers:
+// window maxima of the onset ages; thread 0 also totals the row's luminance
+// and its patterned pixels. No workgroup memory and no barriers:
 // windows overlap, so the redundant reads are cache hits, and the thread
 // count is small enough that this is latency-bound rather than
 // bandwidth-bound on any real GPU.
@@ -11,6 +12,8 @@
 @group(0) @binding(3) var<storage, read> pixout: array<u32>;
 @group(0) @binding(4) var<storage, read_write> rowwin: array<u32>;
 @group(0) @binding(5) var<storage, read_write> rowtot: array<f32>;
+@group(0) @binding(6) var<storage, read> patmask: array<u32>;
+@group(0) @binding(7) var<storage, read_write> rowpat: array<u32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
@@ -22,10 +25,19 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let ww = geo[GEO_WW];
     if (t == 0u) {
         var s = 0.0;
-        for (var x = 0u; x < w; x = x + 1u) {
-            s = s + bitcast<f32>(inputs[y * w + x]);
+        var pc = 0u;
+        if (params.pat_enabled != 0u) {
+            for (var x = 0u; x < w; x = x + 1u) {
+                s = s + bitcast<f32>(inputs[y * w + x]);
+                pc = pc + u32(patmask[y * w + x] != 0u);
+            }
+        } else {
+            for (var x = 0u; x < w; x = x + 1u) {
+                s = s + bitcast<f32>(inputs[y * w + x]);
+            }
         }
         rowtot[y] = s;
+        rowpat[y] = pc;
     }
     if (t >= ngx) {
         return;

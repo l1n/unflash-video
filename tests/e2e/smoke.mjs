@@ -1,5 +1,6 @@
-// Smoke-test a deployed copy of the app: load it, open the synthetic
-// flashing clip, scan, and expect the two violations.
+// Smoke-test a deployed copy of the app: load it, open the published
+// stripes test clip with its "open" button and scan it (one pattern), then
+// open the local synthetic flashing clip and scan it (two violations).
 //   node tests/e2e/smoke.mjs https://l1n.github.io/unflash-video/ [--gpu]
 import path from 'node:path';
 import { loadPlaywright } from './playwright.mjs';
@@ -20,15 +21,26 @@ try {
   await page.goto(target.toString());
   await page.waitForFunction(() => document.querySelector('#support') && document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
   console.log('loaded:', await page.textContent('#support'), `(${Date.now() - t0} ms)`);
+  const scan = async (expect) => {
+    await page.waitForFunction(() => !document.querySelector('#btnScan').disabled, null, { timeout: 60000 });
+    console.log('opened:', await page.textContent('#videoInfo'));
+    console.log('status:', await page.textContent('#status'));
+    await page.click('#btnScan');
+    await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('found'), null, { timeout: 300000 });
+    const toast = await page.textContent('#toast');
+    console.log('scan:', toast);
+    if (!expect.test(toast)) throw new Error('unexpected scan result: ' + toast);
+  };
+  // the published test clip, through the welcome page's button
+  await page.click('[data-clip="stripes.mp4"]');
+  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('stripes.mp4') || !document.querySelector('#banner').classList.contains('hidden'), null, { timeout: 120000 });
+  const banner = await page.evaluate(() => (document.querySelector('#banner').classList.contains('hidden') ? '' : document.querySelector('#bannerText').textContent));
+  if (banner) throw new Error('banner: ' + banner);
+  await scan(/1 violation found \(1 regular pattern/);
+  // a local file through the file input
   await page.setInputFiles('#fileInput', path.join(ROOT, 'tests/media/e2e/flash.mp4'));
-  await page.waitForFunction(() => !document.querySelector('#btnScan').disabled, null, { timeout: 60000 });
-  console.log('opened:', await page.textContent('#videoInfo'));
-  console.log('status:', await page.textContent('#status'));
-  await page.click('#btnScan');
-  await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('found'), null, { timeout: 300000 });
-  const toast = await page.textContent('#toast');
-  console.log('scan:', toast);
-  if (!/2 flash violations/.test(toast)) throw new Error('unexpected scan result: ' + toast);
+  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash.mp4'), null, { timeout: 60000 });
+  await scan(/2 violations found/);
   console.log('SMOKE OK');
 } finally {
   if (errors.length) console.log('page errors:', errors);

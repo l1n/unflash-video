@@ -43,7 +43,7 @@ pub(crate) const UP: u32 = 1;
 pub(crate) const DN: u32 = 2;
 
 /// Everything the kernels need per frame, `repr(C)` so it doubles as the
-/// GPU uniform block (80 bytes).
+/// GPU uniform block (112 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct KernelParams {
@@ -79,11 +79,22 @@ pub struct KernelParams {
     pub held_bar: u32,
     pub height: u32,
     pub red_saturation: f32,
+    // --- regular patterns (see crate::pattern) ---
+    pub pat_swing: f32,
+    pub pat_coherence: f32,
+    pub pat_min_transitions: u32,
+    pub pat_reg_num: u32,
+    pub pat_reg_den: u32,
+    /// 0 = skip the pattern pass.
+    pub pat_enabled: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
 }
 
 impl KernelParams {
     /// Frame-independent part of the parameters for a configuration.
     pub fn template(cfg: &DetectorConfig, geom: &GridGeometry) -> Self {
+        let pat = crate::pattern::PatternParams::from_config(cfg);
         KernelParams {
             now: 0,
             mode: 0,
@@ -105,6 +116,27 @@ impl KernelParams {
             held_bar: geom.held_bar_int(),
             height: geom.ah,
             red_saturation: cfg.red_saturation,
+            pat_swing: pat.swing,
+            pat_coherence: pat.coherence,
+            pat_min_transitions: pat.min_transitions,
+            pat_reg_num: pat.reg_num,
+            pat_reg_den: pat.reg_den,
+            pat_enabled: cfg.flag_patterns() as u32,
+            _pad0: 0,
+            _pad1: 0,
+        }
+    }
+
+    /// The pattern kernel's parameters as carried here.
+    pub fn pattern_params(&self) -> crate::pattern::PatternParams {
+        crate::pattern::PatternParams {
+            swing: self.pat_swing,
+            dark: self.dark,
+            eps: self.eps_l,
+            coherence: self.pat_coherence,
+            min_transitions: self.pat_min_transitions,
+            reg_num: self.pat_reg_num,
+            reg_den: self.pat_reg_den,
         }
     }
 

@@ -147,6 +147,11 @@ pub struct GridStats {
     /// One entry per window position, row-major over (gys, gxs). Empty on
     /// a held frame.
     pub cells: Vec<GridCell>,
+    /// Pixels inside a regular pattern (see [`crate::pattern`]), and the
+    /// spacing statistics of its stripes.
+    pub pattern_count: u32,
+    pub pattern_spacing_sum: u32,
+    pub pattern_spacing_n: u32,
 }
 
 /// A frame handed to a CPU pixel stage: 8-bit sRGB at analysis resolution.

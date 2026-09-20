@@ -45,6 +45,22 @@ pub struct DetectorConfig {
     pub extended_hold: f64,
     pub extended_window: f64,
     pub extended_coverage: f64,
+    // --- regular patterns (stripes, gratings) ---
+    /// Flag hazardous static patterns as violations with their own sections,
+    /// or ignore them.
+    pub pattern_mode: ExtendedMode,
+    /// More than this many light–dark stripe pairs make a pattern.
+    pub pattern_pairs: u32,
+    /// Relative-luminance difference between stripes that counts.
+    pub pattern_swing: f32,
+    /// Of the whole screen.
+    pub pattern_area_fraction: f64,
+    /// A pattern has to stay on screen this long, seconds.
+    pub pattern_min_seconds: f64,
+    /// Patterned frames closer than this are one pattern, seconds.
+    pub pattern_hold: f64,
+    /// Longest / shortest stripe spacing allowed inside one pattern.
+    pub pattern_regularity: f64,
     // --- analysis model ---
     pub screen_w: u32,
     pub screen_h: u32,
@@ -83,6 +99,13 @@ impl Default for DetectorConfig {
             extended_hold: 1.0,
             extended_window: 5.0,
             extended_coverage: 0.80,
+            pattern_mode: ExtendedMode::Section,
+            pattern_pairs: 5,
+            pattern_swing: 0.10,
+            pattern_area_fraction: 0.25,
+            pattern_min_seconds: 0.5,
+            pattern_hold: 0.5,
+            pattern_regularity: 2.5,
             screen_w: 1024,
             screen_h: 768,
             window_w: 341,
@@ -138,6 +161,7 @@ impl Profile {
             Profile::WcagExt => DetectorConfig::default(),
             Profile::Wcag => DetectorConfig {
                 extended_mode: ExtendedMode::Off,
+                pattern_mode: ExtendedMode::Off,
                 ..DetectorConfig::default()
             },
             Profile::Strict => DetectorConfig {
@@ -157,6 +181,11 @@ impl DetectorConfig {
     /// Extended flashes count as violations and get their own sections.
     pub fn flag_extended(&self) -> bool {
         self.extended_mode == ExtendedMode::Section
+    }
+
+    /// Regular patterns count as violations and get their own sections.
+    pub fn flag_patterns(&self) -> bool {
+        self.pattern_mode == ExtendedMode::Section
     }
 
     /// Which profile this configuration is, if any.

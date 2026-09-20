@@ -107,6 +107,9 @@ pub fn violations_to_sections(
         if v.kind == ViolationKind::Extended && !cfg.flag_extended() {
             continue;
         }
+        if v.kind == ViolationKind::Pattern && !cfg.flag_patterns() {
+            continue;
+        }
         let mut s = (v.onset.min(v.start) - cfg.section_pad).max(ts_min);
         let mut e = (v.end + cfg.section_pad).min(ts_max);
         if e - s < cfg.section_min_len {
@@ -184,6 +187,9 @@ pub struct TimelineSummary {
     pub t0: f64,
     pub general: Vec<f32>,
     pub red: Vec<f32>,
+    /// Bins inside a reported regular-pattern violation (its severity).
+    #[serde(default)]
+    pub pattern: Vec<f32>,
 }
 
 pub fn timeline_summary(result: &AnalysisResult, bounds: (f64, f64), bin_seconds: f64) -> TimelineSummary {
@@ -192,6 +198,7 @@ pub fn timeline_summary(result: &AnalysisResult, bounds: (f64, f64), bin_seconds
     let nbins = ((span / bin_seconds).ceil() as usize).max(1);
     let mut general = vec![0f32; nbins];
     let mut red = vec![0f32; nbins];
+    let mut pattern = vec![0f32; nbins];
     for e in &result.events {
         let b = (((e.t - ts_min) / bin_seconds) as i64).clamp(0, nbins as i64 - 1) as usize;
         match e.kind {
@@ -199,7 +206,14 @@ pub fn timeline_summary(result: &AnalysisResult, bounds: (f64, f64), bin_seconds
             EventKind::Red => red[b] += 1.0,
         }
     }
-    TimelineSummary { bin: bin_seconds, t0: ts_min, general, red }
+    for v in result.violations.iter().filter(|v| v.kind == ViolationKind::Pattern && result.reports(v.kind)) {
+        let b0 = (((v.start - ts_min) / bin_seconds) as i64).clamp(0, nbins as i64 - 1) as usize;
+        let b1 = (((v.end - ts_min) / bin_seconds) as i64).clamp(0, nbins as i64 - 1) as usize;
+        for b in b0..=b1 {
+            pattern[b] = pattern[b].max(v.count as f32);
+        }
+    }
+    TimelineSummary { bin: bin_seconds, t0: ts_min, general, red, pattern }
 }
 
 #[cfg(test)]

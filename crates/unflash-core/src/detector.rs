@@ -136,6 +136,7 @@ pub struct CpuStage {
     out: PixelOutputs,
     cells: Vec<GridCell>,
     red_saturation: f32,
+    pat_mask: Vec<u32>,
     pub use_simd: bool,
 }
 
@@ -149,9 +150,15 @@ impl CpuStage {
             out: PixelOutputs::new(n),
             cells: Vec::new(),
             red_saturation: cfg.red_saturation,
+            pat_mask: vec![0; n],
             use_simd: cfg!(feature = "simd"),
             geom,
         }
+    }
+
+    /// The pattern mask of the last frame (bit k = orientation k).
+    pub fn pattern_mask(&self) -> &[u32] {
+        &self.pat_mask
     }
 
     pub fn state(&self) -> &PixelState {
@@ -188,6 +195,11 @@ impl CpuStage {
         run_frame_scalar(&mut self.state, &self.planes, &params, &mut self.out);
 
         let sum_l: f64 = self.planes.l.iter().map(|&x| x as f64).sum();
+        let pat = if params.pat_enabled != 0 {
+            crate::pattern::detect(&self.planes.l, self.geom.aw, self.geom.ah, &params.pattern_params(), &mut self.pat_mask)
+        } else {
+            crate::pattern::PatternOut::default()
+        };
         if held {
             self.cells.clear();
         } else {
@@ -201,7 +213,15 @@ impl CpuStage {
                 &mut self.cells,
             );
         }
-        GridStats { held, held_count: moved, sum_l, cells: self.cells.clone() }
+        GridStats {
+            held,
+            held_count: moved,
+            sum_l,
+            cells: self.cells.clone(),
+            pattern_count: pat.count,
+            pattern_spacing_sum: pat.spacing_sum,
+            pattern_spacing_n: pat.spacing_n,
+        }
     }
 }
 

@@ -182,7 +182,7 @@ pub struct Classified {
 pub fn classify(result: &AnalysisResult, end_disp: f64, next_at: Option<f64>) -> Classified {
     let mut c = Classified::default();
     for v in &result.violations {
-        if v.kind == ViolationKind::Extended && !result.flag_extended {
+        if !result.reports(v.kind) {
             continue;
         }
         if v.end < -1e-6 {
@@ -201,10 +201,12 @@ pub fn classify(result: &AnalysisResult, end_disp: f64, next_at: Option<f64>) ->
 
 /// Time spans the suggester should work on, from each violation's onset.
 pub fn violation_spans(result: &AnalysisResult, pad: f64) -> Vec<(f64, f64)> {
+    // patterns are not something a frame removal can fix, so the suggesters
+    // leave them alone
     let mut spans: Vec<(f64, f64)> = result
         .violations
         .iter()
-        .filter(|v| !(v.kind == ViolationKind::Extended && !result.flag_extended))
+        .filter(|v| result.reports(v.kind) && v.kind != ViolationKind::Pattern)
         .map(|v| (v.onset.min(v.start) - pad, v.end + pad))
         .collect();
     spans.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -443,12 +445,22 @@ impl Suggester {
             self.last_proposal = self.base_edits.clone();
             return SuggestStep::Simulate(self.last_proposal.clone());
         };
-        if result.safe() {
-            let note = if self.attempt == 0 {
+        let flashes_ok = result.violations.iter().all(|v| v.kind == ViolationKind::Pattern || !result.reports(v.kind));
+        if flashes_ok {
+            let patterns = result.violations.iter().any(|v| v.kind == ViolationKind::Pattern && result.reports(v.kind));
+            let mut note = if self.attempt == 0 {
                 "Already passes, nothing to remove.".to_string()
             } else {
                 format!("Passes after removing {} frames.", self.removed.len())
             };
+            if patterns {
+                note = if self.attempt == 0 {
+                    "No flashing to remove.".to_string()
+                } else {
+                    format!("No flashing left after removing {} frames.", self.removed.len())
+                };
+                note.push_str(" A regular pattern (stripes) remains; removing frames cannot fix that. Turn on “soften stripes” for this section instead.");
+            }
             return SuggestStep::Done(Suggestion {
                 edits: if self.attempt == 0 { Edits::new() } else { self.removals() },
                 safe: true,

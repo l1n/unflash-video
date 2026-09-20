@@ -3,7 +3,7 @@
 // from the source without re-encoding.
 
 import { decodeRange, ChunkReader, tick } from './media.js';
-import { shownPts } from './analysis.js';
+import { shownPts, softenPlan } from './analysis.js';
 
 function avcLevel(w, h, fps) {
   const mbs = Math.ceil(w / 16) * Math.ceil(h / 16);
@@ -99,7 +99,14 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
       const needCount = new Map();
       for (const src of seq.src) needCount.set(src, (needCount.get(src) || 0) + 1);
       const extra = seq.t.length ? seq.t[seq.t.length - 1] - shown[shown.length - 1] : 0;
-      return { sec: s, base: tl.base, seq, nOut: tl.n_out, hasEdits, needCount, extra };
+      // "soften stripes": blur the patterned frames at source resolution with
+      // the σ the section's check used, scaled up from analysis pixels
+      let soft = null;
+      if (s.soften && s.cache) {
+        const plan = softenPlan(s);
+        if (plan) soft = { frames: plan.frames, sigma: plan.sigma * (movie.width / s.cache.width()) };
+      }
+      return { sec: s, base: tl.base, seq, nOut: tl.n_out, hasEdits, needCount, extra, soft };
     });
   const unprepared = project.sections.filter((s) => !s.prepared && Object.values(s.edits || {}).some((e) => e.removed || e.extended));
   if (unprepared.length) warnings.push(`Sections ${unprepared.map((s) => '#' + s.id).join(', ')} have marks but are not prepared; their marks were not applied. Prepare them and export again.`);
@@ -138,6 +145,7 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
   await out.write(mx.start());
 
   let outFrames = 0;
+  let softened = 0;
   let lastKey = -Infinity;
   let pending = null; // { frame, tUs } waiting for its duration
   const medianUs = Math.round(movie.medianDelta * 1e6);
@@ -175,7 +183,12 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
     while (st.next < p.seq.t.length && st.frames.has(p.seq.src[st.next])) {
       const src = p.seq.src[st.next];
       const t = p.sec.start + p.base + p.seq.t[st.next] + offset;
-      await emit(st.frames.get(src), t);
+      if (p.soft && p.soft.frames.has(src)) {
+        const b = blurFrame(st.frames.get(src), p.soft.sigma);
+        await emit(b, t);
+        b.close();
+        softened++;
+      } else await emit(st.frames.get(src), t);
       const left = st.need.get(src) - 1;
       st.need.set(src, left);
       if (left <= 0) {
@@ -259,7 +272,26 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
   await out.write(moov);
   const blob = await out.close();
   mx.free();
-  return { blob, warnings, frames: outFrames, elapsedMs: performance.now() - started, codec: codecString, encoderLabel: chosen.label };
+  return { blob, warnings, frames: outFrames, softened, elapsedMs: performance.now() - started, codec: codecString, encoderLabel: chosen.label };
+}
+
+let blurCanvas = null;
+/**
+ * A Gaussian-blurred copy of a frame (σ in source pixels). The sharp frame
+ * is drawn first so the blur's transparent fringe at the picture edge shows
+ * the original there rather than black.
+ */
+function blurFrame(frame, sigma) {
+  const w = frame.displayWidth || frame.codedWidth;
+  const h = frame.displayHeight || frame.codedHeight;
+  if (!blurCanvas || blurCanvas.width !== w || blurCanvas.height !== h) blurCanvas = new OffscreenCanvas(w, h);
+  const ctx = blurCanvas.getContext('2d');
+  ctx.filter = 'none';
+  ctx.drawImage(frame, 0, 0, w, h);
+  ctx.filter = `blur(${Math.max(0.5, sigma).toFixed(2)}px)`;
+  ctx.drawImage(frame, 0, 0, w, h);
+  ctx.filter = 'none';
+  return new VideoFrame(blurCanvas, { timestamp: frame.timestamp || 0 });
 }
 
 export async function pickSaveSink(suggestedName) {

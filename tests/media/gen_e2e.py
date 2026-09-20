@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Synthetic videos for the browser tests: known flashing at known times.
+"""Synthetic videos for the browser tests and the site's test clips: known
+problems at known times.
 
     python3 tests/media/gen_e2e.py [outdir]
 
@@ -8,8 +9,11 @@ flash.mp4    640x360 30 fps 10 s VP9: a slow pan over a textured scene, then
              a red flash from 7.0 to 8.5 s, quiet elsewhere. With audio.
 steady.mp4   the same scene with no flashing.
 extended.mp4 3 Hz flashing for 8 s (an extended flash, not a WCAG failure).
-flash_h264.mp4  as flash.mp4 but H.264 (for browsers without VP9 / to test
-             the unsupported-codec path where H.264 is missing).
+stripes.mp4  the scene, then fine vertical stripes (16 px period, 40 pairs)
+             from 2 to 6 s and diagonal stripes from 6 to 9 s: no flashing,
+             a hazardous regular pattern.
+*_h264.mp4   the same clips as H.264 (what most browsers decode; also the
+             unsupported-codec path in a Chromium without H.264).
 """
 import os
 import subprocess
@@ -30,10 +34,10 @@ def scene(i):
     return np.repeat(f[..., None], 3, axis=2)
 
 
-def encode(name, frames, codec, secs):
+def encode(name, frames, codec, secs, bitrate="1200k"):
     path = os.path.join(OUT, name)
     if codec == "vp9":
-        vcodec = ["-c:v", "libvpx-vp9", "-b:v", "1200k", "-deadline", "realtime", "-cpu-used", "8", "-pix_fmt", "yuv420p"]
+        vcodec = ["-c:v", "libvpx-vp9", "-b:v", bitrate, "-deadline", "realtime", "-cpu-used", "8", "-pix_fmt", "yuv420p"]
     else:
         vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-g", "30"]
     cmd = ["ffmpeg", "-y", "-v", "error",
@@ -85,9 +89,31 @@ def extended_frames(secs=10.0):
         yield f
 
 
+def stripes_frames(secs=10.0):
+    """Stationary high-contrast gratings: 8 px light / 8 px dark bars, so
+    well over five pairs cover the whole picture and the bars survive the
+    detector's downscale."""
+    yy, xx = np.mgrid[0:H, 0:W]
+    vertical = ((xx // 8) % 2 == 0)
+    diagonal = (((xx + yy) // 10) % 2 == 0)
+    n = int(secs * FPS)
+    for i in range(n):
+        t = i / FPS
+        f = scene(i)
+        if 2.0 <= t < 6.0:
+            f[...] = np.where(vertical, 20, 200)[..., None]
+        elif 6.0 <= t < 9.0:
+            f[...] = np.where(diagonal, 20, 200)[..., None]
+        yield f
+
+
 if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
     encode("flash.mp4", flash_frames(), "vp9", 10)
     encode("steady.mp4", steady_frames(), "vp9", 6)
     encode("extended.mp4", extended_frames(), "vp9", 10)
+    encode("stripes.mp4", stripes_frames(), "vp9", 10, bitrate="2500k")
     encode("flash_h264.mp4", flash_frames(), "h264", 10)
+    encode("steady_h264.mp4", steady_frames(), "h264", 6)
+    encode("extended_h264.mp4", extended_frames(), "h264", 10)
+    encode("stripes_h264.mp4", stripes_frames(), "h264", 10)

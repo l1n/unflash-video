@@ -5,7 +5,7 @@
 // the source box it covers (weights are the fractional overlaps), in sRGB
 // code space, then rounds to an 8-bit code and linearises through the same
 // table the CPU uses. A source already at analysis resolution copies through
-// exactly.
+// exactly. Also clears the pattern mask for the pattern pass.
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> geo: array<u32>;
@@ -15,6 +15,7 @@
 @group(0) @binding(5) var<storage, read> state: array<u32>;
 @group(0) @binding(6) var<storage, read_write> globals: array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read_write> rgba: array<u32>;
+@group(0) @binding(8) var<storage, read_write> patmask: array<u32>;
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -65,6 +66,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         inputs[i] = bitcast<u32>(l);
         inputs[n + i] = bitcast<u32>(v);
         inputs[2u * n + i] = u32(sat);
+        patmask[i] = 0u;
         if ((params.mode & MODE_FIRST) == 0u) {
             let prev = bitcast<f32>(state[F_PREV_L * n + i]);
             moved = u32(abs(l - prev) > params.held_delta);

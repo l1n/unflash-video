@@ -8,6 +8,8 @@
 //!   pairing, rate rings) written so that the GPU shader in `unflash-gpu`
 //!   and the CPU kernels here are the *same algorithm on the same integer
 //!   clock*, and can be compared bit for bit.
+//! * [`pattern`] — the regular-pattern (stripe) detector the flash tests
+//!   cannot see, walking the picture along eight orientations.
 //! * [`grid`] — the sliding-window geometry and the per-frame statistics
 //!   that the pixel stage hands to the temporal stage.
 //! * [`temporal`] — the window-mean coherence gate, event and hazard
@@ -28,6 +30,7 @@ pub mod detector;
 pub mod editing;
 pub mod grid;
 pub mod lut;
+pub mod pattern;
 pub mod pixel;
 pub mod resample;
 pub mod sections;

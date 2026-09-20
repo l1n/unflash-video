@@ -4,7 +4,9 @@ Unflash finds the flashing in a video that can trigger photosensitive
 seizures, and helps you take it out without wrecking the footage. It removes
 individual frames and holds a neighbouring frame in their place, so the
 picture stays sharp, the audio stays in sync and the running time doesn't
-change.
+change. It also finds hazardous **stripe patterns** (fine gratings, the
+other photosensitive trigger broadcast guidance names) and can soften just
+the frames that carry them.
 
 This is the **WebAssembly + WebGPU** implementation: the detector is written
 in Rust, the per-pixel work runs as WebGPU compute shaders (or an 8-lane SIMD
@@ -58,26 +60,49 @@ cannot decode can still be watched with the live monitor.
    uploaded), the detector starts on WebGPU or, failing that, on the CPU, and
    the project is restored from the browser's storage if you have opened this
    file before.
-2. **Scan for flashes.** Every frame is decoded with WebCodecs and pushed
-   through the detector. A numbered *section* is put around each problem and
-   the timeline shows where the flashing is. Or tick **live monitor** and
-   press play: the meter above the video shows how much of the picture is
-   flashing right now, and the verdict flips the moment a violation lands.
+2. **Scan for flashes & patterns.** Every frame is decoded with WebCodecs
+   and pushed through the detector. A numbered *section* is put around each
+   problem (flashing, or a stripe pattern) and the timeline shows where it
+   is. Or tick **live monitor** and press play: the meter above the video
+   shows how much of the picture is flashing or striped right now, and the
+   verdict flips the moment a violation lands.
 3. **Prepare** a section. Its frames, plus a run-up and run-out, are decoded
    into memory at analysis resolution.
 4. **Edit.** Mark frames (**R** remove and show the previous frame, **F**
    remove and show the next, **E** hold for a second muted, **U** unmark), or
    let **Suggest** do it. The section is re-checked automatically after every
-   change, in well under a second.
+   change, in well under a second. A stripe pattern can't be removed a frame
+   at a time; tick **soften stripes** and the frames that carry it are
+   blurred just enough to take it under the threshold, in the check and in
+   the export alike.
 5. **Export**: the video is re-encoded in the browser with the edits applied
    and the audio copied through untouched. **Verify** re-scans the exported
    file with the same detector.
 
-Profiles (**Exact WCAG + flag extended flashes**, **Exact WCAG only**,
-**Stricter than WCAG**), the suggesters, the safe frame-rate bound and the
-run-up/run-out logic are the reference's; see [DETECTION.md](DETECTION.md)
-for what counts as a flash and why the check of a section agrees with a scan
-of the export.
+Profiles (**WCAG + extended flashes + stripe patterns**, **Exact WCAG
+only**, **Stricter than WCAG**), the suggesters, the safe frame-rate bound
+and the run-up/run-out logic are the reference's; see
+[DETECTION.md](DETECTION.md) for what counts as a flash or a pattern and
+why the check of a section agrees with a scan of the export.
+
+### Test clips
+
+The hosted site publishes short synthetic videos with known problems, so
+there is something to try it on: open one with its **open** button on the
+start page, or download it and open it from your disk (or feed it to any
+other checker).
+
+| clip | contents | VP9 | H.264 |
+|---|---|---|---|
+| flash | a slow pan, 4 flashes/s over the whole picture at 3.0–5.5 s, a red flash at 7.0–8.5 s | [flash.mp4](https://l1n.github.io/unflash-video/clips/flash.mp4) | [flash_h264.mp4](https://l1n.github.io/unflash-video/clips/flash_h264.mp4) |
+| stripes | the pan, fine vertical stripes at 2–6 s, diagonal stripes at 6–9 s, no flashing | [stripes.mp4](https://l1n.github.io/unflash-video/clips/stripes.mp4) | [stripes_h264.mp4](https://l1n.github.io/unflash-video/clips/stripes_h264.mp4) |
+| extended | 3 flashes/s for 8 s: passes WCAG, an extended flash under the default profile | [extended.mp4](https://l1n.github.io/unflash-video/clips/extended.mp4) | [extended_h264.mp4](https://l1n.github.io/unflash-video/clips/extended_h264.mp4) |
+| steady | the pan alone | [steady.mp4](https://l1n.github.io/unflash-video/clips/steady.mp4) | [steady_h264.mp4](https://l1n.github.io/unflash-video/clips/steady_h264.mp4) |
+
+All are 640×360, 30 fps, with a tone on the audio track, made by
+`tests/media/gen_e2e.py` (the same files the browser test runs on). The
+Pages build regenerates them; for a local copy run
+`python3 tests/media/gen_e2e.py web/clips`.
 
 `?cpu=1` in the URL forces the CPU detector (for comparison);
 `web/bench.html` measures both on your machine.
@@ -117,6 +142,18 @@ flight while the CPU handles the rest. The reduction passes use no
 workgroup barriers: on a real GPU they are latency-bound and take tens of
 microseconds; on a software implementation (SwiftShader, lavapipe) they are
 merely slow rather than pathological.
+
+The **pattern stage** (`crates/unflash-core/src/pattern.rs`, and a fifth
+dispatch on the GPU) looks for stationary hazards the flash detector cannot
+see: regular stripes and gratings. It walks the luminance plane along
+parallel lines in eight orientations with the same monotonic-run tracker,
+and marks a pixel when it lies in a stretch of more than five regularly
+spaced light–dark pairs of flash-strength contrast that is coherent across
+neighbouring lines. The frame's pattern area is the number of marked
+pixels; a quarter of the screen for half a second is a violation of kind
+*pattern*, with its own sections. The GPU and CPU versions produce the
+identical mask (it is integer and fixed-point throughout), and the mean
+stripe spacing they measure sizes the blur that **soften stripes** applies.
 
 The **temporal stage** (`crates/unflash-core/src/temporal.rs`) is the rest
 of the reference `FlashDetector`, unchanged in logic: the window-mean
@@ -189,7 +226,7 @@ WASM and runs the browser test on every push.
 cargo test --workspace                    # unit tests, the reference cross-check, GPU-vs-CPU (needs any Vulkan/Metal/DX12 adapter; lavapipe is enough)
 python3 tests/gen_fixtures.py             # regenerate the reference fixtures from unflash/analysis.py (needs numpy)
 bash tests/media/gen.sh                   # demuxer/muxer test files (needs ffmpeg)
-python3 tests/media/gen_e2e.py            # synthetic flashing videos for the browser test
+python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
 ```
 
@@ -197,15 +234,22 @@ node tests/e2e/run.mjs                    # the whole app in headless Chromium w
 Python detector was run on (CRC-checked) and asserts identical per-frame
 hazard areas, events, violations and verdicts on all fixtures.
 `crates/unflash-gpu/tests/gpu_vs_cpu.rs` compares the entire per-pixel state
-of the GPU stage with the CPU kernel after every frame.
+of the GPU stage with the CPU kernel after every frame, and the pattern mask
+and statistics on striped frames. `tests/e2e/run.mjs` scans, edits, softens,
+exports and verifies the synthetic clips in headless Chromium.
 
 ## Limitations
 
 - **This reduces risk. It does not guarantee safety.** Passing the detector
   means passing a published set of thresholds, not that the video is safe
   for every person.
-- Static patterns like fine stripes and gratings can also trigger
-  photosensitive responses, and Unflash does **not** detect those.
+- The pattern test covers regular stripes and gratings, the case the
+  broadcast guidance quantifies (more than five light–dark pairs, flash-
+  strength contrast, a quarter of the screen). It measures contrast and
+  area, not how many *cycles per degree* a viewer sees, and it does not
+  claim to catch every texture that could affect someone. Softening blurs
+  the frames that carry the pattern; the result is verified by the same
+  detector, and it is still a blur.
 - The export re-encodes the whole video (no smart-cut) and copies the audio;
   after an **E** hold the audio runs ahead of the picture by the length of
   the hold. Removals (R/F) do not change timing and need no audio work.

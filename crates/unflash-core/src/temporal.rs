@@ -24,6 +24,8 @@ const NEVER: f64 = -1e12;
 pub enum ViolationKind {
     Extended,
     Flash,
+    /// A hazardous regular pattern (stripes); not a WCAG failure.
+    Pattern,
     Red,
 }
 
@@ -37,6 +39,7 @@ impl ViolationKind {
         match self {
             ViolationKind::Extended => "extended",
             ViolationKind::Flash => "flash",
+            ViolationKind::Pattern => "pattern",
             ViolationKind::Red => "red",
         }
     }
@@ -86,6 +89,7 @@ impl Violation {
 
 /// Per-frame chart statistics (parallel arrays).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FrameStats {
     pub t: Vec<f64>,
     pub tc: Vec<f64>,
@@ -102,6 +106,10 @@ pub struct FrameStats {
     /// failure window on this frame (tc when the frame is not strobing).
     pub hazard_onset: Vec<f64>,
     pub hazard_red_onset: Vec<f64>,
+    /// Pixels inside a regular pattern.
+    pub pattern: Vec<u32>,
+    /// Mean half-period of the pattern's stripes, analysis px (0 if none).
+    pub pattern_period: Vec<f32>,
 }
 
 impl FrameStats {
@@ -115,6 +123,7 @@ impl FrameStats {
 
 /// What one fed frame produced, for live displays.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FrameRecord {
     pub index: usize,
     pub t: f64,
@@ -130,9 +139,12 @@ pub struct FrameRecord {
     pub ext_red: u32,
     pub hazard_onset: f64,
     pub hazard_red_onset: f64,
+    pub pattern: u32,
+    pub pattern_period: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AnalysisResult {
     pub events: Vec<TransitionEvent>,
     pub violations: Vec<Violation>,
@@ -145,8 +157,12 @@ pub struct AnalysisResult {
     pub frame_stats: FrameStats,
     /// Profile treats extended flashes as violations to fix.
     pub flag_extended: bool,
+    /// Profile treats regular patterns as violations to fix.
+    pub flag_patterns: bool,
     /// Pixels a flash has to cover (for severity display).
     pub area_thresh: u32,
+    /// Pixels a pattern has to cover.
+    pub pattern_thresh: u32,
 }
 
 impl AnalysisResult {
@@ -155,12 +171,18 @@ impl AnalysisResult {
         self.violations.iter().all(|v| !v.wcag())
     }
 
+    /// Does the active profile report this kind?
+    pub fn reports(&self, kind: ViolationKind) -> bool {
+        match kind {
+            ViolationKind::Extended => self.flag_extended,
+            ViolationKind::Pattern => self.flag_patterns,
+            _ => true,
+        }
+    }
+
     /// Passes everything the active profile flags.
     pub fn safe(&self) -> bool {
-        if !self.wcag_safe() {
-            return false;
-        }
-        !(self.flag_extended && self.violations.iter().any(|v| v.kind == ViolationKind::Extended))
+        self.violations.iter().all(|v| !self.reports(v.kind))
     }
 }
 
@@ -519,6 +541,8 @@ impl Temporal {
             ext_red: s.ext_red[i],
             hazard_onset: s.hazard_onset[i],
             hazard_red_onset: s.hazard_red_onset[i],
+            pattern: s.pattern[i],
+            pattern_period: s.pattern_period[i],
         }
     }
 
@@ -546,6 +570,8 @@ impl Temporal {
             s.held.push(true);
             s.hazard_onset.push(tc);
             s.hazard_red_onset.push(tc);
+            s.pattern.push(st.pattern_count);
+            s.pattern_period.push(pattern_period(st));
             self.n += 1;
             return self.record(self.n - 1);
         }
@@ -648,8 +674,15 @@ impl Temporal {
         s.held.push(false);
         s.hazard_onset.push(onsets[0]);
         s.hazard_red_onset.push(onsets[1]);
+        s.pattern.push(st.pattern_count);
+        s.pattern_period.push(pattern_period(st));
         self.n += 1;
         self.record(self.n - 1)
+    }
+
+    /// Pixels a regular pattern has to cover.
+    pub fn pattern_thresh(&self) -> u32 {
+        ((self.cfg.pattern_area_fraction * self.geom.npix() as f64).round() as u32).max(1)
     }
 
     /// Internal-clock times -> the native pts of the frames they fell on.
@@ -670,12 +703,15 @@ impl Temporal {
             held: self.held,
             frame_stats: self.stats.clone(),
             flag_extended: cfg.flag_extended(),
+            flag_patterns: cfg.flag_patterns(),
             area_thresh: self.geom.area_thresh,
+            pattern_thresh: self.pattern_thresh(),
             ..Default::default()
         };
         let mut v = self.strobe_violations(&self.stats.hazard, &self.stats.hazard_onset, ViolationKind::Flash);
         v.extend(self.strobe_violations(&self.stats.hazard_red, &self.stats.hazard_red_onset, ViolationKind::Red));
         v.extend(self.extended_violations());
+        v.extend(self.pattern_violations());
         v.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
         res.violations = v;
         res
@@ -708,6 +744,45 @@ impl Temporal {
             cur_end_tc = tc;
         }
         out
+    }
+
+    /// Regular patterns: frames whose patterned pixels cover the area
+    /// threshold, merged where they are closer than `pattern_hold`, kept
+    /// where the pattern stays on screen for `pattern_min_seconds`.
+    fn pattern_violations(&self) -> Vec<Violation> {
+        let cfg = &self.cfg;
+        if self.n == 0 || !cfg.flag_patterns() {
+            return vec![];
+        }
+        let thresh = self.pattern_thresh();
+        let s = &self.stats;
+        let dt = median(s.tc.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0.0)).unwrap_or(1.0 / 30.0);
+        let mut out: Vec<(usize, usize, usize)> = Vec::new(); // first, last, peak frame
+        for i in 0..self.n {
+            if s.pattern[i] < thresh {
+                continue;
+            }
+            match out.last_mut() {
+                Some(run) if s.tc[i] - s.tc[run.1] <= cfg.pattern_hold => {
+                    run.1 = i;
+                    if s.pattern[i] > s.pattern[run.2] {
+                        run.2 = i;
+                    }
+                }
+                _ => out.push((i, i, i)),
+            }
+        }
+        out.into_iter()
+            .filter(|&(a, b, _)| s.tc[b] - s.tc[a] + dt >= cfg.pattern_min_seconds)
+            .map(|(a, b, p)| Violation {
+                start: s.t[a],
+                end: s.t[b],
+                kind: ViolationKind::Pattern,
+                count: round2(s.pattern[p] as f64 / thresh as f64),
+                onset: s.t[a],
+                peak: s.t[p],
+            })
+            .collect()
     }
 
     /// ITC/Ofcom-style extended flash: flashing that meets every failure
@@ -807,6 +882,14 @@ impl Temporal {
             });
         }
         out
+    }
+}
+
+fn pattern_period(st: &GridStats) -> f32 {
+    if st.pattern_spacing_n == 0 {
+        0.0
+    } else {
+        st.pattern_spacing_sum as f32 / st.pattern_spacing_n as f32
     }
 }
 

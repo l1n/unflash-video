@@ -1,6 +1,6 @@
 //! The GPU stage must agree with the CPU kernel bit for bit on everything
-//! integer (masks, onsets, the whole per-pixel state) and to float tolerance
-//! on the window sums. Runs on whatever adapter wgpu finds (a software
+//! integer (masks, onsets, the whole per-pixel state, the pattern mask and
+//! its statistics) and to float tolerance on the window sums. Runs on whatever adapter wgpu finds (a software
 //! Vulkan driver such as lavapipe is enough); skips when there is none unless
 //! UNFLASH_REQUIRE_GPU is set.
 
@@ -91,7 +91,70 @@ fn gen(i: usize, t: f64, aw: usize, ah: usize) -> Vec<u8> {
     f
 }
 
+/// Frames for the pattern pass: fine vertical stripes, coarse diagonal
+/// stripes, stripes over part of the picture, noise, low-contrast stripes,
+/// each held for a few frames, with a repeat every seventh frame.
+fn gen_stripes(i: usize, _t: f64, aw: usize, ah: usize) -> Vec<u8> {
+    let src_i = if i % 7 == 6 { i - 1 } else { i };
+    let mut f = vec![0u8; aw * ah * 3];
+    let phase = (src_i / 5) % 6;
+    for y in 0..ah {
+        for x in 0..aw {
+            let c: u8 = match phase {
+                0 => {
+                    if (x / 3) % 2 == 0 {
+                        20
+                    } else {
+                        170
+                    }
+                }
+                1 => {
+                    if ((x + y) / 6) % 2 == 0 {
+                        30
+                    } else {
+                        200
+                    }
+                }
+                2 => {
+                    if x < aw * 2 / 5 && (y / 4) % 2 == 0 {
+                        25
+                    } else if x < aw * 2 / 5 {
+                        180
+                    } else {
+                        90
+                    }
+                }
+                3 => (90 + hash_noise(src_i, y, x, 80)).clamp(0, 255) as u8,
+                4 => {
+                    if (x / 3) % 2 == 0 {
+                        100
+                    } else {
+                        118
+                    }
+                }
+                _ => {
+                    // moving stripes: strobe-like scrolling grating
+                    if ((x + src_i * 2) / 4) % 2 == 0 {
+                        20
+                    } else {
+                        160
+                    }
+                }
+            };
+            let k = (y * aw + x) * 3;
+            f[k] = c;
+            f[k + 1] = c;
+            f[k + 2] = c;
+        }
+    }
+    f
+}
+
 fn compare(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframes: usize) {
+    compare_with(ctx, cfg, src_w, src_h, nframes, &gen, true)
+}
+
+fn compare_with(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframes: usize, gen: &dyn Fn(usize, f64, usize, usize) -> Vec<u8>, flashing: bool) {
     let (aw, ah) = cfg.analysis_dims(src_w, src_h);
     let geom = GridGeometry::new(&cfg, aw, ah);
     eprintln!("analysis {}x{} window {}x{} cells {} E={}", aw, ah, geom.ww, geom.wh, geom.ncells(), aw.div_ceil(256));
@@ -104,6 +167,7 @@ fn compare(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframe
     let n = geom.npix();
     let mut held_frames = 0;
     let mut strobe_frames = 0;
+    let mut pattern_frames = 0;
     for i in 0..nframes {
         let t = i as f64 * 1001.0 / 30000.0;
         let mut p = tmpl;
@@ -156,6 +220,19 @@ fn compare(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframe
             held_frames += 1;
         }
         assert!((gs.sum_l - cs.sum_l).abs() <= 1e-3 * n as f64, "f{i}: frame luminance {} vs {}", gs.sum_l, cs.sum_l);
+        assert_eq!(gs.pattern_count, cs.pattern_count, "f{i}: patterned pixels");
+        assert_eq!(gs.pattern_spacing_sum, cs.pattern_spacing_sum, "f{i}: pattern spacing sum");
+        assert_eq!(gs.pattern_spacing_n, cs.pattern_spacing_n, "f{i}: pattern spacing count");
+        if cfg.flag_patterns() {
+            let gmask = gpu.debug_patmask();
+            let cmask = cpu.pattern_mask();
+            for j in 0..n {
+                assert_eq!(gmask[j], cmask[j], "f{i} px{j}: pattern mask");
+            }
+            if gs.pattern_count as f64 >= 0.25 * n as f64 {
+                pattern_frames += 1;
+            }
+        }
         assert_eq!(gs.cells.len(), cs.cells.len(), "f{i}: cell count");
         for (c, (a, b)) in gs.cells.iter().zip(&cs.cells).enumerate() {
             assert_eq!(a.cnt, b.cnt, "f{i} cell {c}: counts");
@@ -182,11 +259,14 @@ fn compare(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframe
             assert_eq!(a, b, "f{i}: state word {j} (field {}, pixel {})", j / n, j % n);
         }
     }
-    eprintln!("ok: {nframes} frames, {held_frames} held, {strobe_frames} strobing cells");
+    eprintln!("ok: {nframes} frames, {held_frames} held, {strobe_frames} strobing cells, {pattern_frames} patterned frames");
     assert!(held_frames > 0, "the generator repeats frames, some must be held");
-    if nframes >= 40 {
+    if flashing && nframes >= 40 {
         // a failure needs four flashes inside a second, so short runs cannot strobe
         assert!(strobe_frames > 0, "the generator flashes, some cells must strobe");
+    }
+    if !flashing {
+        assert!(pattern_frames >= 10, "the striped generator must produce patterned frames, got {pattern_frames}");
     }
 }
 
@@ -208,6 +288,19 @@ fn gpu_matches_cpu_full_width() {
     let Some(ctx) = context() else { return };
     let cfg = DetectorConfig { analysis_scale: 1.0, ..Profile::Wcag.config() };
     compare(&ctx, cfg, 1000, 600, 14);
+}
+
+#[test]
+fn gpu_matches_cpu_patterns() {
+    let Some(ctx) = context() else { return };
+    compare_with(&ctx, Profile::WcagExt.config(), 640, 360, 35, &gen_stripes, false);
+}
+
+#[test]
+fn gpu_matches_cpu_patterns_odd_size_strict() {
+    let Some(ctx) = context() else { return };
+    let cfg = DetectorConfig { analysis_scale: 0.3, ..Profile::Strict.config() };
+    compare_with(&ctx, cfg, 333, 201, 35, &gen_stripes, false);
 }
 
 #[test]

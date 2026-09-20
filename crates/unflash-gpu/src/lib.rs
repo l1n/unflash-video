@@ -1,17 +1,20 @@
 //! WebGPU pixel stage for the Unflash detector, on wgpu (native backends and
 //! the browser's WebGPU alike).
 //!
-//! Each frame runs four compute passes:
+//! Each frame runs four compute passes, five with pattern detection on:
 //!
 //! 1. **ingest** — area-average the source texture to the analysis size,
 //!    linearise through the sRGB table, produce L / V / saturation planes and
 //!    count the pixels that moved since the last new picture;
-//! 2. **update** — the per-pixel state machine
+//! 2. **pattern** — the regular-pattern (stripe) detector
+//!    (`unflash_core::pattern`, restated in WGSL), one thread per sampling
+//!    line, marking the patterned pixels;
+//! 3. **update** — the per-pixel state machine
 //!    (`unflash_core::pixel::run_frame_scalar`, restated in WGSL);
-//! 3. **rows** — per-row window sums and onset maxima, one thread per window
+//! 4. **rows** — per-row window sums and onset maxima, one thread per window
 //!    position (no workgroup barriers: cheap on real GPUs and not
 //!    pathological on software ones);
-//! 4. **gather** — one grid cell per window position.
+//! 5. **gather** — one grid cell per window position.
 //!
 //! The output is a few kilobytes per frame, copied into a staging buffer and
 //! mapped asynchronously; several frames can be in flight. Per-pixel state
@@ -33,14 +36,17 @@ pub use wgpu;
 
 const PRELUDE: &str = include_str!("shaders/prelude.wgsl");
 const INGEST: &str = include_str!("shaders/ingest.wgsl");
+const PATTERN: &str = include_str!("shaders/pattern.wgsl");
 const UPDATE: &str = include_str!("shaders/update.wgsl");
 const ROWS: &str = include_str!("shaders/rows.wgsl");
 const GATHER: &str = include_str!("shaders/gather.wgsl");
 
 const OUT_HEADER: usize = 8;
 const CELL_WORDS: usize = 12;
-const GEO_WORDS: usize = 8 + 64 + 64;
+const GEO_WORDS: usize = 8 + 64 + 64 + 4;
 const GEO_MAX_POS: usize = 64;
+const GEO_PAT_R: usize = 136;
+const PATTERN_WG: u32 = 64;
 /// Frames that may be in flight before `submit` refuses.
 pub const DEFAULT_SLOTS: usize = 4;
 
@@ -133,8 +139,14 @@ pub struct GpuStage {
     globals_buf: wgpu::Buffer,
     rowwin_buf: wgpu::Buffer,
     rowtot_buf: wgpu::Buffer,
+    /// Read back only by the native debug helpers (the per-row pattern
+    /// counts live in the rows / gather bind groups alone).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    patmask_buf: wgpu::Buffer,
     out_buf: wgpu::Buffer,
     out_words: usize,
+    /// threads of the pattern pass: orientations × sampling lines
+    pat_threads: u32,
     // source texture
     src: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
     rgba_scratch: Vec<u8>,
@@ -142,6 +154,8 @@ pub struct GpuStage {
     ingest_bgl: wgpu::BindGroupLayout,
     ingest_pipe: wgpu::ComputePipeline,
     ingest_bg: Option<wgpu::BindGroup>,
+    pattern_pipe: wgpu::ComputePipeline,
+    pattern_bg: wgpu::BindGroup,
     update_pipe: wgpu::ComputePipeline,
     update_bg: wgpu::BindGroup,
     rows_pipe: wgpu::ComputePipeline,
@@ -237,7 +251,11 @@ impl GpuStage {
         let globals_buf = mk("globals", 16, st);
         let rowwin_buf = mk("rowwin", geom.ah as usize * geom.gxs.len() * CELL_WORDS * 4, st);
         let rowtot_buf = mk("rowtot", geom.ah as usize * 4, st);
+        let patmask_buf = mk("patmask", npix * 4, st);
+        let rowpat_buf = mk("rowpat", geom.ah as usize * 4, st);
         let out_buf = mk("out", out_words * 4, st);
+        let pat_r = unflash_core::pattern::line_radius(geom.aw, geom.ah);
+        let pat_threads = unflash_core::pattern::ORIENTATIONS as u32 * (2 * pat_r as u32 + 1);
 
         // static uploads
         let mut geo_words = vec![0u32; GEO_WORDS];
@@ -253,6 +271,7 @@ impl GpuStage {
         for (i, &g) in geom.gys.iter().enumerate() {
             geo_words[8 + 64 + i] = g;
         }
+        geo_words[GEO_PAT_R] = pat_r as u32;
         queue.write_buffer(&geo_buf, 0, cast_slice(&geo_words));
         queue.write_buffer(&lut_buf, 0, cast_slice(lut()));
         queue.write_buffer(&globals_buf, 0, &[0u8; 16]);
@@ -267,6 +286,7 @@ impl GpuStage {
             device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)) })
         };
         let ingest_mod = module("ingest", assemble(INGEST));
+        let pattern_mod = module("pattern", assemble(PATTERN));
         let update_mod = module("update", assemble(UPDATE));
         let rows_mod = module("rows", assemble(ROWS));
         let gather_mod = module("gather", assemble(GATHER));
@@ -276,11 +296,28 @@ impl GpuStage {
         };
         let ingest_bgl = bgl(
             "ingest",
-            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), texture_entry(3), storage_entry(4, false), storage_entry(5, true), storage_entry(6, false), storage_entry(7, false)],
+            &[
+                uniform_entry(0),
+                storage_entry(1, true),
+                storage_entry(2, true),
+                texture_entry(3),
+                storage_entry(4, false),
+                storage_entry(5, true),
+                storage_entry(6, false),
+                storage_entry(7, false),
+                storage_entry(8, false),
+            ],
         );
+        let pattern_bgl = bgl("pattern", &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, false), storage_entry(4, false)]);
         let update_bgl = bgl("update", &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false), storage_entry(3, false), storage_entry(4, true)]);
-        let rows_bgl = bgl("rows", &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, true), storage_entry(4, false), storage_entry(5, false)]);
-        let gather_bgl = bgl("gather", &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, true), storage_entry(4, false), storage_entry(5, false)]);
+        let rows_bgl = bgl(
+            "rows",
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, true), storage_entry(4, false), storage_entry(5, false), storage_entry(6, true), storage_entry(7, false)],
+        );
+        let gather_bgl = bgl(
+            "gather",
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, true), storage_entry(4, false), storage_entry(5, false), storage_entry(6, true)],
+        );
 
         let pipe = |label: &str, l: &wgpu::BindGroupLayout, m: &wgpu::ShaderModule| {
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[Some(l)], immediate_size: 0 });
@@ -294,10 +331,16 @@ impl GpuStage {
             })
         };
         let ingest_pipe = pipe("ingest", &ingest_bgl, &ingest_mod);
+        let pattern_pipe = pipe("pattern", &pattern_bgl, &pattern_mod);
         let update_pipe = pipe("update", &update_bgl, &update_mod);
         let rows_pipe = pipe("rows", &rows_bgl, &rows_mod);
         let gather_pipe = pipe("gather", &gather_bgl, &gather_mod);
 
+        let pattern_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pattern"),
+            layout: &pattern_bgl,
+            entries: &[buf_entry(0, &params_buf), buf_entry(1, &geo_buf), buf_entry(2, &inputs_buf), buf_entry(3, &patmask_buf), buf_entry(4, &globals_buf)],
+        });
         let update_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("update"),
             layout: &update_bgl,
@@ -306,12 +349,29 @@ impl GpuStage {
         let rows_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rows"),
             layout: &rows_bgl,
-            entries: &[buf_entry(0, &params_buf), buf_entry(1, &geo_buf), buf_entry(2, &inputs_buf), buf_entry(3, &pixout_buf), buf_entry(4, &rowwin_buf), buf_entry(5, &rowtot_buf)],
+            entries: &[
+                buf_entry(0, &params_buf),
+                buf_entry(1, &geo_buf),
+                buf_entry(2, &inputs_buf),
+                buf_entry(3, &pixout_buf),
+                buf_entry(4, &rowwin_buf),
+                buf_entry(5, &rowtot_buf),
+                buf_entry(6, &patmask_buf),
+                buf_entry(7, &rowpat_buf),
+            ],
         });
         let gather_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("gather"),
             layout: &gather_bgl,
-            entries: &[buf_entry(0, &params_buf), buf_entry(1, &geo_buf), buf_entry(2, &rowwin_buf), buf_entry(3, &rowtot_buf), buf_entry(4, &globals_buf), buf_entry(5, &out_buf)],
+            entries: &[
+                buf_entry(0, &params_buf),
+                buf_entry(1, &geo_buf),
+                buf_entry(2, &rowwin_buf),
+                buf_entry(3, &rowtot_buf),
+                buf_entry(4, &globals_buf),
+                buf_entry(5, &out_buf),
+                buf_entry(6, &rowpat_buf),
+            ],
         });
 
         let slots = (0..nslots.max(1))
@@ -346,13 +406,17 @@ impl GpuStage {
             globals_buf,
             rowwin_buf,
             rowtot_buf,
+            patmask_buf,
             out_buf,
             out_words,
+            pat_threads,
             src: None,
             rgba_scratch: Vec::new(),
             ingest_bgl,
             ingest_pipe,
             ingest_bg: None,
+            pattern_pipe,
+            pattern_bg,
             update_pipe,
             update_bg,
             rows_pipe,
@@ -393,8 +457,11 @@ impl GpuStage {
     pub fn bytes_per_frame(&self) -> u64 {
         let n = self.geom.npix() as u64;
         // inputs (l, v, sat) written by ingest and read by update + rows;
-        // state fields read (≈20) and written (≈8); pixout written and read
-        n * 4 * (3 * 3 + 20 + 8 + 3 * 2)
+        // state fields read (≈20) and written (≈8); pixout written and read;
+        // the pattern pass reads L once per orientation and clears / marks /
+        // counts the mask
+        let pattern = if self.cfg.flag_patterns() { unflash_core::pattern::ORIENTATIONS as u64 + 3 } else { 0 };
+        n * 4 * (3 * 3 + 20 + 8 + 3 * 2 + pattern)
     }
 
     /// The source texture at the given size, (re)created as needed. Fill it
@@ -429,6 +496,7 @@ impl GpuStage {
                     buf_entry(5, &self.state_buf),
                     buf_entry(6, &self.globals_buf),
                     buf_entry(7, &self.rgba_buf),
+                    buf_entry(8, &self.patmask_buf),
                 ],
             }));
             let mut geo = [0u32; 2];
@@ -488,6 +556,11 @@ impl GpuStage {
             pass.set_pipeline(&self.ingest_pipe);
             pass.set_bind_group(0, self.ingest_bg.as_ref().unwrap(), &[]);
             pass.dispatch_workgroups(self.geom.aw.div_ceil(16), self.geom.ah.div_ceil(16), 1);
+            if params.pat_enabled != 0 {
+                pass.set_pipeline(&self.pattern_pipe);
+                pass.set_bind_group(0, &self.pattern_bg, &[]);
+                pass.dispatch_workgroups(self.pat_threads.div_ceil(PATTERN_WG), 1, 1);
+            }
             pass.set_pipeline(&self.update_pipe);
             pass.set_bind_group(0, &self.update_bg, &[]);
             pass.dispatch_workgroups((self.geom.npix() as u32).div_ceil(256), 1, 1);
@@ -614,7 +687,7 @@ impl GpuStage {
         } else {
             cast_slice::<u32, GridCell>(&words[OUT_HEADER..OUT_HEADER + self.geom.ncells() * CELL_WORDS]).to_vec()
         };
-        GridStats { held, held_count, sum_l, cells }
+        GridStats { held, held_count, sum_l, cells, pattern_count: words[4], pattern_spacing_sum: words[5], pattern_spacing_n: words[6] }
     }
 
     /// Block until every in-flight frame is done (native only; a no-op on
@@ -674,6 +747,13 @@ impl GpuStage {
         let w = self.read_buffer_words(&self.pixout_buf);
         let n = self.geom.npix();
         (w[..n].to_vec(), w[n..2 * n].to_vec(), w[2 * n..3 * n].to_vec())
+    }
+
+    /// The pattern mask of the last frame, bit k = orientation k (native,
+    /// for tests).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn debug_patmask(&self) -> Vec<u32> {
+        self.read_buffer_words(&self.patmask_buf)
     }
 
     pub fn state_layout(&self) -> StateLayout {

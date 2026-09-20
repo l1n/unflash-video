@@ -341,6 +341,7 @@ fn check(fix: &Fixture) {
             ViolationKind::Flash => "flash",
             ViolationKind::Red => "red",
             ViolationKind::Extended => "extended",
+            ViolationKind::Pattern => "pattern",
         };
         assert_eq!(kind, b.kind, "{name} violation {i}: kind");
         assert!((a.start - b.start).abs() < 1e-9, "{name} violation {i}: start {} vs {}", a.start, b.start);

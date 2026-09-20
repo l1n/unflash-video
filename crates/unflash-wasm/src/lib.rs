@@ -313,6 +313,25 @@ impl FrameCache {
         self.data.truncate(n * (self.width * self.height * 4) as usize);
         self.n = n;
     }
+
+    /// A copy of this cache with the frames whose `mask` entry is non-zero
+    /// blurred (three box passes of `radius`); the others are copied as
+    /// they are. A short or empty mask blurs every frame.
+    pub fn blurred(&self, radius: u32, mask: &[u8]) -> FrameCache {
+        let fs = (self.width * self.height * 4) as usize;
+        let mut out = FrameCache { width: self.width, height: self.height, data: Vec::with_capacity(self.data.len()), n: self.n };
+        let mut tmp = Vec::new();
+        for i in 0..self.n {
+            let f = &self.data[i * fs..(i + 1) * fs];
+            if mask.is_empty() || i >= mask.len() || mask[i] != 0 {
+                unflash_core::resample::blur_rgba(f, self.width, self.height, radius, &mut tmp);
+                out.data.extend_from_slice(&tmp);
+            } else {
+                out.data.extend_from_slice(f);
+            }
+        }
+        out
+    }
 }
 
 impl FrameCache {
@@ -648,6 +667,10 @@ impl Detector {
     }
     pub fn area_thresh(&self) -> u32 {
         self.det.geometry().area_thresh
+    }
+    /// Pixels a regular pattern has to cover to count.
+    pub fn pattern_thresh(&self) -> u32 {
+        self.det.temporal().pattern_thresh()
     }
     pub fn config_json(&self) -> String {
         serde_json::to_string(self.det.config()).unwrap()

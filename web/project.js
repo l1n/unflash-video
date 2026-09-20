@@ -63,9 +63,12 @@ export class Project {
           ...s,
           prepared: false,
           cache: null,
+          softCache: null,
           ctx: null,
           check: s.check || null,
           edits: s.edits || {},
+          soften: !!s.soften,
+          pattern: s.pattern || null,
         }));
       }
     } catch (e) {
@@ -86,6 +89,8 @@ export class Project {
       pts: s.pts || null,
       warnings: s.warnings || [],
       custom: !!s.custom,
+      soften: !!s.soften,
+      pattern: s.pattern || null,
     }));
     try {
       await idbPut(this.key, { profile: this.profile, nextId: this.nextId, scan: this.scan, sections, savedAt: Date.now() });
@@ -115,9 +120,12 @@ export class Project {
       edits: {},
       prepared: false,
       cache: null,
+      softCache: null,
       ctx: null,
       check: null,
       custom,
+      soften: false,
+      pattern: null,
     };
     this.sections.push(sec);
     return sec;
@@ -127,6 +135,7 @@ export class Project {
     const sec = this.section(id);
     if (!sec) return;
     if (sec.cache) sec.cache.clear();
+    if (sec.softCache) sec.softCache.clear();
     if (sec.ctx) {
       sec.ctx.lead.clear();
       sec.ctx.tail.clear();
@@ -149,6 +158,7 @@ export class Project {
     let b = 0;
     for (const s of this.sections) {
       if (s.cache) b += s.cache.byte_length();
+      if (s.softCache) b += s.softCache.byte_length();
       if (s.ctx) b += s.ctx.lead.byte_length() + s.ctx.tail.byte_length();
     }
     return b;
@@ -160,11 +170,14 @@ export class Project {
     for (const s of order) {
       if (this.cacheBytes() <= budget) break;
       if (s.cache) s.cache.clear();
+      if (s.softCache) s.softCache.clear();
       if (s.ctx) {
         s.ctx.lead.clear();
         s.ctx.tail.clear();
       }
       s.cache = null;
+      s.softCache = null;
+      s.softKey = null;
       s.ctx = null;
       s.prepared = false;
     }
@@ -177,6 +190,11 @@ export function summarizeCheck(c) {
     safe: c.safe,
     wcag_safe: c.wcag_safe,
     flag_extended: c.flag_extended,
+    flag_patterns: c.flag_patterns,
+    pattern_thresh: c.pattern_thresh,
+    soften: c.soften,
+    soft_frames: c.soft_frames,
+    soft_sigma: c.soft_sigma,
     violations: c.violations,
     after: c.after,
     elsewhere: c.elsewhere,

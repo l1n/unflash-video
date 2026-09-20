@@ -85,3 +85,94 @@ mod tests {
         assert_eq!(out[4], 150);
     }
 }
+
+/// Three-pass box blur of an RGBA8 picture (close to a Gaussian of
+/// σ ≈ 0.9·radius, edges replicated), for softening a regular pattern.
+/// `radius` 0 copies. The output is written to `dst`.
+pub fn blur_rgba(src: &[u8], w: u32, h: u32, radius: u32, dst: &mut Vec<u8>) {
+    let (w, h) = (w as usize, h as usize);
+    let n = w * h * 4;
+    dst.clear();
+    dst.extend_from_slice(&src[..n]);
+    if radius == 0 || w == 0 || h == 0 {
+        return;
+    }
+    let r = radius as usize;
+    let mut tmp = vec![0u8; n];
+    let mut line: Vec<[u32; 4]> = Vec::with_capacity(w.max(h));
+    for _ in 0..3 {
+        box_pass(dst, &mut tmp, w, h, r, true, &mut line);
+        box_pass(&tmp, dst, w, h, r, false, &mut line);
+    }
+}
+
+/// One box pass along rows (`horizontal`) or columns.
+fn box_pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizontal: bool, line: &mut Vec<[u32; 4]>) {
+    let (lines, len) = if horizontal { (h, w) } else { (w, h) };
+    let win = (2 * r + 1) as u32;
+    let half = win / 2;
+    for l in 0..lines {
+        let at = |i: usize| -> usize {
+            if horizontal {
+                (l * w + i) * 4
+            } else {
+                (i * w + l) * 4
+            }
+        };
+        line.clear();
+        for i in 0..len {
+            let k = at(i);
+            line.push([src[k] as u32, src[k + 1] as u32, src[k + 2] as u32, src[k + 3] as u32]);
+        }
+        let clamp = |i: isize| -> [u32; 4] { line[i.clamp(0, len as isize - 1) as usize] };
+        let mut sum = [0u32; 4];
+        for k in -(r as isize)..=(r as isize) {
+            let v = clamp(k);
+            for c in 0..4 {
+                sum[c] += v[c];
+            }
+        }
+        for i in 0..len {
+            let k = at(i);
+            for c in 0..4 {
+                dst[k + c] = ((sum[c] + half) / win) as u8;
+            }
+            let add = clamp(i as isize + r as isize + 1);
+            let sub = clamp(i as isize - r as isize);
+            for c in 0..4 {
+                sum[c] = sum[c] + add[c] - sub[c];
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod blur_tests {
+    use super::*;
+
+    #[test]
+    fn blur_keeps_flat_pictures_and_flattens_stripes() {
+        let (w, h) = (32u32, 8u32);
+        let flat = vec![100u8; (w * h * 4) as usize];
+        let mut out = Vec::new();
+        blur_rgba(&flat, w, h, 3, &mut out);
+        assert_eq!(out, flat);
+        let mut stripes = vec![255u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let v = if (x / 3) % 2 == 0 { 20 } else { 200 };
+                let k = ((y * w + x) * 4) as usize;
+                stripes[k] = v;
+                stripes[k + 1] = v;
+                stripes[k + 2] = v;
+            }
+        }
+        blur_rgba(&stripes, w, h, 3, &mut out);
+        let row: Vec<u8> = (0..w).map(|x| out[(x * 4) as usize]).collect();
+        let (lo, hi) = (row[4..28].iter().min().unwrap(), row[4..28].iter().max().unwrap());
+        assert!(hi - lo < 20, "stripes should flatten: {row:?}");
+        assert!(out.iter().skip(3).step_by(4).all(|&a| a == 255), "alpha is untouched");
+        blur_rgba(&stripes, w, h, 0, &mut out);
+        assert_eq!(out, stripes);
+    }
+}

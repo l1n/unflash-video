@@ -15,13 +15,13 @@
   <div id="videoInfo" class="video-info"></div>
   <div class="spacer"></div>
   <label class="profile-label">Profile
-    <select id="profileSel" title="What counts as a problem. Extended flashes are not WCAG failures, but they still affect some viewers.">
-      <option value="wcag_ext">Exact WCAG + flag extended flashes (default)</option>
+    <select id="profileSel" title="What counts as a problem. Extended flashes and hazardous stripe patterns are not WCAG failures, but they still affect some viewers.">
+      <option value="wcag_ext">WCAG + extended flashes + stripe patterns (default)</option>
       <option value="wcag">Exact WCAG only</option>
       <option value="strict">Stricter than WCAG</option>
     </select>
   </label>
-  <button id="btnScan" disabled title="Decode every frame with WebCodecs and run the detector over it, as fast as the GPU goes">Scan for flashes</button>
+  <button id="btnScan" disabled title="Decode every frame with WebCodecs and run the detector over it, as fast as the GPU goes">Scan for flashes &amp; patterns</button>
   <label class="toggle" title="Run the detector live on whatever the player is showing"><input type="checkbox" id="liveToggle" disabled> live monitor</label>
   <button id="btnExport" disabled>Export…</button>
 </header>
@@ -38,7 +38,7 @@
 <div id="timelineWrap" class="timeline-wrap hidden">
   <canvas id="timeline" height="64"></canvas>
   <div class="timeline-row">
-    <div class="timeline-hint">Flashing across the whole video: orange for general flashes, magenta for red ones, the thin trace is what the live monitor saw. Numbered boxes are sections; click one to open it. Drag on an empty stretch to add a section, or type times:</div>
+    <div class="timeline-hint">Problems across the whole video: orange for general flashes, magenta for red ones, teal for stripe patterns; the thin trace is what the live monitor saw. Numbered boxes are sections; click one to open it. Drag on an empty stretch to add a section, or type times:</div>
     <span class="addsec">
       <input type="text" id="addStart" placeholder="start (e.g. 1:23.5)" size="12">
       <input type="text" id="addEnd" placeholder="end" size="12">
@@ -72,6 +72,7 @@
           <div id="hud" class="hud hidden">
             <div class="hud-row"><span class="hud-label">flash area</span><div class="hud-bar"><div id="hudHaz" class="hud-fill"></div><div class="hud-mark" title="area threshold"></div></div><span id="hudHazText" class="hud-val">0%</span></div>
             <div class="hud-row"><span class="hud-label">red flash</span><div class="hud-bar"><div id="hudRed" class="hud-fill red"></div><div class="hud-mark"></div></div><span id="hudRedText" class="hud-val">0%</span></div>
+            <div class="hud-row"><span class="hud-label">stripes</span><div class="hud-bar"><div id="hudPat" class="hud-fill pat"></div><div class="hud-mark" title="pattern area threshold"></div></div><span id="hudPatText" class="hud-val">0%</span></div>
             <div class="hud-row small"><span id="hudInfo"></span></div>
           </div>
         </div>
@@ -128,6 +129,10 @@
           <span class="group">
             <button id="btnClearEdits" class="small">clear all marks</button>
           </span>
+          <span class="group hidden" id="softenWrap">
+            <label class="toggle" title="Blur the frames where a hazardous stripe pattern was found, just enough to take it under the threshold. The check and the export apply the same blur."><input type="checkbox" id="softenToggle"> soften stripes</label>
+            <span id="softenNote" class="rate"></span>
+          </span>
         </div>
         <div class="grid-head">
           <h3>Frames <span id="frameCount"></span></h3>
@@ -136,6 +141,8 @@
             <span class="chip extended" title="Held on screen for 1 second with the sound muted">held 1s</span>
             <span class="chip flagged">in flash event</span>
             <span class="chip flagged-red">in red-flash event</span>
+            <span class="chip flagged-pat" title="Inside a hazardous stripe pattern">stripes</span>
+            <span class="chip soft" title="Blurred by the soften-stripes option; the thumbnail shows roughly how much">softened</span>
             <span class="chip selected">selected</span>
           </div>
           <div class="grid-actions">
@@ -154,16 +161,27 @@
 
   <section id="welcome">
     <h1>Unflash</h1>
-    <p>Find the flashing in a video that can trigger photosensitive seizures, and take it out without wrecking the footage. Everything runs in your browser, on your GPU; nothing is uploaded anywhere.</p>
+    <p>Find the flashing and the stripe patterns in a video that can trigger photosensitive seizures, and take them out without wrecking the footage. Everything runs in your browser, on your GPU; nothing is uploaded anywhere.</p>
     <ol>
       <li><b>Open a video</b> (an MP4), then <b>Scan</b> it. Every frame is decoded with WebCodecs and pushed through the detector as fast as your GPU allows. Unflash puts a numbered <i>section</i> around every problem it finds.</li>
       <li>Or just <b>play</b> it with <b>live monitor</b> on: the detector runs on every frame the player shows and the meter above the video tells you, as it happens, how much of the picture is flashing.</li>
       <li><b>Prepare</b> a section to pull out its frames, then <b>mark the frames</b> you want gone (<b>R</b>/<b>F</b>) or held (<b>E</b>). The section is re-checked the instant you change anything, with nothing to render.</li>
       <li>Or let <b>Suggest</b> do it: keep-light and keep-dark work out a set of removals, <b>reduce FPS</b> thins the section down to a rate that cannot flash fast enough to fail.</li>
+      <li><b>Stripe patterns</b> (fine gratings, more than five light–dark pairs, high contrast, a quarter of the screen or more) get their own sections. Removing frames can't fix those; turn on <b>soften stripes</b> and the export blurs just those frames, just enough.</li>
       <li><b>Export</b> re-encodes the edited video in the browser and <b>Verify</b> re-scans the result.</li>
     </ol>
     <p class="note-extended"><b>Extended flashes</b> are 5 seconds or more of flashing that meets every WCAG failure condition except the rate: it runs <i>at</i> the permitted speed (3 flashes/s) instead of above it. WCAG lets that through, but UK broadcast guidance doesn't and it does affect some viewers, so the default profile flags them as ordinary sections. Pick <i>Exact WCAG only</i> to ignore them. <i>Stricter than WCAG</i> already fails at that speed.</p>
-    <p class="disclaimer">This reduces risk. It can't guarantee safety. It doesn't detect hazardous static patterns such as fine stripes, and individual sensitivity varies, so review the flagged sections yourself before you share anything.</p>
+    <p class="disclaimer">This reduces risk. It can't guarantee safety. The pattern test covers regular stripes and gratings (the case broadcast guidance names), not every texture that could affect someone, and individual sensitivity varies, so review the flagged sections yourself before you share anything.</p>
+    <h2 class="clips-head">Test clips</h2>
+    <p class="clips-intro">Short synthetic videos with known problems, to try the app with. <b>Open</b> loads one straight into Unflash; the links download the file so you can open it from your disk (or upload it anywhere else). Each is 640×360, 30 fps, with a tone on the audio track.</p>
+    <table class="clips">
+      <tr><th>clip</th><th>what's in it</th><th></th><th>download</th></tr>
+      <tr><td><b>flash</b></td><td>a slow pan, then 4 flashes/s over the whole picture from 3.0 to 5.5 s and a red flash from 7.0 to 8.5 s (two WCAG failures, one section)</td><td><button class="small" data-clip="flash.mp4">open</button></td><td><a href="clips/flash.mp4" download>VP9</a> · <a href="clips/flash_h264.mp4" download>H.264</a></td></tr>
+      <tr><td><b>stripes</b></td><td>the pan, then fine vertical stripes from 2 to 6 s and diagonal ones from 6 to 9 s: no flashing at all, one stripe-pattern section</td><td><button class="small" data-clip="stripes.mp4">open</button></td><td><a href="clips/stripes.mp4" download>VP9</a> · <a href="clips/stripes_h264.mp4" download>H.264</a></td></tr>
+      <tr><td><b>extended</b></td><td>3 flashes/s for 8 s: passes WCAG, flagged as an extended flash by the default profile</td><td><button class="small" data-clip="extended.mp4">open</button></td><td><a href="clips/extended.mp4" download>VP9</a> · <a href="clips/extended_h264.mp4" download>H.264</a></td></tr>
+      <tr><td><b>steady</b></td><td>the pan alone: nothing to find</td><td><button class="small" data-clip="steady.mp4">open</button></td><td><a href="clips/steady.mp4" download>VP9</a> · <a href="clips/steady_h264.mp4" download>H.264</a></td></tr>
+    </table>
+    <p class="clips-note">Most browsers decode H.264 with WebCodecs; Chromium builds without proprietary codecs decode only the VP9 ones. The clips come from <code>tests/media/gen_e2e.py</code> in the repository.</p>
     <p id="support" class="support"></p>
   </section>
 </main>

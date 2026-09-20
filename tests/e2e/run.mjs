@@ -1,8 +1,10 @@
 // End-to-end test of the web app in headless Chromium with WebGPU (SwiftShader).
 //   node tests/e2e/run.mjs [--headed] [--keep]
 // The long editing flow runs on the CPU detector (SwiftShader's WebGPU is a
-// software emulation and slow); a GPU scan of the same file must then find
-// the same violations.
+// software emulation and slow); a GPU scan of the same files must then find
+// the same violations. The synthetic clips come from tests/media/gen_e2e.py;
+// they are also copied to web/clips so the welcome page's "open" buttons
+// (the published test clips) can be exercised.
 import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -12,7 +14,10 @@ const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../.
 const WEB = path.join(ROOT, 'web');
 const MEDIA = path.join(ROOT, 'tests/media/e2e');
 const OUT = path.join(ROOT, 'tests/e2e/out');
+const CLIPS = path.join(WEB, 'clips');
 fs.mkdirSync(OUT, { recursive: true });
+fs.mkdirSync(CLIPS, { recursive: true });
+for (const f of fs.readdirSync(MEDIA)) if (f.endsWith('.mp4') && !fs.existsSync(path.join(CLIPS, f))) fs.copyFileSync(path.join(MEDIA, f), path.join(CLIPS, f));
 
 function assert(cond, msg) {
   if (!cond) throw new Error('ASSERT: ' + msg);
@@ -236,6 +241,67 @@ try {
   console.log('extended (wcag):', scan.toast);
   assert(scan.toast.includes('No flashing'), 'under exact WCAG the 3 Hz file passes');
 
+  // --- stripes: a stationary pattern with no flashing; softening fixes it ------
+  await openFile('stripes.mp4');
+  assert((await page.$eval('#profileSel', (s) => s.value)) === 'wcag_ext', 'a new file starts on the default profile');
+  scan = await scanCurrent();
+  results.stripesScan = scan;
+  console.log('stripes scan:', scan.ms, 'ms |', scan.toast);
+  results.stripesViolations = await page.evaluate(() => window.__unflash.lastScan.result.violations);
+  console.log('stripes violations:', JSON.stringify(results.stripesViolations));
+  const pats = results.stripesViolations.filter((v) => v.kind === 'pattern');
+  assert(pats.length >= 1 && pats.length === results.stripesViolations.length, 'the stripes file has pattern violations and nothing else');
+  assert(pats[0].start > 1.8 && pats[0].start < 2.6 && pats[pats.length - 1].end > 8.5 && pats[pats.length - 1].end < 9.4, 'the pattern runs from 2 s to 9 s: ' + JSON.stringify(pats));
+  results.stripesSections = await page.$$eval('#sectionList .sec-item', (els) => els.map((e) => e.textContent));
+  assert(results.stripesSections.length === 1 && results.stripesSections[0].includes('stripes'), 'one section, labeled stripes: ' + JSON.stringify(results.stripesSections));
+  await page.click('#sectionList .sec-item');
+  await page.waitForSelector('#btnPrepare', { state: 'visible' });
+  await page.click('#btnPrepare');
+  await page.waitForFunction(() => !document.querySelector('#wsBody').classList.contains('hidden'), null, { timeout: 120000 });
+  await verdictReady(page);
+  results.stripesVerdict = await page.textContent('#wsVerdict');
+  results.softenNote = await page.textContent('#softenNote');
+  console.log('stripes verdict:', results.stripesVerdict, '| soften:', results.softenNote);
+  assert(results.stripesVerdict === 'passes WCAG, stripes remain', 'a pattern is not a WCAG failure but is reported: ' + results.stripesVerdict);
+  assert(!(await page.$eval('#softenWrap', (e) => e.classList.contains('hidden'))), 'the soften switch is offered');
+  assert(/\d+ of \d+ frames · blur/.test(results.softenNote), 'the switch says what it would blur: ' + results.softenNote);
+  const flaggedPat = await page.$$eval('#frameGrid .frame.flagged-pat', (els) => els.length);
+  assert(flaggedPat > 60, 'the patterned frames are marked in the grid: ' + flaggedPat);
+  await page.check('#softenToggle');
+  await page.waitForFunction(
+    () => {
+      const s = window.__unflash.currentSection();
+      return s.check && !s.check.stale && s.check.soften === true && !document.querySelector('#wsVerdict').textContent.includes('checking');
+    },
+    null,
+    { timeout: 120000 }
+  );
+  results.softVerdict = await page.textContent('#wsVerdict');
+  results.softFrames = await page.evaluate(() => window.__unflash.currentSection().check.soft_frames.length);
+  console.log('after soften:', results.softVerdict, '|', results.softFrames, 'frames softened');
+  assert(results.softVerdict === 'passes', 'softening the stripes makes the section pass: ' + results.softVerdict);
+  assert(results.softFrames > 60, 'the frames with stripes are softened');
+  await page.screenshot({ path: path.join(OUT, '7-stripes.png'), fullPage: true });
+  await page.click('#btnExport');
+  await page.waitForSelector('#exportModal', { state: 'visible' });
+  results.stripesPlan = await page.textContent('#exportPlan');
+  assert(results.stripesPlan.includes('softened'), 'the export plan mentions the softening: ' + results.stripesPlan);
+  t0 = Date.now();
+  await page.click('#btnDoExport');
+  await jobStarted(page);
+  await jobDone(page, 600000);
+  await page.waitForFunction(() => !document.querySelector('#btnVerifyExport').disabled, null, { timeout: 30000 });
+  results.stripesExport = await page.textContent('#exportResult');
+  console.log('stripes export:', Date.now() - t0, 'ms;', results.stripesExport);
+  assert(/softened/.test(results.stripesExport), 'the export reports the softened frames: ' + results.stripesExport);
+  await page.click('#btnVerifyExport');
+  await jobStarted(page);
+  await jobDone(page, 600000);
+  results.stripesVerify = await page.textContent('#exportResult');
+  console.log('stripes verify:', results.stripesVerify);
+  assert(results.stripesVerify.includes('Passes WCAG') && results.stripesVerify.includes('No hazardous stripe patterns'), 'the softened export has no stripes left: ' + results.stripesVerify);
+  await page.click('#btnCloseExport');
+
   // --- H.264 in a browser without H.264: the app says so ---------------------
   await openFile('flash_h264.mp4');
   results.h264 = { scanDisabled: await page.$eval('#btnScan', (b) => b.disabled), banner: await page.textContent('#bannerText') };
@@ -243,9 +309,26 @@ try {
   const h264Decodable = await page.evaluate(() => VideoDecoder.isConfigSupported({ codec: 'avc1.42C01E', codedWidth: 64, codedHeight: 64 }).then((r) => r.supported));
   if (!h264Decodable) assert(results.h264.scanDisabled && results.h264.banner.includes('cannot decode'), 'without an H.264 decoder the app must explain');
 
-  // ======== the same scan on the GPU must agree ===============================
+  // ======== the same scans on the GPU must agree ==============================
   await page.goto(`http://127.0.0.1:${port}/`);
   await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+  // the welcome page's test clips open straight into the app
+  await page.click('[data-clip="stripes.mp4"]');
+  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('stripes.mp4'), null, { timeout: 60000 });
+  await page.waitForFunction(() => !document.querySelector('#status').textContent.includes('ready ·'), null, { timeout: 60000 });
+  await noBanner(page);
+  page.once('dialog', (d) => d.accept());
+  await page.click('#btnDeleteAll');
+  await page.waitForFunction(() => document.querySelectorAll('#sectionList .sec-item').length === 1);
+  scan = await scanCurrent();
+  results.gpuStripes = await page.evaluate(() => window.__unflash.lastScan.result.violations);
+  console.log('gpu stripes scan:', scan.ms, 'ms |', scan.toast, '|', JSON.stringify(results.gpuStripes));
+  assert(results.gpuStripes.length === results.stripesViolations.length, 'GPU and CPU scans must find the same pattern violations');
+  for (let i = 0; i < results.gpuStripes.length; i++) {
+    const a = results.gpuStripes[i];
+    const b = results.stripesViolations[i];
+    assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.05 && Math.abs(a.end - b.end) < 0.05, `pattern violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
+  }
   await openFile('flash.mp4');
   results.gpuStatus = await page.textContent('#status');
   assert(results.gpuStatus.includes('WebGPU'), 'the default detector must be WebGPU: ' + results.gpuStatus);

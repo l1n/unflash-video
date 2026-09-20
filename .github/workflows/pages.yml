@@ -57,6 +57,12 @@ jobs:
           fi
       - name: Build
         run: ./build.sh release
+      - name: Test clips (ffmpeg, numpy)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-numpy
+          python3 tests/media/gen_e2e.py web/clips
+          ls -la web/clips
       - id: pages
         uses: actions/configure-pages@v5
         with:

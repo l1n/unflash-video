@@ -5,9 +5,10 @@ check the reasoning rather than take the verdict on trust. Nothing here is
 needed to use the tool.
 
 Unflash implements the WCAG 2.x / PEAT definitions of general flash and red
-flash, adds an optional test for sustained flashing at the legal limit, and
-tries hard to make sure that a section which passes its own check also
-passes when you re-scan the exported file.
+flash, adds an optional test for sustained flashing at the legal limit and
+one for hazardous stationary stripe patterns, and tries hard to make sure
+that a section which passes its own check also passes when you re-scan the
+exported file.
 
 ## Contents
 
@@ -16,6 +17,7 @@ passes when you re-scan the exported file.
 - [Applying a 1024x768 rule to other shapes](#applying-a-1024x768-rule-to-other-shapes)
 - [Calibration](#calibration)
 - [Extended flashes](#extended-flashes)
+- [Regular patterns](#regular-patterns)
 - [The three profiles](#the-three-profiles)
 - [The safe frame rate](#the-safe-frame-rate)
 - [Why a section's check matches the export](#why-a-sections-check-matches-the-export)
@@ -140,16 +142,82 @@ section or exported file whose only remaining problems are extended flashes
 still passes WCAG, and Unflash says so while still marking it unsafe under
 the active profile.
 
+## Regular patterns
+
+Flashing is not the only photosensitive trigger. The Ofcom guidance (and
+ITU-R BT.1702, which it follows) also names **regular patterns**: stripes,
+gratings and checkerboards that are stationary or move slowly. Their
+criterion is that a pattern is potentially harmful when it shows **more
+than five clearly discernible light–dark stripe pairs** in any orientation,
+the stripes differ by at least the flash luminance threshold, and the
+pattern covers **a quarter of the screen or more**. WCAG has no such
+criterion, so a pattern is never a WCAG failure; the default profile reports
+it like an extended flash, as a violation of its own kind with its own
+sections, and the *Exact WCAG only* profile ignores it.
+
+The flash detector is blind to a stationary pattern, because nothing
+changes over time. The pattern test works on a single frame:
+
+1. **Sampling lines.** The luminance plane is walked along parallel lines in
+   eight orientations 22.5° apart, so every stripe orientation is crossed
+   within 11.25° of perpendicular (a grating crossed at that angle shows its
+   period stretched by 2%, which is nothing). Positions are 16.16 fixed
+   point and the walk is integer throughout, so the GPU produces exactly the
+   CPU's mask.
+2. **Runs.** Along a line the same monotonic-run tracker the flash detector
+   uses turns the profile into runs. A run *qualifies* when its swing is at
+   least the flash threshold (0.10 of maximum luminance) and its darker end
+   is below 0.80: the same two tests a flash transition has to pass, applied
+   across space instead of time.
+3. **Stripes.** A stretch of at least eleven consecutive qualifying runs
+   (five pairs plus one, so *more than five*) whose spacings are regular
+   (longest at most 2.5× the shortest) is a pattern, and every pixel it
+   crosses is marked. Regularity is what separates a grating from a busy
+   texture such as text, foliage or a crowd, which produce plenty of
+   contrast but no rhythm.
+4. **Coherence.** Each extremum of a qualifying run has to agree with the
+   pixel one step perpendicular to the line to within half the swing.
+   Stripes are uniform along their length; noise is not. Without this test
+   a frame of pixel noise reads as a two-pixel grating in every orientation.
+5. **Area and time.** The frame's pattern area is the number of pixels
+   marked in any orientation, measured against the whole picture (a quarter
+   of it, at the analysis size). Frames over the threshold that are within
+   half a second of each other belong to one pattern, and a pattern that
+   stays on screen for at least half a second is a violation. Its severity
+   is the peak area over the threshold, like a flash's.
+
+A moving grating that scrolls fast enough to make pixels flash is caught by
+both tests; the flash test then decides the WCAG verdict.
+
+**Softening.** Removing frames cannot fix a stationary pattern, so a
+section with one offers **soften stripes** instead: the frames whose pattern
+area reaches half the threshold, plus a quarter of a second either side, are
+blurred with a Gaussian whose σ equals the stripes' mean half-period (the
+detector measures the spacing of the extrema it marked). That takes a
+square-wave grating's fundamental down by a factor of about 140, far below
+the swing threshold, while leaving everything coarser than the stripes
+recognisable. The section's check reads the blurred frames (a three-pass
+box blur of the cached analysis-size pictures), the export applies the
+same σ scaled to source resolution, and the verify pass checks the result
+with the detector as always.
+
+**What it does not do.** The guidance's finer conditions (the pattern's
+spatial frequency in cycles per degree, whether it is stationary, drifts,
+oscillates or reverses in phase) are not modelled; the test asks only how
+many pairs, how much contrast, how much area, for how long, which is what
+the published thresholds quantify. Textures that affect some viewers
+without being regular gratings are outside it.
+
 ## The three profiles
 
 The profile is chosen in the header and used by every check, render verdict
 and verification.
 
-| Profile | WCAG thresholds | Extended flashes |
-|---|---|---|
-| **Exact WCAG + flag extended flashes** (default) | exact | reported as violations: they get their own work sections labeled *extended flash*, count in the verdict, and Suggest tries to clear them |
-| **Exact WCAG only** | exact | not detected or reported at all |
-| **Stricter than WCAG** | tighter: 0.08 swing, 1/5 area, 2 flashes/s | not reported separately, because this profile already fails at 3 flashes/s |
+| Profile | WCAG thresholds | Extended flashes | Regular patterns |
+|---|---|---|---|
+| **WCAG + extended flashes + stripe patterns** (default) | exact | reported as violations: they get their own work sections labeled *extended flash*, count in the verdict, and Suggest tries to clear them | reported as violations with sections labeled *stripes*; soften clears them |
+| **Exact WCAG only** | exact | not detected or reported at all | not reported |
+| **Stricter than WCAG** | tighter: 0.08 swing, 1/5 area, 2 flashes/s | not reported separately, because this profile already fails at 3 flashes/s | reported |
 
 ## The safe frame rate
 
@@ -166,7 +234,7 @@ that many intervals into a second and the verdict is unreachable.
 
 | Profile | flashes needed | frame intervals | safe rate |
 |---|---|---|---|
-| **Exact WCAG + flag extended flashes** | 3 (extended, at the limit) | 4 | 3.8 /s |
+| **WCAG + extended flashes + stripe patterns** | 3 (extended, at the limit) | 4 | 3.8 /s |
 | **Exact WCAG only** | 4 (more than 3) | 6 | 5.71 /s |
 | **Stricter than WCAG** | 3 (more than 2) | 4 | 3.8 /s |
 
@@ -460,3 +528,11 @@ reference too.
 keyframes for the sake of its stream-copy export. The browser export
 re-encodes everything, so sections are padded from the violation's onset
 and not extended to keyframes.
+
+**The pattern pass is one thread per sampling line.** Eight orientations
+times the lines that cover the picture, each walking its line with the
+state machine above in registers and OR-ing its orientation's bit into a
+per-pixel mask with atomics; ORs and the integer spacing sums commute, so
+the thread order cannot change a result. The rows pass counts the marked
+pixels. It costs about eight reads of the luminance plane per frame, which
+is less than the flash kernel's own traffic.
