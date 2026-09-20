@@ -1,9 +1,15 @@
 // The detector, wrapped so the rest of the app does not care whether it runs
-// on the GPU or the CPU.
+// on the GPU or the CPU, nor by which route a picture reaches it.
 
-import { tick } from './media.js';
+import { tick, yuvLayoutWords } from './media.js';
+import { profile } from './profile.js';
 
-export async function createDetector(wasm, configJson, width, height, { preferGpu = true, externalSources = null } = {}) {
+/**
+ * `route`: force one way of feeding VideoFrames (tests / diagnostics):
+ * videoframe, yuv, rgba, canvas or pixels. `externalSources`: pretend the
+ * browser's WebGPU accepts only these kinds of copy source.
+ */
+export async function createDetector(wasm, configJson, width, height, { preferGpu = true, externalSources = null, route = null } = {}) {
   let det = null;
   let backend = 'cpu';
   let note = '';
@@ -21,7 +27,7 @@ export async function createDetector(wasm, configJson, width, height, { preferGp
     note = 'This browser has no WebGPU; using the CPU detector';
   }
   if (!det) det = new wasm.Detector(configJson, width, height);
-  return new Feeder(wasm, det, backend, note, probe);
+  return new Feeder(wasm, det, backend, note, probe, route);
 }
 
 /**
@@ -30,9 +36,7 @@ export async function createDetector(wasm, configJson, width, height, { preferGp
  * HTMLImageElement, HTMLCanvasElement and OffscreenCanvas; a VideoFrame or a
  * <video> makes it throw a TypeError, which wgpu unwraps, and that aborts the
  * whole WASM instance. So every kind of source is tried once on a throwaway
- * device before it is allowed through to WASM; rejected kinds are blitted
- * through an OffscreenCanvas instead (and if even that is rejected, copied
- * out as RGBA).
+ * device before it is allowed through to WASM.
  */
 export class SourceProbe {
   /** `allowed`: an optional list of kinds to treat as accepted without asking (tests: `?extsrc=canvas`). */
@@ -49,7 +53,7 @@ export class SourceProbe {
       p.texture = p.device.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
       p.device.lost.then(() => p.release());
     } catch (e) {
-      console.warn('cannot probe WebGPU picture sources; copying frames as RGBA', e);
+      console.warn('cannot probe WebGPU picture sources; pictures will not be handed to WebGPU directly', e);
       p.release();
     }
     return p;
@@ -89,7 +93,7 @@ export class SourceProbe {
     } catch (e) {
       ok = false;
       if (!(e instanceof TypeError)) return false;
-      console.warn(`WebGPU does not take a ${kind} as a copy source here (${e.message}); blitting through a canvas`);
+      console.debug(`[unflash] WebGPU does not take a ${kind} as a copy source here (${e.message})`);
     }
     this.support[kind] = ok;
     if (['videoframe', 'video', 'canvas'].every((k) => this.support[k] !== undefined)) this.release();
@@ -97,9 +101,14 @@ export class SourceProbe {
   }
 }
 
+/** The routes a VideoFrame can take to the detector, best first. */
+const FRAME_ROUTES = ['videoframe', 'yuv', 'rgba', 'canvas', 'pixels'];
+/** The routes the live monitor's <video> element can take. */
+const VIDEO_ROUTES = ['video', 'canvas', 'pixels'];
+
 /** Feeds pictures of any kind into a Detector with back-pressure. */
 export class Feeder {
-  constructor(wasm, det, backend, note, probe = null) {
+  constructor(wasm, det, backend, note, probe = null, route = null) {
     this.wasm = wasm;
     this.det = det;
     this.backend = backend;
@@ -109,7 +118,11 @@ export class Feeder {
     this.ah = det.analysis_height();
     this.fed = 0;
     this.busyNs = 0;
-    this.route = ''; // how the last picture reached the GPU detector (diagnostics)
+    this.route = ''; // how the last picture reached the detector
+    this.reported = '';
+    this.frameRoutes = route ? [route] : FRAME_ROUTES.slice();
+    this.videoRoutes = route && VIDEO_ROUTES.includes(route) ? [route] : VIDEO_ROUTES.slice();
+    this.submitted = []; // submit times of the GPU frames in flight (latency accounting)
     if (backend === 'cpu') {
       this.canvas = new OffscreenCanvas(this.aw, this.ah);
       this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
@@ -118,6 +131,41 @@ export class Feeder {
 
   get gpu() {
     return this.backend === 'webgpu';
+  }
+
+  /** Collect finished GPU frames; returns how many completed. */
+  poll() {
+    const t0 = performance.now();
+    const n = this.det.poll();
+    const now = performance.now();
+    profile.add('poll', now - t0);
+    for (let i = 0; i < n && this.submitted.length; i++) profile.add('gpu.latency', now - this.submitted.shift());
+    return n;
+  }
+
+  async waitSlot() {
+    if (this.det.can_submit()) return;
+    const t0 = performance.now();
+    while (!this.det.can_submit()) {
+      this.poll();
+      if (!this.det.can_submit()) await tick();
+    }
+    profile.add('feed.wait', performance.now() - t0);
+  }
+
+  setRoute(route, detail = '') {
+    this.route = route;
+    if (route !== this.reported) {
+      this.reported = route;
+      profile.note('route', route + (detail ? ` (${detail})` : ''));
+      console.debug(`[unflash] pictures reach the ${this.backend} detector as: ${route}${detail ? ' (' + detail + ')' : ''}`);
+    }
+  }
+
+  dropRoute(list, route, why) {
+    const i = list.indexOf(route);
+    if (i >= 0) list.splice(i, 1);
+    console.warn(`[unflash] picture route ${route} does not work here (${why}); ${list.length ? 'trying ' + list[0] : 'no route left'}`);
   }
 
   /** Draw a picture at its own size into the blit canvas (the GPU detector downsamples). */
@@ -129,132 +177,247 @@ export class Feeder {
       this.blitCanvas.width = w;
       this.blitCanvas.height = h;
     }
+    const t0 = performance.now();
     this.blitCtx.drawImage(source, 0, 0, w, h);
+    profile.add('feed.blit', performance.now() - t0);
     return this.blitCanvas;
   }
 
-  /**
-   * Feed a picture to the GPU detector by whichever route this browser's
-   * WebGPU accepts: the picture itself, a canvas it is drawn into, or its
-   * pixels. `kind` is 'videoframe' or 'video'; `w`×`h` its visible size.
-   */
-  feedGpuSource(kind, source, w, h, t, capture) {
-    const probe = this.probe;
-    if (probe && probe.accepts(kind, source)) {
-      this.route = kind;
-      if (kind === 'videoframe') this.det.feed_video_frame(source, t, capture);
-      else this.det.feed_video_element(source, t, capture);
-      return;
+  /** The picture's pixels through a canvas: at full size for the GPU (it downsamples), at analysis size for the CPU. */
+  feedPixels(source, w, h, t, capture) {
+    const t0 = performance.now();
+    let img;
+    if (this.gpu) {
+      if (!this.readCtx) {
+        this.readCanvas = new OffscreenCanvas(w, h);
+        this.readCtx = this.readCanvas.getContext('2d', { willReadFrequently: true });
+      } else if (this.readCanvas.width !== w || this.readCanvas.height !== h) {
+        this.readCanvas.width = w;
+        this.readCanvas.height = h;
+      }
+      this.readCtx.drawImage(source, 0, 0, w, h);
+      img = this.readCtx.getImageData(0, 0, w, h);
+    } else {
+      this.ctx.drawImage(source, 0, 0, this.aw, this.ah);
+      img = this.ctx.getImageData(0, 0, this.aw, this.ah);
     }
-    let canvas = null;
-    try {
-      canvas = this.blit(source, w, h);
-    } catch (e) {
-      canvas = null;
-    }
-    if (canvas && probe && probe.accepts('canvas', canvas)) {
-      this.route = 'canvas';
-      this.det.feed_canvas(canvas, t, capture);
-      return;
-    }
-    // no external source at all: the pixels through WASM memory
-    if (!this.readCtx) {
-      this.readCanvas = new OffscreenCanvas(w, h);
-      this.readCtx = this.readCanvas.getContext('2d', { willReadFrequently: true });
-    } else if (this.readCanvas.width !== w || this.readCanvas.height !== h) {
-      this.readCanvas.width = w;
-      this.readCanvas.height = h;
-    }
-    this.readCtx.drawImage(source, 0, 0, w, h);
-    const img = this.readCtx.getImageData(0, 0, w, h);
-    this.route = 'rgba';
-    this.det.feed_rgba(img.data, w, h, t, capture);
+    profile.add('feed.pixels', performance.now() - t0);
+    const t1 = performance.now();
+    this.det.feed_rgba(img.data, img.width, img.height, t, capture);
+    profile.add('feed.upload', performance.now() - t1);
   }
 
-  async waitSlot() {
-    while (!this.det.can_submit()) {
-      this.det.poll();
-      if (!this.det.can_submit()) await tick();
+  /** The frame's own 4:2:0 planes (I420 / NV12), converted by the detector. False when the frame cannot give them. */
+  async feedYuv(frame, w, h, t, capture) {
+    const fmt = frame.format;
+    if (fmt !== 'I420' && fmt !== 'I420A' && fmt !== 'NV12') return false;
+    const size = frame.allocationSize();
+    if (!this.yuvBuf || this.yuvBuf.byteLength < size) this.yuvBuf = new Uint8Array(size);
+    const t0 = performance.now();
+    const planes = await frame.copyTo(this.yuvBuf);
+    profile.add('feed.copyTo', performance.now() - t0);
+    if (!planes || planes.length < (fmt === 'NV12' ? 2 : 3)) return false;
+    const layout = yuvLayoutWords(fmt, planes, frame.colorSpace, h);
+    const t1 = performance.now();
+    this.det.feed_yuv(this.yuvBuf.subarray(0, size), w, h, layout, t, capture);
+    profile.add('feed.upload', performance.now() - t1);
+    this.yuvDetail = `${fmt}, ${layout[7] ? 'BT.709' : 'BT.601'} ${layout[8] ? 'full' : 'limited'} range`;
+    return true;
+  }
+
+  /** WebCodecs' own RGBA conversion. False when this browser's copyTo cannot convert. */
+  async feedRgba(frame, w, h, t, capture) {
+    if (this.rgbaCopy === false || typeof frame.allocationSize !== 'function') return false;
+    let layout;
+    const opts = { format: 'RGBA' };
+    try {
+      const size = frame.allocationSize(opts);
+      if (!this.rgbaBuf || this.rgbaBuf.byteLength < size) this.rgbaBuf = new Uint8Array(size);
+      const t0 = performance.now();
+      layout = await frame.copyTo(this.rgbaBuf, opts);
+      profile.add('feed.copyTo', performance.now() - t0);
+    } catch (e) {
+      this.rgbaCopy = false;
+      return false;
     }
+    if (!layout || !layout[0] || layout[0].stride !== w * 4) {
+      this.rgbaCopy = false;
+      return false;
+    }
+    this.rgbaCopy = true;
+    const t1 = performance.now();
+    this.det.feed_rgba(this.rgbaBuf.subarray(0, w * h * 4), w, h, t, capture);
+    profile.add('feed.upload', performance.now() - t1);
+    return true;
+  }
+
+  /** A picture from the built-in decoder: I420 planes already in memory. */
+  feedRaw(pic, t, capture) {
+    const t0 = performance.now();
+    this.det.feed_yuv(pic.data, pic.codedWidth, pic.codedHeight, pic.layout, t, capture);
+    profile.add('feed.upload', performance.now() - t0);
+    this.setRoute('raw', 'I420 from the built-in decoder');
+  }
+
+  /** Feed a VideoFrame by the first route that works here. */
+  async feedFrame(frame, t, capture) {
+    if (frame.raw) {
+      this.feedRaw(frame, t, capture);
+      return;
+    }
+    const w = frame.visibleRect ? frame.visibleRect.width : frame.codedWidth;
+    const h = frame.visibleRect ? frame.visibleRect.height : frame.codedHeight;
+    const routes = this.frameRoutes;
+    while (routes.length) {
+      const route = routes[0];
+      let detail = '';
+      try {
+        switch (route) {
+          case 'videoframe': {
+            if (!this.gpu || !this.probe || !this.probe.accepts('videoframe', frame)) {
+              this.dropRoute(routes, route, this.gpu ? 'not accepted by WebGPU' : 'CPU detector');
+              continue;
+            }
+            const t0 = performance.now();
+            this.det.feed_video_frame(frame, t, capture);
+            profile.add('feed.upload', performance.now() - t0);
+            break;
+          }
+          case 'yuv':
+            if (!(await this.feedYuv(frame, w, h, t, capture))) {
+              this.dropRoute(routes, route, `frames are ${frame.format || 'opaque'}`);
+              continue;
+            }
+            detail = this.yuvDetail;
+            break;
+          case 'rgba':
+            if (!(await this.feedRgba(frame, w, h, t, capture))) {
+              this.dropRoute(routes, route, 'copyTo cannot convert to RGBA');
+              continue;
+            }
+            break;
+          case 'canvas': {
+            if (!this.gpu) {
+              this.dropRoute(routes, route, 'CPU detector');
+              continue;
+            }
+            const canvas = this.blit(frame, w, h);
+            if (!this.probe || !this.probe.accepts('canvas', canvas)) {
+              this.dropRoute(routes, route, 'not accepted by WebGPU');
+              continue;
+            }
+            const t0 = performance.now();
+            this.det.feed_canvas(canvas, t, capture);
+            profile.add('feed.upload', performance.now() - t0);
+            break;
+          }
+          case 'pixels':
+            this.feedPixels(frame, w, h, t, capture);
+            break;
+          default:
+            this.dropRoute(routes, route, 'unknown route');
+            continue;
+        }
+      } catch (e) {
+        this.dropRoute(routes, route, e && e.message ? e.message : e);
+        continue;
+      }
+      this.setRoute(route, detail);
+      return;
+    }
+    throw new Error('no way to feed pictures to the detector in this browser');
   }
 
   async videoFrame(frame, t, capture = false) {
     await this.waitSlot();
     const t0 = performance.now();
     try {
-      if (this.gpu) {
-        const w = frame.visibleRect ? frame.visibleRect.width : frame.codedWidth;
-        const h = frame.visibleRect ? frame.visibleRect.height : frame.codedHeight;
-        this.feedGpuSource('videoframe', frame, w, h, t, capture);
-      } else {
-        // WebCodecs' own RGBA conversion plus the same box filter the GPU
-        // applies (in WASM); the canvas is the fallback for browsers whose
-        // copyTo cannot convert
-        let fed = false;
-        if (this.rgbaCopy !== false && typeof frame.allocationSize === 'function') {
-          try {
-            const opts = { format: 'RGBA' };
-            const size = frame.allocationSize(opts);
-            if (!this.rgbaBuf || this.rgbaBuf.byteLength < size) this.rgbaBuf = new Uint8Array(size);
-            const layout = await frame.copyTo(this.rgbaBuf, opts);
-            const w = frame.visibleRect ? frame.visibleRect.width : frame.codedWidth;
-            const h = frame.visibleRect ? frame.visibleRect.height : frame.codedHeight;
-            if (layout && layout[0] && layout[0].stride === w * 4) {
-              this.det.feed_rgba(this.rgbaBuf.subarray(0, w * h * 4), w, h, t, capture);
-              fed = true;
-              this.rgbaCopy = true;
-            }
-          } catch (e) {
-            this.rgbaCopy = false;
-          }
-        }
-        if (!fed) {
-          this.ctx.drawImage(frame, 0, 0, this.aw, this.ah);
-          const img = this.ctx.getImageData(0, 0, this.aw, this.ah);
-          this.det.feed_rgba(img.data, this.aw, this.ah, t, capture);
-        }
-      }
+      await this.feedFrame(frame, t, capture);
     } finally {
       frame.close();
     }
-    this.busyNs += (performance.now() - t0) * 1e6;
+    const now = performance.now();
+    profile.add('feed', now - t0);
+    this.busyNs += (now - t0) * 1e6;
     this.fed++;
-    this.det.poll();
+    if (this.gpu) this.submitted.push(now);
+    this.poll();
   }
 
   /** Feed the current picture of a <video> without waiting (the live monitor: the caller checked can_submit). */
   videoElementNow(video, t, capture = false) {
     const t0 = performance.now();
-    if (this.gpu) {
-      this.feedGpuSource('video', video, video.videoWidth, video.videoHeight, t, capture);
-    } else {
-      this.ctx.drawImage(video, 0, 0, this.aw, this.ah);
-      const img = this.ctx.getImageData(0, 0, this.aw, this.ah);
-      this.det.feed_rgba(img.data, this.aw, this.ah, t, capture);
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    const routes = this.videoRoutes;
+    let done = false;
+    while (routes.length && !done) {
+      const route = routes[0];
+      try {
+        switch (route) {
+          case 'video':
+            if (!this.gpu || !this.probe || !this.probe.accepts('video', video)) {
+              this.dropRoute(routes, route, this.gpu ? 'not accepted by WebGPU' : 'CPU detector');
+              continue;
+            }
+            this.det.feed_video_element(video, t, capture);
+            break;
+          case 'canvas': {
+            if (!this.gpu) {
+              this.dropRoute(routes, route, 'CPU detector');
+              continue;
+            }
+            const canvas = this.blit(video, w, h);
+            if (!this.probe || !this.probe.accepts('canvas', canvas)) {
+              this.dropRoute(routes, route, 'not accepted by WebGPU');
+              continue;
+            }
+            this.det.feed_canvas(canvas, t, capture);
+            break;
+          }
+          default:
+            this.feedPixels(video, w, h, t, capture);
+            break;
+        }
+      } catch (e) {
+        this.dropRoute(routes, route, e && e.message ? e.message : e);
+        continue;
+      }
+      this.setRoute(route);
+      done = true;
     }
-    this.busyNs += (performance.now() - t0) * 1e6;
+    if (!done) throw new Error('no way to feed the video to the detector in this browser');
+    const now = performance.now();
+    profile.add('feed', now - t0);
+    this.busyNs += (now - t0) * 1e6;
     this.fed++;
+    if (this.gpu) this.submitted.push(now);
   }
 
   async videoElement(video, t, capture = false) {
     await this.waitSlot();
     this.videoElementNow(video, t, capture);
-    this.det.poll();
+    this.poll();
   }
 
   async cached(cache, index, t) {
     await this.waitSlot();
+    const t0 = performance.now();
     this.det.feed_cached(cache, index, t);
+    profile.add('feed', performance.now() - t0);
     this.fed++;
-    this.det.poll();
+    if (this.gpu) this.submitted.push(performance.now());
+    this.poll();
   }
 
   /** Wait until every submitted frame has been processed. */
   async drain() {
+    const t0 = performance.now();
     while (this.det.pending() > 0) {
-      this.det.poll();
+      this.poll();
       if (this.det.pending() > 0) await tick();
     }
+    profile.add('drain', performance.now() - t0);
   }
 
   records() {
@@ -265,6 +428,7 @@ export class Feeder {
     this.det.reset();
     this.fed = 0;
     this.busyNs = 0;
+    this.submitted.length = 0;
   }
 
   finish(includeStats = false) {

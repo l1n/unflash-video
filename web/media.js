@@ -1,3 +1,4 @@
+import { profile } from './profile.js';
 // Demuxing (through the WASM MP4 parser, served byte ranges from the File)
 // and decoding through WebCodecs.
 
@@ -164,10 +165,12 @@ export class Movie {
 /**
  * Decode every frame with presentation time in [startSec, endSec) and hand
  * each VideoFrame to `onFrame(frame, tSec)` (which must close it). Frames
- * arrive in presentation order.
+ * arrive in presentation order. With `raw`, the built-in decoder's pictures
+ * come as plain I420 buffers (see rawPicture) instead of VideoFrames; with
+ * `fast` it skips the deblocking filter (statistics only).
  */
-export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress } = {}) {
-  if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress });
+export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false } = {}) {
+  if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast });
   const cfg = movie.decoderConfig();
   const reader = new ChunkReader(movie.file);
   const { pts, dts, offset, size, sync, dur } = movie.v;
@@ -202,10 +205,14 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
       if (dts[i] >= endUs && pts[i] >= endUs) break;
       while ((decoder.decodeQueueSize > 12 || queue.length > 6) && !error) {
         await pump();
+        const tw = performance.now();
         await tick();
+        profile.add('decode.wait', performance.now() - tw);
       }
       if (error) break;
+      const tr = performance.now();
       const data = await reader.read(offset[i], size[i]);
+      profile.add('read', performance.now() - tr);
       decoder.decode(new EncodedVideoChunk({ type: sync[i] ? 'key' : 'delta', timestamp: pts[i], duration: dur[i], data }));
       i++;
       if (onProgress && i % 30 === 0) onProgress((i - startIdx) / Math.max(1, n - startIdx));
@@ -213,7 +220,7 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
     }
     if (!error && !(cancel && cancel())) {
       try {
-        await decoder.flush();
+        await profile.timeAsync('decode.flush', () => decoder.flush());
       } catch (e) {
         error = error || e;
       }
@@ -232,21 +239,68 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
 }
 
 /**
- * A VideoFrame (I420, copied out of WebAssembly memory) of the picture the
- * built-in decoder just produced.
+ * The layout words Detector.feed_yuv takes: [format (0 I420, 1 NV12), y_off,
+ * y_stride, u_off, u_stride, v_off, v_stride, matrix (0 BT.601, 1 BT.709),
+ * full_range], from WebCodecs plane layouts and a VideoColorSpace (the
+ * matrix is guessed from the picture height when unknown, as players do).
  */
-export function softwareFrame(wasm, dec, timestampUs) {
+export function yuvLayoutWords(format, planes, colorSpace, height) {
+  const nv12 = format === 'NV12';
+  const cs = colorSpace || {};
+  let bt709;
+  if (cs.matrix === 'bt709' || cs.matrix === 'bt2020-ncl') bt709 = 1;
+  else if (cs.matrix === 'smpte170m' || cs.matrix === 'bt470bg' || cs.matrix === 'fcc') bt709 = 0;
+  else bt709 = height > 576 ? 1 : 0;
+  const u = planes[1];
+  const v = nv12 ? planes[1] : planes[2];
+  return Uint32Array.from([nv12 ? 1 : 0, planes[0].offset, planes[0].stride, u.offset, u.stride, v.offset, v.stride, bt709, cs.fullRange ? 1 : 0]);
+}
+
+/**
+ * A picture as packed I420 planes in memory (from the built-in decoder),
+ * shaped enough like a VideoFrame for the detector's Feeder (`raw` marks
+ * it); toVideoFrame() makes a real one for the encoder or a canvas.
+ */
+export function rawPicture(data, width, height, timestampUs, colorSpace) {
+  const cw = (width + 1) >> 1;
+  const ch = (height + 1) >> 1;
+  const planes = [
+    { offset: 0, stride: width },
+    { offset: width * height, stride: cw },
+    { offset: width * height + cw * ch, stride: cw },
+  ];
+  return {
+    raw: true,
+    format: 'I420',
+    codedWidth: width,
+    codedHeight: height,
+    displayWidth: width,
+    displayHeight: height,
+    timestamp: timestampUs,
+    colorSpace,
+    data,
+    layout: yuvLayoutWords('I420', planes, colorSpace, height),
+    close() {},
+    toVideoFrame() {
+      const init = { format: 'I420', codedWidth: width, codedHeight: height, timestamp: timestampUs };
+      if (colorSpace) init.colorSpace = colorSpace;
+      return new VideoFrame(data, init);
+    },
+  };
+}
+
+/** The picture the built-in decoder just produced, copied out of WebAssembly memory. */
+export function softwarePicture(wasm, dec, timestampUs) {
   const w = dec.width();
   const h = dec.height();
-  const mem = wasm.wasm_memory();
-  const data = new Uint8Array(mem.buffer, dec.frame_ptr(), dec.frame_len());
-  const init = { format: 'I420', codedWidth: w, codedHeight: h, timestamp: timestampUs };
+  const data = new Uint8Array(wasm.wasm_memory().buffer, dec.frame_ptr(), dec.frame_len()).slice();
+  let colorSpace = null;
   try {
-    init.colorSpace = JSON.parse(dec.color_json());
+    colorSpace = JSON.parse(dec.color_json());
   } catch (e) {
     /* default colour space */
   }
-  return new VideoFrame(data, init);
+  return rawPicture(data, w, h, timestampUs, colorSpace);
 }
 
 /**
@@ -254,7 +308,7 @@ export function softwareFrame(wasm, dec, timestampUs) {
  * Samples are decoded in file (decode) order and the pictures handed out in
  * presentation order once every earlier picture has been decoded.
  */
-async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress } = {}) {
+async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false } = {}) {
   const reader = new ChunkReader(movie.file);
   const { pts, dts, offset, size } = movie.v;
   const n = pts.length;
@@ -264,9 +318,9 @@ async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, o
   if (pool && !pool.busy) {
     let endIdx = startIdx;
     while (endIdx < n && !(dts[endIdx] >= endUs && pts[endIdx] >= endUs)) endIdx++;
-    return pool.decodeRange(startIdx, endIdx, startSec, endSec, onFrame, { cancel, onProgress });
+    return pool.decodeRange(startIdx, endIdx, startSec, endSec, onFrame, { cancel, onProgress, raw, fast });
   }
-  const dec = new movie.wasm.H264Decoder(movie.dx.track_description(movie.video.index));
+  const dec = new movie.wasm.H264Decoder(movie.dx.track_description(movie.video.index), fast);
   // presentation order of the samples this pass will decode
   const ptsSorted = [];
   for (let i = startIdx; i < n; i++) {
@@ -274,21 +328,18 @@ async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, o
     ptsSorted.push(pts[i]);
   }
   ptsSorted.sort((a, b) => a - b);
-  const ready = new Map(); // pts -> VideoFrame
+  const ready = new Map(); // pts -> picture (rawPicture)
   let next = 0;
   let frames = 0;
   let damaged = 0;
   const release = async () => {
     while (next < ptsSorted.length && ready.has(ptsSorted[next])) {
-      const f = ready.get(ptsSorted[next]);
+      const pic = ready.get(ptsSorted[next]);
       ready.delete(ptsSorted[next]);
       next++;
-      const t = f.timestamp / 1e6;
-      if (t < startSec - 1e-6 || t >= endSec - 1e-9) {
-        f.close();
-        continue;
-      }
-      await onFrame(f, t);
+      const t = pic.timestamp / 1e6;
+      if (t < startSec - 1e-6 || t >= endSec - 1e-9) continue;
+      await onFrame(raw ? pic : pic.toVideoFrame(), t);
       frames++;
     }
   };
@@ -298,15 +349,17 @@ async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, o
       if (dts[i] >= endUs && pts[i] >= endUs) break;
       const data = await reader.read(offset[i], size[i]);
       let got = false;
+      const td = performance.now();
       try {
         got = dec.decode(data, pts[i] / 1e6);
       } catch (e) {
         console.warn('built-in H.264 decoder:', e);
         damaged++;
       }
+      profile.add('sw.decode', performance.now() - td);
       if (got) {
         if (dec.frame_damaged()) damaged++;
-        ready.set(pts[i], softwareFrame(movie.wasm, dec, pts[i]));
+        ready.set(pts[i], softwarePicture(movie.wasm, dec, pts[i]));
       } else {
         // no picture for this sample: do not wait for it
         const k = ptsSorted.indexOf(pts[i]);
@@ -319,7 +372,6 @@ async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, o
     }
     await release();
   } finally {
-    for (const f of ready.values()) f.close();
     dec.free();
   }
   if (damaged) console.warn(`built-in H.264 decoder: ${damaged} damaged pictures`);

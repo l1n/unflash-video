@@ -85,7 +85,7 @@ window.runDecodeBench = async (url) => {
   const movie = await Movie.open(file, wasm);
   const desc = movie.dx.track_description(movie.video.index);
   const info = JSON.parse(wasm.h264_probe(desc));
-  const dec = new wasm.H264Decoder(desc);
+  const dec = new wasm.H264Decoder(desc, new URLSearchParams(location.search).has('fast'));
   const reader = new ChunkReader(file);
   const { pts, offset, size } = movie.v;
   const n = pts.length;

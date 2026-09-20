@@ -9,8 +9,11 @@
 // references); {type:'credit', n} after consuming n pictures (the worker
 // holds at most `window` unconsumed pictures); {type:'cancel'}.
 // Worker -> main: {type:'ready'} | {type:'error', message} |
-// {type:'frame', id, frame} (a transferred VideoFrame) |
-// {type:'done', id, emitted, damaged}.
+// {type:'frame', id, pic} (a transferred I420 picture record: data, width,
+// height, timestamp, colorSpace) | {type:'done', id, emitted, damaged,
+// decodeMs, decoded}.
+import { rawPicture } from './media.js';
+import { profile } from './profile.js';
 
 /** How many decoder workers to run: leave a core for the page itself. */
 export function defaultWorkerCount() {
@@ -120,7 +123,7 @@ export class SoftwarePool {
     return Math.max(4, Math.min(256, Math.floor(budget / Math.max(1, this.workers.length) / frameBytes)));
   }
 
-  async decodeRange(startIdx, endIdx, startSec, endSec, onFrame, { cancel, onProgress, window } = {}) {
+  async decodeRange(startIdx, endIdx, startSec, endSec, onFrame, { cancel, onProgress, window, raw = false, fast = false } = {}) {
     if (this.busy) throw new Error('the decoder pool is busy');
     this.busy = true;
     if (!window) window = this.window();
@@ -144,15 +147,16 @@ export class SoftwarePool {
       const g = groups[k];
       out[k].worker = w;
       inflight++;
-      w.postMessage({ type: 'decode', id: k, file: this.movie.file, offset: offset.slice(g.a, g.ext), size: size.slice(g.a, g.ext), pts: pts.slice(g.a, g.ext), minPts: g.minPts, maxPts: g.maxPts });
+      w.postMessage({ type: 'decode', id: k, file: this.movie.file, offset: offset.slice(g.a, g.ext), size: size.slice(g.a, g.ext), pts: pts.slice(g.a, g.ext), minPts: g.minPts, maxPts: g.maxPts, fast: !!fast });
     };
     const handlers = this.workers.map((w) => {
       const h = (e) => {
         const m = e.data;
-        if (m.type === 'frame') out[m.id].queue.push(m.frame);
+        if (m.type === 'frame') out[m.id].queue.push(rawPicture(m.pic.data, m.pic.width, m.pic.height, m.pic.timestamp, m.pic.colorSpace));
         else if (m.type === 'done') {
           out[m.id].done = true;
           out[m.id].damaged = m.damaged;
+          if (m.decoded) profile.add('sw.decode', m.decodeMs, m.decoded);
           if (m.error) console.warn('built-in H.264 decoder:', m.error);
           inflight--;
           assign(w);
@@ -176,16 +180,19 @@ export class SoftwarePool {
             break;
           }
           if (o.queue.length) {
-            const f = o.queue.shift();
-            const t = f.timestamp / 1e6;
-            if (t < startSec - 1e-6 || t >= endSec - 1e-9) f.close();
-            else {
-              await onFrame(f, t);
+            const pic = o.queue.shift();
+            const t = pic.timestamp / 1e6;
+            if (t >= startSec - 1e-6 && t < endSec - 1e-9) {
+              await onFrame(raw ? pic : pic.toVideoFrame(), t);
               frames++;
             }
             o.worker.postMessage({ type: 'credit', n: 1 });
           } else if (o.done) break;
-          else await wait();
+          else {
+            const tw = performance.now();
+            await wait();
+            profile.add('sw.wait', performance.now() - tw);
+          }
         }
         if (stopped) break;
         damaged += o.damaged;
@@ -196,7 +203,7 @@ export class SoftwarePool {
       nextJob = groups.length;
       for (const w of this.workers) w.postMessage({ type: 'cancel' });
       while (inflight > 0) await wait();
-      for (const o of out) for (const f of o.queue) f.close();
+      for (const o of out) o.queue.length = 0;
       this.workers.forEach((w, i) => w.removeEventListener('message', handlers[i]));
       // credits granted but unused must not carry over
       this.busy = false;

@@ -624,6 +624,8 @@ pub struct Detector {
     captures: BTreeMap<usize, Vec<u8>>,
     /// capture flags of frames submitted to the GPU, in order
     pending_capture: std::collections::VecDeque<bool>,
+    /// RGBA conversion buffer of the CPU detector's YUV input
+    yuv_scratch: Vec<u8>,
 }
 
 #[wasm_bindgen]
@@ -634,7 +636,7 @@ impl Detector {
         let cfg = parse_cfg(config_json)?;
         let det = CoreDetector::for_source(cfg.clone(), src_width, src_height);
         let stage = CpuStage::new(&cfg, det.geometry().clone());
-        Ok(Detector { det, stage: Stage::Cpu(stage), records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default() })
+        Ok(Detector { det, stage: Stage::Cpu(stage), records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default(), yuv_scratch: Vec::new() })
     }
 
     /// WebGPU detector; resolves to a `Detector` or rejects when there is no
@@ -646,7 +648,7 @@ impl Detector {
             let ctx = GpuContext::new().await.map_err(js_err)?;
             let det = CoreDetector::for_source(cfg.clone(), src_width, src_height);
             let stage = GpuStage::new(&ctx, &cfg, det.geometry().clone()).map_err(js_err)?;
-            let d = Detector { det, stage: Stage::Gpu(Box::new(stage)), records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default() };
+            let d = Detector { det, stage: Stage::Gpu(Box::new(stage)), records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default(), yuv_scratch: Vec::new() };
             Ok(JsValue::from(d))
         })
     }
@@ -741,6 +743,33 @@ impl Detector {
                 Ok(())
             }
         }
+    }
+
+    /// Feed 8-bit 4:2:0 planes (I420 or NV12) of any size, as WebCodecs'
+    /// `VideoFrame.copyTo` and the built-in decoder lay them out. `layout`
+    /// is [format (0 I420, 1 NV12), y_off, y_stride, u_off, u_stride, v_off,
+    /// v_stride, matrix (0 BT.601, 1 BT.709), full_range]. The GPU converts
+    /// to RGB in a shader; the CPU detector converts in WASM.
+    pub fn feed_yuv(&mut self, data: &[u8], width: u32, height: u32, layout: &[u32], t: f64, capture: bool) -> Result<(), JsValue> {
+        let layout = unflash_core::yuv::YuvLayout::from_words(layout).ok_or_else(|| js_err("bad picture layout"))?;
+        if width == 0 || height == 0 || !layout.fits(data.len(), width as usize, height as usize) {
+            return Err(js_err("picture data too short for its layout"));
+        }
+        if matches!(self.stage, Stage::Cpu(_)) {
+            let mut rgba = std::mem::take(&mut self.yuv_scratch);
+            unflash_core::yuv::to_rgba(data, width as usize, height as usize, &layout, &mut rgba);
+            let r = self.feed_rgba(&rgba, width, height, t, capture);
+            self.yuv_scratch = rgba;
+            return r;
+        }
+        let Stage::Gpu(stage) = &mut self.stage else { unreachable!() };
+        if !stage.can_submit() {
+            return Err(js_err("detector busy: poll() before submitting more frames"));
+        }
+        let params = self.det.begin_frame(t);
+        stage.submit(params, GpuSource::Yuv420 { data, width, height, layout }, capture).map_err(js_err)?;
+        self.pending_capture.push_back(capture);
+        Ok(())
     }
 
     /// Feed frame `index` of a [`FrameCache`] (already at analysis
@@ -960,9 +989,13 @@ pub struct H264Decoder {
 
 #[wasm_bindgen]
 impl H264Decoder {
+    /// `fast` leaves the deblocking filter out (about a quarter of the
+    /// decoding time): pictures good for statistics, not for showing or
+    /// re-encoding.
     #[wasm_bindgen(constructor)]
-    pub fn new(avcc: &[u8]) -> Result<H264Decoder, JsValue> {
+    pub fn new(avcc: &[u8], fast: bool) -> Result<H264Decoder, JsValue> {
         let mut inner = unflash_h264::Decoder::new();
+        inner.set_skip_deblock(fast);
         inner.configure_avcc(avcc).map_err(js_err)?;
         let (width, height) = inner.first_sps().map(|s| s.cropped_size()).ok_or_else(|| js_err("no sequence parameter set in the file"))?;
         let color = color_space_json(inner.first_sps().unwrap());

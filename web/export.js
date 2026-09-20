@@ -3,6 +3,7 @@
 // from the source without re-encoding.
 
 import { decodeRange, ChunkReader, tick } from './media.js';
+import { profile } from './profile.js';
 import { shownPts, softenPlan } from './analysis.js';
 
 function avcLevel(w, h, fps) {
@@ -177,6 +178,7 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
   const total = movie.frameCount;
   let seen = 0;
   const started = performance.now();
+  profile.reset();
   const enterSection = (p) => ({ p, ordinal: 0, next: 0, frames: new Map(), need: new Map(p.needCount) });
   const flushSection = async (st) => {
     const { p } = st;
@@ -272,6 +274,7 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
   await out.write(moov);
   const blob = await out.close();
   mx.free();
+  profile.report(`export (${chosen.label})`, outFrames, performance.now() - started);
   return { blob, warnings, frames: outFrames, softened, elapsedMs: performance.now() - started, codec: codecString, encoderLabel: chosen.label };
 }
 

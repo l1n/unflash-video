@@ -64,6 +64,8 @@ pub struct Decoder {
     retired: Vec<Rc<Picture>>,
     mbs_buf: Vec<MbInfo>,
     deblock_buf: Vec<MbDeblockInfo>,
+    /// leave the deblocking filter out (see `set_skip_deblock`)
+    skip_deblock: bool,
 }
 
 impl Default for Decoder {
@@ -89,7 +91,17 @@ impl Decoder {
             retired: Vec::new(),
             mbs_buf: Vec::new(),
             deblock_buf: Vec::new(),
+            skip_deblock: std::env::var_os("H264_NO_DEBLOCK").is_some(),
         }
+    }
+
+    /// Skip the in-loop deblocking filter: about a quarter of the decoding
+    /// time. The pictures are no longer bit-exact (block edges keep their
+    /// coding artefacts, and later pictures predicted from them drift very
+    /// slightly), which is fine for statistics such as flash detection but
+    /// not for pictures that are shown or re-encoded.
+    pub fn set_skip_deblock(&mut self, skip: bool) {
+        self.skip_deblock = skip;
     }
 
     /// Feed an `AVCDecoderConfigurationRecord` (the `avcC` box payload):
@@ -404,7 +416,7 @@ impl Decoder {
             cur.damaged = true;
             self.conceal(&mut cur, wm, hm);
         }
-        if std::env::var_os("H264_NO_DEBLOCK").is_none() {
+        if !self.skip_deblock {
             deblock::filter_picture(&mut cur.pic, &cur.deblock, wm, hm, cur.structure);
         }
         self.last_kinds = cur.mbs.iter().map(|m| if m.slice != 0 { m.kind } else { crate::mb::MbKind::None }).collect();

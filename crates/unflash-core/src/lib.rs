@@ -37,6 +37,7 @@ pub mod sections;
 pub mod temporal;
 pub mod time;
 pub mod timeline;
+pub mod yuv;
 
 #[cfg(feature = "simd")]
 pub mod pixel_simd;

@@ -4,6 +4,7 @@ import init, * as wasm from './pkg/unflash.js';
 import { defaultWorkerCount } from './h264pool.js';
 import { Movie, tick } from './media.js';
 import { createDetector } from './detector.js';
+import { profile } from './profile.js';
 import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, shownPts, softenPlan } from './analysis.js';
 import { Project, projectKey } from './project.js';
 import { exportMovie, encoderCandidates, pickSaveSink } from './export.js';
@@ -111,6 +112,11 @@ function externalSourcesSetting() {
   const v = new URLSearchParams(location.search).get('extsrc');
   if (v === null) return null;
   return v === 'none' ? [] : v.split(',');
+}
+
+/** `?route=yuv` (videoframe, yuv, rgba, canvas or pixels) forces one way of feeding pictures to the detector. */
+function routeSetting() {
+  return new URLSearchParams(location.search).get('route');
 }
 
 // ---- boot ---------------------------------------------------------------------
@@ -235,9 +241,10 @@ async function createFeeders(progress) {
   if (state.liveFeeder) state.liveFeeder.det.free();
   const preferGpu = preferGpuSetting();
   const externalSources = externalSourcesSetting();
-  const feeder = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu, externalSources });
+  const route = routeSetting();
+  const feeder = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu, externalSources, route });
   state.env = { wasm, config: state.config, feeder };
-  const live = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu, externalSources });
+  const live = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu, externalSources, route });
   state.liveFeeder = live;
   if (feeder.note) banner(feeder.note, 'info');
   if (progress) progress(0.8, `${feeder.backend} detector at ${feeder.aw}×${feeder.ah}`);
@@ -360,7 +367,7 @@ function startLiveLoop() {
       return;
     }
     const det = feeder.det;
-    det.poll();
+    feeder.poll();
     if (det.can_submit()) {
       try {
         feeder.videoElementNow(player, meta.mediaTime, false);
@@ -382,7 +389,8 @@ function drainLive() {
   const feeder = state.liveFeeder;
   if (!feeder || !state.live.on) return;
   const det = feeder.det;
-  det.poll();
+  feeder.poll();
+  profile.reportEvery(5000, `live monitor (${feeder.fed} pictures watched)`, 0, 0);
   const recs = feeder.records();
   if (!recs.length) return;
   const thresh = det.area_thresh();
@@ -1266,7 +1274,7 @@ async function verifyExport() {
   $('exportModal').classList.add('hidden');
   const res = await runJob('Verifying the exported file', async (progress, cancelled) => {
     const m = await Movie.open(state.exportBlob, wasm);
-    const feeder = await createDetector(wasm, state.config, m.width, m.height, { preferGpu: preferGpuSetting(), externalSources: externalSourcesSetting() });
+    const feeder = await createDetector(wasm, state.config, m.width, m.height, { preferGpu: preferGpuSetting(), externalSources: externalSourcesSetting(), route: routeSetting() });
     try {
       return await scanMovie({ wasm, config: state.config, feeder }, m, { cancel: cancelled, onProgress: (p, _t, count, ms) => progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`) });
     } finally {
@@ -1299,6 +1307,7 @@ window.__unflash = {
   currentSection,
   softenPlan,
   openClip,
+  profile,
 };
 
 boot().catch((e) => {

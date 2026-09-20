@@ -109,6 +109,26 @@ Pages build regenerates them; for a local copy run
 `?cpu=1` in the URL forces the CPU detector (for comparison);
 `web/bench.html` measures both on your machine.
 
+### Diagnostics
+
+The console reports, at **debug level** (enable "Debug" / "Verbose" messages
+in the devtools console), how long each operation takes: decoder waits, file
+reads, `copyTo`, canvas blits, uploads to the detector, the GPU's
+submit-to-result latency, polling, the built-in decoder's time per picture.
+A summary is printed every 5 s during a scan and at the end of every scan,
+section prepare, export and verify; `window.__unflash.profile.summary()`
+gives the same text at any moment. The first line of each report names the
+route pictures take to the detector.
+
+Pictures reach the GPU detector by the first route that works in the
+browser: the `VideoFrame` itself (Chrome, Safari); its own YUV planes
+(`copyTo` of I420 / NV12, converted to RGB on the GPU: what Firefox needs,
+since its WebGPU takes no `VideoFrame` or `<video>` as a copy source, and
+what the built-in decoder hands over directly); WebCodecs' RGBA conversion;
+a canvas blit; or canvas pixels. `?route=videoframe|yuv|rgba|canvas|pixels`
+forces one, `?extsrc=canvas` (or `none`) pretends WebGPU accepts only those
+copy sources, `?workers=N` sets the number of built-in decoder workers.
+
 ## How it works
 
 ```
@@ -177,13 +197,26 @@ It is written to the standard and tested bit-exact against ffmpeg's
 decoder on x264 streams that exercise those tools
 (`crates/unflash-h264/tests`, media in `tests/media/h264`). Pictures come
 back in decode order with the container's timestamps; `web/media.js`
-re-orders them for presentation and wraps them as `VideoFrame`s, so the
-rest of the app (scan, sections, export, verify) does not know which
-decoder it is on. It is single-threaded and unoptimised: about 250 fps at
-640×360 and 30 fps at 1080p natively, a few times slower in WebAssembly,
-which is still well above real time for the analysis but slower than a
-hardware decoder. The player itself still cannot play such a file, so the
-live monitor is off for it.
+re-orders them for presentation, so the rest of the app (scan, sections,
+export, verify) does not know which decoder it is on. Scans and section
+prepares take the pictures as I420 planes straight into the detector (no
+`VideoFrame` in between); the export, which re-encodes them, gets real
+`VideoFrame`s.
+
+The decoding runs in parallel Web Workers (`web/h264pool.js`, one group of
+pictures per worker, split at sync samples) and, for statistics, in a
+**fast mode** that leaves out the in-loop deblocking filter: about a quarter
+of the decoding time. A full reconstruction is still needed (H.264 predicts
+every macroblock from its neighbours and from earlier pictures, so there is
+no DC-only or low-resolution shortcut as for MPEG-2), but the filter only
+touches block edges: measured on a 1080p clip, at the 256×144 analysis
+resolution 99.7 % of the cells differ by at most one luma code from the
+full decode and the mean difference is 0.07 codes, far below anything the
+flash thresholds react to. The export uses the full decode. Natively the
+decoder does about 55 fps at 1080p (70 fast); in WebAssembly about 40 fps
+single-threaded and 90 fps with four workers, well above real time for the
+analysis but slower than a hardware decoder. The player itself still cannot
+play such a file, so the live monitor is off for it.
 
 The **temporal stage** (`crates/unflash-core/src/temporal.rs`) is the rest
 of the reference `FlashDetector`, unchanged in logic: the window-mean

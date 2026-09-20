@@ -1,7 +1,8 @@
 // A Web Worker running the built-in H.264 decoder over one group of
-// pictures at a time (see h264pool.js for the protocol).
+// pictures at a time (see h264pool.js for the protocol). Pictures leave as
+// plain I420 buffers (transferred, not copied).
 import init, * as wasm from './pkg/unflash.js';
-import { ChunkReader, softwareFrame } from './media.js';
+import { ChunkReader } from './media.js';
 
 const ready = init();
 let desc = null;
@@ -17,35 +18,48 @@ const wake = () => {
   }
 };
 
+/** The picture the decoder just produced, copied out of WASM memory as a transferable record. */
+function picture(dec, timestamp) {
+  const width = dec.width();
+  const height = dec.height();
+  const data = new Uint8Array(wasm.wasm_memory().buffer, dec.frame_ptr(), dec.frame_len()).slice();
+  let colorSpace = null;
+  try {
+    colorSpace = JSON.parse(dec.color_json());
+  } catch (e) {
+    /* default colour space */
+  }
+  return { data, width, height, timestamp, colorSpace };
+}
+
 async function run(job) {
-  const { id, file, offset, size, pts, minPts, maxPts } = job;
+  const { id, file, offset, size, pts, minPts, maxPts, fast } = job;
   cancelled = false;
   const reader = new ChunkReader(file);
   let dec;
   try {
-    dec = new wasm.H264Decoder(desc);
+    dec = new wasm.H264Decoder(desc, !!fast);
   } catch (e) {
-    postMessage({ type: 'done', id, emitted: 0, damaged: pts.length, error: String(e && e.message ? e.message : e) });
+    postMessage({ type: 'done', id, emitted: 0, damaged: pts.length, decodeMs: 0, decoded: 0, error: String(e && e.message ? e.message : e) });
     return;
   }
   // presentation order of the pictures this job emits
   const order = Array.from(pts).filter((p) => p >= minPts && p < maxPts).sort((a, b) => a - b);
-  const pictures = new Map(); // pts -> VideoFrame
+  const pictures = new Map(); // pts -> picture record
   let next = 0;
   let emitted = 0;
   let damaged = 0;
+  let decodeMs = 0;
+  let decoded = 0;
   const release = async () => {
     while (next < order.length && pictures.has(order[next])) {
-      const f = pictures.get(order[next]);
+      const pic = pictures.get(order[next]);
       pictures.delete(order[next]);
       next++;
       while (credits <= 0 && !cancelled) await wait();
-      if (cancelled) {
-        f.close();
-        continue;
-      }
+      if (cancelled) continue;
       credits--;
-      postMessage({ type: 'frame', id, frame: f }, [f]);
+      postMessage({ type: 'frame', id, pic }, [pic.data.buffer]);
       emitted++;
     }
   };
@@ -53,14 +67,17 @@ async function run(job) {
     for (let i = 0; i < pts.length && !cancelled; i++) {
       const data = await reader.read(offset[i], size[i]);
       let got = false;
+      const t0 = performance.now();
       try {
         got = dec.decode(data, pts[i] / 1e6);
       } catch (e) {
         damaged++;
       }
+      decodeMs += performance.now() - t0;
+      decoded++;
       if (got) {
         if (dec.frame_damaged()) damaged++;
-        if (pts[i] >= minPts && pts[i] < maxPts) pictures.set(pts[i], softwareFrame(wasm, dec, pts[i]));
+        if (pts[i] >= minPts && pts[i] < maxPts) pictures.set(pts[i], picture(dec, pts[i]));
       } else {
         // no picture for this sample: do not wait for it
         const k = order.indexOf(pts[i]);
@@ -69,10 +86,9 @@ async function run(job) {
       await release();
     }
   } finally {
-    for (const f of pictures.values()) f.close();
     dec.free();
   }
-  postMessage({ type: 'done', id, emitted, damaged });
+  postMessage({ type: 'done', id, emitted, damaged, decodeMs, decoded });
 }
 
 self.onmessage = async (e) => {
@@ -82,7 +98,7 @@ self.onmessage = async (e) => {
       try {
         await ready;
         desc = m.desc;
-        new wasm.H264Decoder(desc).free();
+        new wasm.H264Decoder(desc, false).free();
         postMessage({ type: 'ready' });
       } catch (err) {
         postMessage({ type: 'error', message: String(err && err.message ? err.message : err) });

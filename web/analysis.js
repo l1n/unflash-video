@@ -3,11 +3,13 @@
 // WASM detector over WebCodecs frames or cached section frames.
 
 import { decodeRange, tick } from './media.js';
+import { profile } from './profile.js';
 
 /** Whole-video scan. Returns { result, sections, summary, trace }. */
 export async function scanMovie(env, movie, { onProgress, cancel } = {}) {
   const { wasm, config, feeder } = env;
   feeder.reset();
+  profile.reset();
   const trace = { t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] };
   const collect = () => {
     for (const r of feeder.records()) {
@@ -30,13 +32,15 @@ export async function scanMovie(env, movie, { onProgress, cancel } = {}) {
       if (++count % 30 === 0) {
         collect();
         if (onProgress) onProgress(count / Math.max(1, movie.frameCount), trace, count, performance.now() - started);
+        profile.reportEvery(5000, 'scan so far', count, performance.now() - started);
       }
     },
-    { cancel }
+    { cancel, raw: true, fast: true }
   );
   await feeder.drain();
   collect();
   const elapsed = performance.now() - started;
+  profile.report(`scan of ${(movie.file && movie.file.name) || 'the file'} (${movie.width}×${movie.height}, ${feeder.backend})`, count, elapsed);
   const result = feeder.finish(false);
   const vjson = JSON.stringify(result.violations);
   // no keyframe snapping: the export re-encodes, so sections can follow the
@@ -87,6 +91,8 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel } = {
     }
   };
   let count = 0;
+  profile.reset();
+  const prepStarted = performance.now();
   await decodeRange(
     movie,
     leadFrom,
@@ -99,10 +105,11 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel } = {
         if (onProgress) onProgress(count);
       }
     },
-    { cancel }
+    { cancel, raw: true, fast: true }
   );
   await feeder.drain();
   settle();
+  profile.report(`section prepare (${count} frames with captures)`, count, performance.now() - prepStarted);
   if (cache.len() === 0) throw new Error('Section decoded zero frames');
   // the section works on a sanitised timeline (timestamp anomalies bridged)
   const san = JSON.parse(wasm.sanitize_deltas(Float64Array.from(rawPts), JSON.parse(config).max_frame_gap));

@@ -31,11 +31,13 @@ use unflash_core::config::DetectorConfig;
 use unflash_core::grid::{GridCell, GridGeometry, GridStats};
 use unflash_core::lut::lut;
 use unflash_core::pixel::{KernelParams, StateLayout, MODE_FIRST};
+use unflash_core::yuv::YuvLayout;
 
 pub use wgpu;
 
 const PRELUDE: &str = include_str!("shaders/prelude.wgsl");
 const INGEST: &str = include_str!("shaders/ingest.wgsl");
+const YUV: &str = include_str!("shaders/yuv.wgsl");
 const PATTERN: &str = include_str!("shaders/pattern.wgsl");
 const UPDATE: &str = include_str!("shaders/update.wgsl");
 const ROWS: &str = include_str!("shaders/rows.wgsl");
@@ -92,6 +94,9 @@ pub enum FrameSource<'a> {
     Rgb8 { data: &'a [u8], width: u32, height: u32 },
     /// 8-bit sRGB pixels with an ignored fourth byte.
     Rgba8 { data: &'a [u8], width: u32, height: u32 },
+    /// 8-bit 4:2:0 YCbCr planes (I420 or NV12) of any size, converted to RGB
+    /// on the GPU.
+    Yuv420 { data: &'a [u8], width: u32, height: u32, layout: YuvLayout },
     /// The stage's own source texture, which the caller has already filled
     /// (see [`GpuStage::source_texture`]) — the browser path.
     SourceTexture,
@@ -150,6 +155,11 @@ pub struct GpuStage {
     // source texture
     src: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
     rgba_scratch: Vec<u8>,
+    // YUV sources: the plane textures and the conversion pass into `src`
+    yuv_bgl: wgpu::BindGroupLayout,
+    yuv_pipe: wgpu::ComputePipeline,
+    yuv_params_buf: wgpu::Buffer,
+    yuv: Option<YuvPlanes>,
     // pipelines
     ingest_bgl: wgpu::BindGroupLayout,
     ingest_pipe: wgpu::ComputePipeline,
@@ -191,6 +201,29 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
             has_dynamic_offset: false,
             min_binding_size: None,
         },
+        count: None,
+    }
+}
+
+/// The plane textures of a YUV source at one size, and the bind group of
+/// the conversion pass writing them into the source texture.
+struct YuvPlanes {
+    y: wgpu::Texture,
+    /// Cb (I420) or interleaved CbCr (NV12)
+    c: wgpu::Texture,
+    /// Cr (I420 only)
+    c2: Option<wgpu::Texture>,
+    width: u32,
+    height: u32,
+    nv12: bool,
+    bg: wgpu::BindGroup,
+}
+
+fn storage_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba8Unorm, view_dimension: wgpu::TextureViewDimension::D2 },
         count: None,
     }
 }
@@ -286,6 +319,7 @@ impl GpuStage {
             device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)) })
         };
         let ingest_mod = module("ingest", assemble(INGEST));
+        let yuv_mod = module("yuv", assemble(YUV));
         let pattern_mod = module("pattern", assemble(PATTERN));
         let update_mod = module("update", assemble(UPDATE));
         let rows_mod = module("rows", assemble(ROWS));
@@ -308,6 +342,7 @@ impl GpuStage {
                 storage_entry(8, false),
             ],
         );
+        let yuv_bgl = bgl("yuv", &[uniform_entry(0), texture_entry(1), texture_entry(2), texture_entry(3), storage_texture_entry(4)]);
         let pattern_bgl = bgl("pattern", &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, false), storage_entry(4, false)]);
         let update_bgl = bgl("update", &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false), storage_entry(3, false), storage_entry(4, true)]);
         let rows_bgl = bgl(
@@ -331,6 +366,8 @@ impl GpuStage {
             })
         };
         let ingest_pipe = pipe("ingest", &ingest_bgl, &ingest_mod);
+        let yuv_pipe = pipe("yuv", &yuv_bgl, &yuv_mod);
+        let yuv_params_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("yuv params"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let pattern_pipe = pipe("pattern", &pattern_bgl, &pattern_mod);
         let update_pipe = pipe("update", &update_bgl, &update_mod);
         let rows_pipe = pipe("rows", &rows_bgl, &rows_mod);
@@ -412,6 +449,10 @@ impl GpuStage {
             pat_threads,
             src: None,
             rgba_scratch: Vec::new(),
+            yuv_bgl,
+            yuv_pipe,
+            yuv_params_buf,
+            yuv: None,
             ingest_bgl,
             ingest_pipe,
             ingest_bg: None,
@@ -480,10 +521,12 @@ impl GpuStage {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::STORAGE_BINDING,
                 view_formats: &[],
             });
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            // the conversion pass writes into this texture: rebind it
+            self.yuv = None;
             self.ingest_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ingest"),
                 layout: &self.ingest_bgl,
@@ -515,6 +558,7 @@ impl GpuStage {
         let Some(slot_idx) = self.free.pop() else {
             return Err("all readback slots are in flight".into());
         };
+        let mut yuv_pass = false;
         // 1. source
         match source {
             FrameSource::Rgb8 { data, width, height } => {
@@ -546,6 +590,35 @@ impl GpuStage {
                     return Err("no source texture has been created".into());
                 }
             }
+            FrameSource::Yuv420 { data, width, height, layout } => {
+                if width == 0 || height == 0 || !layout.fits(data.len(), width as usize, height as usize) {
+                    self.free.push(slot_idx);
+                    return Err("picture data too short for its layout".into());
+                }
+                self.source_texture(width, height);
+                self.yuv_planes(width, height, layout.nv12);
+                let k = layout.coefficients();
+                let mut p = [0u32; 12];
+                p[0] = width;
+                p[1] = height;
+                p[2] = layout.nv12 as u32;
+                p[3] = layout.full_range as u32;
+                for i in 0..5 {
+                    p[4 + i] = (k[i] as f32 / 65536.0).to_bits();
+                }
+                p[9] = (k[5] as f32).to_bits();
+                self.queue.write_buffer(&self.yuv_params_buf, 0, cast_slice(&p));
+                let planes = self.yuv.as_ref().unwrap();
+                let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+                self.write_plane(&planes.y, &data[layout.y_off..], layout.y_stride as u32, width, height, 1);
+                if layout.nv12 {
+                    self.write_plane(&planes.c, &data[layout.u_off..], layout.u_stride as u32, cw, ch, 2);
+                } else {
+                    self.write_plane(&planes.c, &data[layout.u_off..], layout.u_stride as u32, cw, ch, 1);
+                    self.write_plane(planes.c2.as_ref().unwrap(), &data[layout.v_off..], layout.v_stride as u32, cw, ch, 1);
+                }
+                yuv_pass = true;
+            }
         }
         // 2. params
         self.queue.write_buffer(&self.params_buf, 0, bytes_of(&params));
@@ -553,6 +626,12 @@ impl GpuStage {
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("unflash frame") });
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("detector"), timestamp_writes: None });
+            if yuv_pass {
+                let p = self.yuv.as_ref().unwrap();
+                pass.set_pipeline(&self.yuv_pipe);
+                pass.set_bind_group(0, &p.bg, &[]);
+                pass.dispatch_workgroups(p.width.div_ceil(16), p.height.div_ceil(16), 1);
+            }
             pass.set_pipeline(&self.ingest_pipe);
             pass.set_bind_group(0, self.ingest_bg.as_ref().unwrap(), &[]);
             pass.dispatch_workgroups(self.geom.aw.div_ceil(16), self.geom.ah.div_ceil(16), 1);
@@ -608,6 +687,63 @@ impl GpuStage {
         self.in_flight.push_back(slot_idx);
         self.frames_submitted += 1;
         Ok(())
+    }
+
+    /// The plane textures for a YUV source of this size and kind, (re)created
+    /// as needed together with the conversion pass's bind group (which also
+    /// holds the source texture, so call `source_texture` first).
+    fn yuv_planes(&mut self, width: u32, height: u32, nv12: bool) {
+        let needs = match &self.yuv {
+            Some(p) => p.width != width || p.height != height || p.nv12 != nv12,
+            None => true,
+        };
+        if !needs {
+            return;
+        }
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        let mk = |label: &str, w: u32, h: u32, format: wgpu::TextureFormat| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let y = mk("yuv y", width, height, wgpu::TextureFormat::R8Unorm);
+        let c = mk("yuv c", cw, ch, if nv12 { wgpu::TextureFormat::Rg8Unorm } else { wgpu::TextureFormat::R8Unorm });
+        let c2 = (!nv12).then(|| mk("yuv v", cw, ch, wgpu::TextureFormat::R8Unorm));
+        let yv = y.create_view(&wgpu::TextureViewDescriptor::default());
+        let cv = c.create_view(&wgpu::TextureViewDescriptor::default());
+        let c2v = c2.as_ref().map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
+        let dst = &self.src.as_ref().expect("source texture before the planes").1;
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("yuv"),
+            layout: &self.yuv_bgl,
+            entries: &[
+                buf_entry(0, &self.yuv_params_buf),
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&yv) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&cv) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(c2v.as_ref().unwrap_or(&cv)) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(dst) },
+            ],
+        });
+        self.yuv = Some(YuvPlanes { y, c, c2, width, height, nv12, bg });
+    }
+
+    /// Upload one plane; rows are `stride` bytes apart (the last row may be
+    /// shorter than the stride).
+    fn write_plane(&self, tex: &wgpu::Texture, data: &[u8], stride: u32, width: u32, height: u32, bpp: u32) {
+        let needed = ((height - 1) * stride + width * bpp) as usize;
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &data[..needed],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride), rows_per_image: None },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
     }
 
     fn write_source(&self, tex: &wgpu::Texture, rgba: &[u8], width: u32, height: u32) {
