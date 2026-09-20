@@ -25,6 +25,7 @@ if (process.env.SMOKE_VERBOSE) page.on('console', (m) => console.log('[browser]'
 try {
   const target = new URL(url);
   if (!useGpu) target.searchParams.set('cpu', '1');
+  target.searchParams.set('auto', '0'); // these scans are pressed by hand; auto-fix is tried at the end
   const extsrc = process.argv.find((a) => a.startsWith('--extsrc='));
   if (extsrc) target.searchParams.set('extsrc', extsrc.slice('--extsrc='.length));
   const t0 = Date.now();
@@ -63,6 +64,16 @@ try {
   await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash_h264.mp4') || !document.querySelector('#banner').classList.contains('hidden'), null, { timeout: 120000 });
   console.log('h264 status:', await page.textContent('#status'));
   await scan(/2 violations found/);
+  // the unattended run: open a file, and a fixed, checked export appears
+  target.searchParams.delete('auto');
+  await page.goto(target.toString(), { timeout: 120000 });
+  await page.waitForFunction(() => document.querySelector('#support') && document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 120000 });
+  await page.setInputFiles('#fileInput', path.join(ROOT, 'tests/media/e2e/flash.mp4'));
+  await page.waitForFunction(() => window.__unflash && window.__unflash.auto && Object.keys(window.__unflash.auto.steps).length > 0, null, { timeout: 120000 });
+  await page.waitForFunction(() => !window.__unflash.auto.running, null, { timeout: 900000 });
+  const auto = await page.evaluate(() => ({ steps: window.__unflash.auto.steps, summary: window.__unflash.auto.summary }));
+  console.log('auto-fix:', JSON.stringify(auto));
+  if (!(auto.steps.verify && auto.steps.verify.status === 'done')) throw new Error('auto-fix did not reach a checked export: ' + JSON.stringify(auto));
   console.log('SMOKE OK');
 } finally {
   if (errors.length) console.log('page errors:', errors);

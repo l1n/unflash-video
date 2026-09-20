@@ -74,7 +74,8 @@ async function scanCurrent() {
 
 try {
   // ======== the editing flow, CPU detector ==================================
-  await page.goto(`http://127.0.0.1:${port}/?cpu=1`);
+  // ?auto=0: these flows press every button themselves
+  await page.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0`);
   await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
   results.support = await page.textContent('#support');
   console.log(results.support);
@@ -374,7 +375,7 @@ try {
   assert(results.h264Verdict.startsWith('fails'), 'the H.264 section fails before editing: ' + results.h264Verdict);
 
   // ======== the same scans on the GPU must agree ==============================
-  await page.goto(`http://127.0.0.1:${port}/`);
+  await page.goto(`http://127.0.0.1:${port}/?auto=0`);
   await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
   // the welcome page's test clips open straight into the app
   await page.click('[data-clip="stripes.mp4"]');
@@ -429,7 +430,7 @@ try {
     ['route=pixels', 'pixels', 'pixels'],
     ['extsrc=none', 'yuv', 'pixels'],
   ]) {
-    await page.goto(`http://127.0.0.1:${port}/?${query}`);
+    await page.goto(`http://127.0.0.1:${port}/?${query}&auto=0`);
     await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
     await openFile('flash.mp4');
     assert((await page.textContent('#status')).includes('WebGPU'), `the detector is still WebGPU with ?${query}`);
@@ -473,6 +474,81 @@ try {
   const profileText = await page.evaluate(() => window.__unflash.profile.summary(1));
   console.log('profile summary:\n' + profileText);
   assert(/feed/.test(profileText) && /gpu.latency/.test(profileText), 'the profile knows the feed and GPU latency timings');
+
+  // ======== auto-fix: open a file and the rest happens by itself =============
+  // (the CPU detector again: SwiftShader's WebGPU is too slow for the prepares and the export)
+  await page.goto(`http://127.0.0.1:${port}/?cpu=1`);
+  await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+  // start from nothing: no remembered scans or marks from the flows above
+  await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        const r = indexedDB.deleteDatabase('unflash');
+        r.onsuccess = r.onerror = r.onblocked = () => resolve();
+      })
+  );
+  const autoDone = async () => {
+    await page.waitForFunction(() => window.__unflash.auto && Object.keys(window.__unflash.auto.steps).length > 0, null, { timeout: 60000 });
+    await page.waitForFunction(() => !window.__unflash.auto.running, null, { timeout: 600000 });
+    await noBanner(page);
+    return page.evaluate(() => {
+      const a = window.__unflash.auto;
+      const dl = document.querySelector('#autoDownload');
+      return { steps: a.steps, summary: a.summary, hasBlob: !!a.blobUrl, download: dl.classList.contains('hidden') ? null : dl.getAttribute('download') };
+    });
+  };
+  assert(await page.$eval('#autoToggle', (c) => c.checked), 'auto-fix is on by default');
+  t0 = Date.now();
+  await openFile('flash.mp4');
+  results.autoFlash = await autoDone();
+  results.autoFlash.ms = Date.now() - t0;
+  console.log('auto-fix flash.mp4:', results.autoFlash.ms, 'ms |', JSON.stringify(results.autoFlash));
+  const st = results.autoFlash.steps;
+  assert(st.scan.status === 'done' && /2 violations/.test(st.scan.text), 'auto-fix scans the file first: ' + JSON.stringify(st.scan));
+  assert(st.fix.status === 'done' && /keep dark|keep light|frame rate/.test(st.fix.text), 'auto-fix takes the flashing out: ' + JSON.stringify(st.fix));
+  assert(st.export.status === 'done' && st.verify.status === 'done', 'auto-fix exports and checks the export: ' + JSON.stringify(st));
+  assert(/Passes WCAG/.test(st.verify.text), 'the exported file passes WCAG: ' + st.verify.text);
+  assert(results.autoFlash.download === 'flash.unflashed.mp4' && results.autoFlash.hasBlob, 'the fixed video is offered for download: ' + JSON.stringify(results.autoFlash));
+  assert(/ready to download/.test(results.autoFlash.summary), 'the summary says so: ' + results.autoFlash.summary);
+  const autoSections = await page.$$eval('#sectionList .sec-item', (els) => els.map((e) => e.textContent));
+  assert(autoSections.length === 1 && /safe/.test(autoSections[0]) && !/unsafe/.test(autoSections[0]), 'the section is marked safe after the automatic fix: ' + JSON.stringify(autoSections));
+  await page.screenshot({ path: path.join(OUT, '7-autofix.png'), fullPage: true });
+  // the download link serves the exported file
+  const dlBytes = await page.evaluate(async () => (await (await fetch(document.querySelector('#autoDownload').href)).arrayBuffer()).byteLength);
+  assert(dlBytes > 10000, 'the download link serves the exported MP4: ' + dlBytes + ' bytes');
+  // the export dialog offers the same file
+  await page.click('#btnExport');
+  await page.waitForFunction(() => !document.querySelector('#exportModal').classList.contains('hidden'));
+  assert(!(await page.$eval('#exportDownload', (a) => a.classList.contains('hidden'))) && !(await page.$eval('#btnVerifyExport', (b) => b.disabled)), 'the export dialog offers the automatic export for download and verification');
+  await page.click('#btnCloseExport');
+
+  // stripes: softened, exported, checked
+  await openFile('stripes.mp4');
+  results.autoStripes = await autoDone();
+  console.log('auto-fix stripes.mp4:', JSON.stringify(results.autoStripes));
+  assert(results.autoStripes.steps.fix.status === 'done' && /softened/.test(results.autoStripes.steps.fix.text), 'auto-fix softens the stripes: ' + JSON.stringify(results.autoStripes.steps.fix));
+  assert(results.autoStripes.steps.export.status === 'done' && /softened/.test(results.autoStripes.steps.export.text), 'the export softens the patterned frames: ' + JSON.stringify(results.autoStripes.steps.export));
+  assert(results.autoStripes.steps.verify.status === 'done' && /No hazardous stripe patterns/.test(results.autoStripes.steps.verify.text), 'no stripes are left in the exported file: ' + results.autoStripes.steps.verify.text);
+
+  // a clean file: nothing to fix, nothing to export
+  await openFile('steady.mp4');
+  results.autoSteady = await autoDone();
+  console.log('auto-fix steady.mp4:', JSON.stringify(results.autoSteady));
+  assert(results.autoSteady.steps.fix.status === 'skipped' && !results.autoSteady.hasBlob && /passes as it is/.test(results.autoSteady.summary), 'a clean file needs no fix: ' + JSON.stringify(results.autoSteady));
+
+  // a second visit reuses the scan and the marks, and exports again
+  await openFile('flash.mp4');
+  results.autoAgain = await autoDone();
+  console.log('auto-fix flash.mp4 again:', JSON.stringify(results.autoAgain));
+  assert(/last visit/.test(results.autoAgain.steps.scan.text) && /marks from before/.test(results.autoAgain.steps.fix.text) && results.autoAgain.steps.verify.status === 'done', 'the second visit reuses the scan and the marks: ' + JSON.stringify(results.autoAgain.steps));
+
+  // the switch in the header turns it off
+  await page.uncheck('#autoToggle');
+  await openFile('steady.mp4');
+  await page.waitForTimeout(800);
+  assert(await page.$eval('#auto', (e) => e.classList.contains('hidden')), 'with auto-fix off, opening a file starts nothing');
+  assert(await page.evaluate(() => !window.__unflash.auto), 'no run was started');
+  await page.check('#autoToggle');
 } finally {
   fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 2));
   if (errors.length) console.log('BROWSER ERRORS:\n' + errors.join('\n'));

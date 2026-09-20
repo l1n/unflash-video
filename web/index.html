@@ -21,6 +21,7 @@
       <option value="strict">Stricter than WCAG</option>
     </select>
   </label>
+  <label class="toggle" title="When a video is opened: scan it, fix every section it finds, export the result and check it, with nothing to click"><input type="checkbox" id="autoToggle" checked> auto-fix</label>
   <button id="btnScan" disabled title="Decode every frame with WebCodecs and run the detector over it, as fast as the GPU goes">Scan for flashes &amp; patterns</button>
   <label class="toggle" title="Run the detector live on whatever the player is showing"><input type="checkbox" id="liveToggle" disabled> live monitor</label>
   <button id="btnExport" disabled>Export…</button>
@@ -33,6 +34,16 @@
   <div class="progress"><div class="bar" id="jobBar"></div></div>
   <div id="jobMsg" class="jobmsg"></div>
   <button id="btnCancelJob" class="small danger">cancel</button>
+</div>
+
+<div id="auto" class="auto hidden">
+  <span class="auto-title" title="The unattended run: scan, fix every section, export, check the export">Auto-fix</span>
+  <span id="autoSteps" class="auto-steps"></span>
+  <span id="autoSummary" class="auto-summary"></span>
+  <span class="spacer"></span>
+  <a id="autoDownload" class="button primary hidden" download>Download fixed video</a>
+  <button id="btnAutoStop" class="small danger hidden" title="Stop the run; every step can still be done by hand">stop</button>
+  <button id="btnAutoRerun" class="small hidden" title="Scan again and redo the fixes under the current profile">run again</button>
 </div>
 
 <div id="timelineWrap" class="timeline-wrap hidden">
@@ -163,12 +174,11 @@
     <h1>Unflash</h1>
     <p>Find the flashing and the stripe patterns in a video that can trigger photosensitive seizures, and take them out without wrecking the footage. Everything runs in your browser, on your GPU; nothing is uploaded anywhere.</p>
     <ol>
-      <li><b>Open a video</b> (an MP4), then <b>Scan</b> it. Every frame is decoded with WebCodecs and pushed through the detector as fast as your GPU allows. Unflash puts a numbered <i>section</i> around every problem it finds.</li>
+      <li><b>Open a video</b> (an MP4). That is the only step. Every frame is decoded and pushed through the detector as fast as your GPU allows; Unflash puts a numbered <i>section</i> around every problem it finds, works out a fix for each one, exports the fixed video and re-scans the export. When it is done, <b>Download fixed video</b> is the one thing left to click.</li>
+      <li>The fixes are the ones you could make by hand. <b>Stripe patterns</b> (fine gratings, more than five light–dark pairs, high contrast, a quarter of the screen or more) can't be removed a frame at a time, so those frames are <b>softened</b>: blurred just enough, and only where the stripes are. <b>Flashing</b> is taken out by removing the frames that make it (<b>keep dark</b>, then <b>keep light</b>) and, when that isn't enough, by thinning the section to a rate that cannot flash fast enough to fail. A section that still fails is opened for you to edit.</li>
+      <li>Everything stays yours to change: open a section and <b>mark frames</b> to remove (<b>R</b>/<b>F</b>) or hold (<b>E</b>), let <b>Suggest</b> redo the removals, switch <b>soften stripes</b> on or off. The section is re-checked the instant you change anything, with nothing to render. <b>Export</b> and <b>Verify</b> then do what auto-fix did, with your edits.</li>
       <li>Or just <b>play</b> it with <b>live monitor</b> on: the detector runs on every frame the player shows and the meter above the video tells you, as it happens, how much of the picture is flashing.</li>
-      <li><b>Prepare</b> a section to pull out its frames, then <b>mark the frames</b> you want gone (<b>R</b>/<b>F</b>) or held (<b>E</b>). The section is re-checked the instant you change anything, with nothing to render.</li>
-      <li>Or let <b>Suggest</b> do it: keep-light and keep-dark work out a set of removals, <b>reduce FPS</b> thins the section down to a rate that cannot flash fast enough to fail.</li>
-      <li><b>Stripe patterns</b> (fine gratings, more than five light–dark pairs, high contrast, a quarter of the screen or more) get their own sections. Removing frames can't fix those; turn on <b>soften stripes</b> and the export blurs just those frames, just enough.</li>
-      <li><b>Export</b> re-encodes the edited video in the browser and <b>Verify</b> re-scans the result.</li>
+      <li>Prefer to drive? Untick <b>auto-fix</b> in the header and nothing happens until you press <b>Scan</b>.</li>
     </ol>
     <p class="note-extended"><b>Extended flashes</b> are 5 seconds or more of flashing that meets every WCAG failure condition except the rate: it runs <i>at</i> the permitted speed (3 flashes/s) instead of above it. WCAG lets that through, but UK broadcast guidance doesn't and it does affect some viewers, so the default profile flags them as ordinary sections. Pick <i>Exact WCAG only</i> to ignore them. <i>Stricter than WCAG</i> already fails at that speed.</p>
     <p class="disclaimer">This reduces risk. It can't guarantee safety. The pattern test covers regular stripes and gratings (the case broadcast guidance names), not every texture that could affect someone, and individual sensitivity varies, so review the flagged sections yourself before you share anything.</p>

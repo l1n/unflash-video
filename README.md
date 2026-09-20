@@ -62,24 +62,37 @@ is decoded by Unflash itself when the browser cannot.
    uploaded), the detector starts on WebGPU or, failing that, on the CPU, and
    the project is restored from the browser's storage if you have opened this
    file before.
-2. **Scan for flashes & patterns.** Every frame is decoded with WebCodecs
-   and pushed through the detector. A numbered *section* is put around each
-   problem (flashing, or a stripe pattern) and the timeline shows where it
-   is. Or tick **live monitor** and press play: the meter above the video
-   shows how much of the picture is flashing or striped right now, and the
-   verdict flips the moment a violation lands.
-3. **Prepare** a section. Its frames, plus a run-up and run-out, are decoded
-   into memory at analysis resolution.
-4. **Edit.** Mark frames (**R** remove and show the previous frame, **F**
-   remove and show the next, **E** hold for a second muted, **U** unmark), or
-   let **Suggest** do it. The section is re-checked automatically after every
-   change, in well under a second. A stripe pattern can't be removed a frame
-   at a time; tick **soften stripes** and the frames that carry it are
-   blurred just enough to take it under the threshold, in the check and in
-   the export alike.
-5. **Export**: the video is re-encoded in the browser with the edits applied
-   and the audio copied through untouched. **Verify** re-scans the exported
-   file with the same detector.
+2. **Wait.** With **auto-fix** on (the default) the rest happens by itself,
+   and the strip under the toolbar shows where it is: *scan* decodes every
+   frame and puts a numbered *section* around each problem; *fix* prepares
+   each section and makes it pass (stripes are softened; flashing is taken
+   out by removing frames, keep-dark then keep-light, and when that isn't
+   enough by thinning the section to a rate that cannot fail); *export*
+   re-encodes the video with those edits; *verify* re-scans the export. A
+   file with nothing wrong stops after the scan. A section the suggesters
+   can't fix stops the run and is opened for editing.
+3. **Download fixed video.** The one button.
+
+Everything the run did can be redone by hand, and that is also the way to
+work with **auto-fix** unticked (or `?auto=0` in the URL):
+
+- **Scan for flashes & patterns** decodes every frame with WebCodecs and
+  pushes it through the detector; the timeline shows where the problems
+  are. Or tick **live monitor** and press play: the meter above the video
+  shows how much of the picture is flashing or striped right now, and the
+  verdict flips the moment a violation lands.
+- **Prepare** a section: its frames, plus a run-up and run-out, are decoded
+  into memory at analysis resolution.
+- **Edit.** Mark frames (**R** remove and show the previous frame, **F**
+  remove and show the next, **E** hold for a second muted, **U** unmark), or
+  let **Suggest** do it. The section is re-checked automatically after every
+  change, in well under a second. A stripe pattern can't be removed a frame
+  at a time; tick **soften stripes** and the frames that carry it are
+  blurred just enough to take it under the threshold, in the check and in
+  the export alike.
+- **Export**: the video is re-encoded in the browser with the edits applied
+  and the audio copied through untouched. **Verify** re-scans the exported
+  file with the same detector.
 
 Profiles (**WCAG + extended flashes + stripe patterns**, **Exact WCAG
 only**, **Stricter than WCAG**), the suggesters, the safe frame-rate bound
@@ -128,7 +141,8 @@ since its WebGPU takes no `VideoFrame` or `<video>` as a copy source, and
 what the built-in decoder hands over directly); WebCodecs' RGBA conversion;
 a canvas blit; or canvas pixels. `?route=videoframe|yuv|rgba|canvas|pixels`
 forces one, `?extsrc=canvas` (or `none`) pretends WebGPU accepts only those
-copy sources, `?workers=N` sets the number of built-in decoder workers.
+copy sources, `?workers=N` sets the number of built-in decoder workers,
+`?auto=0` keeps auto-fix from starting when a file is opened.
 
 ## How it works
 

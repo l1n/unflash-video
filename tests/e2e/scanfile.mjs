@@ -19,7 +19,7 @@ const page = await browser.newPage();
 page.on('pageerror', (e) => console.log('[pageerror]', e.message));
 page.on('console', (m) => { if (m.type() === 'error' || process.env.E2E_VERBOSE) console.log('[browser]', m.type(), m.text()); });
 try {
-  await page.goto(`http://127.0.0.1:${port}/${cpu ? '?cpu=1' : ''}`);
+  await page.goto(`http://127.0.0.1:${port}/?auto=0${cpu ? '&cpu=1' : ''}`);
   await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
   await page.setInputFiles('#fileInput', file);
   await page.waitForFunction((n) => document.querySelector('#videoInfo').textContent.includes(n), path.basename(file), { timeout: 60000 });

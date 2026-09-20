@@ -23,6 +23,20 @@ label.profile-label, label.toggle, label.sel-only, label.dim-toggle { display: i
 .banner { background: #4b2a2a; border-bottom: 1px solid #7a3a3a; padding: 8px 14px; display: flex; gap: 10px; align-items: center; }
 .banner.info { background: #2a3b4b; border-color: #3a5a7a; }
 .jobbar { display: flex; align-items: center; gap: 12px; padding: 6px 14px; background: var(--bg2); border-bottom: 1px solid var(--line); }
+.auto { display: flex; align-items: center; gap: 10px; padding: 6px 14px; background: var(--bg2); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.auto-title { font-weight: 600; }
+.auto-steps { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+.auto-step { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; padding: 2px 9px; border-radius: 10px; background: var(--bg3); color: var(--fg2); border: 1px solid transparent; }
+.auto-step b { color: var(--fg); font-weight: 600; }
+.auto-step.running { border-color: var(--accent); color: var(--fg); }
+.auto-step.running b::after { content: '…'; }
+.auto-step.done { background: #1f4a2f; color: #8fe3ad; }
+.auto-step.done b { color: #d6ffe4; }
+.auto-step.failed { background: #5a2a24; color: #ffb0a4; }
+.auto-step.failed b { color: #ffd9d2; }
+.auto-step.stopped { background: #5a4a24; color: #ffe0a4; }
+.auto-step.skipped { opacity: .6; }
+.auto-summary { color: var(--fg2); font-size: 12px; }
 .jobname { font-weight: 600; }
 .progress { flex: 1; height: 10px; background: var(--bg); border-radius: 5px; overflow: hidden; border: 1px solid var(--line); }
 .progress .bar { height: 100%; width: 0; background: var(--accent); transition: width .15s; }
