@@ -180,7 +180,7 @@ impl CpuStage {
     /// cross-check tests, which want identical inputs on both sides).
     pub fn run_planes(&mut self, mut params: KernelParams) -> GridStats {
         let first = params.mode & MODE_FIRST != 0;
-        let moved = if first { 0 } else { held_count(&self.planes.l, &self.state.prev_l, self.geom.held_delta) };
+        let moved = if first { 0 } else { held_count(&self.planes.l, &self.state.prev_l, self.geom.held_delta, &self.planes.v, &self.state.prev_v, self.geom.held_delta_v) };
         let held = !first && self.geom.is_held(moved);
         if held {
             params.mode |= MODE_HELD;
@@ -404,6 +404,37 @@ mod tests {
         }
         let r = d.finish();
         assert!(r.violations.iter().any(|v| v.kind == ViolationKind::Red), "{:?}", r.violations);
+    }
+
+    #[test]
+    fn equiluminant_red_flash_is_detected() {
+        let cfg = Profile::Wcag.config();
+        let (aw, ah) = cfg.analysis_dims(1280, 720);
+        let n = (aw * ah) as usize;
+        // saturated red (250, 0, 0) <-> grey (122, 124, 122): the same relative
+        // luminance (0.203 vs 0.200), so a luminance-only held-frame gate took
+        // every swap for a repeat of the last picture and never examined it
+        let red: Vec<u8> = (0..n).flat_map(|_| [250u8, 0, 0]).collect();
+        let grey: Vec<u8> = (0..n).flat_map(|_| [122u8, 124, 122]).collect();
+        let black = vec![0u8; n * 3];
+        let mut d = CpuDetector::new(cfg, aw, ah);
+        for i in 0..240 {
+            let t = i as f64 / 30.0;
+            let f = if t < 3.0 {
+                &black
+            } else if ((t * 10.0).floor() as i64) % 2 == 0 {
+                &red
+            } else {
+                &grey
+            };
+            d.feed(t, FrameInput::rgb(f));
+        }
+        let r = d.finish();
+        assert!(!r.safe(), "{:?}", r.violations);
+        assert!(r.violations.iter().any(|v| v.kind == ViolationKind::Red), "{:?}", r.violations);
+        // the 89 black repeats and the 2 repeats inside each 3-frame run are
+        // held; the 50 colour swaps must not be
+        assert_eq!(r.held, 189, "{:?}", r.frame_stats.held);
     }
 
     #[test]

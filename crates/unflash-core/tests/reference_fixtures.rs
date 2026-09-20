@@ -173,6 +173,21 @@ fn scenario(name: &str) -> (Vec<f64>, Vec<Vec<u8>>) {
                 .collect();
             (ts, fr)
         }
+        "red_equilum" => {
+            // saturated red against a grey of the same relative luminance:
+            // no luminance flash at all, only the colour moves
+            let ts = times_2997(n2997(5.0));
+            let fr = ts
+                .iter()
+                .map(|&t| {
+                    let mut f = solid(0);
+                    let rgb = if phase(t, 5.0) == 0 { [250, 0, 0] } else { [122, 124, 122] };
+                    fill_rect(&mut f, 0, 0, W, H, rgb);
+                    f
+                })
+                .collect();
+            (ts, fr)
+        }
         "pan_bar" => {
             let ts = times_2997(n2997(6.0));
             let bw = W / 10;

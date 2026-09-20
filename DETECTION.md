@@ -519,10 +519,13 @@ any verdict) are the best of the grid of window positions rather than of
 every position, so they can read slightly lower than the reference's. The
 hazard tests themselves always used the grid.
 
-**Held frames are luminance-only, as before.** A frame whose luminance moves
-in fewer than a tenth of the area a flash needs is a re-show, and a red
-flash with no luminance change at all is invisible to that test — in the
-reference too.
+**Held frames look at colour too.** A frame counts as a re-show of the
+previous picture when fewer than a tenth of the area a flash needs moved,
+in luminance (by half the general swing) *or* in red value (by half the red
+swing, on the R−G−B scale), against the last frame that was not held. The
+reference and earlier versions compared luminance alone, so a saturated red
+swapped for a grey of the same luminance (a textbook red flash) was taken
+for a held picture and never examined.
 
 **Sections follow the flashing.** The reference snaps sections outward to
 keyframes for the sake of its stream-copy export. The browser export

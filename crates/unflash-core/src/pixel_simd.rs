@@ -265,6 +265,7 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
         let sat_arr: [u32; 8] = std::array::from_fn(|j| if planes.sat[i + j] != 0 { !0u32 } else { 0 });
         let sat = u32x8::from(sat_arr);
         st_f(&mut st.prev_l, i, l);
+        st_f(&mut st.prev_v, i, v);
         let mut flags = ld_u(&st.flags, i);
 
         // --- luminance run tracker --------------------------------------

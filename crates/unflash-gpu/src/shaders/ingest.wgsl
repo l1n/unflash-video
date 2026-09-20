@@ -1,5 +1,6 @@
 // Pass A: source texture -> linear luminance L, red value V, saturation flag,
-// plus the count of pixels that moved since the last new picture.
+// plus the count of pixels that moved (in luminance or in red value) since
+// the last new picture.
 //
 // The source may be any size: each analysis pixel takes the area average of
 // the source box it covers (weights are the fractional overlaps), in sRGB
@@ -69,7 +70,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         patmask[i] = 0u;
         if ((params.mode & MODE_FIRST) == 0u) {
             let prev = bitcast<f32>(state[F_PREV_L * n + i]);
-            moved = u32(abs(l - prev) > params.held_delta);
+            let prev_v = bitcast<f32>(state[F_PREV_V * n + i]);
+            moved = u32(abs(l - prev) > params.held_delta || abs(v - prev_v) > params.held_delta_v);
         }
     }
     if (moved != 0u) {

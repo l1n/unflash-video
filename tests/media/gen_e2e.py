@@ -12,6 +12,9 @@ extended.mp4 3 Hz flashing for 8 s (an extended flash, not a WCAG failure).
 stripes.mp4  the scene, then fine vertical stripes (16 px period, 40 pairs)
              from 2 to 6 s and diagonal stripes from 6 to 9 s: no flashing,
              a hazardous regular pattern.
+redflash.mp4 the pan, then saturated red swapped for a grey of the same
+             luminance 5 times a second from 2 s: a red flash with no
+             luminance flash.
 *_h264.mp4   the same clips as H.264 (what most browsers decode; also the
              unsupported-codec path in a Chromium without H.264).
 flash_h264i.mp4  the flash clip as interlaced H.264 (MBAFF), for the
@@ -78,6 +81,25 @@ def flash_frames(secs=10.0, red=True):
         yield f
 
 
+def redflash_frames(secs=8.0):
+    """The pan, then from 2 s a saturated red swapped for a grey of the same
+    relative luminance 5 times a second: no luminance flash, a red flash."""
+    n = int(secs * FPS)
+    for i in range(n):
+        t = i / FPS
+        f = scene(i)
+        if t >= 2.0:
+            if int(t * 10) % 2 == 0:
+                f[..., 0] = 250
+                f[..., 1] = 0
+                f[..., 2] = 0
+            else:
+                f[..., 0] = 122
+                f[..., 1] = 124
+                f[..., 2] = 122
+        yield f
+
+
 def steady_frames(secs=6.0):
     for i in range(int(secs * FPS)):
         yield scene(i)
@@ -118,8 +140,10 @@ if __name__ == "__main__":
     encode("steady.mp4", steady_frames(), "vp9", 6)
     encode("extended.mp4", extended_frames(), "vp9", 10)
     encode("stripes.mp4", stripes_frames(), "vp9", 10, bitrate="2500k")
+    encode("redflash.mp4", redflash_frames(), "vp9", 8)
     encode("flash_h264.mp4", flash_frames(), "h264", 10)
     encode("steady_h264.mp4", steady_frames(), "h264", 6)
     encode("extended_h264.mp4", extended_frames(), "h264", 10)
     encode("stripes_h264.mp4", stripes_frames(), "h264", 10)
+    encode("redflash_h264.mp4", redflash_frames(), "h264", 8)
     encode("flash_h264i.mp4", flash_frames(), "h264i", 10)

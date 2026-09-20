@@ -81,8 +81,12 @@ MAX_RUN_SECONDS = 2.0
 # So "the same picture" is decided by how much of the picture has moved far
 # enough to be part of a flash: pixels whose luminance differs by more than
 # HELD_DELTA_RATIO of swing_threshold from the last frame that was *not*
-# held. Comparing against the last distinct frame rather than the previous
-# one is what keeps a slow ramp accumulating instead of being held for ever
+# held, or whose red value (R-G-B on the 0..320 scale) differs by more than
+# HELD_DELTA_RATIO of red_delta_threshold -- a saturated red swapped for a
+# grey of the same luminance moves no luminance at all and is still a new
+# picture (and a red flash). Comparing against the last distinct frame
+# rather than the previous one is what keeps a slow ramp accumulating
+# instead of being held for ever
 # -- but it also means an encoder's drift accumulates, which is why the bar
 # is on magnitude rather than on the tracker's own noise deadband. x264
 # codes the first copy of a new picture roughly and refines it over the
@@ -492,10 +496,12 @@ class FlashDetector:
         self._clock = 0.0
         self._recent_dt = []
         self._prev_L = None     # luminance of the last frame not held
+        self._prev_V = None     # its red value (R-G-B scale)
         self.held = 0           # frames that only repeated the picture
         # what makes a frame a new picture rather than a re-show of the last
         # one: this much of it moved this far (see HELD_DELTA_RATIO)
         self._held_delta = HELD_DELTA_RATIO * cfg.swing_threshold
+        self._held_delta_v = HELD_DELTA_RATIO * cfg.red_delta_threshold
         self._held_bar = max(1.0, HELD_AREA_RATIO * self.area_thresh)
 
     def _window_sums(self, arr):
@@ -548,8 +554,14 @@ class FlashDetector:
         # The clock still advances: the picture really was on screen for
         # that long, and the time it occupies has to count against the
         # sustained-flashing windows like any other quiet moment.
+        # A picture is a repeat only if neither its luminance nor its red
+        # value moved: a saturated red swapped for a grey of the same
+        # luminance is a new picture (and a red flash) although no pixel
+        # changed luminance.
+        V = np.maximum(R - G - B, 0.0) * 320.0
         if self._prev_L is not None and np.count_nonzero(
-                np.abs(L - self._prev_L) > self._held_delta
+                (np.abs(L - self._prev_L) > self._held_delta)
+                | (np.abs(V - self._prev_V) > self._held_delta_v)
                 ) < self._held_bar:
             self.held += 1
             # the runs still age: time passes while a picture is held, and a
@@ -573,9 +585,9 @@ class FlashDetector:
         # compared against the last frame that was not held, so a drift too
         # slow to trip the bar in one step still trips it eventually
         self._prev_L = L
+        self._prev_V = V
         total = R + G + B
         sat = (total > 1e-5) & (R >= cfg.red_saturation * total)
-        V = np.maximum(R - G - B, 0.0) * 320.0
 
         rev_up, rev_dn, base, ext, _, _ = self.lum.feed(L, tc)
         # upward run: base is darker end; downward run: ext is darker end

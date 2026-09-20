@@ -106,6 +106,26 @@ def scenario_red_grey(secs, hz, grey):
     return ts, frames
 
 
+def scenario_red_equilum(secs, hz):
+    """Saturated red against a grey of the same relative luminance: no
+    luminance flash at all, only the colour moves."""
+    n = int(round(secs * 30000 / 1001))
+    ts = times_2997(n)
+    frames = []
+    for t in ts:
+        f = np.empty((H, W, 3), np.uint8)
+        if phase(t, hz) == 0:
+            f[..., 0] = 250
+            f[..., 1] = 0
+            f[..., 2] = 0
+        else:
+            f[..., 0] = 122
+            f[..., 1] = 124
+            f[..., 2] = 122
+        frames.append(f)
+    return ts, frames
+
+
 def scenario_pan_bar(secs):
     n = int(round(secs * 30000 / 1001))
     ts = times_2997(n)
@@ -181,6 +201,7 @@ SCENARIOS = {
     "square3hz": (lambda: scenario_square(3.0, 10.0, 0.5, 20, 200), ["wcag_ext", "wcag", "strict"]),
     "noise_drift": (lambda: scenario_noise_drift(8.0, 12), ["wcag_ext"]),
     "red_grey": (lambda: scenario_red_grey(5.0, 4.0, 144), ["wcag"]),
+    "red_equilum": (lambda: scenario_red_equilum(5.0, 5.0), ["wcag"]),
     "pan_bar": (lambda: scenario_pan_bar(6.0), ["wcag_ext"]),
     "repeat120": (lambda: scenario_repeat120(4.0, 4.0), ["wcag"]),
     "vfr": (lambda: scenario_vfr(8.0, 4.0), ["wcag"]),

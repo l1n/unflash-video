@@ -246,6 +246,21 @@ try {
   console.log('extended (wcag):', scan.toast);
   assert(scan.toast.includes('No flashing'), 'under exact WCAG the 3 Hz file passes');
 
+  // --- red flash with no luminance change: a red-flash failure (and, kept up
+  // for six seconds, an extended flash under the default profile), never a
+  // general flash
+  await openFile('redflash.mp4');
+  scan = await scanCurrent();
+  results.redflashViolations = await page.evaluate(() => window.__unflash.lastScan.result.violations);
+  console.log('redflash scan:', scan.ms, 'ms |', scan.toast, '|', JSON.stringify(results.redflashViolations));
+  const redViol = results.redflashViolations.filter((v) => v.kind === 'red');
+  assert(redViol.length === 1 && !results.redflashViolations.some((v) => v.kind === 'flash'), 'the equiluminant red flash is a red-flash failure and not a general one: ' + JSON.stringify(results.redflashViolations));
+  // the swaps start at 2 s; the fourth flash inside a second lands under a second later
+  assert(redViol[0].start > 2.4 && redViol[0].start < 3.1 && redViol[0].end > 7.4, 'the red flash runs from 2 s to the end: ' + JSON.stringify(redViol));
+  page.once('dialog', (d) => d.accept());
+  await page.click('#btnDeleteAll');
+  await page.waitForFunction(() => document.querySelectorAll('#sectionList .sec-item').length === 1);
+
   // --- stripes: a stationary pattern with no flashing; softening fixes it ------
   await openFile('stripes.mp4');
   assert((await page.$eval('#profileSel', (s) => s.value)) === 'wcag_ext', 'a new file starts on the default profile');

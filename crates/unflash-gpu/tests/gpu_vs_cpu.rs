@@ -91,6 +91,31 @@ fn gen(i: usize, t: f64, aw: usize, ah: usize) -> Vec<u8> {
     f
 }
 
+/// Saturated red swapped for a grey of the same relative luminance every
+/// three frames over the whole picture, with a faint drifting noise patch in
+/// one corner: the held-frame gate must see the colour move even though the
+/// luminance does not, and the repeats inside each run must still be held.
+fn gen_equilum(i: usize, _t: f64, aw: usize, ah: usize) -> Vec<u8> {
+    let rgb = if (i / 3) % 2 == 0 { [250u8, 0, 0] } else { [122u8, 124, 122] };
+    let mut f = vec![0u8; aw * ah * 3];
+    for px in f.chunks_exact_mut(3) {
+        px.copy_from_slice(&rgb);
+    }
+    // a small noisy patch that changes only every fifth frame (well under the
+    // held bar), so the colour swap alone decides whether a frame is new
+    let src_i = i / 5;
+    for y in 0..(ah / 8).max(1) {
+        for x in 0..(aw / 8).max(1) {
+            let c = (60 + hash_noise(src_i, y, x, 12)).clamp(0, 255) as u8;
+            let k = (y * aw + x) * 3;
+            f[k] = c;
+            f[k + 1] = c;
+            f[k + 2] = c;
+        }
+    }
+    f
+}
+
 /// Frames for the pattern pass: fine vertical stripes, coarse diagonal
 /// stripes, stripes over part of the picture, noise, low-contrast stripes,
 /// each held for a few frames, with a repeat every seventh frame.
@@ -150,11 +175,22 @@ fn gen_stripes(i: usize, _t: f64, aw: usize, ah: usize) -> Vec<u8> {
     f
 }
 
-fn compare(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframes: usize) {
-    compare_with(ctx, cfg, src_w, src_h, nframes, &gen, true)
+/// What a generator's frames must provoke, beyond matching the CPU.
+#[derive(Clone, Copy, PartialEq)]
+enum Expect {
+    /// General (luminance) flashing in some cells.
+    Flash,
+    /// Red flashing in some cells and no general flashing anywhere.
+    RedFlash,
+    /// Patterned frames.
+    Patterns,
 }
 
-fn compare_with(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframes: usize, gen: &dyn Fn(usize, f64, usize, usize) -> Vec<u8>, flashing: bool) {
+fn compare(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframes: usize) {
+    compare_with(ctx, cfg, src_w, src_h, nframes, &gen, Expect::Flash)
+}
+
+fn compare_with(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframes: usize, gen: &dyn Fn(usize, f64, usize, usize) -> Vec<u8>, expect: Expect) {
     let (aw, ah) = cfg.analysis_dims(src_w, src_h);
     let geom = GridGeometry::new(&cfg, aw, ah);
     eprintln!("analysis {}x{} window {}x{} cells {} E={}", aw, ah, geom.ww, geom.wh, geom.ncells(), aw.div_ceil(256));
@@ -167,6 +203,7 @@ fn compare_with(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, n
     let n = geom.npix();
     let mut held_frames = 0;
     let mut strobe_frames = 0;
+    let mut red_strobe_frames = 0;
     let mut pattern_frames = 0;
     for i in 0..nframes {
         let t = i as f64 * 1001.0 / 30000.0;
@@ -244,6 +281,9 @@ fn compare_with(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, n
             if a.cnt[0] > 0 {
                 strobe_frames += 1;
             }
+            if a.cnt[1] > 0 {
+                red_strobe_frames += 1;
+            }
         }
         let (mask, og, or) = gpu.debug_pixout();
         let out = cpu.outputs();
@@ -259,14 +299,21 @@ fn compare_with(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, n
             assert_eq!(a, b, "f{i}: state word {j} (field {}, pixel {})", j / n, j % n);
         }
     }
-    eprintln!("ok: {nframes} frames, {held_frames} held, {strobe_frames} strobing cells, {pattern_frames} patterned frames");
+    eprintln!("ok: {nframes} frames, {held_frames} held, {strobe_frames} strobing cells ({red_strobe_frames} red), {pattern_frames} patterned frames");
     assert!(held_frames > 0, "the generator repeats frames, some must be held");
-    if flashing && nframes >= 40 {
+    match expect {
         // a failure needs four flashes inside a second, so short runs cannot strobe
-        assert!(strobe_frames > 0, "the generator flashes, some cells must strobe");
-    }
-    if !flashing {
-        assert!(pattern_frames >= 10, "the striped generator must produce patterned frames, got {pattern_frames}");
+        Expect::Flash if nframes >= 40 => {
+            assert!(strobe_frames > 0, "the generator flashes, some cells must strobe");
+        }
+        Expect::RedFlash if nframes >= 40 => {
+            assert!(red_strobe_frames > 0, "the generator flashes red, some cells must strobe red");
+            assert_eq!(strobe_frames, 0, "an equiluminant red flash must not register as a general flash");
+        }
+        Expect::Patterns => {
+            assert!(pattern_frames >= 10, "the striped generator must produce patterned frames, got {pattern_frames}");
+        }
+        _ => {}
     }
 }
 
@@ -291,16 +338,24 @@ fn gpu_matches_cpu_full_width() {
 }
 
 #[test]
+fn gpu_matches_cpu_equiluminant_red() {
+    let Some(ctx) = context() else { return };
+    compare_with(&ctx, Profile::Wcag.config(), 640, 360, 60, &gen_equilum, Expect::RedFlash);
+    let cfg = DetectorConfig { analysis_scale: 0.2, ..Profile::Strict.config() };
+    compare_with(&ctx, cfg, 320, 180, 45, &gen_equilum, Expect::RedFlash);
+}
+
+#[test]
 fn gpu_matches_cpu_patterns() {
     let Some(ctx) = context() else { return };
-    compare_with(&ctx, Profile::WcagExt.config(), 640, 360, 35, &gen_stripes, false);
+    compare_with(&ctx, Profile::WcagExt.config(), 640, 360, 35, &gen_stripes, Expect::Patterns);
 }
 
 #[test]
 fn gpu_matches_cpu_patterns_odd_size_strict() {
     let Some(ctx) = context() else { return };
     let cfg = DetectorConfig { analysis_scale: 0.3, ..Profile::Strict.config() };
-    compare_with(&ctx, cfg, 333, 201, 35, &gen_stripes, false);
+    compare_with(&ctx, cfg, 333, 201, 35, &gen_stripes, Expect::Patterns);
 }
 
 #[test]

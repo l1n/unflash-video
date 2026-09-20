@@ -138,6 +138,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         state[F_POOL_GEN_T * n + i] = nv;
         state[F_POOL_RED_T * n + i] = nv;
         state[F_PREV_L * n + i] = bitcast<u32>(l);
+        state[F_PREV_V * n + i] = bitcast<u32>(v);
         pixout[i] = 0u;
         pixout[n + i] = 0u;
         pixout[2u * n + i] = 0u;
@@ -183,6 +184,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     state[F_PREV_L * n + i] = bitcast<u32>(l);
+    state[F_PREV_V * n + i] = bitcast<u32>(v);
 
     // --- luminance run tracker --------------------------------------------
     var lt: Tr;

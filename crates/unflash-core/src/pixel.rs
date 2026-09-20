@@ -87,7 +87,8 @@ pub struct KernelParams {
     pub pat_reg_den: u32,
     /// 0 = skip the pattern pass.
     pub pat_enabled: u32,
-    pub _pad0: u32,
+    /// Held-frame bar on the red value (see `GridGeometry::held_delta_v`).
+    pub held_delta_v: f32,
     pub _pad1: u32,
 }
 
@@ -122,7 +123,7 @@ impl KernelParams {
             pat_reg_num: pat.reg_num,
             pat_reg_den: pat.reg_den,
             pat_enabled: cfg.flag_patterns() as u32,
-            _pad0: 0,
+            held_delta_v: geom.held_delta_v,
             _pad1: 0,
         }
     }
@@ -205,9 +206,12 @@ impl StateLayout {
     pub fn prev_l(&self) -> usize {
         self.pool_red_t() + 1
     }
+    pub fn prev_v(&self) -> usize {
+        self.prev_l() + 1
+    }
     /// Number of `npix`-sized runs in the state buffer.
     pub fn fields(&self) -> usize {
-        self.prev_l() + 1
+        self.prev_v() + 1
     }
 }
 
@@ -234,7 +238,9 @@ pub struct PixelState {
     pub red_pend_t: Vec<u32>,
     pub pool_gen_t: Vec<u32>,
     pub pool_red_t: Vec<u32>,
+    /// luminance and red value of the last frame that was not held
     pub prev_l: Vec<f32>,
+    pub prev_v: Vec<f32>,
 }
 
 impl PixelState {
@@ -261,6 +267,7 @@ impl PixelState {
             pool_gen_t: vec![0; n],
             pool_red_t: vec![0; n],
             prev_l: vec![0.0; n],
+            prev_v: vec![0.0; n],
         }
     }
 
@@ -296,6 +303,7 @@ impl PixelState {
         put_u(&mut out, lay.pool_gen_t(), &self.pool_gen_t);
         put_u(&mut out, lay.pool_red_t(), &self.pool_red_t);
         put_f(&mut out, lay.prev_l(), &self.prev_l);
+        put_f(&mut out, lay.prev_v(), &self.prev_v);
         out
     }
 }
@@ -347,9 +355,10 @@ impl PixelOutputs {
     }
 }
 
-/// Pixels whose luminance moved more than `delta` since the last new picture.
-pub fn held_count(l: &[f32], prev_l: &[f32], delta: f32) -> u32 {
-    l.iter().zip(prev_l).filter(|(a, b)| (**a - **b).abs() > delta).count() as u32
+/// Pixels whose luminance moved more than `delta` or whose red value moved
+/// more than `delta_v` since the last new picture.
+pub fn held_count(l: &[f32], prev_l: &[f32], delta: f32, v: &[f32], prev_v: &[f32], delta_v: f32) -> u32 {
+    l.iter().zip(prev_l).zip(v.iter().zip(prev_v)).filter(|((a, b), (c, d))| (**a - **b).abs() > delta || (**c - **d).abs() > delta_v).count() as u32
 }
 
 /// One monotonic-run tracker step. Returns (reversed_up, reversed_down,
@@ -510,6 +519,7 @@ pub(crate) fn run_range_scalar(
             st.pool_gen_t[i] = nv;
             st.pool_red_t[i] = nv;
             st.prev_l[i] = l;
+            st.prev_v[i] = v;
             out.mask[i] = 0;
             out.onset_gen[i] = 0;
             out.onset_red[i] = 0;
@@ -565,6 +575,7 @@ pub(crate) fn run_range_scalar(
         let v = planes.v[i];
         let sat = planes.sat[i] != 0;
         st.prev_l[i] = l;
+        st.prev_v[i] = v;
         let mut flags = st.flags[i];
 
         // --- luminance run tracker ------------------------------------
@@ -830,8 +841,8 @@ mod tests {
     #[test]
     fn layout_is_consistent() {
         let lay = StateLayout { k: 4 };
-        assert_eq!(lay.fields(), 30);
+        assert_eq!(lay.fields(), 31);
         let st = PixelState::new(3, 4);
-        assert_eq!(st.to_flat().len(), 90);
+        assert_eq!(st.to_flat().len(), 93);
     }
 }

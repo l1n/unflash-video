@@ -29,7 +29,7 @@ struct Params {
     pat_reg_num: u32,
     pat_reg_den: u32,
     pat_enabled: u32,
-    _pad0: u32,
+    held_delta_v: f32,
     _pad1: u32,
 };
 
@@ -73,6 +73,7 @@ const F_RED_PEND_T: u32 = 10u + 4u * K;
 const F_POOL_GEN_T: u32 = 11u + 4u * K;
 const F_POOL_RED_T: u32 = 12u + 4u * K;
 const F_PREV_L: u32 = 13u + 4u * K;
+const F_PREV_V: u32 = 14u + 4u * K;
 
 // mask bits
 const MASK_STROBE_GEN: u32 = 1u;

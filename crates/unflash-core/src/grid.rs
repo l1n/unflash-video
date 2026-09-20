@@ -37,6 +37,8 @@ pub struct GridGeometry {
     pub gys: Vec<u32>,
     /// Luminance delta that counts as "moved" for the held-frame test.
     pub held_delta: f32,
+    /// A pixel whose red value (R−G−B scale) moved this much has moved too.
+    pub held_delta_v: f32,
     /// Fewer moved pixels than this and the frame is a re-show.
     pub held_bar: f64,
 }
@@ -67,6 +69,7 @@ impl GridGeometry {
             gxs,
             gys,
             held_delta: HELD_DELTA_RATIO * cfg.swing_threshold,
+            held_delta_v: HELD_DELTA_RATIO * cfg.red_delta_threshold,
             held_bar: (HELD_AREA_RATIO * area_thresh as f64).max(1.0),
         }
     }
