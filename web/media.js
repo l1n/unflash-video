@@ -86,6 +86,38 @@ export class Movie {
     return m;
   }
 
+  /** Release the decoder workers (if any); the Movie is not usable afterwards. */
+  close() {
+    if (this.pool) {
+      this.pool.close();
+      this.pool = null;
+    }
+    this.poolPromise = null;
+  }
+
+  /**
+   * The worker pool for the built-in decoder, created on first use; null
+   * when workers cannot run it (the page then decodes inline).
+   */
+  async softwarePool() {
+    if (this.pool) return this.pool;
+    if (this.poolFailed) return null;
+    if (!this.poolPromise) {
+      this.poolPromise = (async () => {
+        try {
+          const { SoftwarePool } = await import('./h264pool.js');
+          this.pool = await SoftwarePool.create(this);
+          return this.pool;
+        } catch (e) {
+          console.warn('built-in H.264 decoder: decoding on the page instead of in workers:', e && e.message ? e.message : e);
+          this.poolFailed = true;
+          return null;
+        }
+      })();
+    }
+    return this.poolPromise;
+  }
+
   decoderConfig() {
     const desc = this.dx.track_description(this.video.index);
     const cfg = {
@@ -200,6 +232,24 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
 }
 
 /**
+ * A VideoFrame (I420, copied out of WebAssembly memory) of the picture the
+ * built-in decoder just produced.
+ */
+export function softwareFrame(wasm, dec, timestampUs) {
+  const w = dec.width();
+  const h = dec.height();
+  const mem = wasm.wasm_memory();
+  const data = new Uint8Array(mem.buffer, dec.frame_ptr(), dec.frame_len());
+  const init = { format: 'I420', codedWidth: w, codedHeight: h, timestamp: timestampUs };
+  try {
+    init.colorSpace = JSON.parse(dec.color_json());
+  } catch (e) {
+    /* default colour space */
+  }
+  return new VideoFrame(data, init);
+}
+
+/**
  * The same as decodeRange, through the built-in H.264 decoder in WASM.
  * Samples are decoded in file (decode) order and the pictures handed out in
  * presentation order once every earlier picture has been decoded.
@@ -210,6 +260,12 @@ async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, o
   const n = pts.length;
   const startIdx = movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
   const endUs = endSec * 1e6;
+  const pool = await movie.softwarePool();
+  if (pool && !pool.busy) {
+    let endIdx = startIdx;
+    while (endIdx < n && !(dts[endIdx] >= endUs && pts[endIdx] >= endUs)) endIdx++;
+    return pool.decodeRange(startIdx, endIdx, startSec, endSec, onFrame, { cancel, onProgress });
+  }
   const dec = new movie.wasm.H264Decoder(movie.dx.track_description(movie.video.index));
   // presentation order of the samples this pass will decode
   const ptsSorted = [];
@@ -250,10 +306,7 @@ async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, o
       }
       if (got) {
         if (dec.frame_damaged()) damaged++;
-        const w = dec.width();
-        const h = dec.height();
-        const rgba = dec.frame_rgba();
-        ready.set(pts[i], new VideoFrame(rgba, { format: 'RGBA', codedWidth: w, codedHeight: h, timestamp: pts[i] }));
+        ready.set(pts[i], softwareFrame(movie.wasm, dec, pts[i]));
       } else {
         // no picture for this sample: do not wait for it
         const k = ptsSorted.indexOf(pts[i]);

@@ -40,6 +40,11 @@ pub struct Decoder {
     last_output: Option<Rc<Picture>>,
     /// macroblock kinds of the last finished picture (debugging aid)
     last_kinds: Vec<crate::mb::MbKind>,
+    /// Picture buffers free for reuse, and per-picture macroblock tables.
+    pool: Vec<Picture>,
+    retired: Vec<Rc<Picture>>,
+    mbs_buf: Vec<MbInfo>,
+    deblock_buf: Vec<MbDeblockInfo>,
 }
 
 impl Default for Decoder {
@@ -50,7 +55,7 @@ impl Default for Decoder {
 
 impl Decoder {
     pub fn new() -> Decoder {
-        Decoder { spss: vec![None; 32], ppss: vec![None; 256], dpb: Dpb::new(), cur: None, nal_length_size: 4, active_sps: None, last_output: None, last_kinds: Vec::new() }
+        Decoder { spss: vec![None; 32], ppss: vec![None; 256], dpb: Dpb::new(), cur: None, nal_length_size: 4, active_sps: None, last_output: None, last_kinds: Vec::new(), pool: Vec::new(), retired: Vec::new(), mbs_buf: Vec::new(), deblock_buf: Vec::new() }
     }
 
     /// Feed an `AVCDecoderConfigurationRecord` (the `avcC` box payload):
@@ -248,7 +253,7 @@ impl Decoder {
         let poc = cur.poc.poc;
         if std::env::var_os("H264_TRACE").is_some() {
             let show = |l: &Vec<crate::picture::RefPic>| l.iter().map(|r| format!("{}{}", r.poc, if r.long_term { "L" } else { "" })).collect::<Vec<_>>().join(" ");
-            let dpb = self.dpb.entries.iter().map(|e| format!("fn{}/poc{}{}", e.pic.frame_num, e.pic.poc, if e.kind == crate::picture::RefKind::Long { "L" } else { "" })).collect::<Vec<_>>().join(" ");
+            let dpb = self.dpb.entries.iter().map(|e| format!("fn{}/poc{}{}", e.frame_num, e.poc, if e.kind == crate::picture::RefKind::Long { "L" } else { "" })).collect::<Vec<_>>().join(" ");
             eprintln!("slice pts {} type {:?} poc {} frame_num {} ref {} first_mb {} L0 [{}] L1 [{}] mods {:?} mmco {:?} dpb [{}]", pts, hdr.slice_type, poc, hdr.frame_num, hdr.nal_ref_idc, hdr.first_mb, show(&lists[0]), show(&lists[1]), hdr.ref_list_mods, hdr.mmco, dpb);
         }
         let mut sd = SliceDecoder::new(&sps, &pps, &scaling, &hdr, &lists, slice_id, entropy, &mut cur.mbs, &mut cur.deblock, &mut cur.pic, poc);
@@ -259,19 +264,39 @@ impl Decoder {
         Ok(finished)
     }
 
+    /// A picture buffer of the right size: one nobody uses any more, or a
+    /// new one.
+    fn take_picture(&mut self, id: u32, wm: usize, hm: usize) -> Picture {
+        for rc in self.dpb.graveyard.drain(..).chain(self.retired.drain(..)) {
+            if let Ok(p) = Rc::try_unwrap(rc) {
+                if p.width == wm * 16 && p.height == hm * 16 {
+                    self.pool.push(p);
+                }
+            }
+        }
+        match self.pool.pop() {
+            Some(mut p) => {
+                p.reset(id);
+                p
+            }
+            None => Picture::new(id, wm, hm),
+        }
+    }
+
     fn start_picture(&mut self, sps: &Sps, hdr: &SliceHeader, pts: f64) -> Result<()> {
         if self.active_sps.as_ref().map_or(true, |a| a.id != sps.id || a.width_mbs != sps.width_mbs || a.height_mbs != sps.height_mbs) {
             // a new sequence: references from the old one are useless
             if !hdr.is_idr() {
                 self.dpb.clear();
             }
+            self.pool.clear();
             self.active_sps = Some(sps.clone());
         }
+        let (wm, hm) = (sps.width_mbs as usize, sps.height_mbs as usize);
         if hdr.is_idr() {
             self.dpb.clear();
         } else {
             let last = self.last_output.clone();
-            let (wm, hm) = (sps.width_mbs as usize, sps.height_mbs as usize);
             self.dpb.fill_frame_num_gap(sps, hdr, &|id, _fn| {
                 let mut p = Picture::new(id, wm, hm);
                 if let Some(l) = &last {
@@ -286,22 +311,22 @@ impl Decoder {
         }
         let poc = self.dpb.compute_poc(sps, hdr);
         let id = self.dpb.alloc_id();
-        let (wm, hm) = (sps.width_mbs as usize, sps.height_mbs as usize);
-        let mut pic = Picture::new(id, wm, hm);
+        let mut pic = self.take_picture(id, wm, hm);
         pic.poc = poc.poc;
         pic.frame_num = hdr.frame_num;
         pic.is_idr = hdr.is_idr();
         pic.is_ref = hdr.is_ref();
         pic.pts = pts;
-        // conceal undecoded areas with the previous picture
-        if let Some(l) = &self.last_output {
-            if l.width == pic.width && l.height == pic.height {
-                pic.y.copy_from_slice(&l.y);
-                pic.u.copy_from_slice(&l.u);
-                pic.v.copy_from_slice(&l.v);
-            }
+        let n = wm * hm;
+        let mut mbs = std::mem::take(&mut self.mbs_buf);
+        mbs.resize(n, MbInfo::default());
+        for m in mbs.iter_mut() {
+            m.slice = 0;
         }
-        self.cur = Some(Current { pic, hdr: hdr.clone(), poc, mbs: vec![MbInfo::default(); wm * hm], deblock: vec![MbDeblockInfo::default(); wm * hm], slices: 0, damaged: false, decoded_mbs: 0 });
+        let mut deblock = std::mem::take(&mut self.deblock_buf);
+        deblock.clear();
+        deblock.resize(n, MbDeblockInfo::default());
+        self.cur = Some(Current { pic, hdr: hdr.clone(), poc, mbs, deblock, slices: 0, damaged: false, decoded_mbs: 0 });
         Ok(())
     }
 
@@ -311,12 +336,63 @@ impl Decoder {
         let (wm, hm) = (sps.width_mbs as usize, sps.height_mbs as usize);
         if cur.decoded_mbs < wm * hm {
             cur.damaged = true;
+            self.conceal(&mut cur, wm, hm);
         }
         deblock::filter_picture(&mut cur.pic, &cur.deblock, wm, hm);
-        self.last_kinds = cur.mbs.iter().map(|m| m.kind).collect();
+        self.last_kinds = cur.mbs.iter().map(|m| if m.slice != 0 { m.kind } else { crate::mb::MbKind::None }).collect();
         let pic = Rc::new(cur.pic);
         self.dpb.mark(&sps, &cur.hdr, pic.clone(), cur.poc)?;
-        self.last_output = Some(pic.clone());
+        if let Some(prev) = self.last_output.replace(pic.clone()) {
+            self.retired.push(prev);
+        }
+        self.mbs_buf = cur.mbs;
+        self.deblock_buf = cur.deblock;
         Ok(Some(DecodedFrame { pic, damaged: cur.damaged }))
+    }
+
+    /// Fill the macroblocks no slice covered with the co-located samples of
+    /// the previous output picture (or mid grey when there is none).
+    fn conceal(&self, cur: &mut Current, wm: usize, hm: usize) {
+        let w = cur.pic.width;
+        let cw = w / 2;
+        let last = self.last_output.as_ref().filter(|l| l.width == cur.pic.width && l.height == cur.pic.height);
+        for my in 0..hm {
+            for mx in 0..wm {
+                if cur.deblock[my * wm + mx].decoded {
+                    continue;
+                }
+                for y in 0..16 {
+                    let o = (my * 16 + y) * w + mx * 16;
+                    match last {
+                        Some(l) => cur.pic.y[o..o + 16].copy_from_slice(&l.y[o..o + 16]),
+                        None => cur.pic.y[o..o + 16].fill(128),
+                    }
+                }
+                for y in 0..8 {
+                    let o = (my * 8 + y) * cw + mx * 8;
+                    match last {
+                        Some(l) => {
+                            cur.pic.u[o..o + 8].copy_from_slice(&l.u[o..o + 8]);
+                            cur.pic.v[o..o + 8].copy_from_slice(&l.v[o..o + 8]);
+                        }
+                        None => {
+                            cur.pic.u[o..o + 8].fill(128);
+                            cur.pic.v[o..o + 8].fill(128);
+                        }
+                    }
+                }
+                // a concealed macroblock predicts like an intra one with no motion
+                cur.pic.mb_intra[my * wm + mx] = true;
+                let w4 = w / 4;
+                for by in 0..4 {
+                    let row = (my * 4 + by) * w4 + mx * 4;
+                    for l in 0..2 {
+                        cur.pic.mv[l][row..row + 4].fill([0, 0]);
+                        cur.pic.ref_idx[l][row..row + 4].fill(-1);
+                        cur.pic.ref_id[l][row..row + 4].fill(-1);
+                    }
+                }
+            }
+        }
     }
 }

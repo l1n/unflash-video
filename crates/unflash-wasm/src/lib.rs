@@ -13,7 +13,7 @@ use unflash_core::pixel::MODE_FIRST;
 use unflash_core::temporal::{AnalysisResult, FrameRecord, Violation};
 use unflash_core::{sections, timeline};
 use unflash_gpu::{FrameSource as GpuSource, GpuContext, GpuStage};
-use unflash_h264::yuv::{matrix_for, to_rgba};
+use unflash_h264::yuv::to_i420;
 use unflash_mp4::demux::TrackKind;
 use wasm_bindgen::prelude::*;
 
@@ -908,8 +908,17 @@ pub fn h264_probe(avcc: &[u8]) -> Result<String, JsValue> {
     .to_string())
 }
 
+/// The WebAssembly linear memory, so JavaScript can read decoded pictures
+/// in place (`H264Decoder::frame_ptr`).
+#[wasm_bindgen]
+pub fn wasm_memory() -> JsValue {
+    wasm_bindgen::memory()
+}
+
 /// A software H.264 decoder for one track: samples in decode order in,
-/// RGBA pictures (at the cropped size) out, one per sample.
+/// I420 pictures (at the cropped size) out, one per sample. The picture
+/// stays in WebAssembly memory; `frame_ptr` / `frame_len` locate it for a
+/// `VideoFrame` of format I420 (which copies it).
 #[wasm_bindgen]
 pub struct H264Decoder {
     inner: unflash_h264::Decoder,
@@ -918,6 +927,7 @@ pub struct H264Decoder {
     damaged: bool,
     width: u32,
     height: u32,
+    color: String,
 }
 
 #[wasm_bindgen]
@@ -927,7 +937,8 @@ impl H264Decoder {
         let mut inner = unflash_h264::Decoder::new();
         inner.configure_avcc(avcc).map_err(js_err)?;
         let (width, height) = inner.first_sps().map(|s| s.cropped_size()).ok_or_else(|| js_err("no sequence parameter set in the file"))?;
-        Ok(H264Decoder { inner, frame: Vec::new(), pts: 0.0, damaged: false, width, height })
+        let color = color_space_json(inner.first_sps().unwrap());
+        Ok(H264Decoder { inner, frame: Vec::new(), pts: 0.0, damaged: false, width, height, color })
     }
 
     pub fn width(&self) -> u32 {
@@ -944,11 +955,10 @@ impl H264Decoder {
             Some(f) => {
                 let sps = self.inner.sps().ok_or_else(|| js_err("no active sequence"))?;
                 let (w, h) = sps.cropped_size();
-                let (matrix, full) = match &sps.vui {
-                    Some(v) => (matrix_for(Some(v.matrix_coefficients), h), v.video_full_range),
-                    None => (matrix_for(None, h), false),
-                };
-                to_rgba(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), matrix, full, &mut self.frame);
+                to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut self.frame);
+                if self.width != w || self.height != h {
+                    self.color = color_space_json(sps);
+                }
                 self.width = w;
                 self.height = h;
                 self.pts = f.pic.pts;
@@ -958,8 +968,34 @@ impl H264Decoder {
         }
     }
 
-    /// The last decoded picture as RGBA8, `width() * height() * 4` bytes.
-    pub fn frame_rgba(&self) -> Vec<u8> {
+    /// Flush the picture in progress at the end of the stream (Annex B
+    /// input only; MP4 samples always complete their picture).
+    pub fn flush(&mut self) -> Result<bool, JsValue> {
+        match self.inner.flush().map_err(js_err)? {
+            None => Ok(false),
+            Some(f) => {
+                let sps = self.inner.sps().ok_or_else(|| js_err("no active sequence"))?;
+                let (w, h) = sps.cropped_size();
+                to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut self.frame);
+                self.width = w;
+                self.height = h;
+                self.pts = f.pic.pts;
+                self.damaged = f.damaged;
+                Ok(true)
+            }
+        }
+    }
+
+    /// The last decoded picture as packed I420 (Y then Cb then Cr, no
+    /// padding) in WebAssembly memory: its address and length in bytes.
+    pub fn frame_ptr(&self) -> *const u8 {
+        self.frame.as_ptr()
+    }
+    pub fn frame_len(&self) -> u32 {
+        self.frame.len() as u32
+    }
+    /// A copy of the last picture (for callers that cannot read memory).
+    pub fn frame_i420(&self) -> Vec<u8> {
         self.frame.clone()
     }
     pub fn frame_pts(&self) -> f64 {
@@ -968,4 +1004,44 @@ impl H264Decoder {
     pub fn frame_damaged(&self) -> bool {
         self.damaged
     }
+    /// The picture's colour space as a `VideoColorSpaceInit` JSON object.
+    pub fn color_json(&self) -> String {
+        self.color.clone()
+    }
+}
+
+/// The VideoColorSpace of a sequence, from its VUI or the usual defaults
+/// by picture size.
+fn color_space_json(sps: &unflash_h264::Sps) -> String {
+    let (_, h) = sps.cropped_size();
+    let hd = h > 576;
+    let (mut primaries, mut transfer, mut matrix, mut full) = (if hd { "bt709" } else { "smpte170m" }, if hd { "bt709" } else { "smpte170m" }, if hd { "bt709" } else { "smpte170m" }, false);
+    if let Some(v) = &sps.vui {
+        full = v.video_full_range;
+        primaries = match v.colour_primaries {
+            1 => "bt709",
+            5 => "bt470bg",
+            6 => "smpte170m",
+            9 => "bt2020",
+            _ => primaries,
+        };
+        transfer = match v.transfer_characteristics {
+            1 => "bt709",
+            6 => "smpte170m",
+            8 => "linear",
+            13 => "iec61966-2-1",
+            16 => "pq",
+            18 => "hlg",
+            _ => transfer,
+        };
+        matrix = match v.matrix_coefficients {
+            0 => "rgb",
+            1 => "bt709",
+            5 => "bt470bg",
+            6 => "smpte170m",
+            9 => "bt2020-ncl",
+            _ => matrix,
+        };
+    }
+    serde_json::json!({ "primaries": primaries, "transfer": transfer, "matrix": matrix, "fullRange": full }).to_string()
 }

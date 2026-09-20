@@ -1,6 +1,7 @@
 // Unflash web app: wiring between the WASM detector, WebCodecs and the UI.
 
 import init, * as wasm from './pkg/unflash.js';
+import { defaultWorkerCount } from './h264pool.js';
 import { Movie, tick } from './media.js';
 import { createDetector } from './detector.js';
 import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, shownPts, softenPlan } from './analysis.js';
@@ -168,6 +169,7 @@ async function openFile(file) {
   await runJob('Opening video', async (progress) => {
     progress(0.1, 'reading the index');
     const movie = await Movie.open(file, wasm);
+    if (state.movie) state.movie.close();
     state.movie = movie;
     state.decode = await movie.decoderSupport();
     progress(0.4, 'starting the detector');
@@ -192,7 +194,7 @@ async function openFile(file) {
     if (!state.decode.supported) banner(`This browser cannot decode ${movie.video.codec} with WebCodecs (${state.decode.reason}). The live monitor still works while the player plays; scanning and section editing need a decodable file (H.264 in most browsers).`, 'info');
     else if (state.decode.software) {
       const info = movie.softwareInfo || {};
-      banner(`This browser cannot decode ${movie.video.codec} with WebCodecs, so Unflash uses its built-in H.264 decoder (profile ${info.profile_idc}, level ${info.level_idc}) for scanning, sections and export. It is slower than a hardware decoder, and the player cannot play this file here, so the live monitor is off.`, 'info');
+      banner(`This browser cannot decode ${movie.video.codec} with WebCodecs, so Unflash uses its built-in H.264 decoder (profile ${info.profile_idc}, level ${info.level_idc}) for scanning, sections and export, decoding in ${defaultWorkerCount()} parallel workers. The player cannot play this file here, so the live monitor is off.`, 'info');
     }
     $('liveToggle').disabled = !!state.decode.software;
     state.current = null;

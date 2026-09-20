@@ -5,12 +5,60 @@
 use crate::tables::{CABAC_INIT_I, CABAC_INIT_PB, RANGE_LPS, TRANS_LPS, TRANS_MPS};
 use crate::{Error, Result};
 
+/// rangeTabLPS indexed by the combined context state (pStateIdx << 1 | valMPS).
+const LPS_RANGE: [[u8; 4]; 128] = {
+    let mut t = [[0u8; 4]; 128];
+    let mut s = 0;
+    while s < 128 {
+        t[s] = RANGE_LPS[s >> 1];
+        s += 1;
+    }
+    t
+};
+/// The next combined state after an MPS / an LPS.
+const NEXT_MPS: [u8; 128] = {
+    let mut t = [0u8; 128];
+    let mut s = 0;
+    while s < 128 {
+        t[s] = (TRANS_MPS[s >> 1] << 1) | (s as u8 & 1);
+        s += 1;
+    }
+    t
+};
+const NEXT_LPS: [u8; 128] = {
+    let mut t = [0u8; 128];
+    let mut s = 0;
+    while s < 128 {
+        let mps = s as u8 & 1;
+        t[s] = (TRANS_LPS[s >> 1] << 1) | if s >> 1 == 0 { 1 - mps } else { mps };
+        s += 1;
+    }
+    t
+};
+
+/// ctxIdxInc of significant_coeff_flag / last_significant_coeff_flag for
+/// the block categories where it is the scan position.
+const CTX_IDENTITY: [u8; 63] = {
+    let mut t = [0u8; 63];
+    let mut i = 0;
+    while i < 63 {
+        t[i] = i as u8;
+        i += 1;
+    }
+    t
+};
+/// The same for chroma DC: Min(i, 2).
+const CTX_CHROMA_DC: [u8; 3] = [0, 1, 2];
+
 pub struct Cabac<'a> {
     data: &'a [u8],
-    /// bits consumed so far
+    /// the next byte to fetch
     pos: usize,
     range: u32,
-    offset: u32,
+    /// codIOffset scaled by 2^7, with up to 7 not yet needed bits below it
+    value: u32,
+    /// shifts until the next byte must be fetched, minus 8 (-8..=-1)
+    bits_needed: i32,
     /// (pStateIdx << 1) | valMPS
     ctx: [u8; 1024],
 }
@@ -19,34 +67,36 @@ impl<'a> Cabac<'a> {
     /// Start decoding slice data at byte `byte_pos` of `data`, with the
     /// context variables initialised for the slice (9.3.1.1, 9.3.1.2).
     pub fn new(data: &'a [u8], byte_pos: usize, is_i_slice: bool, cabac_init_idc: u32, slice_qp: i32) -> Result<Cabac<'a>> {
-        let mut c = Cabac { data, pos: byte_pos * 8, range: 510, offset: 0, ctx: [0; 1024] };
+        let mut c = Cabac { data, pos: byte_pos, range: 510, value: 0, bits_needed: -8, ctx: [0; 1024] };
         let qp = slice_qp.clamp(0, 51);
+        let table: &[[i8; 2]; 1024] = if is_i_slice { &CABAC_INIT_I } else { &CABAC_INIT_PB[cabac_init_idc as usize] };
         for i in 0..1024 {
-            let (m, n) = if is_i_slice { (CABAC_INIT_I[i][0] as i32, CABAC_INIT_I[i][1] as i32) } else { (CABAC_INIT_PB[cabac_init_idc as usize][i][0] as i32, CABAC_INIT_PB[cabac_init_idc as usize][i][1] as i32) };
+            let (m, n) = (table[i][0] as i32, table[i][1] as i32);
             let pre = (((m * qp) >> 4) + n).clamp(1, 126);
             c.ctx[i] = if pre <= 63 { ((63 - pre) << 1) as u8 } else { (((pre - 64) << 1) | 1) as u8 };
         }
-        c.offset = c.read_bits(9);
-        if c.offset >= 510 {
-            return Err(Error::Bitstream("bad CABAC initialisation"));
-        }
+        c.restart(byte_pos)?;
         Ok(c)
     }
 
-    /// Re-initialise the arithmetic decoder at a byte position (after PCM
-    /// samples), keeping the context variables.
+    /// (Re-)initialise the arithmetic decoding engine at a byte position
+    /// (9.3.1.2; after PCM samples), keeping the context variables.
     pub fn restart(&mut self, byte_pos: usize) -> Result<()> {
-        self.pos = byte_pos * 8;
+        self.pos = byte_pos;
         self.range = 510;
-        self.offset = self.read_bits(9);
-        if self.offset >= 510 {
-            return Err(Error::Bitstream("bad CABAC re-initialisation"));
+        self.value = (self.next_byte() as u32) << 8;
+        self.value |= self.next_byte() as u32;
+        self.bits_needed = -8;
+        if self.value >> 7 >= 510 {
+            return Err(Error::Bitstream("bad CABAC initialisation"));
         }
         Ok(())
     }
 
-    /// Bits consumed by the arithmetic decoder so far.
-    pub fn bit_pos(&self) -> usize {
+    /// The byte at which the PCM samples of an I_PCM macroblock start once
+    /// its mb_type has been decoded: the arithmetic decoder has consumed
+    /// every bit before it (9.3.1.2).
+    pub fn byte_pos(&self) -> usize {
         self.pos
     }
 
@@ -54,55 +104,63 @@ impl<'a> Cabac<'a> {
         self.data
     }
 
-    #[inline]
-    fn read_bits(&mut self, n: u32) -> u32 {
-        if n == 0 {
-            return 0;
+    #[inline(always)]
+    fn next_byte(&mut self) -> u8 {
+        match self.data.get(self.pos) {
+            Some(&b) => {
+                self.pos += 1;
+                b
+            }
+            None => 0,
         }
-        let byte = self.pos >> 3;
-        let mut v: u64 = 0;
-        for i in 0..5 {
-            v = (v << 8) | *self.data.get(byte + i).unwrap_or(&0) as u64;
-        }
-        let bits = ((v << (self.pos & 7)) >> 8) as u32;
-        self.pos += n as usize;
-        bits >> (32 - n)
     }
 
     /// 9.3.3.2.1 DecodeDecision.
     #[inline]
     pub fn decision(&mut self, ctx_idx: usize) -> u32 {
-        let s = self.ctx[ctx_idx];
-        let state = (s >> 1) as usize;
-        let mps = (s & 1) as u32;
-        let q = ((self.range >> 6) & 3) as usize;
-        let r_lps = RANGE_LPS[state][q] as u32;
-        self.range -= r_lps;
-        let bin;
-        if self.offset >= self.range {
-            bin = 1 - mps;
-            self.offset -= self.range;
-            self.range = r_lps;
-            let new_mps = if state == 0 { 1 - mps } else { mps };
-            self.ctx[ctx_idx] = (TRANS_LPS[state] << 1) | new_mps as u8;
+        let s = self.ctx[ctx_idx] as usize;
+        let lps = LPS_RANGE[s][((self.range >> 6) & 3) as usize] as u32;
+        self.range -= lps;
+        let scaled = self.range << 7;
+        if self.value < scaled {
+            self.ctx[ctx_idx] = NEXT_MPS[s];
+            if scaled < (256 << 7) {
+                // one renormalisation shift at most on the MPS path
+                self.range = scaled >> 6;
+                self.value <<= 1;
+                self.bits_needed += 1;
+                if self.bits_needed == 0 {
+                    self.bits_needed = -8;
+                    self.value |= self.next_byte() as u32;
+                }
+            }
+            (s & 1) as u32
         } else {
-            bin = mps;
-            self.ctx[ctx_idx] = (TRANS_MPS[state] << 1) | mps as u8;
+            let n = lps.leading_zeros() - 23;
+            self.value = (self.value - scaled) << n;
+            self.range = lps << n;
+            self.ctx[ctx_idx] = NEXT_LPS[s];
+            self.bits_needed += n as i32;
+            if self.bits_needed >= 0 {
+                self.value |= (self.next_byte() as u32) << self.bits_needed;
+                self.bits_needed -= 8;
+            }
+            (!s & 1) as u32
         }
-        if self.range < 256 {
-            let shift = self.range.leading_zeros() - 23;
-            self.range <<= shift;
-            self.offset = (self.offset << shift) | self.read_bits(shift);
-        }
-        bin
     }
 
     /// 9.3.3.2.3 DecodeBypass.
     #[inline]
     pub fn bypass(&mut self) -> u32 {
-        self.offset = (self.offset << 1) | self.read_bits(1);
-        if self.offset >= self.range {
-            self.offset -= self.range;
+        self.value <<= 1;
+        self.bits_needed += 1;
+        if self.bits_needed >= 0 {
+            self.bits_needed = -8;
+            self.value |= self.next_byte() as u32;
+        }
+        let scaled = self.range << 7;
+        if self.value >= scaled {
+            self.value -= scaled;
             1
         } else {
             0
@@ -112,13 +170,18 @@ impl<'a> Cabac<'a> {
     /// 9.3.3.2.4 DecodeTerminate.
     pub fn terminate(&mut self) -> u32 {
         self.range -= 2;
-        if self.offset >= self.range {
+        let scaled = self.range << 7;
+        if self.value >= scaled {
             1
         } else {
-            if self.range < 256 {
-                let shift = self.range.leading_zeros() - 23;
-                self.range <<= shift;
-                self.offset = (self.offset << shift) | self.read_bits(shift);
+            if scaled < (256 << 7) {
+                self.range = scaled >> 6;
+                self.value <<= 1;
+                self.bits_needed += 1;
+                if self.bits_needed == 0 {
+                    self.bits_needed = -8;
+                    self.value |= self.next_byte() as u32;
+                }
             }
             0
         }
@@ -376,41 +439,43 @@ impl<'a> Cabac<'a> {
             4 => (105 + 47, 166 + 47, 227 + 39),
             _ => (402, 417, 426),
         };
-        let mut significant = [false; 64];
-        let mut num_coeff = max;
+        let (sig_tab, last_tab): (&[u8], &[u8]) = match cat {
+            3 => (&CTX_CHROMA_DC, &CTX_CHROMA_DC),
+            5 => (&crate::tables::SIG_COEFF_8X8, &crate::tables::LAST_COEFF_8X8),
+            _ => (&CTX_IDENTITY, &CTX_IDENTITY),
+        };
+        // positions of the significant coefficients, in scan order
+        let mut sig = [0u8; 64];
+        let mut nsig = 0usize;
         let mut i = 0;
+        let mut last_found = false;
         while i < max - 1 {
-            let (sig_inc, last_inc) = match cat {
-                3 => (i.min(2), i.min(2)),
-                5 => (crate::tables::SIG_COEFF_8X8[i] as usize, crate::tables::LAST_COEFF_8X8[i] as usize),
-                _ => (i, i),
-            };
-            if self.decision(sig_base + sig_inc) != 0 {
-                significant[i] = true;
-                if self.decision(last_base + last_inc) != 0 {
-                    num_coeff = i + 1;
+            if self.decision(sig_base + sig_tab[i] as usize) != 0 {
+                sig[nsig] = i as u8;
+                nsig += 1;
+                if self.decision(last_base + last_tab[i] as usize) != 0 {
+                    last_found = true;
                     break;
                 }
             }
             i += 1;
         }
-        if num_coeff == max {
-            significant[max - 1] = true;
+        if !last_found {
+            sig[nsig] = (max - 1) as u8;
+            nsig += 1;
         }
         let mut num_gt1 = 0usize;
         let mut num_eq1 = 0usize;
-        let mut count = 0;
-        for i in (0..num_coeff).rev() {
-            if !significant[i] {
-                continue;
-            }
+        let abs_cap = 4 - (cat == 3) as usize;
+        for k in (0..nsig).rev() {
+            let i = sig[k] as usize;
             // coeff_abs_level_minus1: prefix TU (cMax 14) then EG0 suffix
             let inc0 = if num_gt1 != 0 { 0 } else { (1 + num_eq1).min(4) };
             let mut abs_m1: u32;
             if self.decision(abs_base + inc0) == 0 {
                 abs_m1 = 0;
             } else {
-                let inc = 5 + num_gt1.min(4 - if cat == 3 { 1 } else { 0 });
+                let inc = 5 + num_gt1.min(abs_cap);
                 abs_m1 = 1;
                 while abs_m1 < 14 && self.decision(abs_base + inc) != 0 {
                     abs_m1 += 1;
@@ -437,9 +502,8 @@ impl<'a> Cabac<'a> {
             }
             let level = abs_m1 as i32 + 1;
             coeffs[start + i] = if self.bypass() != 0 { -level } else { level };
-            count += 1;
         }
-        Ok(count)
+        Ok(nsig as u32)
     }
 
     /// end_of_slice_flag.

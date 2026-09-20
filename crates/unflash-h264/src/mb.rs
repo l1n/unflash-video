@@ -147,10 +147,11 @@ pub struct SliceDecoder<'a> {
     /// implicit bipred weights [ref0][ref1] -> (w0, w1)
     implicit: Vec<Vec<(i32, i32)>>,
     prev_qp_delta_nonzero: bool,
-    /// per list: 4x4 blocks of the current MB whose motion is decided
     /// 4x4 blocks of the current MB whose partition is decoded (its motion
     /// for both lists is final): available neighbours for prediction
     done: u16,
+    /// the macroblock-level spatial direct parameters, once derived
+    spatial_direct: Option<([i32; 2], [[i32; 2]; 2], bool)>,
     width_mbs: usize,
     height_mbs: usize,
     // current MB
@@ -158,6 +159,9 @@ pub struct SliceDecoder<'a> {
     mx: usize,
     my: usize,
     cur: MbInfo,
+    /// the residual levels of the current MB (only the blocks flagged in
+    /// `cur.nonzero` / `cur.cbf` hold meaningful values)
+    co: Coeffs,
 }
 
 fn chroma_qp(qp: i32, offset: i32) -> i32 {
@@ -211,12 +215,14 @@ impl<'a> SliceDecoder<'a> {
             implicit,
             prev_qp_delta_nonzero: false,
             done: 0,
+            spatial_direct: None,
             width_mbs: sps.width_mbs as usize,
             height_mbs: sps.height_mbs as usize,
             mb_addr: 0,
             mx: 0,
             my: 0,
             cur: MbInfo::default(),
+            co: Coeffs::default(),
         }
     }
 
@@ -297,18 +303,15 @@ impl<'a> SliceDecoder<'a> {
         self.my = addr / self.width_mbs;
         self.cur = MbInfo { slice: self.slice_id, ..Default::default() };
         self.done = 0;
+        self.spatial_direct = None;
         // clear the motion field of this MB
         let w4 = self.pic.width / 4;
         for by in 0..4 {
-            for bx in 0..4 {
-                let b = (self.my * 4 + by) * w4 + self.mx * 4 + bx;
-                for l in 0..2 {
-                    self.pic.mv[l][b] = [0, 0];
-                    self.pic.ref_idx[l][b] = -1;
-                    self.pic.ref_id[l][b] = -1;
-                    self.pic.ref_poc[l][b] = 0;
-                    self.pic.ref_long[l][b] = false;
-                }
+            let row = (self.my * 4 + by) * w4 + self.mx * 4;
+            for l in 0..2 {
+                self.pic.mv[l][row..row + 4].fill([0, 0]);
+                self.pic.ref_idx[l][row..row + 4].fill(-1);
+                self.pic.ref_id[l][row..row + 4].fill(-1);
             }
         }
     }
@@ -585,21 +588,22 @@ impl<'a> SliceDecoder<'a> {
         // mb_qp_delta and residual
         let has_residual = self.cur.cbp != 0 || itype != 0;
         self.qp_delta(has_residual)?;
-        let mut coeffs = Coeffs::default();
         if has_residual {
-            self.residual(&mut coeffs)?;
+            self.residual()?;
+        } else if itype != 0 {
+            self.co.luma_dc = [0; 16];
         }
         // reconstruction
         if itype == 0 {
             if self.cur.transform8x8 {
-                self.recon_intra8x8(&coeffs);
+                self.recon_intra8x8();
             } else {
-                self.recon_intra4x4(&coeffs);
+                self.recon_intra4x4();
             }
         } else {
-            self.recon_intra16x16(i16_mode, &coeffs);
+            self.recon_intra16x16(i16_mode);
         }
-        self.recon_chroma_intra(cpm, &coeffs);
+        self.recon_chroma_intra(cpm);
         Ok(())
     }
 
@@ -622,7 +626,7 @@ impl<'a> SliceDecoder<'a> {
                 }
             }
             Entropy::Cabac(c) => {
-                let pos = (c.bit_pos() + 7) / 8;
+                let pos = c.byte_pos();
                 let data = c.data();
                 if pos + 384 > data.len() {
                     return Err(Error::Bitstream("truncated PCM samples"));
@@ -856,8 +860,8 @@ impl<'a> SliceDecoder<'a> {
         }
     }
 
-    /// 7.3.5.3: all residual blocks of the macroblock.
-    fn residual(&mut self, co: &mut Coeffs) -> Result<()> {
+    /// 7.3.5.3: all residual blocks of the macroblock, into `self.co`.
+    fn residual(&mut self) -> Result<()> {
         let cbp_luma = self.cur.cbp & 15;
         let cbp_chroma = (self.cur.cbp >> 4) & 3;
         let i16 = self.cur.kind == MbKind::I16x16;
@@ -883,7 +887,7 @@ impl<'a> SliceDecoder<'a> {
                 }
             }
             for k in 0..16 {
-                co.luma_dc[ZIGZAG4X4[k] as usize] = dc[k];
+                self.co.luma_dc[ZIGZAG4X4[k] as usize] = dc[k];
             }
         }
         // luma 4x4 / 8x8 blocks
@@ -896,7 +900,7 @@ impl<'a> SliceDecoder<'a> {
                     let mut blk = [0i32; 64];
                     let n = if let Entropy::Cabac(c) = &mut self.entropy { c.residual_block(5, 64, 0, &mut blk)? } else { unreachable!() };
                     for k in 0..64 {
-                        co.luma8[b8][ZIGZAG8X8[k] as usize] = blk[k];
+                        self.co.luma8[b8][ZIGZAG8X8[k] as usize] = blk[k];
                     }
                     for dy in 0..2 {
                         for dx in 0..2 {
@@ -923,7 +927,7 @@ impl<'a> SliceDecoder<'a> {
                 if t8 {
                     // CAVLC 8x8: the four 4x4 blocks interleave into the 8x8 scan
                     for k in 0..16 {
-                        co.luma8[b8][ZIGZAG8X8[4 * k + b4] as usize] = blk[k];
+                        self.co.luma8[b8][ZIGZAG8X8[4 * k + b4] as usize] = blk[k];
                     }
                     if n > 0 {
                         let bx = (b8 % 2) * 2;
@@ -936,7 +940,7 @@ impl<'a> SliceDecoder<'a> {
                     }
                 } else {
                     for k in 0..16 {
-                        co.luma4[raster][ZIGZAG4X4[k] as usize] = blk[k];
+                        self.co.luma4[raster][ZIGZAG4X4[k] as usize] = blk[k];
                     }
                     if n > 0 {
                         self.cur.nonzero |= 1 << raster;
@@ -962,7 +966,7 @@ impl<'a> SliceDecoder<'a> {
                         }
                     }
                 }
-                co.chroma_dc[comp] = [dc[0], dc[1], dc[2], dc[3]];
+                self.co.chroma_dc[comp] = [dc[0], dc[1], dc[2], dc[3]];
             }
         }
         // chroma AC
@@ -992,7 +996,7 @@ impl<'a> SliceDecoder<'a> {
                         }
                     }
                     for k in 1..16 {
-                        co.chroma_ac[comp][blk][ZIGZAG4X4[k] as usize] = ac[k];
+                        self.co.chroma_ac[comp][blk][ZIGZAG4X4[k] as usize] = ac[k];
                     }
                 }
             }
@@ -1038,7 +1042,7 @@ impl<'a> SliceDecoder<'a> {
         self.intra_avail(dx, dy)
     }
 
-    fn recon_intra4x4(&mut self, co: &Coeffs) {
+    fn recon_intra4x4(&mut self) {
         let w = self.pic.width;
         let mut done: u16 = 0;
         let qp = self.cur.qp as i32;
@@ -1075,7 +1079,7 @@ impl<'a> SliceDecoder<'a> {
                 self.pic.y[(y0 + y) * w + x0..(y0 + y) * w + x0 + 4].copy_from_slice(&pred[y * 4..y * 4 + 4]);
             }
             if self.cur.nonzero & (1 << raster) != 0 {
-                let mut d = co.luma4[raster];
+                let mut d = self.co.luma4[raster];
                 transform::dequant4x4(&mut d, ls, qp, false);
                 transform::idct4x4_add(&d, &mut self.pic.y[y0 * w + x0..], w);
             }
@@ -1083,7 +1087,7 @@ impl<'a> SliceDecoder<'a> {
         }
     }
 
-    fn recon_intra8x8(&mut self, co: &Coeffs) {
+    fn recon_intra8x8(&mut self) {
         let w = self.pic.width;
         let mut done: u16 = 0;
         let qp = self.cur.qp as i32;
@@ -1120,7 +1124,7 @@ impl<'a> SliceDecoder<'a> {
             }
             let r0 = (by as usize / 4) * 4 + bx as usize / 4;
             if self.cur.nonzero & (1 << r0) != 0 {
-                let mut d = co.luma8[b8];
+                let mut d = self.co.luma8[b8];
                 transform::dequant8x8(&mut d, ls, qp);
                 transform::idct8x8_add(&d, &mut self.pic.y[y0 * w + x0..], w);
             }
@@ -1128,7 +1132,7 @@ impl<'a> SliceDecoder<'a> {
         }
     }
 
-    fn recon_intra16x16(&mut self, mode: u32, co: &Coeffs) {
+    fn recon_intra16x16(&mut self, mode: u32) {
         let w = self.pic.width;
         let avail_above = self.intra_avail(0, -1);
         let avail_left = self.intra_avail(-1, 0);
@@ -1153,19 +1157,19 @@ impl<'a> SliceDecoder<'a> {
         for y in 0..16 {
             self.pic.y[(y0 + y) * w + x0..(y0 + y) * w + x0 + 16].copy_from_slice(&pred[y * 16..y * 16 + 16]);
         }
-        self.add_luma_residual_i16(co);
+        self.add_luma_residual_i16();
     }
 
-    fn add_luma_residual_i16(&mut self, co: &Coeffs) {
+    fn add_luma_residual_i16(&mut self) {
         let w = self.pic.width;
         let qp = self.cur.qp as i32;
         let ls = &self.scaling.level4[(qp % 6) as usize][0];
-        let dc = transform::luma_dc(&co.luma_dc, ls[0], qp);
+        let dc = transform::luma_dc(&self.co.luma_dc, ls[0], qp);
         let x0 = self.mx * 16;
         let y0 = self.my * 16;
         for raster in 0..16 {
             let (bx, by) = ((raster % 4) * 4, (raster / 4) * 4);
-            let mut d = co.luma4[raster];
+            let mut d = self.co.luma4[raster];
             let has_ac = self.cur.nonzero & (1 << raster) != 0;
             if has_ac {
                 transform::dequant4x4(&mut d, ls, qp, true);
@@ -1177,7 +1181,7 @@ impl<'a> SliceDecoder<'a> {
         }
     }
 
-    fn recon_chroma_intra(&mut self, mode: u32, co: &Coeffs) {
+    fn recon_chroma_intra(&mut self, mode: u32) {
         let avail_above = self.intra_avail(0, -1);
         let avail_left = self.intra_avail(-1, 0);
         let avail_corner = self.intra_avail(-1, -1);
@@ -1205,10 +1209,10 @@ impl<'a> SliceDecoder<'a> {
                 plane[(y0 + y) * cw + x0..(y0 + y) * cw + x0 + 8].copy_from_slice(&pred[y * 8..y * 8 + 8]);
             }
         }
-        self.add_chroma_residual(co);
+        self.add_chroma_residual();
     }
 
-    fn add_chroma_residual(&mut self, co: &Coeffs) {
+    fn add_chroma_residual(&mut self) {
         let cw = self.pic.width / 2;
         let intra = self.cur.intra;
         let cbp_chroma = (self.cur.cbp >> 4) & 3;
@@ -1219,7 +1223,7 @@ impl<'a> SliceDecoder<'a> {
             let qpc = self.cur.qpc[comp] as i32;
             let list = if intra { 1 + comp } else { 4 + comp };
             let ls = &self.scaling.level4[(qpc % 6) as usize][list];
-            let dc = transform::chroma_dc(&co.chroma_dc[comp], ls[0], qpc);
+            let dc = transform::chroma_dc(&self.co.chroma_dc[comp], ls[0], qpc);
             let x0 = self.mx * 8;
             let y0 = self.my * 8;
             let plane = if comp == 0 { &mut self.pic.u } else { &mut self.pic.v };
@@ -1227,7 +1231,7 @@ impl<'a> SliceDecoder<'a> {
                 let (bx, by) = ((blk % 2) * 4, (blk / 2) * 4);
                 let has_ac = cbp_chroma == 2 && (self.cur.cbf >> (16 + comp * 4 + blk)) & 1 != 0;
                 if has_ac {
-                    let mut d = co.chroma_ac[comp][blk];
+                    let mut d = self.co.chroma_ac[comp][blk];
                     transform::dequant4x4(&mut d, ls, qpc, true);
                     d[0] = dc[blk];
                     transform::idct4x4_add(&d, &mut plane[(y0 + by) * cw + x0 + bx..], cw);
@@ -1239,7 +1243,7 @@ impl<'a> SliceDecoder<'a> {
     }
 
     /// Inter luma residual (4x4 or 8x8 transform) added to the prediction.
-    fn add_luma_residual_inter(&mut self, co: &Coeffs) {
+    fn add_luma_residual_inter(&mut self) {
         let w = self.pic.width;
         let qp = self.cur.qp as i32;
         let x0 = self.mx * 16;
@@ -1250,7 +1254,7 @@ impl<'a> SliceDecoder<'a> {
                 let (bx, by) = ((b8 % 2) * 8, (b8 / 2) * 8);
                 let r0 = (by / 4) * 4 + bx / 4;
                 if self.cur.nonzero & (1 << r0) != 0 {
-                    let mut d = co.luma8[b8];
+                    let mut d = self.co.luma8[b8];
                     transform::dequant8x8(&mut d, ls, qp);
                     transform::idct8x8_add(&d, &mut self.pic.y[(y0 + by) * w + x0 + bx..], w);
                 }
@@ -1260,7 +1264,7 @@ impl<'a> SliceDecoder<'a> {
             for raster in 0..16 {
                 if self.cur.nonzero & (1 << raster) != 0 {
                     let (bx, by) = ((raster % 4) * 4, (raster / 4) * 4);
-                    let mut d = co.luma4[raster];
+                    let mut d = self.co.luma4[raster];
                     transform::dequant4x4(&mut d, ls, qp, false);
                     transform::idct4x4_add(&d, &mut self.pic.y[(y0 + by) * w + x0 + bx..], w);
                 }
@@ -1311,12 +1315,11 @@ impl<'a> SliceDecoder<'a> {
                 self.cur.transform8x8 = self.parse_transform8x8()?;
             }
             self.qp_delta(cbp != 0)?;
-            let mut co = Coeffs::default();
             if cbp != 0 {
-                self.residual(&mut co)?;
+                self.residual()?;
             }
-            self.add_luma_residual_inter(&co);
-            self.add_chroma_residual(&co);
+            self.add_luma_residual_inter();
+            self.add_chroma_residual();
             return Ok(());
         }
         self.cur.kind = MbKind::Inter;
@@ -1632,20 +1635,15 @@ impl<'a> SliceDecoder<'a> {
     /// Store the motion of a (sub)partition into the picture and the done mask.
     fn set_motion(&mut self, list: usize, x: usize, y: usize, w: usize, h: usize, ref_idx: i32, mv: [i32; 2]) {
         let w4 = self.pic.width / 4;
-        let (id, poc, long) = if ref_idx >= 0 {
-            let r = &self.lists[list][ref_idx as usize];
-            (r.pic.id as i32, r.poc, r.long_term)
-        } else {
-            (-1, 0, false)
-        };
+        let id = if ref_idx >= 0 { self.lists[list][ref_idx as usize].pic.id as i32 } else { -1 };
+        let mv = [mv[0].clamp(-32768, 32767) as i16, mv[1].clamp(-32768, 32767) as i16];
         for by in y / 4..(y + h) / 4 {
+            let row = (self.my * 4 + by) * w4 + self.mx * 4;
             for bx in x / 4..(x + w) / 4 {
-                let b = (self.my * 4 + by) * w4 + self.mx * 4 + bx;
+                let b = row + bx;
                 self.pic.ref_idx[list][b] = ref_idx as i8;
-                self.pic.mv[list][b] = [mv[0].clamp(-32768, 32767) as i16, mv[1].clamp(-32768, 32767) as i16];
+                self.pic.mv[list][b] = mv;
                 self.pic.ref_id[list][b] = id;
-                self.pic.ref_poc[list][b] = poc;
-                self.pic.ref_long[list][b] = long;
             }
         }
     }
@@ -1661,9 +1659,9 @@ impl<'a> SliceDecoder<'a> {
     }
 
     /// Motion of the co-located block for direct prediction: (ref_idx in
-    /// the col picture's list, mv, referenced picture id, list used) or
-    /// None for an intra co-located block.
-    fn col_motion(&self, x: usize, y: usize) -> Option<(i32, [i32; 2], i32, bool)> {
+    /// the col picture's list, mv, referenced picture id) or None for an
+    /// intra co-located block.
+    fn col_motion(&self, x: usize, y: usize) -> Option<(i32, [i32; 2], i32)> {
         let col = self.col.as_ref()?;
         let addr = self.my * self.width_mbs + self.mx;
         if col.mb_intra[addr] {
@@ -1675,135 +1673,164 @@ impl<'a> SliceDecoder<'a> {
         let b = (self.my * 4 + by) * w4 + self.mx * 4 + bx;
         if col.ref_idx[0][b] >= 0 {
             let mv = col.mv[0][b];
-            Some((col.ref_idx[0][b] as i32, [mv[0] as i32, mv[1] as i32], col.ref_id[0][b], col.ref_long[0][b]))
+            Some((col.ref_idx[0][b] as i32, [mv[0] as i32, mv[1] as i32], col.ref_id[0][b]))
         } else if col.ref_idx[1][b] >= 0 {
             let mv = col.mv[1][b];
-            Some((col.ref_idx[1][b] as i32, [mv[0] as i32, mv[1] as i32], col.ref_id[1][b], col.ref_long[1][b]))
+            Some((col.ref_idx[1][b] as i32, [mv[0] as i32, mv[1] as i32], col.ref_id[1][b]))
         } else {
             None
         }
     }
 
-    /// 8.4.1.2: direct prediction of the 8x8 block `b8` (all four for
-    /// B_Skip / B_Direct_16x16). Sets the motion and predicts the samples.
-    fn direct_8x8(&mut self, b8: usize) -> Result<()> {
-        let (x8, y8) = ((b8 % 2) * 8, (b8 / 2) * 8);
+    /// 8.4.1.2.2: the macroblock-level part of spatial direct prediction
+    /// (reference indices and motion vector predictors), computed once per
+    /// macroblock: (ref_idx per list, mvp per list, all-zero flag).
+    fn spatial_direct_params(&mut self) -> ([i32; 2], [[i32; 2]; 2], bool) {
+        if let Some(p) = self.spatial_direct {
+            return p;
+        }
+        let min_pos = |a: i32, b: i32| if a >= 0 && b >= 0 { a.min(b) } else { a.max(b) };
+        let mut ref_idx = [0i32; 2];
+        let mut mvp = [[0i32; 2]; 2];
+        for list in 0..2 {
+            let a = self.nb_motion(list, -1, 0).map_or(-1, |v| v.0);
+            let b = self.nb_motion(list, 0, -1).map_or(-1, |v| v.0);
+            let c = self.nb_motion(list, 16, -1).or_else(|| self.nb_motion(list, -1, -1)).map_or(-1, |v| v.0);
+            ref_idx[list] = min_pos(a, min_pos(b, c));
+        }
+        let zero = ref_idx[0] < 0 && ref_idx[1] < 0;
+        if zero {
+            ref_idx = [0, 0];
+        } else {
+            for list in 0..2 {
+                if ref_idx[list] >= 0 {
+                    mvp[list] = self.mv_pred(list, ref_idx[list], 0, 0, 16, 16, 0);
+                }
+            }
+        }
+        let p = (ref_idx, mvp, zero);
+        self.spatial_direct = Some(p);
+        p
+    }
+
+    /// 8.4.1.2: the motion of one direct-predicted block at (x, y) of size
+    /// `sz`: (reference indices, motion vectors) per list, -1 = unused.
+    fn direct_motion(&mut self, bx: usize, by: usize) -> Result<([i32; 2], [[i32; 2]; 2])> {
         if self.col.is_none() {
             return Err(Error::Bitstream("B slice without a list 1 reference"));
         }
         if self.hdr.direct_spatial_mv_pred {
-            // 8.4.1.2.2: the MB-level reference indices and predictors
-            let min_pos = |a: i32, b: i32| if a >= 0 && b >= 0 { a.min(b) } else { a.max(b) };
-            let mut ref_idx = [0i32; 2];
-            let mut mvp = [[0i32; 2]; 2];
-            for list in 0..2 {
-                let a = self.nb_motion(list, -1, 0).map_or(-1, |v| v.0);
-                let b = self.nb_motion(list, 0, -1).map_or(-1, |v| v.0);
-                let c = self.nb_motion(list, 16, -1).or_else(|| self.nb_motion(list, -1, -1)).map_or(-1, |v| v.0);
-                ref_idx[list] = min_pos(a, min_pos(b, c));
-            }
-            let zero = ref_idx[0] < 0 && ref_idx[1] < 0;
-            if zero {
-                ref_idx = [0, 0];
-            } else {
-                for list in 0..2 {
-                    if ref_idx[list] >= 0 {
-                        mvp[list] = self.mv_pred(list, ref_idx[list], 0, 0, 16, 16, 0);
-                    }
-                }
-            }
+            let (ref_idx, mvp, zero) = self.spatial_direct_params();
             let l1_short = !self.lists[1][0].long_term;
-            let blocks: Vec<(usize, usize, usize)> = if self.sps.direct_8x8_inference { vec![(x8, y8, 8)] } else { vec![(x8, y8, 4), (x8 + 4, y8, 4), (x8, y8 + 4, 4), (x8 + 4, y8 + 4, 4)] };
-            for (bx, by, sz) in blocks {
-                let col = self.col_motion(bx, by);
-                let col_zero = match col {
-                    Some((ridx, mv, _, _)) => l1_short && ridx == 0 && (-1..=1).contains(&mv[0]) && (-1..=1).contains(&mv[1]),
-                    None => false,
-                };
-                let mut mvs = [[0i32; 2]; 2];
-                let mut refs = [-1i32; 2];
-                for list in 0..2 {
-                    if zero {
-                        refs[list] = 0;
-                        mvs[list] = [0, 0];
-                    } else if ref_idx[list] >= 0 {
-                        refs[list] = ref_idx[list];
-                        mvs[list] = if ref_idx[list] == 0 && col_zero { [0, 0] } else { mvp[list] };
-                    }
+            let col = self.col_motion(bx, by);
+            let col_zero = match col {
+                Some((ridx, mv, _)) => l1_short && ridx == 0 && (-1..=1).contains(&mv[0]) && (-1..=1).contains(&mv[1]),
+                None => false,
+            };
+            let mut mvs = [[0i32; 2]; 2];
+            let mut refs = [-1i32; 2];
+            for list in 0..2 {
+                if zero {
+                    refs[list] = 0;
+                } else if ref_idx[list] >= 0 {
+                    refs[list] = ref_idx[list];
+                    mvs[list] = if ref_idx[list] == 0 && col_zero { [0, 0] } else { mvp[list] };
                 }
-                for list in 0..2 {
-                    self.set_motion(list, bx, by, sz, sz, refs[list], mvs[list]);
-                }
-                self.mark_done(bx, by, sz, sz);
-                let r = [if refs[0] >= 0 { Some(refs[0] as usize) } else { None }, if refs[1] >= 0 { Some(refs[1] as usize) } else { None }];
-                self.predict_inter_block(bx, by, sz, sz, r, mvs);
             }
+            Ok((refs, mvs))
         } else {
             // 8.4.1.2.3 temporal
-            let blocks: Vec<(usize, usize, usize)> = if self.sps.direct_8x8_inference { vec![(x8, y8, 8)] } else { vec![(x8, y8, 4), (x8 + 4, y8, 4), (x8, y8 + 4, 4), (x8 + 4, y8 + 4, 4)] };
-            for (bx, by, sz) in blocks {
-                let col = self.col_motion(bx, by);
-                let (mv_col, ref_id_col) = match col {
-                    Some((_, mv, id, _)) => (mv, id),
-                    None => ([0, 0], -1),
-                };
-                let ref0 = if ref_id_col < 0 { 0 } else { self.lists[0].iter().position(|r| r.pic.id as i32 == ref_id_col).unwrap_or(0) };
-                if std::env::var_os("H264_TRACE").is_some() && ref_id_col >= 0 && !self.lists[0].iter().any(|r| r.pic.id as i32 == ref_id_col) {
-                    eprintln!("  temporal direct: col ref id {} not in L0 (mb {},{})", ref_id_col, self.mx, self.my);
-                }
-                let r0 = &self.lists[0][ref0];
-                let r1 = &self.lists[1][0];
-                let (mv0, mv1) = if r0.long_term {
-                    (mv_col, [0, 0])
-                } else {
-                    match inter::dist_scale_factor(self.poc, r0.poc, r1.poc) {
-                        None => (mv_col, [0, 0]),
-                        Some(dsf) => {
-                            let m0 = [(dsf * mv_col[0] + 128) >> 8, (dsf * mv_col[1] + 128) >> 8];
-                            (m0, [m0[0] - mv_col[0], m0[1] - mv_col[1]])
-                        }
+            let col = self.col_motion(bx, by);
+            let (mv_col, ref_id_col) = match col {
+                Some((_, mv, id)) => (mv, id),
+                None => ([0, 0], -1),
+            };
+            let ref0 = if ref_id_col < 0 { 0 } else { self.lists[0].iter().position(|r| r.pic.id as i32 == ref_id_col).unwrap_or(0) };
+            let r0 = &self.lists[0][ref0];
+            let r1 = &self.lists[1][0];
+            let (mv0, mv1) = if r0.long_term {
+                (mv_col, [0, 0])
+            } else {
+                match inter::dist_scale_factor(self.poc, r0.poc, r1.poc) {
+                    None => (mv_col, [0, 0]),
+                    Some(dsf) => {
+                        let m0 = [(dsf * mv_col[0] + 128) >> 8, (dsf * mv_col[1] + 128) >> 8];
+                        (m0, [m0[0] - mv_col[0], m0[1] - mv_col[1]])
                     }
-                };
-                if std::env::var_os("H264_TRACE_MB").map_or(false, |v| v == format!("{},{},{}", self.poc, self.mx, self.my).as_str()) {
-                    eprintln!("  temporal direct poc {} mb ({},{}) blk ({bx},{by}) col {:?} -> ref0 {} (poc {}) l1 poc {} mv0 {:?} mv1 {:?}", self.poc, self.mx, self.my, col, ref0, r0.poc, r1.poc, mv0, mv1);
                 }
-                self.set_motion(0, bx, by, sz, sz, ref0 as i32, mv0);
-                self.set_motion(1, bx, by, sz, sz, 0, mv1);
-                self.mark_done(bx, by, sz, sz);
-                self.predict_inter_block(bx, by, sz, sz, [Some(ref0), Some(0)], [mv0, mv1]);
+            };
+            Ok(([ref0 as i32, 0], [mv0, mv1]))
+        }
+    }
+
+    /// Direct prediction of the 8x8 block `b8` of a B_8x8 macroblock: sets
+    /// the motion and predicts the samples.
+    fn direct_8x8(&mut self, b8: usize) -> Result<()> {
+        let (x8, y8) = ((b8 % 2) * 8, (b8 / 2) * 8);
+        if self.sps.direct_8x8_inference {
+            let (refs, mvs) = self.direct_motion(x8, y8)?;
+            self.apply_motion(x8, y8, 8, 8, refs, mvs);
+        } else {
+            for (bx, by) in [(x8, y8), (x8 + 4, y8), (x8, y8 + 4), (x8 + 4, y8 + 4)] {
+                let (refs, mvs) = self.direct_motion(bx, by)?;
+                self.apply_motion(bx, by, 4, 4, refs, mvs);
             }
         }
         Ok(())
     }
 
+    /// Store the motion of a block for both lists, mark it decoded and
+    /// predict its samples.
+    fn apply_motion(&mut self, x: usize, y: usize, w: usize, h: usize, refs: [i32; 2], mvs: [[i32; 2]; 2]) {
+        for list in 0..2 {
+            self.set_motion(list, x, y, w, h, refs[list], mvs[list]);
+        }
+        self.mark_done(x, y, w, h);
+        let r = [if refs[0] >= 0 { Some(refs[0] as usize) } else { None }, if refs[1] >= 0 { Some(refs[1] as usize) } else { None }];
+        self.predict_inter_block(x, y, w, h, r, mvs);
+    }
+
+    /// B_Skip / B_Direct_16x16: direct prediction of the whole macroblock.
+    /// Blocks that end up with the same motion are predicted together.
     fn direct_all(&mut self) -> Result<()> {
-        for b8 in 0..4 {
-            self.direct_8x8(b8)?;
+        let sz = if self.sps.direct_8x8_inference { 8 } else { 4 };
+        let n = 16 / sz;
+        let mut motion = [([0i32; 2], [[0i32; 2]; 2]); 16];
+        let mut same = true;
+        for by in 0..n {
+            for bx in 0..n {
+                let m = self.direct_motion(bx * sz, by * sz)?;
+                if m != motion[0] && (bx | by) != 0 {
+                    same = false;
+                }
+                motion[by * n + bx] = m;
+            }
+        }
+        if same {
+            let (refs, mvs) = motion[0];
+            self.apply_motion(0, 0, 16, 16, refs, mvs);
+        } else {
+            for by in 0..n {
+                for bx in 0..n {
+                    let (refs, mvs) = motion[by * n + bx];
+                    self.apply_motion(bx * sz, by * sz, sz, sz, refs, mvs);
+                }
+            }
         }
         Ok(())
     }
 
     /// Predict the samples of one block from its motion (both lists) with
-    /// the slice's weighting.
+    /// the slice's weighting, straight into the picture.
     fn predict_inter_block(&mut self, x: usize, y: usize, w: usize, h: usize, refs: [Option<usize>; 2], mvs: [[i32; 2]; 2]) {
-        let mut pl = [[0u8; 256]; 2];
-        let mut pc = [[[0u8; 64]; 2]; 2];
+        let lists = self.lists;
         let px = (self.mx * 16 + x) as i32;
         let py = (self.my * 16 + y) as i32;
-        for list in 0..2 {
-            let Some(r) = refs[list] else { continue };
-            let rp = &self.lists[list][r].pic;
-            inter::mc_luma(&rp.y, rp.width, rp.height, px, py, mvs[list][0], mvs[list][1], w, h, &mut pl[list]);
-            inter::mc_chroma(&rp.u, rp.width / 2, rp.height / 2, px / 2, py / 2, mvs[list][0], mvs[list][1], w / 2, h / 2, &mut pc[list][0]);
-            inter::mc_chroma(&rp.v, rp.width / 2, rp.height / 2, px / 2, py / 2, mvs[list][0], mvs[list][1], w / 2, h / 2, &mut pc[list][1]);
-        }
-        // weights
-        let n = w * h;
-        let nc = (w / 2) * (h / 2);
         let bi = refs[0].is_some() && refs[1].is_some();
         let single = if refs[0].is_some() { 0 } else { 1 };
-        let mut wl: Option<(i32, i32, i32, i32, i32)> = None;
-        let mut wc: [Option<(i32, i32, i32, i32, i32)>; 2] = [None, None];
+        // weights: None means the default (unweighted) process
+        let mut wl: Option<inter::Weights> = None;
+        let mut wc: [Option<inter::Weights>; 2] = [None, None];
         if let Some(t) = &self.hdr.pred_weight {
             let ent = |list: usize| -> (i32, i32, [i32; 2], [i32; 2]) {
                 let r = refs[list].unwrap();
@@ -1837,31 +1864,70 @@ impl<'a> SliceDecoder<'a> {
             wl = Some((w0, 0, w1, 0, 5));
             wc = [Some((w0, 0, w1, 0, 5)); 2];
         }
-        let mut outl = [0u8; 256];
-        let mut outc = [[0u8; 64]; 2];
-        if bi {
-            inter::weight(&pl[0][..n], Some(&pl[1][..n]), wl, &mut outl);
-            for c in 0..2 {
-                inter::weight(&pc[0][c][..nc], Some(&pc[1][c][..nc]), wc[c], &mut outc[c]);
-            }
-        } else {
-            inter::weight(&pl[single][..n], None, wl, &mut outl);
-            for c in 0..2 {
-                inter::weight(&pc[single][c][..nc], None, wc[c], &mut outc[c]);
+        // weights that are exactly the default prediction take the plain path
+        if wl.map_or(false, |v| inter::weights_are_default(v, bi)) {
+            wl = None;
+        }
+        for c in 0..2 {
+            if wc[c].map_or(false, |v| inter::weights_are_default(v, bi)) {
+                wc[c] = None;
             }
         }
-        // write into the picture
         let pw = self.pic.width;
+        let cw = pw / 2;
         let x0 = self.mx * 16 + x;
         let y0 = self.my * 16 + y;
-        for j in 0..h {
-            self.pic.y[(y0 + j) * pw + x0..(y0 + j) * pw + x0 + w].copy_from_slice(&outl[j * w..j * w + w]);
+        let ybase = y0 * pw + x0;
+        let cbase = (y0 / 2) * cw + x0 / 2;
+        let (cwid, chei) = (w / 2, h / 2);
+        // luma
+        if wl.is_none() {
+            let mut first = true;
+            for list in 0..2 {
+                let Some(r) = refs[list] else { continue };
+                let rp = &lists[list][r].pic;
+                inter::mc_luma(&rp.y, rp.width, rp.height, px, py, mvs[list][0], mvs[list][1], w, h, &mut self.pic.y[ybase..], pw, !first);
+                first = false;
+            }
+        } else {
+            let mut pl = [[0u8; 256]; 2];
+            for list in 0..2 {
+                let Some(r) = refs[list] else { continue };
+                let rp = &lists[list][r].pic;
+                inter::mc_luma(&rp.y, rp.width, rp.height, px, py, mvs[list][0], mvs[list][1], w, h, &mut pl[list], w, false);
+            }
+            if bi {
+                inter::weight_bi(&pl[0], &pl[1], w, h, wl.unwrap(), &mut self.pic.y[ybase..], pw);
+            } else {
+                inter::weight_uni(&pl[single], w, h, wl.unwrap(), &mut self.pic.y[ybase..], pw);
+            }
         }
-        let cw = pw / 2;
-        let (cx0, cy0, cwid, chei) = (x0 / 2, y0 / 2, w / 2, h / 2);
-        for j in 0..chei {
-            self.pic.u[(cy0 + j) * cw + cx0..(cy0 + j) * cw + cx0 + cwid].copy_from_slice(&outc[0][j * cwid..j * cwid + cwid]);
-            self.pic.v[(cy0 + j) * cw + cx0..(cy0 + j) * cw + cx0 + cwid].copy_from_slice(&outc[1][j * cwid..j * cwid + cwid]);
+        // chroma
+        for c in 0..2 {
+            let dst = if c == 0 { &mut self.pic.u[cbase..] } else { &mut self.pic.v[cbase..] };
+            if wc[c].is_none() {
+                let mut first = true;
+                for list in 0..2 {
+                    let Some(r) = refs[list] else { continue };
+                    let rp = &lists[list][r].pic;
+                    let plane = if c == 0 { &rp.u } else { &rp.v };
+                    inter::mc_chroma(plane, rp.width / 2, rp.height / 2, px / 2, py / 2, mvs[list][0], mvs[list][1], cwid, chei, dst, cw, !first);
+                    first = false;
+                }
+            } else {
+                let mut pc = [[0u8; 64]; 2];
+                for list in 0..2 {
+                    let Some(r) = refs[list] else { continue };
+                    let rp = &lists[list][r].pic;
+                    let plane = if c == 0 { &rp.u } else { &rp.v };
+                    inter::mc_chroma(plane, rp.width / 2, rp.height / 2, px / 2, py / 2, mvs[list][0], mvs[list][1], cwid, chei, &mut pc[list], cwid, false);
+                }
+                if bi {
+                    inter::weight_bi(&pc[0], &pc[1], cwid, chei, wc[c].unwrap(), dst, cw);
+                } else {
+                    inter::weight_uni(&pc[single], cwid, chei, wc[c].unwrap(), dst, cw);
+                }
+            }
         }
     }
 
@@ -1923,12 +1989,11 @@ impl<'a> SliceDecoder<'a> {
             }
         }
         self.qp_delta(cbp != 0)?;
-        let mut co = Coeffs::default();
         if cbp != 0 {
-            self.residual(&mut co)?;
+            self.residual()?;
         }
-        self.add_luma_residual_inter(&co);
-        self.add_chroma_residual(&co);
+        self.add_luma_residual_inter();
+        self.add_chroma_residual();
         Ok(())
     }
 }

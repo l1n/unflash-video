@@ -24,13 +24,10 @@ pub struct Picture {
     /// Inserted for a gap in frame_num: no samples of its own.
     pub non_existing: bool,
     /// Per 4x4 block (raster over the picture), per list: motion vector,
-    /// reference index (-1 = none), referenced picture id, its POC and
-    /// whether it was a long-term reference.
+    /// reference index (-1 = none) and the referenced picture's id.
     pub mv: [Vec<[i16; 2]>; 2],
     pub ref_idx: [Vec<i8>; 2],
     pub ref_id: [Vec<i32>; 2],
-    pub ref_poc: [Vec<i32>; 2],
-    pub ref_long: [Vec<bool>; 2],
     /// Per macroblock.
     pub mb_intra: Vec<bool>,
     /// The caller's timestamp for this picture.
@@ -56,11 +53,21 @@ impl Picture {
             mv: [vec![[0; 2]; n4], vec![[0; 2]; n4]],
             ref_idx: [vec![-1; n4], vec![-1; n4]],
             ref_id: [vec![-1; n4], vec![-1; n4]],
-            ref_poc: [vec![0; n4], vec![0; n4]],
-            ref_long: [vec![false; n4], vec![false; n4]],
             mb_intra: vec![false; width_mbs * height_mbs],
             pts: 0.0,
         }
+    }
+
+    /// Make a reused picture buffer a fresh picture (its samples and motion
+    /// are left as they were; every decoded macroblock overwrites its own).
+    pub fn reset(&mut self, id: u32) {
+        self.id = id;
+        self.poc = 0;
+        self.frame_num = 0;
+        self.is_idr = false;
+        self.is_ref = false;
+        self.non_existing = false;
+        self.pts = 0.0;
     }
 
     pub fn chroma_width(&self) -> usize {
@@ -91,11 +98,18 @@ pub struct DpbEntry {
     pub pic: Rc<Picture>,
     pub kind: RefKind,
     pub long_term_frame_idx: u32,
+    /// The frame_num and POC the picture is referenced by (a memory
+    /// management control operation 5 renumbers a picture after the fact).
+    pub frame_num: u32,
+    pub poc: i32,
 }
 
 /// The reference pictures and the state that carries between pictures.
 pub struct Dpb {
     pub entries: Vec<DpbEntry>,
+    /// Pictures that left the buffer since the decoder last reclaimed them
+    /// (their sample buffers are reused once nobody else holds them).
+    pub graveyard: Vec<Rc<Picture>>,
     /// None: "no long-term frame indices".
     pub max_long_term_frame_idx: Option<u32>,
     prev_ref_frame_num: u32,
@@ -105,6 +119,9 @@ pub struct Dpb {
     prev_frame_num: u32,
     prev_had_mmco5: bool,
     next_id: u32,
+    /// A reference picture has been marked (gaps in frame_num are relative
+    /// to it; a stream that starts on a non-IDR picture has none to fill).
+    started: bool,
 }
 
 impl Default for Dpb {
@@ -126,6 +143,7 @@ impl Dpb {
     pub fn new() -> Dpb {
         Dpb {
             entries: Vec::new(),
+            graveyard: Vec::new(),
             max_long_term_frame_idx: None,
             prev_ref_frame_num: 0,
             prev_poc_msb: 0,
@@ -134,6 +152,7 @@ impl Dpb {
             prev_frame_num: 0,
             prev_had_mmco5: false,
             next_id: 1,
+            started: false,
         }
     }
 
@@ -144,8 +163,21 @@ impl Dpb {
     }
 
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.graveyard.extend(self.entries.drain(..).map(|e| e.pic));
         self.max_long_term_frame_idx = None;
+    }
+
+    /// Drop the entries matching `pred`, keeping their pictures for reuse.
+    fn remove_where(&mut self, pred: impl Fn(&DpbEntry) -> bool) {
+        let mut i = 0;
+        while i < self.entries.len() {
+            if pred(&self.entries[i]) {
+                let e = self.entries.remove(i);
+                self.graveyard.push(e.pic);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     pub fn prev_ref_frame_num(&self) -> u32 {
@@ -238,8 +270,8 @@ impl Dpb {
             .map(|e| RefPic {
                 pic: e.pic.clone(),
                 long_term: e.kind == RefKind::Long,
-                poc: e.pic.poc,
-                pic_num: if e.kind == RefKind::Long { e.long_term_frame_idx as i32 } else { self.frame_num_wrap(sps, e.pic.frame_num, cur_frame_num) },
+                poc: e.poc,
+                pic_num: if e.kind == RefKind::Long { e.long_term_frame_idx as i32 } else { self.frame_num_wrap(sps, e.frame_num, cur_frame_num) },
             })
             .collect()
     }
@@ -342,7 +374,7 @@ impl Dpb {
     /// lost), so the reference picture numbering stays consistent. `fill`
     /// makes the picture used to stand in for them.
     pub fn fill_frame_num_gap(&mut self, sps: &Sps, hdr: &SliceHeader, fill: &dyn Fn(u32, u32) -> Picture) {
-        if hdr.is_idr() {
+        if hdr.is_idr() || !self.started {
             return;
         }
         let max = sps.max_frame_num();
@@ -359,7 +391,7 @@ impl Dpb {
             pic.non_existing = true;
             pic.is_ref = true;
             self.sliding_window(sps);
-            self.entries.push(DpbEntry { pic: Rc::new(pic), kind: RefKind::Short, long_term_frame_idx: 0 });
+            self.entries.push(DpbEntry { frame_num: pic.frame_num, poc: pic.poc, pic: Rc::new(pic), kind: RefKind::Short, long_term_frame_idx: 0 });
             self.prev_ref_frame_num = num;
             num = (num + 1) % max;
             guard += 1;
@@ -376,13 +408,14 @@ impl Dpb {
                 if e.kind != RefKind::Short {
                     continue;
                 }
-                let fnw = self.frame_num_wrap(sps, e.pic.frame_num, cur);
+                let fnw = self.frame_num_wrap(sps, e.frame_num, cur);
                 if worst.map_or(true, |(_, w)| fnw < w) {
                     worst = Some((i, fnw));
                 }
             }
             if let Some((i, _)) = worst {
-                self.entries.remove(i);
+                let e = self.entries.remove(i);
+                self.graveyard.push(e.pic);
             }
         }
     }
@@ -393,12 +426,12 @@ impl Dpb {
         let mut had_mmco5 = false;
         if hdr.is_ref() {
             if hdr.is_idr() {
-                self.entries.clear();
+                self.clear();
                 if hdr.long_term_reference {
-                    self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Long, long_term_frame_idx: 0 });
+                    self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Long, long_term_frame_idx: 0, frame_num: pic.frame_num, poc: pic.poc });
                     self.max_long_term_frame_idx = Some(0);
                 } else {
-                    self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Short, long_term_frame_idx: 0 });
+                    self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Short, long_term_frame_idx: 0, frame_num: pic.frame_num, poc: pic.poc });
                     self.max_long_term_frame_idx = None;
                 }
             } else {
@@ -412,18 +445,18 @@ impl Dpb {
                                 Mmco::UnmarkShortTerm(d) => {
                                     let pic_num = cur_pic_num - d as i32;
                                     let cur = hdr.frame_num;
-                                    self.entries.retain(|e| !(e.kind == RefKind::Short && frame_num_wrap_static(sps, e.pic.frame_num, cur) == pic_num));
+                                    self.remove_where(|e| e.kind == RefKind::Short && frame_num_wrap_static(sps, e.frame_num, cur) == pic_num);
                                 }
                                 Mmco::UnmarkLongTerm(num) => {
-                                    self.entries.retain(|e| !(e.kind == RefKind::Long && e.long_term_frame_idx == num));
+                                    self.remove_where(|e| e.kind == RefKind::Long && e.long_term_frame_idx == num);
                                 }
                                 Mmco::ShortToLong(d, idx) => {
                                     let pic_num = cur_pic_num - d as i32;
                                     let cur = hdr.frame_num;
                                     // a long-term picture already holding this index is unmarked
-                                    self.entries.retain(|e| !(e.kind == RefKind::Long && e.long_term_frame_idx == idx));
+                                    self.remove_where(|e| e.kind == RefKind::Long && e.long_term_frame_idx == idx);
                                     for e in self.entries.iter_mut() {
-                                        if e.kind == RefKind::Short && frame_num_wrap_static(sps, e.pic.frame_num, cur) == pic_num {
+                                        if e.kind == RefKind::Short && frame_num_wrap_static(sps, e.frame_num, cur) == pic_num {
                                             e.kind = RefKind::Long;
                                             e.long_term_frame_idx = idx;
                                         }
@@ -432,15 +465,14 @@ impl Dpb {
                                 Mmco::MaxLongTermIdx(plus1) => {
                                     self.max_long_term_frame_idx = if plus1 == 0 { None } else { Some(plus1 - 1) };
                                     let max = self.max_long_term_frame_idx;
-                                    self.entries.retain(|e| !(e.kind == RefKind::Long && max.map_or(true, |m| e.long_term_frame_idx > m)));
+                                    self.remove_where(|e| e.kind == RefKind::Long && max.map_or(true, |m| e.long_term_frame_idx > m));
                                 }
                                 Mmco::UnmarkAll => {
-                                    self.entries.clear();
-                                    self.max_long_term_frame_idx = None;
+                                    self.clear();
                                     had_mmco5 = true;
                                 }
                                 Mmco::CurrentToLong(idx) => {
-                                    self.entries.retain(|e| !(e.kind == RefKind::Long && e.long_term_frame_idx == idx));
+                                    self.remove_where(|e| e.kind == RefKind::Long && e.long_term_frame_idx == idx);
                                     current_long = Some(idx);
                                 }
                             }
@@ -451,15 +483,18 @@ impl Dpb {
                         }
                     }
                 }
+                // after a memory_management_control_operation 5 the picture counts as frame_num 0 with POC 0
+                let (frame_num, poc_after) = if had_mmco5 { (0, 0) } else { (pic.frame_num, pic.poc) };
                 match current_long {
-                    Some(idx) => self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Long, long_term_frame_idx: idx }),
-                    None => self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Short, long_term_frame_idx: 0 }),
+                    Some(idx) => self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Long, long_term_frame_idx: idx, frame_num, poc: poc_after }),
+                    None => self.entries.push(DpbEntry { pic: pic.clone(), kind: RefKind::Short, long_term_frame_idx: 0, frame_num, poc: poc_after }),
                 }
             }
         }
         // state for the next picture
         let frame_num_after = if had_mmco5 { 0 } else { hdr.frame_num };
         if hdr.is_ref() {
+            self.started = true;
             self.prev_ref_frame_num = frame_num_after;
             if had_mmco5 {
                 // 8.2.1: after mmco 5 the picture's POC counts from zero
@@ -473,15 +508,6 @@ impl Dpb {
         self.prev_frame_num = frame_num_after;
         self.prev_frame_num_offset = if had_mmco5 { 0 } else { poc.frame_num_offset };
         self.prev_had_mmco5 = had_mmco5;
-        if had_mmco5 {
-            // the current picture is renumbered: keep its entry consistent
-            if let Some(e) = self.entries.iter_mut().find(|e| e.pic.id == pic.id) {
-                if let Some(p) = Rc::get_mut(&mut e.pic) {
-                    p.frame_num = 0;
-                    p.poc = 0;
-                }
-            }
-        }
         Ok(())
     }
 
