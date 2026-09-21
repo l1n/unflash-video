@@ -39,6 +39,21 @@ export function projectKey(file) {
   return `${file.name}:${file.size}:${file.lastModified}`;
 }
 
+/** Drop a section's decoded frames (its caches and context); its marks and frame times stay. */
+export function dropCaches(sec) {
+  if (sec.cache) sec.cache.clear();
+  if (sec.softCache) sec.softCache.clear();
+  if (sec.ctx) {
+    sec.ctx.lead.clear();
+    sec.ctx.tail.clear();
+  }
+  sec.cache = null;
+  sec.softCache = null;
+  sec.softKey = null;
+  sec.ctx = null;
+  sec.prepared = false;
+}
+
 export class Project {
   constructor(key, bounds, keyframes) {
     this.key = key;
@@ -134,12 +149,7 @@ export class Project {
   deleteSection(id) {
     const sec = this.section(id);
     if (!sec) return;
-    if (sec.cache) sec.cache.clear();
-    if (sec.softCache) sec.softCache.clear();
-    if (sec.ctx) {
-      sec.ctx.lead.clear();
-      sec.ctx.tail.clear();
-    }
+    dropCaches(sec);
     this.sections = this.sections.filter((s) => s.id !== id);
   }
 
@@ -169,17 +179,7 @@ export class Project {
     const order = this.sections.filter((s) => s.prepared && s.id !== (keep && keep.id)).sort((a, b) => (a.usedAt || 0) - (b.usedAt || 0));
     for (const s of order) {
       if (this.cacheBytes() <= budget) break;
-      if (s.cache) s.cache.clear();
-      if (s.softCache) s.softCache.clear();
-      if (s.ctx) {
-        s.ctx.lead.clear();
-        s.ctx.tail.clear();
-      }
-      s.cache = null;
-      s.softCache = null;
-      s.softKey = null;
-      s.ctx = null;
-      s.prepared = false;
+      dropCaches(s);
     }
   }
 }

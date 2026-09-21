@@ -4,6 +4,7 @@
 
 import { decodeRange, tick } from './media.js';
 import { profile } from './profile.js';
+import { dropCaches } from './project.js';
 
 /** Whole-video scan. Returns { result, sections, summary, trace }. */
 export async function scanMovie(env, movie, { onProgress, cancel } = {}) {
@@ -122,14 +123,7 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel } = {
   if (sec.prepared && Object.keys(sec.edits || {}).length && was && was !== relPts.length) {
     warnings.push(`Re-prepared with ${relPts.length} frames where the marks were made against ${was}. They were kept, but they now sit on different frames, so check them before exporting.`);
   }
-  if (sec.cache) sec.cache.clear();
-  if (sec.softCache) sec.softCache.clear();
-  sec.softCache = null;
-  sec.softKey = null;
-  if (sec.ctx) {
-    sec.ctx.lead.clear();
-    sec.ctx.tail.clear();
-  }
+  dropCaches(sec);
   sec.prepared = true;
   sec.nFrames = relPts.length;
   sec.pts = relPts;

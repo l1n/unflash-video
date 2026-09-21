@@ -6,7 +6,7 @@ import { Movie, tick } from './media.js';
 import { createDetector } from './detector.js';
 import { profile } from './profile.js';
 import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, shownPts, softenPlan } from './analysis.js';
-import { Project, projectKey } from './project.js';
+import { Project, projectKey, dropCaches } from './project.js';
 import { exportMovie, encoderCandidates, pickSaveSink } from './export.js';
 
 const $ = (id) => document.getElementById(id);
@@ -58,6 +58,19 @@ function setStatus(parts) {
   $('status').innerHTML = parts.map((p) => `<span>${p}</span>`).join('');
 }
 
+// Checks, scans, prepares and suggestions all feed the one detector, and a
+// check the UI schedules is not a job: everything that touches the feeder is
+// serialised here.
+let feederLock = Promise.resolve();
+function withFeeder(fn) {
+  const run = feederLock.then(fn, fn);
+  feederLock = run.then(
+    () => {},
+    () => {}
+  );
+  return run;
+}
+
 async function runJob(name, fn) {
   if (state.job) {
     toast('Another job is running');
@@ -74,7 +87,7 @@ async function runJob(name, fn) {
     if (msg !== undefined) $('jobMsg').textContent = msg;
   };
   try {
-    return await fn(progress, () => job.cancelled);
+    return await withFeeder(() => fn(progress, () => job.cancelled));
   } catch (e) {
     if (job.cancelled) {
       toast(`${name}: cancelled`);
@@ -159,7 +172,7 @@ async function boot() {
   });
   $('profileSel').addEventListener('change', () => setProfile($('profileSel').value));
   $('btnScan').addEventListener('click', scan);
-  $('autoToggle').checked = autoEnabled();
+  $('autoToggle').checked = initialAutoSetting();
   $('autoToggle').addEventListener('change', () => {
     try {
       localStorage.setItem('unflash:auto', $('autoToggle').checked ? '1' : '0');
@@ -213,21 +226,13 @@ async function boot() {
 async function openFile(file) {
   $('banner').classList.add('hidden');
   await stopAuto();
-  // the last file's unattended run and export are forgotten
-  if (state.auto && state.auto.blobUrl) URL.revokeObjectURL(state.auto.blobUrl);
-  state.auto = null;
-  renderAuto();
-  state.exportBlob = null;
-  const dl = $('exportDownload');
-  if (dl.getAttribute('href')) {
-    URL.revokeObjectURL(dl.href);
-    dl.removeAttribute('href');
-  }
-  dl.classList.add('hidden');
   const opened = await runJob('Opening video', async (progress) => {
     progress(0.1, 'reading the index');
     const movie = await Movie.open(file, wasm);
+    // the last file, its unattended run and its export go only now that
+    // the new one has opened
     if (state.movie) state.movie.close();
+    forgetExport();
     state.movie = movie;
     state.decode = await movie.decoderSupport();
     progress(0.4, 'starting the detector');
@@ -298,7 +303,7 @@ async function setProfile(name) {
   await stopAuto();
   state.project.profile = name;
   state.config = profileConfig(name);
-  await createFeeders();
+  await withFeeder(() => createFeeders());
   for (const s of state.project.sections) if (s.check) s.check.stale = true;
   await state.project.save();
   renderAll();
@@ -1096,7 +1101,7 @@ async function runCheck(announce) {
   v.textContent = 'checking…';
   const t0 = performance.now();
   try {
-    const c = await checkSection(state.env, state.project, sec, null, { extS: EXT_S });
+    const c = await withFeeder(() => checkSection(state.env, state.project, sec, null, { extS: EXT_S }));
     sec.check = c;
     sec.checkMs = performance.now() - t0;
     if (announce) toast(`${c.safe ? 'Passes' : 'Fails'} (${c.frames} frames checked in ${(sec.checkMs / 1000).toFixed(2)} s)`);
@@ -1128,7 +1133,7 @@ async function doPrepare(sec) {
   });
   if (!ok) {
     // a cancelled prepare decoded only part of the section: forget it
-    unprepare(sec);
+    dropCaches(sec);
     renderAll();
     return false;
   }
@@ -1140,19 +1145,12 @@ async function doPrepare(sec) {
   return true;
 }
 
-/** Drop a section's decoded frames. */
-function unprepare(sec) {
-  if (sec.cache) sec.cache.clear();
-  if (sec.softCache) sec.softCache.clear();
-  if (sec.ctx) {
-    sec.ctx.lead.clear();
-    sec.ctx.tail.clear();
-  }
-  sec.cache = null;
-  sec.softCache = null;
-  sec.softKey = null;
-  sec.ctx = null;
-  sec.prepared = false;
+
+/** Take a suggester's result into the section: its edits, its verdict (or none), and the neighbours' checks go stale. */
+function applySuggestion(sec, res, only) {
+  sec.edits = JSON.parse(wasm.apply_suggestion(JSON.stringify(sec.edits || {}), JSON.stringify(res.edits), only ? JSON.stringify(only) : undefined));
+  sec.check = res.verdict || null;
+  state.project.invalidateNeighbours(sec, wasm.context_seconds(state.config));
 }
 
 async function doSuggest(prefer) {
@@ -1161,9 +1159,7 @@ async function doSuggest(prefer) {
   const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
   const res = await runJob(`Suggesting (keep ${prefer})`, async (progress) => suggestEdits(state.env, state.project, sec, prefer, only, { extS: EXT_S, onProgress: (r) => progress(0.2 + r * 0.15, `round ${r + 1}`) }));
   if (!res) return;
-  sec.edits = JSON.parse(wasm.apply_suggestion(JSON.stringify(sec.edits || {}), JSON.stringify(res.edits), only ? JSON.stringify(only) : undefined));
-  sec.check = res.verdict || null;
-  state.project.invalidateNeighbours(sec, wasm.context_seconds(state.config));
+  applySuggestion(sec, res, only);
   await state.project.save();
   renderAll();
   toast(res.note, 6000);
@@ -1177,9 +1173,7 @@ async function doSuggestFps() {
   const fps = v > 0 ? v : null;
   const res = await runJob('Thinning to a frame rate', async () => suggestFrameRate(state.env, state.project, sec, only, fps, { extS: EXT_S }));
   if (!res) return;
-  sec.edits = JSON.parse(wasm.apply_suggestion(JSON.stringify(sec.edits || {}), JSON.stringify(res.edits), only ? JSON.stringify(only) : undefined));
-  sec.check = res.verdict || null;
-  state.project.invalidateNeighbours(sec, wasm.context_seconds(state.config));
+  applySuggestion(sec, res, only);
   await state.project.save();
   renderAll();
   toast(res.note, 7000);
@@ -1279,7 +1273,8 @@ async function openExport() {
   if (!p) return;
   const rows = p.sectionsSorted().map((s) => {
     const marks = Object.values(s.edits || {}).filter((e) => e.removed || e.extended).length;
-    const status = !s.prepared ? (marks ? 'has marks but is not prepared: marks will NOT be applied' : 'unprepared (nothing to apply)') : s.check && !s.check.stale ? (s.check.safe ? 'passes' : 'still failing') : 'unchecked';
+    const applies = marks || (s.soften && softenPlan(s));
+    const status = !applies ? 'nothing to apply' : !(s.pts && s.pts.length) ? 'has marks but was never prepared: marks will NOT be applied' : s.check && !s.check.stale ? (s.check.safe ? 'passes' : 'still failing') : 'unchecked';
     return `<tr><td>#${s.id}</td><td>${fmt(s.start)} – ${fmt(s.end)}</td><td>${marks} marks</td><td>${status}</td></tr>`;
   });
   $('exportSummary').innerHTML = rows.length ? `<table><tr><th>section</th><th>range</th><th>edits</th><th>status</th></tr>${rows.join('')}</table>` : '<p class="hint">No sections. The export re-encodes the video unchanged.</p>';
@@ -1292,7 +1287,7 @@ async function openExport() {
     o.textContent = `${c.label} (${c.config.codec})`;
     sel.appendChild(o);
   }
-  const softened = p.sectionsSorted().filter((s) => s.soften && s.prepared && softenPlan(s));
+  const softened = p.sectionsSorted().filter((s) => s.soften && softenPlan(s));
   $('exportPlan').textContent = cands.length
     ? `The whole video is decoded and re-encoded in the browser${state.movie.audio ? '; audio is copied without re-encoding' : ''}.${softened.length ? ` Section${softened.length === 1 ? '' : 's'} ${softened.map((s) => '#' + s.id).join(', ')} ${softened.length === 1 ? 'is' : 'are'} softened (blurred) where stripes were found.` : ''} ${window.showSaveFilePicker ? 'You will be asked where to save it.' : 'The file is assembled in memory and offered for download.'}`
     : 'This browser has no WebCodecs video encoder, so it cannot export.';
@@ -1339,14 +1334,33 @@ function exportName(movie) {
 function showExportResult(res, name) {
   const lines = [`Exported ${res.frames} frames with ${res.encoderLabel} (${res.codec}) in ${(res.elapsedMs / 1000).toFixed(1)} s${res.softened ? `, ${res.softened} of them softened` : ''}.`, ...res.warnings];
   $('exportResult').innerHTML = lines.map((l) => `<p>${l}</p>`).join('');
-  if (!res.blob) return;
-  state.exportBlob = res.blob;
+  // the dialog offers this export and no earlier one
   const a = $('exportDownload');
-  if (a.getAttribute('href')) URL.revokeObjectURL(a.href);
+  if (a.getAttribute('href')) {
+    URL.revokeObjectURL(a.href);
+    a.removeAttribute('href');
+  }
+  state.exportBlob = res.blob || null;
+  a.classList.toggle('hidden', !res.blob);
+  $('btnVerifyExport').disabled = !res.blob;
+  if (!res.blob) return;
   a.href = URL.createObjectURL(res.blob);
   a.download = name;
-  a.classList.remove('hidden');
-  $('btnVerifyExport').disabled = false;
+}
+
+/** Drop the last file's unattended run and export, object URLs included. */
+function forgetExport() {
+  if (state.auto && state.auto.blobUrl) URL.revokeObjectURL(state.auto.blobUrl);
+  state.auto = null;
+  renderAuto();
+  state.exportBlob = null;
+  const a = $('exportDownload');
+  if (a.getAttribute('href')) {
+    URL.revokeObjectURL(a.href);
+    a.removeAttribute('href');
+  }
+  a.classList.add('hidden');
+  $('btnVerifyExport').disabled = true;
 }
 
 async function verifyExport() {
@@ -1364,7 +1378,7 @@ async function verifyExport() {
  */
 async function verifyBlob(blob) {
   const res = await runJob('Verifying the exported file', async (progress, cancelled) => {
-    const m = await Movie.open(state.exportBlob, wasm);
+    const m = await Movie.open(blob, wasm);
     const feeder = await createDetector(wasm, state.config, m.width, m.height, { preferGpu: preferGpuSetting(), externalSources: externalSourcesSetting(), route: routeSetting() });
     try {
       return await scanMovie({ wasm, config: state.config, feeder }, m, { cancel: cancelled, onProgress: (p, _t, count, ms) => progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`) });
@@ -1389,8 +1403,8 @@ async function verifyBlob(blob) {
 
 // ---- auto-fix: open a file, and the scan, the fixes, the export and its check follow -----
 
-/** `?auto=0` turns the unattended run off for the session; the switch in the header remembers a choice. */
-function autoEnabled() {
+/** The switch in the header starts as `?auto=0` / `?auto=1` says, else as it was last left. */
+function initialAutoSetting() {
   const q = new URLSearchParams(location.search).get('auto');
   if (q === '0' || q === 'off') return false;
   if (q === '1' || q === 'on') return true;
@@ -1401,6 +1415,11 @@ function autoEnabled() {
   }
 }
 
+/** Whether opening a file (or changing the profile) starts the unattended run: the switch decides. */
+function autoEnabled() {
+  return $('autoToggle').checked;
+}
+
 const AUTO_STEPS = [
   ['scan', 'scan'],
   ['fix', 'fix'],
@@ -1408,10 +1427,9 @@ const AUTO_STEPS = [
   ['verify', 'verify'],
 ];
 
-function autoStep(name, status, text = '') {
-  if (!state.auto) return;
-  state.auto.steps[name] = { status, text };
-  renderAuto();
+function autoStep(auto, name, status, text = '') {
+  auto.steps[name] = { status, text };
+  if (state.auto === auto) renderAuto();
 }
 
 function renderAuto() {
@@ -1459,9 +1477,12 @@ async function stopAuto() {
   const a = state.auto;
   if (!a || !a.running) return;
   a.stopped = true;
-  if (state.job) state.job.cancelled = true;
   const until = performance.now() + 30000;
-  while (a.running && performance.now() < until) await new Promise((r) => setTimeout(r, 50));
+  while (a.running && performance.now() < until) {
+    // whatever job the run is on, or starts next, is cancelled too
+    if (state.job) state.job.cancelled = true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
 }
 
 /**
@@ -1482,7 +1503,7 @@ async function autopilot({ rescan = false } = {}) {
   renderAuto();
   const halted = () => auto.stopped || state.movie !== movie;
   const bail = (step, why) => {
-    autoStep(step, halted() ? 'stopped' : 'failed', halted() ? '' : why);
+    autoStep(auto, step, halted() ? 'stopped' : 'failed', halted() ? '' : why);
     auto.summary = halted() ? 'Stopped. The buttons do each step by hand; "run again" starts over.' : why;
   };
   try {
@@ -1490,18 +1511,18 @@ async function autopilot({ rescan = false } = {}) {
     const sig = wasm.config_signature(state.config);
     const prior = project.scan;
     if (!rescan && prior && prior.sig === sig && prior.profile === project.profile && (prior.safe || project.sections.length)) {
-      autoStep('scan', 'done', `${describeScan(prior)} (from the last visit)`);
+      autoStep(auto, 'scan', 'done', `${describeScan(prior)} (from the last visit)`);
     } else {
-      autoStep('scan', 'running', 'decoding every frame');
+      autoStep(auto, 'scan', 'running', 'decoding every frame');
       const res = await scan();
       if (!res || halted()) return bail('scan', 'The scan did not finish.');
-      autoStep('scan', 'done', describeScan(project.scan));
+      autoStep(auto, 'scan', 'done', describeScan(project.scan));
     }
     const marked = (s) => s.soften || Object.values(s.edits || {}).some((e) => e.removed || e.extended);
     if (project.scan.safe && !project.sections.some(marked)) {
-      autoStep('fix', 'skipped', 'nothing to fix');
-      autoStep('export', 'skipped', 'the file passes as it is');
-      autoStep('verify', 'skipped');
+      autoStep(auto, 'fix', 'skipped', 'nothing to fix');
+      autoStep(auto, 'export', 'skipped', 'the file passes as it is');
+      autoStep(auto, 'verify', 'skipped');
       auto.summary = 'Nothing to fix: the file passes as it is.';
       return;
     }
@@ -1512,7 +1533,7 @@ async function autopilot({ rescan = false } = {}) {
     const partial = [];
     for (const sec of secs) {
       if (halted()) return bail('fix', '');
-      autoStep('fix', 'running', `section #${sec.id} of ${secs.length}${notes.length ? ' · ' + notes.join(' · ') : ''}`);
+      autoStep(auto, 'fix', 'running', `section #${sec.id} of ${secs.length}${notes.length ? ' · ' + notes.join(' · ') : ''}`);
       const r = await autoFixSection(sec, auto);
       if (!r) return bail('fix', `Section #${sec.id} could not be fixed automatically.`);
       notes.push(`#${sec.id}: ${r.note}`);
@@ -1523,25 +1544,26 @@ async function autopilot({ rescan = false } = {}) {
     await project.save();
     updateStatus();
     if (failing.length) {
-      autoStep('fix', 'failed', notes.join(' · '));
-      autoStep('export', 'skipped', 'not while a section fails');
-      autoStep('verify', 'skipped');
+      autoStep(auto, 'fix', 'failed', notes.join(' · '));
+      autoStep(auto, 'export', 'skipped', 'not while a section fails');
+      autoStep(auto, 'verify', 'skipped');
       const ids = failing.map((s) => '#' + s.id).join(', ');
       auto.summary = `Section${failing.length === 1 ? '' : 's'} ${ids} still fail${failing.length === 1 ? 's' : ''} WCAG: edit ${failing.length === 1 ? 'it' : 'them'} by hand, then Export.`;
       openSection(failing[0].id);
       return;
     }
-    autoStep('fix', 'done', notes.join(' · '));
+    autoStep(auto, 'fix', 'done', notes.join(' · '));
+    if (halted()) return bail('export', '');
     // 3. export
     const quality = +$('exportQuality').value;
     const cands = await encoderCandidates(movie.width, movie.height, movie.fps, quality);
     if (!cands.length) {
-      autoStep('export', 'failed', 'this browser has no WebCodecs video encoder');
-      autoStep('verify', 'skipped');
+      autoStep(auto, 'export', 'failed', 'this browser has no WebCodecs video encoder');
+      autoStep(auto, 'verify', 'skipped');
       auto.summary = 'The sections are fixed, but this browser has no video encoder to export with.';
       return;
     }
-    autoStep('export', 'running', `encoding with ${cands[0].label}`);
+    autoStep(auto, 'export', 'running', `encoding with ${cands[0].label}`);
     const res = await runJob('Exporting', (progress, cancelled) =>
       exportMovie(state.env, movie, project, {
         encoder: cands[0].label,
@@ -1558,19 +1580,20 @@ async function autopilot({ rescan = false } = {}) {
     dl.href = auto.blobUrl;
     dl.download = auto.fileName;
     showExportResult(res, auto.fileName);
-    autoStep('export', 'done', `${res.frames} frames with ${res.encoderLabel} in ${(res.elapsedMs / 1000).toFixed(1)} s${res.softened ? `, ${res.softened} softened` : ''}${res.warnings.length ? ' · ' + res.warnings.join(' ') : ''}`);
+    autoStep(auto, 'export', 'done', `${res.frames} frames with ${res.encoderLabel} in ${(res.elapsedMs / 1000).toFixed(1)} s${res.softened ? `, ${res.softened} softened` : ''}${res.warnings.length ? ' · ' + res.warnings.join(' ') : ''}`);
     // 4. verify
-    autoStep('verify', 'running', 're-scanning the exported file');
+    if (halted()) return bail('verify', '');
+    autoStep(auto, 'verify', 'running', 're-scanning the exported file');
     const v = await verifyBlob(res.blob);
     if (!v || halted()) return bail('verify', 'The check of the exported file did not finish.');
-    autoStep('verify', v.wcagBad.length ? 'failed' : 'done', v.text);
+    autoStep(auto, 'verify', v.wcagBad.length ? 'failed' : 'done', v.text);
     const ids = partial.map((s) => '#' + s.id).join(', ');
     const left = partial.length ? ` Section${partial.length === 1 ? '' : 's'} ${ids} pass${partial.length === 1 ? 'es' : ''} WCAG but keep${partial.length === 1 ? 's' : ''} something the profile flags.` : '';
     auto.summary = v.wcagBad.length ? `The exported file still fails WCAG. ${v.text}` : `Done: the fixed video is ready to download. ${v.text}${left}`;
   } catch (e) {
     console.error(e);
     const step = AUTO_STEPS.map(([k]) => k).find((k) => auto.steps[k] && auto.steps[k].status === 'running') || 'scan';
-    autoStep(step, 'failed', e && e.message ? e.message : String(e));
+    autoStep(auto, step, 'failed', e && e.message ? e.message : String(e));
     auto.summary = 'Auto-fix stopped on an error; the buttons do each step by hand.';
   } finally {
     auto.running = false;
@@ -1592,17 +1615,20 @@ async function autoFixSection(sec, auto) {
   const hadMarks = Object.values(sec.edits || {}).some((e) => e.removed || e.extended);
   if (!sec.prepared && !(await doPrepare(sec))) return null;
   const check = async () => {
+    if (auto.stopped) return null;
     const c = await runJob(`Checking section #${sec.id}`, () => checkSection(env, project, sec, null, { extS: EXT_S }));
     if (c) sec.check = c;
     return c;
   };
-  const standing = (note) => ({ note, safe: !!sec.check.safe, wcagSafe: !!sec.check.wcag_safe });
+  const standing = (note) => ({ note, safe: !!(sec.check && sec.check.safe), wcagSafe: !!(sec.check && sec.check.wcag_safe) });
+  // a check's verdict counts what runs past the section's end too
+  const violations = (x) => x.violations || x.inside || [];
   let c = await check();
   if (!c) return null;
   if (c.safe) return standing(hadMarks || sec.soften ? 'passes with the marks from before' : 'already passes');
   const did = [];
   // stripes cannot be removed a frame at a time: soften them
-  if (c.flag_patterns && (c.inside || []).some((v) => v.kind === 'pattern') && !sec.soften && softenPlan(sec)) {
+  if (c.flag_patterns && violations(c).some((v) => v.kind === 'pattern') && !sec.soften && softenPlan(sec)) {
     sec.soften = true;
     project.invalidateNeighbours(sec, ctxS);
     did.push('softened the stripes');
@@ -1611,7 +1637,7 @@ async function autoFixSection(sec, auto) {
     if (c.safe) return standing(did.join(' · '));
   }
   // flashing: the gentle suggesters first, the guaranteed one last
-  const flashing = (c.inside || []).some((v) => v.kind === 'flash' || v.kind === 'red' || (v.kind === 'extended' && c.flag_extended));
+  const flashing = violations(c).some((v) => v.kind === 'flash' || v.kind === 'red' || (v.kind === 'extended' && c.flag_extended));
   if (flashing) {
     const rounds = (progress) => (r) => progress(0.2 + r * 0.15, `round ${r + 1}`);
     const tries = [
@@ -1628,10 +1654,9 @@ async function autoFixSection(sec, auto) {
       if (res.safe) break;
     }
     const [label, res] = last;
-    sec.edits = JSON.parse(wasm.apply_suggestion(JSON.stringify(sec.edits || {}), JSON.stringify(res.edits), undefined));
-    if (res.verdict) sec.check = res.verdict;
-    project.invalidateNeighbours(sec, ctxS);
+    applySuggestion(sec, res, null);
     did.push(`${label}: ${res.note}`);
+    if (!sec.check && !(await check())) return null;
   }
   await project.save();
   const kinds = remainingKinds(sec.check);

@@ -89,9 +89,12 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
   if (!chosen) throw new Error('This browser has no video encoder WebCodecs can use.');
 
   // --- the plan: every prepared section with marks ---------------------------
+  // marks were made against a section's frame times, which outlive its frame
+  // cache (dropped to save memory, or not rebuilt since the project was
+  // restored): every section that was prepared once is applied
   const sections = project
     .sectionsSorted()
-    .filter((s) => s.prepared && s.pts && s.pts.length)
+    .filter((s) => s.pts && s.pts.length)
     .map((s) => {
       const tl = JSON.parse(wasm.section_timeline(Float64Array.from(s.pts), s.start, s.end));
       const shown = shownPts(wasm, s);
@@ -103,14 +106,14 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
       // "soften stripes": blur the patterned frames at source resolution with
       // the σ the section's check used, scaled up from analysis pixels
       let soft = null;
-      if (s.soften && s.cache) {
+      if (s.soften) {
         const plan = softenPlan(s);
-        if (plan) soft = { frames: plan.frames, sigma: plan.sigma * (movie.width / s.cache.width()) };
+        if (plan) soft = { frames: plan.frames, sigma: plan.sigma * (movie.width / env.feeder.aw) };
       }
       return { sec: s, base: tl.base, seq, nOut: tl.n_out, hasEdits, needCount, extra, soft };
     });
-  const unprepared = project.sections.filter((s) => !s.prepared && Object.values(s.edits || {}).some((e) => e.removed || e.extended));
-  if (unprepared.length) warnings.push(`Sections ${unprepared.map((s) => '#' + s.id).join(', ')} have marks but are not prepared; their marks were not applied. Prepare them and export again.`);
+  const unprepared = project.sections.filter((s) => !(s.pts && s.pts.length) && Object.values(s.edits || {}).some((e) => e.removed || e.extended));
+  if (unprepared.length) warnings.push(`Sections ${unprepared.map((s) => '#' + s.id).join(', ')} have marks but were never prepared; their marks were not applied. Prepare them and export again.`);
   if (sections.some((p) => p.extra > 0) && movie.audio) warnings.push('Some frames are held for a second (E marks). The audio is copied unchanged, so it runs ahead of the picture after each hold.');
 
   // --- encoder ---------------------------------------------------------------
