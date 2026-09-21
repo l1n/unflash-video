@@ -331,6 +331,20 @@ decodes the x264 test streams and requires ffmpeg's MD5 of every frame.
 synthetic clips in headless Chromium, including the H.264 clip through the
 built-in decoder (the test browser has no H.264).
 
+To compare the two detectors on a real file rather than on synthetic
+frames, run both over it and line up the violations:
+
+```
+python3 -m unflash.cli analyze file.mp4 --profile wcag_ext --json   # the Python reference (needs ffmpeg, numpy)
+node tests/e2e/scanfile.mjs file.mp4 --profile wcag_ext             # this detector, in headless Chromium
+```
+
+Onsets, starts and ends agree to the hundredth of a second on the test
+clips; the frames come from different decoders and scalers (ffmpeg's
+against the browser's), so a frame's difference at a boundary is possible
+on other material. The reference has no pattern test, so stripes are
+reported by this detector alone.
+
 ## Limitations
 
 - **This reduces risk. It does not guarantee safety.** Passing the detector

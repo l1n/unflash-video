@@ -35,7 +35,8 @@ function picture(dec, timestamp) {
 async function run(job) {
   const { id, file, offset, size, pts, minPts, maxPts, fast } = job;
   cancelled = false;
-  const reader = new ChunkReader(file);
+  // each worker keeps its own window over the file; a whole copy per worker would cost too much
+  const reader = new ChunkReader(file, 8 * 1024 * 1024, 16 * 1024 * 1024);
   let dec;
   try {
     dec = new wasm.H264Decoder(desc, !!fast);

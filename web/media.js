@@ -4,24 +4,39 @@ import { profile } from './profile.js';
 
 export const tick = () => new Promise((r) => setTimeout(r, 0));
 
-/** Reads sample bytes out of a File with a read-ahead window. */
+/**
+ * Reads sample bytes out of a File. A file up to `wholeLimit` bytes is read
+ * whole the first time and kept, so every later pass over it (prepare,
+ * export, verify) costs no file access at all; a larger one is read through
+ * a window that follows the reads. A Movie keeps one reader for all its
+ * passes: some browsers charge a good fraction of a second for the first
+ * read of a file, and that is paid once rather than per pass.
+ */
 export class ChunkReader {
-  constructor(file, chunkSize = 8 * 1024 * 1024) {
+  constructor(file, chunkSize = 8 * 1024 * 1024, wholeLimit = 64 * 1024 * 1024) {
     this.file = file;
     this.chunk = chunkSize;
+    this.wholeLimit = wholeLimit;
     this.buf = null;
     this.start = 0;
     this.end = 0;
   }
   async read(offset, size) {
     if (!(this.buf && offset >= this.start && offset + size <= this.end)) {
-      const start = offset;
-      const end = Math.min(this.file.size, Math.max(offset + size, offset + this.chunk));
+      const whole = this.file.size <= this.wholeLimit;
+      const start = whole ? 0 : offset;
+      const end = whole ? this.file.size : Math.min(this.file.size, Math.max(offset + size, offset + this.chunk));
       this.buf = new Uint8Array(await this.file.slice(start, end).arrayBuffer());
       this.start = start;
       this.end = end;
     }
     return this.buf.subarray(offset - this.start, offset - this.start + size);
+  }
+  /** Forget the bytes read so far. */
+  release() {
+    this.buf = null;
+    this.start = 0;
+    this.end = 0;
   }
 }
 
@@ -49,6 +64,7 @@ export class Movie {
     const at = info.tracks.find((t) => t.kind === 'audio' && t.samples > 0) || null;
     const m = new Movie();
     m.file = file;
+    m.reader = new ChunkReader(file);
     m.name = file.name;
     m.wasm = wasm;
     m.software = false;
@@ -94,6 +110,7 @@ export class Movie {
       this.pool = null;
     }
     this.poolPromise = null;
+    if (this.reader) this.reader.release();
   }
 
   /**
@@ -172,7 +189,7 @@ export class Movie {
 export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false } = {}) {
   if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast });
   const cfg = movie.decoderConfig();
-  const reader = new ChunkReader(movie.file);
+  const reader = movie.reader || new ChunkReader(movie.file);
   const { pts, dts, offset, size, sync, dur } = movie.v;
   const n = pts.length;
   const startIdx = movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
@@ -309,7 +326,7 @@ export function softwarePicture(wasm, dec, timestampUs) {
  * presentation order once every earlier picture has been decoded.
  */
 async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false } = {}) {
-  const reader = new ChunkReader(movie.file);
+  const reader = movie.reader || new ChunkReader(movie.file);
   const { pts, dts, offset, size } = movie.v;
   const n = pts.length;
   const startIdx = movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));

@@ -263,7 +263,7 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
   // --- audio: stream copy ----------------------------------------------------
   if (movie.audio && movie.a) {
     const at = mx.add_copy_track('audio', movie.dx.track_sample_entry(movie.audio.index), movie.audio.timescale, 0, 0);
-    const reader = new ChunkReader(movie.file);
+    const reader = movie.reader || new ChunkReader(movie.file);
     const a = movie.a;
     for (let i = 0; i < a.offset.length; i++) {
       const bytes = await reader.read(a.offset[i], a.size[i]);
