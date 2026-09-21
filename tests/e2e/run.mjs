@@ -223,6 +223,8 @@ try {
   results.hud = await page.textContent('#hudInfo');
   console.log('live verdicts seen:', results.liveVerdicts, '|', results.hud);
   assert([...seen].some((s) => /flashing/.test(s)), 'the live monitor must report the flashing while it plays');
+  // a scan of this file exists, so the meter reads it instead of detecting again
+  assert(/from the scan/.test(results.hud), 'after a scan the monitor reads the scan trace: ' + results.hud);
   await page.screenshot({ path: path.join(OUT, '5-live.png') });
   await page.uncheck('#liveToggle');
   await page.evaluate(() => document.querySelector('#player').pause());
@@ -430,7 +432,8 @@ try {
     ['route=pixels', 'pixels', 'pixels'],
     ['extsrc=none', 'yuv', 'pixels'],
   ]) {
-    await page.goto(`http://127.0.0.1:${port}/?${query}&auto=0`);
+    // ?monitor=detect: the point here is the <video> routes, so the monitor must detect rather than read the scan
+    await page.goto(`http://127.0.0.1:${port}/?${query}&auto=0&monitor=detect`);
     await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
     await openFile('flash.mp4');
     assert((await page.textContent('#status')).includes('WebGPU'), `the detector is still WebGPU with ?${query}`);

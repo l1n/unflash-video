@@ -39,13 +39,18 @@ export function projectKey(file) {
   return `${file.name}:${file.size}:${file.lastModified}`;
 }
 
-/** Drop a section's decoded frames (its caches and context); its marks and frame times stay. */
+/**
+ * Drop a section's decoded frames (its caches and context); its marks and
+ * frame times stay. The caches are freed, not cleared: clearing keeps the
+ * allocation, and WebAssembly memory only ever grows, so a freed cache is
+ * what lets the next prepare reuse the space.
+ */
 export function dropCaches(sec) {
-  if (sec.cache) sec.cache.clear();
-  if (sec.softCache) sec.softCache.clear();
+  if (sec.cache) sec.cache.free();
+  if (sec.softCache) sec.softCache.free();
   if (sec.ctx) {
-    sec.ctx.lead.clear();
-    sec.ctx.tail.clear();
+    sec.ctx.lead.free();
+    sec.ctx.tail.free();
   }
   sec.cache = null;
   sec.softCache = null;

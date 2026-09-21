@@ -56,6 +56,62 @@ class MemorySink {
   async close() {
     return new Blob(this.parts, { type: 'video/mp4' });
   }
+  async abort() {
+    this.parts = [];
+  }
+}
+
+/** Rough size of an export: the encoder's target bitrate over the duration, plus the copied audio. */
+export function estimateExportBytes(movie, quality) {
+  const bpp = 0.03 + (quality / 10) * 0.25;
+  const video = (movie.width * movie.height * movie.fps * bpp * movie.duration) / 8;
+  let audio = 0;
+  if (movie.a) for (let i = 0; i < movie.a.size.length; i++) audio += movie.a.size[i];
+  return video + audio;
+}
+
+/** Whether this browser can write an export to its private storage on disk. */
+export function privateStorageAvailable() {
+  return !!(typeof navigator !== 'undefined' && navigator.storage && navigator.storage.getDirectory && typeof FileSystemFileHandle !== 'undefined' && FileSystemFileHandle.prototype.createWritable);
+}
+
+const PRIVATE_PREFIX = 'unflash-export-';
+
+/**
+ * A sink in the browser's private storage (the origin-private file system):
+ * on disk, without a dialog or a user gesture, so an export need not fit in
+ * memory. Chrome and Firefox; Safari's private storage cannot be written from
+ * the page, so it falls back. Earlier exports there are removed first. Null
+ * when unavailable or when `bytesNeeded` would not fit the storage quota.
+ */
+export async function privateFileSink(bytesNeeded = 0) {
+  try {
+    if (!privateStorageAvailable()) return null;
+    const root = await navigator.storage.getDirectory();
+    await discardPrivateExport(root);
+    if (navigator.storage.estimate) {
+      const { quota, usage } = await navigator.storage.estimate();
+      if (quota && bytesNeeded && quota - (usage || 0) < bytesNeeded * 1.2) return null;
+    }
+    const handle = await root.getFileHandle(`${PRIVATE_PREFIX}${Date.now()}.mp4`, { create: true });
+    const writable = await handle.createWritable({ keepExistingData: false });
+    return { sink: new FileSink(writable), handle, private: true };
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Remove every export written to private storage. */
+export async function discardPrivateExport(root = null) {
+  try {
+    if (!privateStorageAvailable()) return;
+    const dir = root || (await navigator.storage.getDirectory());
+    const names = [];
+    for await (const name of dir.keys()) if (name.startsWith(PRIVATE_PREFIX)) names.push(name);
+    for (const name of names) await dir.removeEntry(name).catch(() => {});
+  } catch (e) {
+    /* nothing to remove, or no private storage */
+  }
 }
 
 class FileSink {
@@ -63,8 +119,11 @@ class FileSink {
     this.w = writable;
     this.size = 0;
   }
+  // every write names its position: a patch moves the stream's cursor to
+  // just past the patched bytes, and a plain write after it would land there
+  // instead of at the end of the file
   async write(bytes) {
-    await this.w.write(bytes);
+    await this.w.write({ type: 'write', position: this.size, data: bytes });
     this.size += bytes.byteLength;
   }
   async patch(offset, bytes) {
@@ -73,6 +132,13 @@ class FileSink {
   async close() {
     await this.w.close();
     return null;
+  }
+  async abort() {
+    try {
+      await this.w.abort();
+    } catch (e) {
+      /* already closed */
+    }
   }
 }
 

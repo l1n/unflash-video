@@ -190,7 +190,7 @@ export function sectionFrames(sec) {
   if (!plan) return sec.cache;
   const key = `${plan.radius}:${sec.preparedAt}:${[...plan.frames].join(',')}`;
   if (sec.softCache && sec.softKey === key) return sec.softCache;
-  if (sec.softCache) sec.softCache.clear();
+  if (sec.softCache) sec.softCache.free();
   const mask = new Uint8Array(sec.cache.len());
   for (const i of plan.frames) if (i < mask.length) mask[i] = 1;
   sec.softCache = sec.cache.blurred(plan.radius, mask);

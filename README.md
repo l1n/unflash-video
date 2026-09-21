@@ -142,7 +142,9 @@ what the built-in decoder hands over directly); WebCodecs' RGBA conversion;
 a canvas blit; or canvas pixels. `?route=videoframe|yuv|rgba|canvas|pixels`
 forces one, `?extsrc=canvas` (or `none`) pretends WebGPU accepts only those
 copy sources, `?workers=N` sets the number of built-in decoder workers,
-`?auto=0` keeps auto-fix from starting when a file is opened.
+`?auto=0` keeps auto-fix from starting when a file is opened, and
+`?monitor=detect` makes the live monitor run the detector on the player
+even when a finished scan of the file could be read instead.
 
 ## How it works
 
@@ -344,6 +346,29 @@ clips; the frames come from different decoders and scalers (ffmpeg's
 against the browser's), so a frame's difference at a boundary is possible
 on other material. The reference has no pattern test, so stripes are
 reported by this detector alone.
+
+### Memory and long files
+
+Nothing scales with the length of the file except what a scan records per
+frame (about 24 bytes) and what a prepared section holds. Sections are
+cached at analysis resolution (256×144 for a 16:9 picture, whatever the
+source), three bytes a pixel, so a second of a 30 fps section costs about
+3.3 MB plus a fixed run-up and run-out of 6.5 s each side under the default
+profile. Cached sections are kept up to a budget scaled to the device's
+memory (a quarter to two-thirds of a gigabyte); older ones are dropped and
+prepared again when opened, and an export applies their marks all the same,
+from the frame times. WebAssembly memory never shrinks, so that budget is
+also the high-water mark a long session settles at.
+
+An export is streamed to disk wherever the browser allows it: to a file of
+your choosing (Chrome, Edge, Opera) or to the browser's private storage
+(Chrome, Firefox), from which it is offered for download. Only where neither
+exists (Safari) is it assembled in memory, and then only up to a size the
+device can hold; a larger one is left for you to export by hand. The
+detector's clock is 32-bit microseconds with wrapping ages, so a film longer
+than the 71 minutes at which it wraps is analysed like any other. With a
+scan in hand, the live monitor reads the scan's per-frame numbers at the
+player's position rather than detecting again, so it never misses a frame.
 
 ## Limitations
 

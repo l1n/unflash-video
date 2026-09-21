@@ -7,11 +7,30 @@ import { createDetector } from './detector.js';
 import { profile } from './profile.js';
 import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, shownPts, softenPlan } from './analysis.js';
 import { Project, projectKey, dropCaches } from './project.js';
-import { exportMovie, encoderCandidates, pickSaveSink } from './export.js';
+import { exportMovie, encoderCandidates, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
 
 const $ = (id) => document.getElementById(id);
 const EXT_S = 1.0;
-const CACHE_BUDGET = 700 * 1024 * 1024;
+
+/**
+ * Bytes of decoded section frames kept in memory (older sections are dropped
+ * and re-prepared when opened again): a share of the device's memory where
+ * the browser says how much there is, a quarter of a gigabyte otherwise.
+ */
+function cacheBudget() {
+  const gb = navigator.deviceMemory || 4;
+  return Math.min(700, Math.max(192, gb * 64)) * 1024 * 1024;
+}
+
+/** The largest export worth assembling in memory when no disk sink is available. */
+function memoryExportLimit() {
+  const gb = navigator.deviceMemory || 4;
+  return Math.min(1, gb / 4) * 1024 * 1024 * 1024;
+}
+
+function fmtBytes(b) {
+  return b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.max(1, Math.round(b / 1e6))} MB`;
+}
 
 const state = {
   movie: null,
@@ -23,13 +42,14 @@ const state = {
   selection: new Set(),
   anchor: null,
   job: null,
-  live: { on: false, t: [], hazard: [], hazardRed: [], pattern: [], violations: 0, lastCheck: 0 },
+  live: { on: false, fromScan: false, t: [], hazard: [], hazardRed: [], pattern: [], violations: 0, lastCheck: 0 },
   decode: { supported: false, reason: '' },
   exportBlob: null,
   checkTimer: null,
   checkRunning: false,
   checkAgain: false,
   scanTrace: null,
+  traceNorm: null, // the scan trace as area fractions, for the timeline and the monitor
   auto: null, // the unattended scan -> fix -> export -> verify run (see autopilot)
 };
 
@@ -218,7 +238,10 @@ async function boot() {
   player.addEventListener('play', () => {
     if (state.live.on) startLiveLoop();
   });
-  player.addEventListener('seeked', drawTimeline);
+  player.addEventListener('seeked', () => {
+    drawTimeline();
+    if (state.live.on && state.live.fromScan) monitorFromScan(player.currentTime);
+  });
 }
 
 // ---- opening a file -------------------------------------------------------------
@@ -233,12 +256,17 @@ async function openFile(file) {
     // the new one has opened
     if (state.movie) state.movie.close();
     forgetExport();
+    if (state.project) for (const s of state.project.sections) dropCaches(s);
+    state.lastScan = null;
+    state.scanTrace = null;
+    state.traceNorm = null;
     state.movie = movie;
     state.decode = await movie.decoderSupport();
     progress(0.4, 'starting the detector');
     const key = projectKey(file);
     const project = await Project.load(key, movie.bounds, movie.keyframes);
     state.project = project;
+    if (project.scan && project.scan.trace) state.scanTrace = project.scan.trace;
     $('profileSel').value = project.profile;
     state.config = profileConfig(project.profile);
     await createFeeders(progress);
@@ -349,7 +377,6 @@ async function scan() {
   });
   if (!res) return null;
   state.lastScan = res;
-  state.scanTrace = res.trace;
   const project = state.project;
   const counted = res.result.violations.filter((v) => reported(res.result, v));
   const n = counted.length;
@@ -365,6 +392,9 @@ async function scan() {
     counted: n,
     patterns: np,
     flag_patterns: !!res.result.flag_patterns,
+    flag_extended: !!res.result.flag_extended,
+    // the per-frame trace, packed: the timeline and the monitor read it, this visit or the next
+    trace: packTrace(res.trace),
     anomalies: res.result.anomalies,
     held: res.result.held,
   };
@@ -375,6 +405,8 @@ async function scan() {
     project.addSection(s.start, s.end, s.kinds, false);
     added++;
   }
+  state.scanTrace = project.scan.trace;
+  state.traceNorm = null;
   await project.save();
   renderAll();
   updateStatus();
@@ -397,6 +429,16 @@ function setLive(on) {
   if (!on) {
     v.className = 'live-verdict idle';
     v.textContent = 'monitor off';
+    state.live.fromScan = false;
+    return;
+  }
+  // a finished scan of this file under this profile already holds every frame's
+  // numbers: the meter reads those, exactly and completely, instead of
+  // detecting again on whatever frames the player happens to show
+  state.live.fromScan = !!monitorTrace();
+  if (state.live.fromScan) {
+    monitorFromScan($('player').currentTime);
+    startLiveLoop();
     return;
   }
   state.liveFeeder.reset();
@@ -421,16 +463,20 @@ function startLiveLoop() {
       liveLoopActive = false;
       return;
     }
-    const det = feeder.det;
-    feeder.poll();
-    if (det.can_submit()) {
-      try {
-        feeder.videoElementNow(player, meta.mediaTime, false);
-      } catch (e) {
-        console.warn(e);
+    if (state.live.fromScan) {
+      monitorFromScan(meta.mediaTime);
+    } else {
+      const det = feeder.det;
+      feeder.poll();
+      if (det.can_submit()) {
+        try {
+          feeder.videoElementNow(player, meta.mediaTime, false);
+        } catch (e) {
+          console.warn(e);
+        }
       }
+      drainLive();
     }
-    drainLive();
     if (!player.paused && !player.ended) player.requestVideoFrameCallback(step);
     else {
       liveLoopActive = false;
@@ -440,9 +486,104 @@ function startLiveLoop() {
   player.requestVideoFrameCallback(step);
 }
 
+/** `?monitor=detect` makes the live monitor run the detector on the player even when a scan exists. */
+function monitorDetectSetting() {
+  return new URLSearchParams(location.search).get('monitor') === 'detect';
+}
+
+/** Pack a scan's per-frame trace into typed arrays (about 24 bytes a frame) for the project store. */
+function packTrace(tr) {
+  return { t: Float64Array.from(tr.t), hazard: Uint32Array.from(tr.hazard), hazardRed: Uint32Array.from(tr.hazardRed), ext: Uint32Array.from(tr.ext), pattern: Uint32Array.from(tr.pattern), lum: Float32Array.from(tr.lum) };
+}
+
+/**
+ * The scan trace as fractions of the area thresholds, built once and
+ * extended as a scan goes on (never recomputed per draw).
+ */
+function normTrace() {
+  const tr = state.scanTrace;
+  if (!tr || !state.env) return null;
+  let n = state.traceNorm;
+  if (!n || n.src !== tr) {
+    n = { src: tr, t: [], h: [], r: [], e: [], p: [] };
+    state.traceNorm = n;
+  }
+  const thresh = state.env.feeder.det.area_thresh() || 1;
+  const pthresh = state.env.feeder.det.pattern_thresh() || 1;
+  for (let i = n.t.length; i < tr.t.length; i++) {
+    n.t.push(tr.t[i]);
+    n.h.push(tr.hazard[i] / thresh);
+    n.r.push(tr.hazardRed[i] / thresh);
+    n.e.push(tr.ext[i] / thresh);
+    n.p.push(tr.pattern[i] / pthresh);
+  }
+  return n;
+}
+
+/** The finished scan of this file under the current profile, as a trace the monitor can read; null to detect live instead. */
+function monitorTrace() {
+  if (monitorDetectSetting() || !state.project || !state.project.scan || (state.job && state.job.name === 'Scanning for flashes')) return null;
+  if (state.project.scan.sig !== wasm.config_signature(state.config)) return null;
+  const n = normTrace();
+  return n && n.t.length ? n : null;
+}
+
+/** Whether a stored scan counts violation `v` (profiles differ on extended flashes and patterns). */
+function scanReports(scan, v) {
+  if (v.kind === 'extended') return scan.flag_extended !== undefined ? !!scan.flag_extended : scan.profile !== 'wcag';
+  if (v.kind === 'pattern') return !!scan.flag_patterns;
+  return true;
+}
+
+function setHudBars(haz, red, pat) {
+  $('hudHaz').style.width = `${Math.min(100, haz * 50)}%`;
+  $('hudRed').style.width = `${Math.min(100, red * 50)}%`;
+  $('hudPat').style.width = `${Math.min(100, pat * 50)}%`;
+  $('hudHazText').textContent = `${Math.round(haz * 100)}%`;
+  $('hudRedText').textContent = `${Math.round(red * 100)}%`;
+  $('hudPatText').textContent = `${Math.round(pat * 100)}%`;
+}
+
+/** The meter and the verdict at time `t`, read from the scan. */
+function monitorFromScan(t) {
+  const n = monitorTrace();
+  if (!n) return;
+  // the scanned frame at or before t
+  let lo = 0;
+  let hi = n.t.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (n.t[mid] <= t) lo = mid;
+    else hi = mid - 1;
+  }
+  const i = lo;
+  const haz = n.h[i];
+  const red = n.r[i];
+  const ext = n.e[i];
+  const pat = n.p[i];
+  setHudBars(haz, red, pat);
+  const scan = state.project.scan;
+  const viol = scan.violations.filter((v) => scanReports(scan, v));
+  const inside = viol.filter((v) => v.start <= t && t <= v.end);
+  const before = viol.filter((v) => v.end < t).length;
+  const v = $('liveVerdict');
+  if (inside.length) {
+    const k = inside[inside.length - 1].kind;
+    v.className = 'live-verdict bad';
+    v.textContent = k === 'pattern' ? 'hazardous pattern: stripes' : `flashing: ${k === 'red' ? 'red flash' : k === 'extended' ? 'extended flash' : 'general flash'}`;
+  } else if (haz > 0 || ext >= 1 || (pat >= 1 && scan.flag_patterns)) {
+    v.className = 'live-verdict warn';
+    v.textContent = haz > 0 || ext >= 1 ? 'flashing below the limit' : 'stripes on screen';
+  } else {
+    v.className = 'live-verdict ok';
+    v.textContent = before ? `${before} violation${before === 1 ? '' : 's'} so far` : 'no flashing so far';
+  }
+  $('hudInfo').textContent = `from the scan · frame ${i + 1} of ${n.t.length}`;
+}
+
 function drainLive() {
   const feeder = state.liveFeeder;
-  if (!feeder || !state.live.on) return;
+  if (!feeder || !state.live.on || state.live.fromScan) return;
   const det = feeder.det;
   feeder.poll();
   profile.reportEvery(5000, `live monitor (${feeder.fed} pictures watched)`, 0, 0);
@@ -462,12 +603,7 @@ function drainLive() {
   const red = last.hazard_red / thresh;
   const ext = Math.max(last.ext, last.ext_red) / thresh;
   const pat = last.pattern / pthresh;
-  $('hudHaz').style.width = `${Math.min(100, haz * 50)}%`;
-  $('hudRed').style.width = `${Math.min(100, red * 50)}%`;
-  $('hudPat').style.width = `${Math.min(100, pat * 50)}%`;
-  $('hudHazText').textContent = `${Math.round(haz * 100)}%`;
-  $('hudRedText').textContent = `${Math.round(red * 100)}%`;
-  $('hudPatText').textContent = `${Math.round(pat * 100)}%`;
+  setHudBars(haz, red, pat);
   const now = performance.now();
   if (now - L.lastCheck > 700) {
     L.lastCheck = now;
@@ -572,7 +708,8 @@ function drawTimeline(dragSpan = null) {
     }
   }
   // the live trace (and the scan trace while scanning)
-  const trace = state.live.on ? { t: state.live.t, h: state.live.hazard, r: state.live.hazardRed } : state.scanTrace ? { t: state.scanTrace.t, h: state.scanTrace.hazard.map((v) => v / state.env.feeder.det.area_thresh()), r: state.scanTrace.hazardRed.map((v) => v / state.env.feeder.det.area_thresh()) } : null;
+  const norm = state.live.on && !state.live.fromScan ? null : normTrace();
+  const trace = state.live.on && !state.live.fromScan ? { t: state.live.t, h: state.live.hazard, r: state.live.hazardRed } : norm ? { t: norm.t, h: norm.h, r: norm.r } : null;
   if (trace && trace.t.length) {
     const base = H - 24;
     g.strokeStyle = 'rgba(232,163,60,.9)';
@@ -1126,7 +1263,7 @@ async function runCheck(announce) {
 async function doPrepare(sec) {
   if (!sec) return;
   if (!state.decode.supported) return banner(`Preparing needs WebCodecs to decode ${state.movie.video.codec}: ${state.decode.reason}`);
-  state.project.evictCaches(sec, CACHE_BUDGET);
+  state.project.evictCaches(sec, cacheBudget());
   const ok = await runJob(`Preparing section #${sec.id}`, async (progress, cancelled) => {
     await prepareSection(state.env, state.movie, sec, { cancel: cancelled, onProgress: (n) => progress(Math.min(0.95, n / Math.max(1, (sec.end - sec.start + 2 * wasm.context_seconds(state.config)) * state.movie.fps)), `${n} frames decoded`) });
     return !cancelled();
@@ -1289,8 +1426,10 @@ async function openExport() {
   }
   const softened = p.sectionsSorted().filter((s) => s.soften && softenPlan(s));
   $('exportPlan').textContent = cands.length
-    ? `The whole video is decoded and re-encoded in the browser${state.movie.audio ? '; audio is copied without re-encoding' : ''}.${softened.length ? ` Section${softened.length === 1 ? '' : 's'} ${softened.map((s) => '#' + s.id).join(', ')} ${softened.length === 1 ? 'is' : 'are'} softened (blurred) where stripes were found.` : ''} ${window.showSaveFilePicker ? 'You will be asked where to save it.' : 'The file is assembled in memory and offered for download.'}`
+    ? `The whole video is decoded and re-encoded in the browser${state.movie.audio ? '; audio is copied without re-encoding' : ''}.${softened.length ? ` Section${softened.length === 1 ? '' : 's'} ${softened.map((s) => '#' + s.id).join(', ')} ${softened.length === 1 ? 'is' : 'are'} softened (blurred) where stripes were found.` : ''}`
     : 'This browser has no WebCodecs video encoder, so it cannot export.';
+  const need = estimateExportBytes(state.movie, +$('exportQuality').value);
+  $('exportSize').textContent = cands.length ? `About ${fmtBytes(need)}. ${window.showSaveFilePicker ? 'You will be asked where to save it.' : privateStorageAvailable() ? "It is written to the browser's private storage on disk and offered for download." : `It is assembled in memory and offered for download${need > memoryExportLimit() ? ', which is more than this browser is likely to hold' : ''}.`}` : '';
   $('btnDoExport').disabled = !cands.length || !state.decode.supported;
   if (!state.exportBlob) $('exportResult').innerHTML = '';
   $('exportDownload').classList.toggle('hidden', !(state.exportBlob && $('exportDownload').getAttribute('href')));
@@ -1300,13 +1439,17 @@ async function openExport() {
 
 async function doExport() {
   const movie = state.movie;
+  const quality = +$('exportQuality').value;
+  // a file of the user's choosing where the browser has the dialog, private
+  // storage on disk where it has that, memory as the last resort
   let sinkInfo = await pickSaveSink(exportName(movie));
   if (sinkInfo && sinkInfo.cancelled) return;
+  if (!sinkInfo) sinkInfo = await privateFileSink(estimateExportBytes(movie, quality));
   $('exportModal').classList.add('hidden');
   const res = await runJob('Exporting', async (progress, cancelled) =>
     exportMovie(state.env, movie, state.project, {
       encoder: $('exportCodec').value,
-      quality: +$('exportQuality').value,
+      quality,
       extS: EXT_S,
       sink: sinkInfo ? sinkInfo.sink : null,
       cancel: cancelled,
@@ -1314,15 +1457,31 @@ async function doExport() {
     })
   );
   $('exportModal').classList.remove('hidden');
-  if (!res) return;
+  if (!res) {
+    if (sinkInfo) await sinkInfo.sink.abort();
+    return;
+  }
+  await readBackExport(res, sinkInfo);
   showExportResult(res, exportName(movie));
-  if (!res.blob && sinkInfo && sinkInfo.handle) {
-    try {
-      state.exportBlob = await sinkInfo.handle.getFile();
-      $('btnVerifyExport').disabled = false;
-    } catch (e) {
-      /* no read access */
-    }
+  if (res.saved) {
+    state.exportBlob = res.saved;
+    $('btnVerifyExport').disabled = false;
+  }
+}
+
+/**
+ * An export that streamed to disk is read back as a File: from private
+ * storage it is what the dialog offers for download (`res.blob`); from the
+ * user's own file it is only there to verify (`res.saved`).
+ */
+async function readBackExport(res, sinkInfo) {
+  if (res.blob || !sinkInfo || !sinkInfo.handle) return;
+  try {
+    const file = await sinkInfo.handle.getFile();
+    if (sinkInfo.private) res.blob = file;
+    else res.saved = file;
+  } catch (e) {
+    /* no read access to the chosen file */
   }
 }
 
@@ -1361,6 +1520,7 @@ function forgetExport() {
   }
   a.classList.add('hidden');
   $('btnVerifyExport').disabled = true;
+  discardPrivateExport();
 }
 
 async function verifyExport() {
@@ -1563,17 +1723,33 @@ async function autopilot({ rescan = false } = {}) {
       auto.summary = 'The sections are fixed, but this browser has no video encoder to export with.';
       return;
     }
-    autoStep(auto, 'export', 'running', `encoding with ${cands[0].label}`);
+    // to disk when the browser has private storage; in memory otherwise, and
+    // only when it will fit
+    const need = estimateExportBytes(movie, quality);
+    const sinkInfo = await privateFileSink(need);
+    if (!sinkInfo && need > memoryExportLimit()) {
+      autoStep(auto, 'export', 'skipped', `about ${fmtBytes(need)}: more than this browser can build in memory`);
+      autoStep(auto, 'verify', 'skipped');
+      auto.summary = `The sections are fixed. The export would be about ${fmtBytes(need)}, more than this browser can hold in memory: ${window.showSaveFilePicker ? 'use Export… to write it to a file of your choice' : 'export from a browser with a save dialog or private storage'}.`;
+      return;
+    }
+    autoStep(auto, 'export', 'running', `encoding with ${cands[0].label}${sinkInfo ? ' to private storage on disk' : ''}`);
     const res = await runJob('Exporting', (progress, cancelled) =>
       exportMovie(state.env, movie, project, {
         encoder: cands[0].label,
         quality,
         extS: EXT_S,
+        sink: sinkInfo ? sinkInfo.sink : null,
         cancel: cancelled,
         onProgress: (p, frames, ms) => progress(p, `${frames} frames encoded · ${(frames / (ms / 1000)).toFixed(0)} fps`),
       })
     );
-    if (!res || !res.blob || halted()) return bail('export', 'The export did not finish.');
+    if (!res || halted()) {
+      if (sinkInfo) await sinkInfo.sink.abort();
+      return bail('export', 'The export did not finish.');
+    }
+    await readBackExport(res, sinkInfo);
+    if (!res.blob) return bail('export', 'The exported file could not be read back.');
     auto.fileName = exportName(movie);
     auto.blobUrl = URL.createObjectURL(res.blob);
     const dl = $('autoDownload');

@@ -90,8 +90,18 @@ mod tests {
 /// σ ≈ 0.9·radius, edges replicated), for softening a regular pattern.
 /// `radius` 0 copies. The output is written to `dst`.
 pub fn blur_rgba(src: &[u8], w: u32, h: u32, radius: u32, dst: &mut Vec<u8>) {
+    blur_px::<4>(src, w, h, radius, dst)
+}
+
+/// The same blur of an RGB8 picture (three bytes per pixel).
+pub fn blur_rgb(src: &[u8], w: u32, h: u32, radius: u32, dst: &mut Vec<u8>) {
+    blur_px::<3>(src, w, h, radius, dst)
+}
+
+/// The blur over `C` interleaved 8-bit channels.
+pub fn blur_px<const C: usize>(src: &[u8], w: u32, h: u32, radius: u32, dst: &mut Vec<u8>) {
     let (w, h) = (w as usize, h as usize);
-    let n = w * h * 4;
+    let n = w * h * C;
     dst.clear();
     dst.extend_from_slice(&src[..n]);
     if radius == 0 || w == 0 || h == 0 {
@@ -99,47 +109,51 @@ pub fn blur_rgba(src: &[u8], w: u32, h: u32, radius: u32, dst: &mut Vec<u8>) {
     }
     let r = radius as usize;
     let mut tmp = vec![0u8; n];
-    let mut line: Vec<[u32; 4]> = Vec::with_capacity(w.max(h));
+    let mut line: Vec<[u32; C]> = Vec::with_capacity(w.max(h));
     for _ in 0..3 {
-        box_pass(dst, &mut tmp, w, h, r, true, &mut line);
-        box_pass(&tmp, dst, w, h, r, false, &mut line);
+        box_pass::<C>(dst, &mut tmp, w, h, r, true, &mut line);
+        box_pass::<C>(&tmp, dst, w, h, r, false, &mut line);
     }
 }
 
 /// One box pass along rows (`horizontal`) or columns.
-fn box_pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizontal: bool, line: &mut Vec<[u32; 4]>) {
+fn box_pass<const C: usize>(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize, horizontal: bool, line: &mut Vec<[u32; C]>) {
     let (lines, len) = if horizontal { (h, w) } else { (w, h) };
     let win = (2 * r + 1) as u32;
     let half = win / 2;
     for l in 0..lines {
         let at = |i: usize| -> usize {
             if horizontal {
-                (l * w + i) * 4
+                (l * w + i) * C
             } else {
-                (i * w + l) * 4
+                (i * w + l) * C
             }
         };
         line.clear();
         for i in 0..len {
             let k = at(i);
-            line.push([src[k] as u32, src[k + 1] as u32, src[k + 2] as u32, src[k + 3] as u32]);
+            let mut px = [0u32; C];
+            for c in 0..C {
+                px[c] = src[k + c] as u32;
+            }
+            line.push(px);
         }
-        let clamp = |i: isize| -> [u32; 4] { line[i.clamp(0, len as isize - 1) as usize] };
-        let mut sum = [0u32; 4];
+        let clamp = |i: isize| -> [u32; C] { line[i.clamp(0, len as isize - 1) as usize] };
+        let mut sum = [0u32; C];
         for k in -(r as isize)..=(r as isize) {
             let v = clamp(k);
-            for c in 0..4 {
+            for c in 0..C {
                 sum[c] += v[c];
             }
         }
         for i in 0..len {
             let k = at(i);
-            for c in 0..4 {
+            for c in 0..C {
                 dst[k + c] = ((sum[c] + half) / win) as u8;
             }
             let add = clamp(i as isize + r as isize + 1);
             let sub = clamp(i as isize - r as isize);
-            for c in 0..4 {
+            for c in 0..C {
                 sum[c] = sum[c] + add[c] - sub[c];
             }
         }

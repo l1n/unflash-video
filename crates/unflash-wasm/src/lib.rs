@@ -256,6 +256,8 @@ pub fn area_downsample(rgba: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u
 pub struct FrameCache {
     width: u32,
     height: u32,
+    /// RGB8, three bytes per pixel: a quarter less memory than the RGBA the
+    /// captures arrive as, and all the detector reads.
     data: Vec<u8>,
     n: usize,
 }
@@ -267,12 +269,19 @@ impl FrameCache {
         FrameCache { width, height, data: Vec::new(), n: 0 }
     }
 
-    pub fn push(&mut self, rgba: &[u8]) -> Result<u32, JsValue> {
-        let need = (self.width * self.height * 4) as usize;
-        if rgba.len() != need {
-            return Err(js_err(format!("frame has {} bytes, expected {need}", rgba.len())));
+    /// Add a frame, given as RGBA8 (as captures come) or RGB8.
+    pub fn push(&mut self, pixels: &[u8]) -> Result<u32, JsValue> {
+        let px = (self.width * self.height) as usize;
+        if pixels.len() == px * 4 {
+            self.data.reserve(px * 3);
+            for p in pixels.chunks_exact(4) {
+                self.data.extend_from_slice(&p[..3]);
+            }
+        } else if pixels.len() == px * 3 {
+            self.data.extend_from_slice(pixels);
+        } else {
+            return Err(js_err(format!("frame has {} bytes, expected {} (RGBA) or {} (RGB)", pixels.len(), px * 4, px * 3)));
         }
-        self.data.extend_from_slice(rgba);
         self.n += 1;
         Ok(self.n as u32 - 1)
     }
@@ -293,12 +302,18 @@ impl FrameCache {
         self.data.len() as f64
     }
 
-    /// A copy of frame `i` (RGBA8).
+    /// A copy of frame `i` as RGBA8 (opaque), ready for an ImageData.
     pub fn frame(&self, i: u32) -> Result<Vec<u8>, JsValue> {
-        Ok(self.frame_ref(i as usize).ok_or_else(|| js_err("no such frame"))?.to_vec())
+        let f = self.frame_ref(i as usize).ok_or_else(|| js_err("no such frame"))?;
+        let mut out = Vec::with_capacity(f.len() / 3 * 4);
+        for p in f.chunks_exact(3) {
+            out.extend_from_slice(p);
+            out.push(255);
+        }
+        Ok(out)
     }
 
-    /// Byte offset of frame `i` in WASM memory (for zero-copy views).
+    /// Byte offset of frame `i` (RGB8) in WASM memory (for zero-copy views).
     pub fn frame_ptr(&self, i: u32) -> Result<usize, JsValue> {
         let f = self.frame_ref(i as usize).ok_or_else(|| js_err("no such frame"))?;
         Ok(f.as_ptr() as usize)
@@ -311,7 +326,7 @@ impl FrameCache {
 
     pub fn truncate(&mut self, n: u32) {
         let n = (n as usize).min(self.n);
-        self.data.truncate(n * (self.width * self.height * 4) as usize);
+        self.data.truncate(n * (self.width * self.height * 3) as usize);
         self.n = n;
     }
 
@@ -319,13 +334,13 @@ impl FrameCache {
     /// blurred (three box passes of `radius`); the others are copied as
     /// they are. A short or empty mask blurs every frame.
     pub fn blurred(&self, radius: u32, mask: &[u8]) -> FrameCache {
-        let fs = (self.width * self.height * 4) as usize;
+        let fs = (self.width * self.height * 3) as usize;
         let mut out = FrameCache { width: self.width, height: self.height, data: Vec::with_capacity(self.data.len()), n: self.n };
         let mut tmp = Vec::new();
         for i in 0..self.n {
             let f = &self.data[i * fs..(i + 1) * fs];
             if mask.is_empty() || i >= mask.len() || mask[i] != 0 {
-                unflash_core::resample::blur_rgba(f, self.width, self.height, radius, &mut tmp);
+                unflash_core::resample::blur_rgb(f, self.width, self.height, radius, &mut tmp);
                 out.data.extend_from_slice(&tmp);
             } else {
                 out.data.extend_from_slice(f);
@@ -337,7 +352,7 @@ impl FrameCache {
 
 impl FrameCache {
     fn frame_ref(&self, i: usize) -> Option<&[u8]> {
-        let fs = (self.width * self.height * 4) as usize;
+        let fs = (self.width * self.height * 3) as usize;
         if i >= self.n {
             return None;
         }
@@ -350,7 +365,7 @@ impl FrameSource for FrameCache {
         self.frame_ref(i).expect("frame index out of range")
     }
     fn bpp(&self) -> usize {
-        4
+        3
     }
     fn width(&self) -> u32 {
         self.width
@@ -783,7 +798,7 @@ impl Detector {
         match &mut self.stage {
             Stage::Cpu(stage) => {
                 let params = self.det.begin_frame(t);
-                let stats = stage.run(params, FrameInput::rgba(f));
+                let stats = stage.run(params, FrameInput::rgb(f));
                 let rec = self.det.complete_frame(&stats);
                 self.records.push(rec);
                 Ok(())
@@ -793,7 +808,7 @@ impl Detector {
                     return Err(js_err("detector busy: poll() before submitting more frames"));
                 }
                 let params = self.det.begin_frame(t);
-                stage.submit(params, GpuSource::Rgba8 { data: f, width: aw, height: ah }, false).map_err(js_err)?;
+                stage.submit(params, GpuSource::Rgb8 { data: f, width: aw, height: ah }, false).map_err(js_err)?;
                 self.pending_capture.push_back(false);
                 Ok(())
             }
