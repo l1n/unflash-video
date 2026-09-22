@@ -182,6 +182,9 @@
         </div>
         <div class="grid-head">
           <h3>Frames <span id="frameCount"></span></h3>
+          <span class="size-switch thumb-size" title="Thumbnail size (they are the detector's small copies: 🔍 view frame shows one at full size)">
+            <button data-thumb="s" class="small">S</button><button data-thumb="m" class="small">M</button><button data-thumb="l" class="small">L</button><button data-thumb="xl" class="small">XL</button>
+          </span>
           <div class="legend">
             <span class="chip removed" title="Removed. The badge says which frame shows in its place.">removed</span>
             <span class="chip extended" title="Held on screen for 1 second">held 1s</span>
@@ -198,6 +201,7 @@
             <button id="btnMarkExtended" class="small">E: hold for 1 second</button>
             <button id="btnMarkKeep" class="small" title="Keep the selected frames: the suggestions leave them alone">K: keep</button>
             <button id="btnUnmark" class="small">U: unmark</button>
+            <button id="btnViewFrame" class="small" title="The selected frame at full size, decoded from the file, to read a subtitle or look closer (also Z, or double-click a frame). ← → step through the frames.">🔍 view frame (Z)</button>
             <button id="btnSelectUnsafe" class="small danger hidden" title="Select the frames inside whatever is still failing">select unsafe frames</button>
           </div>
         </div>
@@ -237,6 +241,14 @@
     <p id="support" class="support"></p>
   </section>
 </main>
+
+<div id="frameViewer" class="viewer hidden" role="dialog" aria-label="Frame at full size">
+  <div class="viewer-box">
+    <div class="viewer-bar"><span id="viewerInfo"></span><span class="spacer"></span><button id="btnCloseViewer" class="small">close (Esc)</button></div>
+    <canvas id="viewerCanvas"></canvas>
+    <div class="viewer-hint">← → step (shift: ten at a time) · R F E K U mark this frame · Esc closes. Decoded from the file at full size; while you step, a new picture shows at most every 0.4 s, so stepping through flashing does not flash.</div>
+  </div>
+</div>
 
 <div id="exportModal" class="modal hidden">
   <div class="modal-box">

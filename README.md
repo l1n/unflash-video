@@ -93,7 +93,12 @@ Files it reads:
    and the keys work with the focus anywhere but a text field. **Ctrl+Z**
    undoes (and **Ctrl+Shift+Z** redoes) any change to the section's marks,
    suggestions included. The section is re-checked after every change, in
-   well under a second.
+   well under a second. Thumbnails come in four sizes (S to XL); **Z**, a
+   double-click or *view frame* shows the selected frame at full size,
+   decoded from the file (the thumbnails are the detector's small copies,
+   too small to read a subtitle on), **←/→** step through the frames and
+   the mark keys work on the frame in view. While you step, a new picture
+   shows at most every 0.4 s, so stepping through flashing doesn't flash.
 4. **Suggest** gives you a first pass: *keep dark* or *keep light* removes
    the frames that make the flashing; *fewest removals* takes out
    whichever of the light or dark frames are fewer and then puts back as

@@ -148,6 +148,45 @@ try {
     assert(JSON.stringify(one.hash) === JSON.stringify(three.hash), 'span prepare pictures differ: ' + JSON.stringify([one.hash, three.hash]));
     results.spanPrepare = { one: one.ms, three: three.ms };
   }
+  // bigger thumbnails, and one frame at full size
+  {
+    await page.click('.thumb-size [data-thumb="xl"]');
+    const xl = await page.evaluate(() => ({ min: getComputedStyle(document.querySelector('#frameGrid')).getPropertyValue('--thumb-min').trim(), w: document.querySelector('#frameGrid .frame').offsetWidth, canvas: document.querySelector('#frameGrid .frame canvas').width }));
+    await page.click('.thumb-size [data-thumb="m"]');
+    const m = await page.evaluate(() => document.querySelector('#frameGrid .frame').offsetWidth);
+    console.log('thumbnails: XL', JSON.stringify(xl), '| M', m);
+    assert(xl.min === '320px' && xl.w >= 320 && xl.w > m && xl.canvas >= 400, 'XL thumbnails are bigger, and drawn bigger: ' + JSON.stringify(xl) + ' vs ' + m);
+    await page.click('#frameGrid .frame:nth-child(11)');
+    await page.keyboard.press('z');
+    await page.waitForFunction(() => (window.__unflash.state.viewerDraws || []).some((d) => d.i === 10), null, { timeout: 30000 });
+    const first = await page.evaluate(() => {
+      const c = document.querySelector('#viewerCanvas');
+      const px = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      let sum = 0;
+      for (let k = 0; k < px.length; k += 4 * 97) sum += px[k];
+      return { w: c.width, h: c.height, sum, info: document.querySelector('#viewerInfo').textContent, visible: !document.querySelector('#frameViewer').classList.contains('hidden') };
+    });
+    console.log('viewer:', JSON.stringify(first));
+    assert(first.visible && first.w === 640 && first.h === 360 && first.sum > 0 && first.info.includes('frame 10 of'), 'the viewer shows frame 10 at the file\'s own size: ' + JSON.stringify(first));
+    // five steps at key-repeat speed: the picture lands on frame 15, never faster than every 0.4 s
+    await page.evaluate(() => (window.__unflash.state.viewerDraws = []));
+    for (let k = 0; k < 5; k++) await page.keyboard.press('ArrowRight');
+    await page.waitForFunction(() => (window.__unflash.state.viewerDraws || []).some((d) => d.i === 15), null, { timeout: 30000 });
+    const draws = await page.evaluate(() => window.__unflash.state.viewerDraws);
+    const gaps = draws.slice(1).map((d, k) => d.t - draws[k].t);
+    console.log('viewer steps drawn:', draws.map((d) => d.i).join(','), '| gaps', gaps.map((g) => Math.round(g)).join(','));
+    assert(draws.length <= 3 && gaps.every((g) => g >= 380), 'stepping shows no more than a picture every 0.4 s: ' + JSON.stringify(draws));
+    // marks go on the frame in view
+    await page.keyboard.press('k');
+    assert(await page.evaluate(() => (window.__unflash.currentSection().keep || []).includes(15)), 'K in the viewer keeps the frame in view');
+    assert((await page.textContent('#viewerInfo')).includes('keep'), 'the viewer says so');
+    await page.keyboard.press('k');
+    assert(!(await page.evaluate(() => (window.__unflash.currentSection().keep || []).includes(15))), 'K again takes it off');
+    await page.keyboard.press('Escape');
+    const after = await page.evaluate(() => ({ hidden: document.querySelector('#frameViewer').classList.contains('hidden'), sel: [...window.__unflash.state.selection] }));
+    assert(after.hidden && after.sel.length === 1 && after.sel[0] === 15, 'Esc closes the viewer and leaves frame 15 selected: ' + JSON.stringify(after));
+    await page.keyboard.press('Escape');
+  }
   assert(results.verdictBefore.startsWith('fails'), 'the flashing section must fail before editing');
   assert(results.verdictBefore.includes('red flash'), 'the red flash must be named: ' + results.verdictBefore);
   await page.screenshot({ path: path.join(OUT, '2-section.png'), fullPage: true });

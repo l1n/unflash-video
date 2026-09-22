@@ -9,6 +9,7 @@ import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate
 import { Project, projectKey, dropCaches } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
+import { FrameViewer } from './viewer.js';
 import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notifyState, systemNotify, titleProgress, titleMark } from './alerts.js';
 
 const $ = (id) => document.getElementById(id);
@@ -386,6 +387,7 @@ async function openFile(file) {
   $('banner').classList.add('hidden');
   await stopAuto();
   if (sectionPlayer) await sectionPlayer.stop();
+  closeViewer();
   const opened = await runJob('Opening video', async (progress) => {
     progress(0.05, 'reading the index');
     const movie = await Movie.open(file, wasm, {
@@ -917,6 +919,21 @@ function applyDim() {
 
 function wirePlayer() {
   sectionPlayer = new SectionPlayer($('preview'), { onFrame: onPreviewFrame, onState: onPreviewState });
+  frameViewer = new FrameViewer($('viewerCanvas'), {
+    onShown: (i) => {
+      // (the draws are kept for tests: how often a new picture came)
+      (state.viewerDraws = state.viewerDraws || []).push({ i, t: performance.now() });
+      if (state.viewerDraws.length > 50) state.viewerDraws.shift();
+    },
+  });
+  $('btnViewFrame').addEventListener('click', () => openViewer(state.selection.size ? Math.min(...state.selection) : 0));
+  $('btnCloseViewer').addEventListener('click', closeViewer);
+  // a click outside the picture closes it too
+  $('frameViewer').addEventListener('click', (e) => {
+    if (e.target === $('frameViewer')) closeViewer();
+  });
+  setThumbSize(thumbSizeSetting(), false);
+  for (const b of document.querySelectorAll('.thumb-size [data-thumb]')) b.addEventListener('click', () => setThumbSize(b.dataset.thumb));
   setPlayerSize(playerSizeSetting());
   for (const b of document.querySelectorAll('.size-switch [data-size]')) b.addEventListener('click', () => setPlayerSize(b.dataset.size));
   $('playerSource').addEventListener('change', () => setPlayerSource($('playerSource').value));
@@ -1358,6 +1375,7 @@ function currentSection() {
 
 function openSection(id) {
   const changed = state.current !== id;
+  if (changed) closeViewer();
   state.current = id;
   state.selection.clear();
   state.anchor = null;
@@ -1489,6 +1507,7 @@ function onKey(e) {
   const tag = e.target && e.target.tagName;
   if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
   if (e.key === 'Escape') {
+    if (viewerOpen()) return closeViewer();
     if (document.body.classList.contains('guide-open')) return setGuide(false);
     if (!$('exportModal').classList.contains('hidden')) return;
     state.selection.clear();
@@ -1515,6 +1534,28 @@ function onKey(e) {
   if (['r', 'f', 'e', 'k', 'u'].includes(k)) {
     e.preventDefault();
     markSelection(k.toUpperCase());
+    renderViewerInfo();
+    return;
+  }
+  if (k === 'z') {
+    e.preventDefault();
+    if (viewerOpen()) closeViewer();
+    else openViewer(state.selection.size ? Math.min(...state.selection) : 0);
+    return;
+  }
+  // the arrows step through the frames (one, or ten with shift)
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    const from = viewerOpen() ? state.viewerAt : state.selection.size ? Math.min(...state.selection) : null;
+    if (from == null) return;
+    e.preventDefault();
+    const i = Math.max(0, Math.min(sec.nFrames - 1, from + (e.key === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 10 : 1)));
+    if (viewerOpen()) return openViewer(i);
+    state.selection.clear();
+    state.selection.add(i);
+    state.anchor = i;
+    renderGridMarks();
+    const tile = $('frameGrid').children[i];
+    if (tile) tile.scrollIntoView({ block: 'nearest' });
   }
 }
 
@@ -1622,7 +1663,81 @@ function describeFailure(c) {
 
 let tileObserver = null;
 let scratch = null; // one analysis-size canvas; tiles are drawn at thumbnail size
-const THUMB_W = 160;
+/** Smallest tile width per thumbnail size (the grid fills the row with them). */
+const THUMB_SIZES = { s: 110, m: 146, l: 220, xl: 320 };
+let THUMB_W = 160;
+
+function thumbSizeSetting() {
+  try {
+    const v = localStorage.getItem('unflash:thumbSize');
+    if (THUMB_SIZES[v]) return v;
+  } catch (e) {
+    /* storage blocked */
+  }
+  return 'm';
+}
+
+function setThumbSize(size, redraw = true) {
+  if (!THUMB_SIZES[size]) size = 'm';
+  const min = THUMB_SIZES[size];
+  $('frameGrid').style.setProperty('--thumb-min', `${min}px`);
+  // drawn a little over the tile's size for a sharp picture, never far past the cache's own
+  THUMB_W = Math.round(Math.max(160, min * 1.3));
+  for (const b of document.querySelectorAll('.thumb-size [data-thumb]')) b.classList.toggle('on', b.dataset.thumb === size);
+  try {
+    localStorage.setItem('unflash:thumbSize', size);
+  } catch (e) {
+    /* the choice lasts the session */
+  }
+  const sec = currentSection();
+  if (redraw && sec && sec.prepared && sec.cache) renderGrid(sec);
+}
+
+// ---- one frame at full size -------------------------------------------------------
+
+let frameViewer = null;
+
+function viewerOpen() {
+  return !$('frameViewer').classList.contains('hidden');
+}
+
+/** Show frame `i` of the open section at full size (and select it). */
+function openViewer(i) {
+  const sec = currentSection();
+  if (!sec || !sec.prepared || !state.movie) return;
+  i = Math.max(0, Math.min(sec.nFrames - 1, i));
+  state.selection.clear();
+  state.selection.add(i);
+  state.anchor = i;
+  state.viewerAt = i;
+  $('viewerCanvas').classList.toggle('dim', $('dimToggle').checked);
+  $('frameViewer').classList.remove('hidden');
+  renderViewerInfo();
+  frameViewer.show(state.movie, sec, i);
+  renderGridMarks();
+  const tile = $('frameGrid').children[i];
+  if (tile) tile.scrollIntoView({ block: 'nearest' });
+}
+
+function closeViewer() {
+  if (!viewerOpen()) return;
+  $('frameViewer').classList.add('hidden');
+  frameViewer.clear();
+  $('frameGrid').focus({ preventScroll: true });
+}
+
+function renderViewerInfo() {
+  const sec = currentSection();
+  const i = state.viewerAt;
+  if (!sec || i == null || !viewerOpen()) return;
+  const e = (sec.edits || {})[i] || {};
+  const marks = [];
+  if (e.removed) marks.push(`removed: frame ${e.fill === 'next' ? 'after' : 'before'} it shows instead`);
+  if (e.extended) marks.push('held for 1 s');
+  if ((sec.keep || []).includes(i)) marks.push('keep');
+  $('viewerInfo').textContent = `Section #${sec.id}, frame ${i} of ${sec.nFrames} · ${fmt(sec.start + sec.pts[i])} (${sec.pts[i].toFixed(3)} s in)${marks.length ? ' · ' + marks.join(' · ') : ''} · ${state.movie.width}×${state.movie.height}`;
+}
+
 function renderGrid(sec) {
   const grid = $('frameGrid');
   grid.innerHTML = '';
@@ -1682,6 +1797,7 @@ function renderGrid(sec) {
       e.preventDefault();
       onTileClick(i, e);
     });
+    tile.addEventListener('dblclick', () => openViewer(i));
     frag.appendChild(tile);
     tileObserver.observe(tile);
   }

@@ -140,7 +140,16 @@ aside#sections { width: 250px; border-right: 1px solid var(--line); background: 
 .chip.kept { border-color: var(--ok); color: #9fe8b8; }
 .grid-actions { display: flex; gap: 6px; margin-left: auto; }
 .grid-hint { color: var(--fg2); font-size: 12px; margin: 6px 0; }
-.frame-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(146px, 1fr)); gap: 6px; outline: none; }
+.frame-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--thumb-min, 146px), 1fr)); gap: 6px; outline: none; }
+.thumb-size button { padding: 1px 7px; }
+.viewer { position: fixed; inset: 0; z-index: 60; background: rgba(0, 0, 0, .88); display: flex; align-items: center; justify-content: center; }
+.viewer.hidden { display: none; }
+.viewer-box { display: flex; flex-direction: column; gap: 6px; max-width: 94vw; }
+.viewer-bar { display: flex; align-items: center; gap: 10px; color: var(--fg); font-size: 13px; }
+.viewer-bar .spacer { flex: 1; }
+#viewerCanvas { max-width: 94vw; max-height: 80vh; width: auto; height: auto; background: black; border-radius: 4px; }
+#viewerCanvas.dim { filter: brightness(.45); }
+.viewer-hint { color: var(--fg2); font-size: 12px; }
 .frame { position: relative; border: 2px solid transparent; border-radius: 4px; background: var(--bg2); cursor: pointer; user-select: none; }
 .frame canvas { width: 100%; display: block; border-radius: 2px; image-rendering: auto; }
 .frame .fno { position: absolute; left: 4px; top: 3px; font-size: 11px; background: rgba(0,0,0,.6); padding: 0 4px; border-radius: 3px; }
