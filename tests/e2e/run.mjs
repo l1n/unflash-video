@@ -406,6 +406,7 @@ try {
   results.gpuScan = scan;
   console.log('gpu scan:', scan.ms, 'ms |', scan.status, '|', scan.toast);
   results.gpuViolations = await page.evaluate(() => window.__unflash.lastScan.result.violations);
+  results.gpuWhole = await page.evaluate(() => ({ frames: window.__unflash.lastScan.frames, held: window.__unflash.lastScan.result.held }));
   console.log('gpu violations:', JSON.stringify(results.gpuViolations));
   assert(results.gpuViolations.length === results.cpuViolations.length, 'GPU and CPU scans must find the same violations');
   for (let i = 0; i < results.gpuViolations.length; i++) {
@@ -416,6 +417,26 @@ try {
     assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.05 && Math.abs(a.end - b.end) < 0.05, `violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
   }
   await page.screenshot({ path: path.join(OUT, '6-gpu-scan.png') });
+
+  // ======== the same scan in two segments run at once must merge into the same result
+  await page.goto(`http://127.0.0.1:${port}/?segments=2&auto=0`);
+  await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+  await openFile('flash.mp4');
+  page.once('dialog', (d) => d.accept());
+  await page.click('#btnDeleteAll');
+  await page.waitForFunction(() => document.querySelectorAll('#sectionList .sec-item').length === 1);
+  scan = await scanCurrent();
+  results.segScan = await page.evaluate(() => ({ segments: window.__unflash.lastScan.segments, frames: window.__unflash.lastScan.frames, violations: window.__unflash.lastScan.result.violations, held: window.__unflash.lastScan.result.held }));
+  console.log('gpu scan in 2 segments:', scan.ms, 'ms |', scan.toast, '|', JSON.stringify(results.segScan));
+  assert(results.segScan.segments === 2, 'the scan ran in two segments: ' + JSON.stringify(results.segScan));
+  assert(results.segScan.frames === results.gpuWhole.frames, `frames ${results.segScan.frames} vs ${results.gpuWhole.frames}`);
+  assert(results.segScan.violations.length === results.gpuViolations.length, 'the segmented scan finds the same violations as the whole scan');
+  for (let i = 0; i < results.segScan.violations.length; i++) {
+    const a = results.segScan.violations[i];
+    const b = results.gpuViolations[i];
+    assert(a.kind === b.kind && Math.abs(a.start - b.start) < 1e-6 && Math.abs(a.end - b.end) < 1e-6 && Math.abs(a.onset - b.onset) < 1e-6, `segmented violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
+  }
+  assert(results.segScan.held === results.gpuWhole.held, `held frames ${results.segScan.held} vs ${results.gpuWhole.held}`);
 
   // ======== every route a picture can take to the GPU detector =============
   // ?route forces one: the frame itself (videoframe), its own YUV planes

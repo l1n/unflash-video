@@ -19,7 +19,8 @@ const out = document.getElementById('out');
 const log = (s) => { out.textContent += s + '\n'; };
 await init();
 async function bench(kind, cfgJson, w, h, n) {
-  const det = kind === 'gpu' ? await wasm.Detector.createGpu(cfgJson, w, h) : new wasm.Detector(cfgJson, w, h);
+  const batch = parseInt(new URLSearchParams(location.search).get('batch') || '16', 10);
+  const det = kind === 'gpu' ? await wasm.Detector.createGpu(cfgJson, w, h, batch) : new wasm.Detector(cfgJson, w, h);
   const aw = det.analysis_width(), ah = det.analysis_height();
   // frames at the analysis size for the CPU (its natural input) and at the source size for the GPU
   const fw = kind === 'gpu' ? w : aw, fh = kind === 'gpu' ? h : ah;

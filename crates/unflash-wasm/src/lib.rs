@@ -119,6 +119,17 @@ pub fn violations_to_sections(violations_json: &str, config_json: &str, ts_min: 
     to_json(&sections::violations_to_sections(&v, &cfg, (ts_min, ts_max), keyframes))
 }
 
+/// Join the results of segments scanned in parallel (JSON `[{from, result}]`,
+/// in order, each result with its per-frame statistics) into the result one
+/// run over the whole file gives.
+#[wasm_bindgen]
+pub fn merge_scan_segments(config_json: &str, src_width: u32, src_height: u32, segments_json: &str) -> Result<String, JsValue> {
+    let cfg = parse_cfg(config_json)?;
+    let segs: Vec<unflash_core::temporal::Segment> = serde_json::from_str(segments_json).map_err(|e| js_err(format!("bad segments: {e}")))?;
+    let det = CoreDetector::for_source(cfg.clone(), src_width, src_height);
+    to_json(&unflash_core::temporal::merge_segments(&cfg, det.geometry(), &segs))
+}
+
 #[wasm_bindgen]
 pub fn timeline_summary(result_json: &str, ts_min: f64, ts_max: f64, bin_seconds: f64) -> Result<String, JsValue> {
     let r = parse_result(result_json)?;
@@ -655,14 +666,17 @@ impl Detector {
     }
 
     /// WebGPU detector; resolves to a `Detector` or rejects when there is no
-    /// adapter.
+    /// adapter. `batch` frames share one command buffer and one readback
+    /// (results arrive when a batch is full or after `flush`); 1 gives a
+    /// result after every frame, for the live monitor.
     #[wasm_bindgen(js_name = createGpu)]
-    pub fn create_gpu(config_json: String, src_width: u32, src_height: u32) -> js_sys::Promise {
+    pub fn create_gpu(config_json: String, src_width: u32, src_height: u32, batch: Option<u32>) -> js_sys::Promise {
         wasm_bindgen_futures::future_to_promise(async move {
             let cfg = parse_cfg(&config_json)?;
             let ctx = GpuContext::new().await.map_err(js_err)?;
             let det = CoreDetector::for_source(cfg.clone(), src_width, src_height);
-            let stage = GpuStage::new(&ctx, &cfg, det.geometry().clone()).map_err(js_err)?;
+            let batch = batch.map(|b| b.max(1) as usize).unwrap_or(unflash_gpu::DEFAULT_BATCH);
+            let stage = GpuStage::with_options(&ctx, &cfg, det.geometry().clone(), unflash_gpu::DEFAULT_SLOTS, batch).map_err(js_err)?;
             let d = Detector { det, stage: Stage::Gpu(Box::new(stage)), records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default(), yuv_scratch: Vec::new() };
             Ok(JsValue::from(d))
         })
@@ -952,6 +966,27 @@ impl Detector {
         self.records.clear();
         self.captures.clear();
         self.pending_capture.clear();
+        if let Stage::Gpu(stage) = &mut self.stage {
+            // frames still on the GPU belong to the old run
+            stage.abandon();
+        }
+    }
+
+    /// Run the detector over the frames fed since the last batch went out
+    /// (a no-op on the CPU, whose frames are done as they are fed). Call
+    /// before waiting for `pending()` to reach zero.
+    pub fn flush(&mut self) {
+        if let Stage::Gpu(stage) = &mut self.stage {
+            stage.flush();
+        }
+    }
+
+    /// Frames of the batch being filled: fed, but not yet run.
+    pub fn queued(&self) -> u32 {
+        match &self.stage {
+            Stage::Gpu(stage) => stage.queued() as u32,
+            Stage::Cpu(_) => 0,
+        }
     }
 
     pub fn is_first_pending(&self) -> bool {

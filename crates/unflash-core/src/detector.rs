@@ -437,6 +437,81 @@ mod tests {
         assert_eq!(r.held, 189, "{:?}", r.frame_stats.held);
     }
 
+    /// Two segments, the second started a run-up early, merge into exactly
+    /// the sequential run: a general flash straddling the seam, a red flash
+    /// after it, repeats, and a pan.
+    #[test]
+    fn parallel_segments_merge_into_the_sequential_run() {
+        use crate::sections::context_seconds;
+        use crate::temporal::{merge_segments, Segment};
+        let cfg = Profile::WcagExt.config();
+        let (aw, ah) = cfg.analysis_dims(640, 360);
+        let n = (aw * ah) as usize;
+        let frame = |i: usize| -> Vec<u8> {
+            let t = i as f64 / 30.0;
+            let mut f = vec![90u8; n * 3];
+            // a drifting texture (new pictures, no flashing)
+            for y in 0..ah as usize {
+                for x in 0..aw as usize {
+                    let c = if ((x + i / 3) / 20 + y / 20) % 2 == 0 { 110 } else { 80 };
+                    let k = (y * aw as usize + x) * 3;
+                    f[k] = c;
+                    f[k + 1] = c;
+                    f[k + 2] = c;
+                }
+            }
+            if (8.0..12.0).contains(&t) {
+                let c = if ((t * 8.0).floor() as i64) % 2 == 0 { 30 } else { 200 };
+                f.iter_mut().for_each(|p| *p = c);
+            } else if (16.0..18.0).contains(&t) {
+                let red = ((t * 8.0).floor() as i64) % 2 == 0;
+                for px in f.chunks_exact_mut(3) {
+                    px.copy_from_slice(if red { &[255, 0, 0] } else { &[144, 144, 144] });
+                }
+            } else if (13.0..14.0).contains(&t) {
+                // a held picture
+                f = vec![100u8; n * 3];
+            }
+            f
+        };
+        let total = 20 * 30;
+        let mut seq = CpuDetector::new(cfg.clone(), aw, ah);
+        for i in 0..total {
+            seq.feed(i as f64 / 30.0, FrameInput::rgb(&frame(i)));
+        }
+        let want = seq.finish();
+        assert!(want.violations.iter().any(|v| v.kind == ViolationKind::Flash) && want.violations.iter().any(|v| v.kind == ViolationKind::Red), "{:?}", want.violations);
+
+        let seam = 10.0;
+        let runup = context_seconds(&cfg);
+        let mut a = CpuDetector::new(cfg.clone(), aw, ah);
+        let mut b = CpuDetector::new(cfg.clone(), aw, ah);
+        for i in 0..total {
+            let t = i as f64 / 30.0;
+            if t < seam {
+                a.feed(t, FrameInput::rgb(&frame(i)));
+            }
+            if t >= seam - runup {
+                b.feed(t, FrameInput::rgb(&frame(i)));
+            }
+        }
+        let geom = a.geometry().clone();
+        let got = merge_segments(&cfg, &geom, &[Segment { from: 0.0, result: a.finish() }, Segment { from: seam, result: b.finish() }]);
+        assert_eq!(got.frames, want.frames);
+        assert_eq!(got.held, want.held);
+        assert_eq!(got.frame_stats.t, want.frame_stats.t);
+        assert_eq!(got.frame_stats.hazard, want.frame_stats.hazard);
+        assert_eq!(got.frame_stats.hazard_red, want.frame_stats.hazard_red);
+        assert_eq!(got.frame_stats.ext, want.frame_stats.ext);
+        assert_eq!(got.frame_stats.held, want.frame_stats.held);
+        for (x, y) in got.frame_stats.tc.iter().zip(&want.frame_stats.tc) {
+            assert!((x - y).abs() < 1e-9, "clock {x} vs {y}");
+        }
+        assert_eq!(got.events.len(), want.events.len(), "events");
+        assert_eq!(got.violations, want.violations);
+        assert_eq!(got.safe(), want.safe());
+    }
+
     #[test]
     fn detector_split_api_matches_cpu_detector() {
         let cfg = Profile::Wcag.config();

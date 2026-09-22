@@ -260,6 +260,31 @@ computing ages with wrapping arithmetic and periodically saturating every
 stored time at 2^30 µs (about 18 minutes), which is the reference's "never"
 sentinel in a different coat. See [DETECTION.md](DETECTION.md#the-webgpu-implementation).
 
+### Frames in batches, files in segments
+
+At 256×144 the detector's work on a frame is a few tens of microseconds of
+GPU time; a scan's speed is set by round trips. The stage therefore runs
+**sixteen frames per command buffer**: each picture is converted into its
+own slice of the input planes as it arrives, and the passes that depend on
+the previous frame's state (the moved-pixel count, the pattern mask, the
+update, the row sums and the gather) run for the whole batch in one
+submission with one readback, so the submit-to-result latency is paid once
+per sixteen frames rather than once per frame. The live monitor asks for a
+batch of one, since it wants a result after every frame.
+
+A scan of a long file is also cut into up to four **segments scanned at the
+same time**, each with its own decoder and detector. Every segment after
+the first starts a run-up early, the same run-up a section check gets, so
+that its detector's state at the seam is the state a run from the start of
+the file would have reached; the per-frame statistics are then joined with
+the run-ups dropped and the internal clock made continuous, and the
+violations are derived from the joined statistics exactly as they are for
+one run. A test holds the merged result of a split run identical to the
+sequential run, frame statistics, events and violations alike. Segments are
+used with the browser's own decoder on the GPU detector (the built-in
+decoder already spreads over workers); `?segments=N` forces a count, and a
+file shorter than four run-ups per segment is scanned in one.
+
 ### What it costs
 
 Per frame at the default analysis size (a 16:9 source becomes 256×144, the
@@ -338,7 +363,7 @@ frames, run both over it and line up the violations:
 
 ```
 python3 -m unflash.cli analyze file.mp4 --profile wcag_ext --json   # the Python reference (needs ffmpeg, numpy)
-node tests/e2e/scanfile.mjs file.mp4 --profile wcag_ext             # this detector, in headless Chromium
+node tests/e2e/scanfile.mjs file.mp4 --profile wcag_ext             # this detector, in headless Chromium (--segments N to force a segment count)
 ```
 
 Onsets, starts and ends agree to the hundredth of a second on the test

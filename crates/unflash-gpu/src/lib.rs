@@ -38,6 +38,7 @@ pub use wgpu;
 const PRELUDE: &str = include_str!("shaders/prelude.wgsl");
 const INGEST: &str = include_str!("shaders/ingest.wgsl");
 const YUV: &str = include_str!("shaders/yuv.wgsl");
+const MOVED: &str = include_str!("shaders/moved.wgsl");
 const PATTERN: &str = include_str!("shaders/pattern.wgsl");
 const UPDATE: &str = include_str!("shaders/update.wgsl");
 const ROWS: &str = include_str!("shaders/rows.wgsl");
@@ -49,8 +50,18 @@ const GEO_WORDS: usize = 8 + 64 + 64 + 4;
 const GEO_MAX_POS: usize = 64;
 const GEO_PAT_R: usize = 136;
 const PATTERN_WG: u32 = 64;
-/// Frames that may be in flight before `submit` refuses.
-pub const DEFAULT_SLOTS: usize = 4;
+/// Batches that may be in flight before `submit` refuses.
+pub const DEFAULT_SLOTS: usize = 2;
+/// Frames per batch: one command buffer and one readback for this many
+/// frames, so the submit-to-result latency is paid once per batch.
+pub const DEFAULT_BATCH: usize = 16;
+/// Dynamic buffer offsets must be multiples of this (the default limit for
+/// uniform and storage bindings alike).
+const REGION_ALIGN: usize = 256;
+
+fn align_up(n: usize) -> usize {
+    n.div_ceil(REGION_ALIGN) * REGION_ALIGN
+}
 
 /// An adapter + device + queue.
 pub struct GpuContext {
@@ -108,12 +119,23 @@ enum SlotState {
     Pending { remaining: u32, err: Option<String> },
 }
 
+/// One batch's readback: the stats of every frame in it, and their captures.
 struct Slot {
     staging: wgpu::Buffer,
     rgba_staging: Option<wgpu::Buffer>,
+    /// Any frame of the batch asked for its picture.
     captured: bool,
     state: Arc<Mutex<SlotState>>,
-    params: KernelParams,
+    /// Per frame of the batch.
+    params: Vec<KernelParams>,
+    captures: Vec<bool>,
+    /// The next frame of the batch to hand out, once mapped.
+    next: usize,
+    /// The mapped readbacks, copied out on the first poll of the batch.
+    words: Vec<u32>,
+    rgba: Vec<u8>,
+    /// Results are dropped (after a reset).
+    discard: bool,
 }
 
 /// One completed frame.
@@ -160,10 +182,16 @@ pub struct GpuStage {
     yuv_pipe: wgpu::ComputePipeline,
     yuv_params_buf: wgpu::Buffer,
     yuv: Option<YuvPlanes>,
+    // per-frame regions inside the batch-sized buffers (bytes)
+    inputs_region: usize,
+    rgba_region: usize,
+    out_region: usize,
     // pipelines
     ingest_bgl: wgpu::BindGroupLayout,
     ingest_pipe: wgpu::ComputePipeline,
     ingest_bg: Option<wgpu::BindGroup>,
+    moved_pipe: wgpu::ComputePipeline,
+    moved_bg: wgpu::BindGroup,
     pattern_pipe: wgpu::ComputePipeline,
     pattern_bg: wgpu::BindGroup,
     update_pipe: wgpu::ComputePipeline,
@@ -172,6 +200,14 @@ pub struct GpuStage {
     rows_bg: wgpu::BindGroup,
     gather_pipe: wgpu::ComputePipeline,
     gather_bg: wgpu::BindGroup,
+    // the batch being filled
+    batch: usize,
+    current: Option<usize>,
+    queued: usize,
+    frame_params: Vec<KernelParams>,
+    frame_capture: Vec<bool>,
+    /// Region of the last frame ingested (for the native debug readbacks).
+    last_pos: usize,
     // readback ring
     slots: Vec<Slot>,
     in_flight: VecDeque<usize>,
@@ -192,17 +228,28 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// A storage binding addressed per frame: the bind group binds one region and
+/// the dispatch supplies the frame's offset.
+fn dyn_storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry { ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: true, min_binding_size: None }, ..storage_entry(binding, read_only) }
+}
+
 fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
+            has_dynamic_offset: true,
             min_binding_size: None,
         },
         count: None,
     }
+}
+
+/// The first `size` bytes of `buf`, moved along by a dynamic offset per frame.
+fn region_entry(binding: u32, buf: &wgpu::Buffer, size: usize) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: buf, offset: 0, size: wgpu::BufferSize::new(size as u64) }) }
 }
 
 /// The plane textures of a YUV source at one size, and the bind group of
@@ -247,10 +294,14 @@ fn buf_entry(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 
 impl GpuStage {
     pub fn new(ctx: &GpuContext, cfg: &DetectorConfig, geom: GridGeometry) -> Result<Self, String> {
-        Self::with_slots(ctx, cfg, geom, DEFAULT_SLOTS)
+        Self::with_options(ctx, cfg, geom, DEFAULT_SLOTS, DEFAULT_BATCH)
     }
 
-    pub fn with_slots(ctx: &GpuContext, cfg: &DetectorConfig, geom: GridGeometry, nslots: usize) -> Result<Self, String> {
+    /// `nslots` batches may be in flight; `batch` frames go into one command
+    /// buffer and one readback (1 for a result after every frame, as the live
+    /// monitor wants).
+    pub fn with_options(ctx: &GpuContext, cfg: &DetectorConfig, geom: GridGeometry, nslots: usize, batch: usize) -> Result<Self, String> {
+        let batch = batch.max(1);
         let device = ctx.device.clone();
         let queue = ctx.queue.clone();
         if geom.aw > 1024 {
@@ -274,19 +325,23 @@ impl GpuStage {
             })
         };
         let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
-        let params_buf = mk("params", std::mem::size_of::<KernelParams>(), wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        // the per-frame buffers hold one region per frame of a batch
+        let inputs_region = align_up(3 * npix * 4);
+        let rgba_region = align_up(npix * 4);
+        let out_region = align_up(out_words * 4);
+        let params_buf = mk("params", batch * REGION_ALIGN, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let geo_buf = mk("geo", GEO_WORDS * 4, st);
         let lut_buf = mk("lut", 256 * 4, st);
-        let inputs_buf = mk("inputs", 3 * npix * 4, st);
+        let inputs_buf = mk("inputs", batch * inputs_region, st);
         let state_buf = mk("state", layout.fields() * npix * 4, st);
         let pixout_buf = mk("pixout", 3 * npix * 4, st);
-        let rgba_buf = mk("rgba", npix * 4, st);
-        let globals_buf = mk("globals", 16, st);
+        let rgba_buf = mk("rgba", batch * rgba_region, st);
+        let globals_buf = mk("globals", batch * REGION_ALIGN, st);
         let rowwin_buf = mk("rowwin", geom.ah as usize * geom.gxs.len() * CELL_WORDS * 4, st);
         let rowtot_buf = mk("rowtot", geom.ah as usize * 4, st);
         let patmask_buf = mk("patmask", npix * 4, st);
         let rowpat_buf = mk("rowpat", geom.ah as usize * 4, st);
-        let out_buf = mk("out", out_words * 4, st);
+        let out_buf = mk("out", batch * out_region, st);
         let pat_r = unflash_core::pattern::line_radius(geom.aw, geom.ah);
         let pat_threads = unflash_core::pattern::ORIENTATIONS as u32 * (2 * pat_r as u32 + 1);
 
@@ -307,7 +362,7 @@ impl GpuStage {
         geo_words[GEO_PAT_R] = pat_r as u32;
         queue.write_buffer(&geo_buf, 0, cast_slice(&geo_words));
         queue.write_buffer(&lut_buf, 0, cast_slice(lut()));
-        queue.write_buffer(&globals_buf, 0, &[0u8; 16]);
+        queue.write_buffer(&globals_buf, 0, &vec![0u8; batch * REGION_ALIGN]);
 
         // shaders
         let assemble = |src: &str| -> String {
@@ -319,6 +374,7 @@ impl GpuStage {
             device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)) })
         };
         let ingest_mod = module("ingest", assemble(INGEST));
+        let moved_mod = module("moved", assemble(MOVED));
         let yuv_mod = module("yuv", assemble(YUV));
         let pattern_mod = module("pattern", assemble(PATTERN));
         let update_mod = module("update", assemble(UPDATE));
@@ -328,30 +384,28 @@ impl GpuStage {
         let bgl = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries })
         };
-        let ingest_bgl = bgl(
-            "ingest",
+        // params, inputs, globals, rgba and out are addressed per frame
+        let ingest_bgl = bgl("ingest", &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), texture_entry(3), dyn_storage_entry(4, false), dyn_storage_entry(5, false)]);
+        let yuv_bgl = bgl(
+            "yuv",
             &[
-                uniform_entry(0),
-                storage_entry(1, true),
-                storage_entry(2, true),
+                wgpu::BindGroupLayoutEntry { ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, ..uniform_entry(0) },
+                texture_entry(1),
+                texture_entry(2),
                 texture_entry(3),
-                storage_entry(4, false),
-                storage_entry(5, true),
-                storage_entry(6, false),
-                storage_entry(7, false),
-                storage_entry(8, false),
+                storage_texture_entry(4),
             ],
         );
-        let yuv_bgl = bgl("yuv", &[uniform_entry(0), texture_entry(1), texture_entry(2), texture_entry(3), storage_texture_entry(4)]);
-        let pattern_bgl = bgl("pattern", &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, false), storage_entry(4, false)]);
-        let update_bgl = bgl("update", &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false), storage_entry(3, false), storage_entry(4, true)]);
+        let moved_bgl = bgl("moved", &[uniform_entry(0), dyn_storage_entry(1, true), storage_entry(2, true), dyn_storage_entry(3, false)]);
+        let pattern_bgl = bgl("pattern", &[uniform_entry(0), storage_entry(1, true), dyn_storage_entry(2, true), storage_entry(3, false), dyn_storage_entry(4, false)]);
+        let update_bgl = bgl("update", &[uniform_entry(0), dyn_storage_entry(1, true), storage_entry(2, false), storage_entry(3, false), dyn_storage_entry(4, true)]);
         let rows_bgl = bgl(
             "rows",
-            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, true), storage_entry(4, false), storage_entry(5, false), storage_entry(6, true), storage_entry(7, false)],
+            &[uniform_entry(0), storage_entry(1, true), dyn_storage_entry(2, true), storage_entry(3, true), storage_entry(4, false), storage_entry(5, false), storage_entry(6, true), storage_entry(7, false)],
         );
         let gather_bgl = bgl(
             "gather",
-            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, true), storage_entry(4, false), storage_entry(5, false), storage_entry(6, true)],
+            &[uniform_entry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, true), dyn_storage_entry(4, false), dyn_storage_entry(5, false), storage_entry(6, true)],
         );
 
         let pipe = |label: &str, l: &wgpu::BindGroupLayout, m: &wgpu::ShaderModule| {
@@ -368,28 +422,35 @@ impl GpuStage {
         let ingest_pipe = pipe("ingest", &ingest_bgl, &ingest_mod);
         let yuv_pipe = pipe("yuv", &yuv_bgl, &yuv_mod);
         let yuv_params_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("yuv params"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let moved_pipe = pipe("moved", &moved_bgl, &moved_mod);
         let pattern_pipe = pipe("pattern", &pattern_bgl, &pattern_mod);
         let update_pipe = pipe("update", &update_bgl, &update_mod);
         let rows_pipe = pipe("rows", &rows_bgl, &rows_mod);
         let gather_pipe = pipe("gather", &gather_bgl, &gather_mod);
 
+        let params_size = std::mem::size_of::<KernelParams>();
+        let moved_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("moved"),
+            layout: &moved_bgl,
+            entries: &[region_entry(0, &params_buf, params_size), region_entry(1, &inputs_buf, inputs_region), buf_entry(2, &state_buf), region_entry(3, &globals_buf, REGION_ALIGN)],
+        });
         let pattern_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pattern"),
             layout: &pattern_bgl,
-            entries: &[buf_entry(0, &params_buf), buf_entry(1, &geo_buf), buf_entry(2, &inputs_buf), buf_entry(3, &patmask_buf), buf_entry(4, &globals_buf)],
+            entries: &[region_entry(0, &params_buf, params_size), buf_entry(1, &geo_buf), region_entry(2, &inputs_buf, inputs_region), buf_entry(3, &patmask_buf), region_entry(4, &globals_buf, REGION_ALIGN)],
         });
         let update_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("update"),
             layout: &update_bgl,
-            entries: &[buf_entry(0, &params_buf), buf_entry(1, &inputs_buf), buf_entry(2, &state_buf), buf_entry(3, &pixout_buf), buf_entry(4, &globals_buf)],
+            entries: &[region_entry(0, &params_buf, params_size), region_entry(1, &inputs_buf, inputs_region), buf_entry(2, &state_buf), buf_entry(3, &pixout_buf), region_entry(4, &globals_buf, REGION_ALIGN)],
         });
         let rows_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rows"),
             layout: &rows_bgl,
             entries: &[
-                buf_entry(0, &params_buf),
+                region_entry(0, &params_buf, params_size),
                 buf_entry(1, &geo_buf),
-                buf_entry(2, &inputs_buf),
+                region_entry(2, &inputs_buf, inputs_region),
                 buf_entry(3, &pixout_buf),
                 buf_entry(4, &rowwin_buf),
                 buf_entry(5, &rowtot_buf),
@@ -401,12 +462,12 @@ impl GpuStage {
             label: Some("gather"),
             layout: &gather_bgl,
             entries: &[
-                buf_entry(0, &params_buf),
+                region_entry(0, &params_buf, params_size),
                 buf_entry(1, &geo_buf),
                 buf_entry(2, &rowwin_buf),
                 buf_entry(3, &rowtot_buf),
-                buf_entry(4, &globals_buf),
-                buf_entry(5, &out_buf),
+                region_entry(4, &globals_buf, REGION_ALIGN),
+                region_entry(5, &out_buf, out_region),
                 buf_entry(6, &rowpat_buf),
             ],
         });
@@ -415,14 +476,19 @@ impl GpuStage {
             .map(|i| Slot {
                 staging: device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(&format!("staging{i}")),
-                    size: (out_words * 4) as u64,
+                    size: (batch * out_region) as u64,
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }),
                 rgba_staging: None,
                 captured: false,
                 state: Arc::new(Mutex::new(SlotState::Idle)),
-                params: KernelParams::default(),
+                params: Vec::new(),
+                captures: Vec::new(),
+                next: 0,
+                words: Vec::new(),
+                rgba: Vec::new(),
+                discard: false,
             })
             .collect::<Vec<_>>();
         let free = (0..slots.len()).rev().collect();
@@ -449,6 +515,9 @@ impl GpuStage {
             pat_threads,
             src: None,
             rgba_scratch: Vec::new(),
+            inputs_region,
+            rgba_region,
+            out_region,
             yuv_bgl,
             yuv_pipe,
             yuv_params_buf,
@@ -456,6 +525,8 @@ impl GpuStage {
             ingest_bgl,
             ingest_pipe,
             ingest_bg: None,
+            moved_pipe,
+            moved_bg,
             pattern_pipe,
             pattern_bg,
             update_pipe,
@@ -464,6 +535,12 @@ impl GpuStage {
             rows_bg,
             gather_pipe,
             gather_bg,
+            batch,
+            current: None,
+            queued: 0,
+            frame_params: Vec::with_capacity(batch),
+            frame_capture: Vec::with_capacity(batch),
+            last_pos: 0,
             slots,
             in_flight: VecDeque::new(),
             free,
@@ -489,8 +566,18 @@ impl GpuStage {
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }
+    /// Room for another frame: the batch being filled has some, or a batch
+    /// slot is free to start one.
     pub fn can_submit(&self) -> bool {
-        !self.free.is_empty()
+        self.current.is_some() || !self.free.is_empty()
+    }
+    /// Frames per batch.
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+    /// Frames ingested into the batch being filled.
+    pub fn queued(&self) -> usize {
+        self.queued
     }
     /// Bytes of per-pixel state touched by one full-update frame: the record
     /// read plus the partial write plus the input planes (for bandwidth
@@ -531,15 +618,12 @@ impl GpuStage {
                 label: Some("ingest"),
                 layout: &self.ingest_bgl,
                 entries: &[
-                    buf_entry(0, &self.params_buf),
+                    region_entry(0, &self.params_buf, std::mem::size_of::<KernelParams>()),
                     buf_entry(1, &self.geo_buf),
                     buf_entry(2, &self.lut_buf),
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&view) },
-                    buf_entry(4, &self.inputs_buf),
-                    buf_entry(5, &self.state_buf),
-                    buf_entry(6, &self.globals_buf),
-                    buf_entry(7, &self.rgba_buf),
-                    buf_entry(8, &self.patmask_buf),
+                    region_entry(4, &self.inputs_buf, self.inputs_region),
+                    region_entry(5, &self.rgba_buf, self.rgba_region),
                 ],
             }));
             let mut geo = [0u32; 2];
@@ -551,20 +635,30 @@ impl GpuStage {
         &self.src.as_ref().unwrap().0
     }
 
-    /// Submit one frame. Fails (without side effects) when every readback
-    /// slot is in flight; call [`poll`](Self::poll) first. With `capture`,
-    /// the analysis-resolution RGBA picture comes back with the result.
+    /// Submit one frame: its picture is converted now, and the detector runs
+    /// over it when its batch is full (or on [`flush`](Self::flush)). Fails
+    /// (without side effects) when every batch slot is in flight; call
+    /// [`poll`](Self::poll) first. With `capture`, the analysis-resolution
+    /// RGBA picture comes back with the result.
     pub fn submit(&mut self, params: KernelParams, source: FrameSource<'_>, capture: bool) -> Result<(), String> {
-        let Some(slot_idx) = self.free.pop() else {
-            return Err("all readback slots are in flight".into());
+        let started_here = self.current.is_none();
+        let slot_idx = match self.current {
+            Some(s) => s,
+            None => match self.free.pop() {
+                Some(s) => s,
+                None => return Err("all readback slots are in flight".into()),
+            },
         };
+        let k = self.queued;
         let mut yuv_pass = false;
         // 1. source
         match source {
             FrameSource::Rgb8 { data, width, height } => {
                 let n = (width * height) as usize;
                 if data.len() < n * 3 {
-                    self.free.push(slot_idx);
+                    if started_here {
+                        self.free.push(slot_idx);
+                    }
                     return Err("frame data too short".into());
                 }
                 self.rgba_scratch.resize(n * 4, 255);
@@ -578,7 +672,9 @@ impl GpuStage {
             FrameSource::Rgba8 { data, width, height } => {
                 let n = (width * height) as usize;
                 if data.len() < n * 4 {
-                    self.free.push(slot_idx);
+                    if started_here {
+                        self.free.push(slot_idx);
+                    }
                     return Err("frame data too short".into());
                 }
                 let tex = self.source_texture(width, height).clone();
@@ -586,13 +682,17 @@ impl GpuStage {
             }
             FrameSource::SourceTexture => {
                 if self.src.is_none() {
-                    self.free.push(slot_idx);
+                    if started_here {
+                        self.free.push(slot_idx);
+                    }
                     return Err("no source texture has been created".into());
                 }
             }
             FrameSource::Yuv420 { data, width, height, layout } => {
                 if width == 0 || height == 0 || !layout.fits(data.len(), width as usize, height as usize) {
-                    self.free.push(slot_idx);
+                    if started_here {
+                        self.free.push(slot_idx);
+                    }
                     return Err("picture data too short for its layout".into());
                 }
                 self.source_texture(width, height);
@@ -620,12 +720,13 @@ impl GpuStage {
                 yuv_pass = true;
             }
         }
-        // 2. params
-        self.queue.write_buffer(&self.params_buf, 0, bytes_of(&params));
-        // 3. passes
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("unflash frame") });
+        // 2. this frame's params, in its region
+        self.queue.write_buffer(&self.params_buf, (k * REGION_ALIGN) as u64, bytes_of(&params));
+        // 3. the picture into this frame's input planes, now: the source
+        // texture is reused by the next frame
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("unflash ingest") });
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("detector"), timestamp_writes: None });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ingest"), timestamp_writes: None });
             if yuv_pass {
                 let p = self.yuv.as_ref().unwrap();
                 pass.set_pipeline(&self.yuv_pipe);
@@ -633,41 +734,101 @@ impl GpuStage {
                 pass.dispatch_workgroups(p.width.div_ceil(16), p.height.div_ceil(16), 1);
             }
             pass.set_pipeline(&self.ingest_pipe);
-            pass.set_bind_group(0, self.ingest_bg.as_ref().unwrap(), &[]);
+            pass.set_bind_group(0, self.ingest_bg.as_ref().unwrap(), &[(k * REGION_ALIGN) as u32, (k * self.inputs_region) as u32, (k * self.rgba_region) as u32]);
             pass.dispatch_workgroups(self.geom.aw.div_ceil(16), self.geom.ah.div_ceil(16), 1);
-            if params.pat_enabled != 0 {
+        }
+        self.queue.submit(Some(enc.finish()));
+        self.current = Some(slot_idx);
+        self.frame_params.push(params);
+        self.frame_capture.push(capture);
+        self.queued += 1;
+        self.last_pos = k;
+        self.frames_submitted += 1;
+        if self.queued >= self.batch {
+            self.submit_batch();
+        }
+        Ok(())
+    }
+
+    /// Run the detector over the frames ingested so far and start their
+    /// readback; a no-op with nothing queued. Results follow through
+    /// [`poll`](Self::poll).
+    pub fn flush(&mut self) {
+        if self.current.is_some() && self.queued > 0 {
+            self.submit_batch();
+        }
+    }
+
+    /// Forget the frames ingested into the batch being filled, and drop the
+    /// results of the batches in flight when they arrive.
+    pub fn abandon(&mut self) {
+        if let Some(s) = self.current.take() {
+            self.free.push(s);
+        }
+        self.queued = 0;
+        self.frame_params.clear();
+        self.frame_capture.clear();
+        for &s in &self.in_flight {
+            self.slots[s].discard = true;
+        }
+    }
+
+    /// The batch being filled: moved count, pattern, update, rows and gather
+    /// for each frame in order, one command buffer, one readback.
+    fn submit_batch(&mut self) {
+        let Some(slot_idx) = self.current.take() else { return };
+        let n = self.queued;
+        let npix = self.geom.npix();
+        let pattern = self.frame_params.iter().any(|p| p.pat_enabled != 0);
+        let capture = self.frame_capture.iter().any(|&c| c);
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("unflash batch") });
+        for k in 0..n {
+            let p = self.frame_params[k];
+            let params_off = (k * REGION_ALIGN) as u32;
+            let inputs_off = (k * self.inputs_region) as u32;
+            let globals_off = (k * REGION_ALIGN) as u32;
+            let out_off = (k * self.out_region) as u32;
+            if pattern {
+                // the pattern pass ORs into the mask
+                enc.clear_buffer(&self.patmask_buf, 0, None);
+            }
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("detector"), timestamp_writes: None });
+            pass.set_pipeline(&self.moved_pipe);
+            pass.set_bind_group(0, &self.moved_bg, &[params_off, inputs_off, globals_off]);
+            pass.dispatch_workgroups((npix as u32).div_ceil(256), 1, 1);
+            if p.pat_enabled != 0 {
                 pass.set_pipeline(&self.pattern_pipe);
-                pass.set_bind_group(0, &self.pattern_bg, &[]);
+                pass.set_bind_group(0, &self.pattern_bg, &[params_off, inputs_off, globals_off]);
                 pass.dispatch_workgroups(self.pat_threads.div_ceil(PATTERN_WG), 1, 1);
             }
             pass.set_pipeline(&self.update_pipe);
-            pass.set_bind_group(0, &self.update_bg, &[]);
-            pass.dispatch_workgroups((self.geom.npix() as u32).div_ceil(256), 1, 1);
+            pass.set_bind_group(0, &self.update_bg, &[params_off, inputs_off, globals_off]);
+            pass.dispatch_workgroups((npix as u32).div_ceil(256), 1, 1);
             pass.set_pipeline(&self.rows_pipe);
-            pass.set_bind_group(0, &self.rows_bg, &[]);
+            pass.set_bind_group(0, &self.rows_bg, &[params_off, inputs_off]);
             pass.dispatch_workgroups(self.geom.ah, 1, 1);
             pass.set_pipeline(&self.gather_pipe);
-            pass.set_bind_group(0, &self.gather_bg, &[]);
+            pass.set_bind_group(0, &self.gather_bg, &[params_off, globals_off, out_off]);
             pass.dispatch_workgroups((self.geom.ncells() as u32).div_ceil(64), 1, 1);
         }
-        let npix = self.geom.npix();
         let slot = &mut self.slots[slot_idx];
-        enc.copy_buffer_to_buffer(&self.out_buf, 0, &slot.staging, 0, (self.out_words * 4) as u64);
+        enc.copy_buffer_to_buffer(&self.out_buf, 0, &slot.staging, 0, (n * self.out_region) as u64);
         if capture {
+            let size = (self.batch * self.rgba_region) as u64;
             let rs = slot.rgba_staging.get_or_insert_with(|| {
-                self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("rgba staging"),
-                    size: (npix * 4) as u64,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
+                self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("rgba staging"), size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
             });
-            enc.copy_buffer_to_buffer(&self.rgba_buf, 0, rs, 0, (npix * 4) as u64);
+            enc.copy_buffer_to_buffer(&self.rgba_buf, 0, rs, 0, (n * self.rgba_region) as u64);
         }
         self.queue.submit(Some(enc.finish()));
-        // 4. async readback
-        slot.params = params;
+        // the async readback
+        slot.params = std::mem::take(&mut self.frame_params);
+        slot.captures = std::mem::take(&mut self.frame_capture);
         slot.captured = capture;
+        slot.next = 0;
+        slot.words.clear();
+        slot.rgba.clear();
+        slot.discard = false;
         *slot.state.lock().unwrap() = SlotState::Pending { remaining: if capture { 2 } else { 1 }, err: None };
         let done = |st: &Arc<Mutex<SlotState>>, r: Result<(), wgpu::BufferAsyncError>| {
             let mut g = st.lock().unwrap();
@@ -679,14 +840,13 @@ impl GpuStage {
             }
         };
         let st = slot.state.clone();
-        slot.staging.slice(..).map_async(wgpu::MapMode::Read, move |r| done(&st, r));
+        slot.staging.slice(..(n * self.out_region) as u64).map_async(wgpu::MapMode::Read, move |r| done(&st, r));
         if capture {
             let st = slot.state.clone();
-            slot.rgba_staging.as_ref().unwrap().slice(..).map_async(wgpu::MapMode::Read, move |r| done(&st, r));
+            slot.rgba_staging.as_ref().unwrap().slice(..(n * self.rgba_region) as u64).map_async(wgpu::MapMode::Read, move |r| done(&st, r));
         }
         self.in_flight.push_back(slot_idx);
-        self.frames_submitted += 1;
-        Ok(())
+        self.queued = 0;
     }
 
     /// The plane textures for a YUV source of this size and kind, (re)created
@@ -763,57 +923,84 @@ impl GpuStage {
         {
             let _ = self.device.poll(wgpu::PollType::Poll);
         }
-        let &slot_idx = self.in_flight.front()?;
-        let ready: Option<Result<(), String>> = {
-            let st = self.slots[slot_idx].state.lock().unwrap();
-            match &*st {
-                SlotState::Pending { remaining: 0, err } => Some(match err {
-                    Some(e) => Err(e.clone()),
-                    None => Ok(()),
-                }),
-                _ => None,
-            }
-        };
-        let r = ready?;
-        self.in_flight.pop_front();
-        let params = self.slots[slot_idx].params;
-        let captured = self.slots[slot_idx].captured;
-        let out = match r {
-            Ok(()) => {
-                let words: Vec<u32> = {
-                    let slot = &self.slots[slot_idx];
-                    let view = slot.staging.slice(..).get_mapped_range().expect("mapped range");
-                    cast_slice::<u8, u32>(&view).to_vec()
-                };
-                self.slots[slot_idx].staging.unmap();
-                let rgba = if captured {
-                    let rs = self.slots[slot_idx].rgba_staging.as_ref().unwrap();
-                    let bytes = rs.slice(..).get_mapped_range().expect("mapped rgba").to_vec();
-                    rs.unmap();
-                    Some(bytes)
-                } else {
-                    None
-                };
-                Ok(GpuFrame { stats: self.parse(&words, params), rgba })
-            }
-            Err(e) => {
-                // leave the buffers unmapped for reuse
-                let slot = &self.slots[slot_idx];
+        loop {
+            let &slot_idx = self.in_flight.front()?;
+            let ready: Option<Result<(), String>> = {
+                let st = self.slots[slot_idx].state.lock().unwrap();
+                match &*st {
+                    SlotState::Pending { remaining: 0, err } => Some(match err {
+                        Some(e) => Err(e.clone()),
+                        None => Ok(()),
+                    }),
+                    _ => None,
+                }
+            };
+            let r = ready?;
+            let n = self.slots[slot_idx].params.len();
+            let out_region = self.out_region;
+            let rgba_region = self.rgba_region;
+            let npix = self.geom.npix();
+            // the first look at a finished batch copies its readbacks out and
+            // unmaps, so the slot can be reused while its frames are handed out
+            if self.slots[slot_idx].next == 0 && self.slots[slot_idx].words.is_empty() {
+                let slot = &mut self.slots[slot_idx];
+                match &r {
+                    Ok(()) => {
+                        let view = slot.staging.slice(..(n * out_region) as u64).get_mapped_range().expect("mapped range");
+                        slot.words = cast_slice::<u8, u32>(&view).to_vec();
+                        drop(view);
+                        if slot.captured {
+                            let rs = slot.rgba_staging.as_ref().unwrap();
+                            slot.rgba = rs.slice(..(n * rgba_region) as u64).get_mapped_range().expect("mapped rgba").to_vec();
+                        }
+                    }
+                    Err(_) => {}
+                }
                 slot.staging.unmap();
-                if captured {
+                if slot.captured {
                     if let Some(rs) = &slot.rgba_staging {
                         rs.unmap();
                     }
                 }
-                Err(e)
             }
-        };
-        *self.slots[slot_idx].state.lock().unwrap() = SlotState::Idle;
-        self.free.push(slot_idx);
-        Some(out)
+            let discard = self.slots[slot_idx].discard;
+            let k = self.slots[slot_idx].next;
+            let last = k + 1 >= n;
+            let out = match &r {
+                Ok(()) if !discard => {
+                    let slot = &self.slots[slot_idx];
+                    let words = &slot.words[k * out_region / 4..(k + 1) * out_region / 4];
+                    let stats = self.parse(words, slot.params[k]);
+                    let rgba = if slot.captures[k] { Some(slot.rgba[k * rgba_region..k * rgba_region + npix * 4].to_vec()) } else { None };
+                    Some(Ok(GpuFrame { stats, rgba }))
+                }
+                Ok(()) => None,
+                Err(e) if !discard => Some(Err(e.clone())),
+                Err(_) => None,
+            };
+            if last {
+                let slot = &mut self.slots[slot_idx];
+                slot.words = Vec::new();
+                slot.rgba = Vec::new();
+                slot.params.clear();
+                slot.captures.clear();
+                slot.next = 0;
+                slot.discard = false;
+                *slot.state.lock().unwrap() = SlotState::Idle;
+                self.in_flight.pop_front();
+                self.free.push(slot_idx);
+            } else {
+                self.slots[slot_idx].next = k + 1;
+            }
+            if let Some(o) = out {
+                return Some(o);
+            }
+            // a discarded batch: on to the next
+        }
     }
 
     fn parse(&self, words: &[u32], params: KernelParams) -> GridStats {
+        debug_assert!(words.len() >= self.out_words);
         let sum_l = f32::from_bits(words[0]) as f64;
         let held_count = words[1];
         let first = params.mode & MODE_FIRST != 0;
@@ -865,10 +1052,11 @@ impl GpuStage {
         self.read_buffer_words(&self.state_buf)
     }
 
-    /// The L / V / sat planes of the last frame (native, for tests).
+    /// The L / V / sat planes of the last frame ingested (native, for tests).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn debug_inputs(&self) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
-        let w = self.read_buffer_words(&self.inputs_buf);
+        let all = self.read_buffer_words(&self.inputs_buf);
+        let w = &all[self.last_pos * self.inputs_region / 4..];
         let n = self.geom.npix();
         (
             w[..n].iter().map(|&b| f32::from_bits(b)).collect(),

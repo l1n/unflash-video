@@ -219,6 +219,8 @@ fn compare_with(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, n
         let frame = gen(i, t, aw as usize, ah as usize);
         let capture = i % 5 == 0;
         gpu.submit(p, FrameSource::Rgb8 { data: &frame, width: aw, height: ah }, capture).expect("submit");
+        // one frame per batch here: every frame's buffers are compared
+        gpu.flush();
         gpu.wait_idle();
         let gf = gpu.poll().expect("a result").expect("no error");
         let gs = gf.stats;
@@ -380,6 +382,7 @@ fn pipelined_submissions_arrive_in_order() {
             gpu.submit(p, FrameSource::Rgb8 { data: &frames[i], width: aw, height: ah }, i % 2 == 0).unwrap();
             i += 1;
         }
+        gpu.flush();
         assert!(gpu.in_flight() <= gpu.capacity());
         gpu.wait_idle();
         while let Some(r) = gpu.poll() {
@@ -392,5 +395,71 @@ fn pipelined_submissions_arrive_in_order() {
         for (c, (a, b)) in g.cells.iter().zip(&e.cells).enumerate() {
             assert_eq!(a.cnt, b.cnt, "frame {k} cell {c}");
         }
+    }
+}
+
+/// Frames batched sixteen to a command buffer must give exactly the stats
+/// (and captures) that one frame per batch gives: the held decision, the
+/// pattern statistics and every cell count, over a generator with repeats,
+/// flashing and stripes.
+#[test]
+fn batched_frames_match_single_frames() {
+    let Some(ctx) = context() else { return };
+    type Gen = fn(usize, f64, usize, usize) -> Vec<u8>;
+    let cases: Vec<(DetectorConfig, Gen, u32, u32, usize)> = vec![
+        (Profile::WcagExt.config(), gen, 640, 480, 70),
+        (Profile::WcagExt.config(), gen_stripes, 640, 360, 40),
+        (DetectorConfig { analysis_scale: 0.3, ..Profile::Strict.config() }, gen_equilum, 320, 180, 45),
+    ];
+    for (cfg, gen, w, h, n) in cases {
+        let (aw, ah) = cfg.analysis_dims(w, h);
+        let geom = GridGeometry::new(&cfg, aw, ah);
+        let mut single = GpuStage::with_options(&ctx, &cfg, geom.clone(), 2, 1).unwrap();
+        let mut batched = GpuStage::with_options(&ctx, &cfg, geom.clone(), 2, 16).unwrap();
+        let tmpl = KernelParams::template(&cfg, &geom);
+        let mut want = Vec::new();
+        let mut got = Vec::new();
+        for i in 0..n {
+            let t = i as f64 * 1001.0 / 30000.0;
+            let mut p = tmpl;
+            p.now = secs_to_us(t);
+            p.mode = if i == 0 { MODE_FIRST } else if i % 37 == 0 { MODE_SATURATE } else { 0 };
+            let frame = gen(i, t, aw as usize, ah as usize);
+            let capture = i % 7 == 3;
+            single.submit(p, FrameSource::Rgb8 { data: &frame, width: aw, height: ah }, capture).unwrap();
+            single.flush();
+            single.wait_idle();
+            want.push(single.poll().unwrap().unwrap());
+            while !batched.can_submit() {
+                batched.wait_idle();
+                while let Some(r) = batched.poll() {
+                    got.push(r.unwrap());
+                }
+            }
+            batched.submit(p, FrameSource::Rgb8 { data: &frame, width: aw, height: ah }, capture).unwrap();
+        }
+        batched.flush();
+        batched.wait_idle();
+        while let Some(r) = batched.poll() {
+            got.push(r.unwrap());
+        }
+        assert_eq!(got.len(), want.len());
+        for (k, (g, e)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g.stats.held, e.stats.held, "frame {k}: held");
+            assert_eq!(g.stats.held_count, e.stats.held_count, "frame {k}: moved pixels");
+            assert_eq!(g.stats.pattern_count, e.stats.pattern_count, "frame {k}: patterned pixels");
+            assert_eq!(g.stats.pattern_spacing_sum, e.stats.pattern_spacing_sum, "frame {k}: spacing sum");
+            assert_eq!(g.stats.pattern_spacing_n, e.stats.pattern_spacing_n, "frame {k}: spacing count");
+            assert_eq!(g.stats.cells.len(), e.stats.cells.len(), "frame {k}: cells");
+            for (c, (a, b)) in g.stats.cells.iter().zip(&e.stats.cells).enumerate() {
+                assert_eq!(a.cnt, b.cnt, "frame {k} cell {c}: counts");
+                assert_eq!(a.onset_gen, b.onset_gen, "frame {k} cell {c}: onset_gen");
+                assert_eq!(a.onset_red, b.onset_red, "frame {k} cell {c}: onset_red");
+                assert!((a.sum_l - b.sum_l).abs() <= 1e-6 * a.sum_l.abs().max(1.0), "frame {k} cell {c}: sum_l");
+            }
+            assert_eq!(g.rgba.is_some(), e.rgba.is_some(), "frame {k}: capture");
+            assert_eq!(g.rgba, e.rgba, "frame {k}: captured picture");
+        }
+        assert_eq!(single.debug_state(), batched.debug_state(), "state after the run");
     }
 }

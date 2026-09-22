@@ -9,14 +9,16 @@ import { profile } from './profile.js';
  * videoframe, yuv, rgba, canvas or pixels. `externalSources`: pretend the
  * browser's WebGPU accepts only these kinds of copy source.
  */
-export async function createDetector(wasm, configJson, width, height, { preferGpu = true, externalSources = null, route = null } = {}) {
+export async function createDetector(wasm, configJson, width, height, { preferGpu = true, externalSources = null, route = null, batch = null } = {}) {
   let det = null;
   let backend = 'cpu';
   let note = '';
   let probe = null;
   if (preferGpu && navigator.gpu) {
     try {
-      det = await wasm.Detector.createGpu(configJson, width, height);
+      // frames per command buffer and readback: many for throughput, one
+      // where a result is wanted after every frame (the live monitor)
+      det = await wasm.Detector.createGpu(configJson, width, height, batch || undefined);
       backend = 'webgpu';
       probe = await SourceProbe.create(externalSources);
     } catch (e) {
@@ -413,6 +415,8 @@ export class Feeder {
   /** Wait until every submitted frame has been processed. */
   async drain() {
     const t0 = performance.now();
+    // the frames of a half-full batch would otherwise wait for more
+    this.det.flush();
     while (this.det.pending() > 0) {
       this.poll();
       if (this.det.pending() > 0) await tick();

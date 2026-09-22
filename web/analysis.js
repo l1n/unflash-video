@@ -6,49 +6,106 @@ import { decodeRange, tick } from './media.js';
 import { profile } from './profile.js';
 import { dropCaches } from './project.js';
 
-/** Whole-video scan. Returns { result, sections, summary, trace }. */
-export async function scanMovie(env, movie, { onProgress, cancel } = {}) {
+/** A segment shorter than this many run-ups is not worth its run-up. */
+const MIN_SEGMENT_RUNUPS = 4;
+
+/**
+ * Whole-video scan. With `segments` above one and a `makeFeeder`, the file
+ * is cut into that many spans scanned at the same time, each by its own
+ * decoder and detector, every span after the first starting a run-up early
+ * (the same run-up a section check gets) so that the detector's state at
+ * the seam is the state a run from the start would have reached; the
+ * results are then joined exactly. Returns { result, sections, summary,
+ * trace, frames, elapsedMs, segments }.
+ */
+export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, makeFeeder = null, forceSegments = false } = {}) {
   const { wasm, config, feeder } = env;
-  feeder.reset();
   profile.reset();
-  const trace = { t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] };
-  const collect = () => {
-    for (const r of feeder.records()) {
-      trace.t.push(r.t);
-      trace.hazard.push(r.hazard);
-      trace.hazardRed.push(r.hazard_red);
-      trace.ext.push(Math.max(r.ext, r.ext_red));
-      trace.lum.push(r.lum);
-      trace.pattern.push(r.pattern);
-    }
-  };
-  let count = 0;
   const started = performance.now();
-  await decodeRange(
-    movie,
-    movie.tsMin,
-    movie.tsMax + 1,
-    async (frame, t) => {
-      await feeder.videoFrame(frame, t, false);
-      if (++count % 30 === 0) {
-        collect();
-        if (onProgress) onProgress(count / Math.max(1, movie.frameCount), trace, count, performance.now() - started);
-        profile.reportEvery(5000, 'scan so far', count, performance.now() - started);
+  const runup = wasm.context_seconds(config);
+  const end = movie.tsMax + 1;
+  const span = end - movie.tsMin;
+  let nseg = Math.max(1, Math.floor(segments));
+  if (!makeFeeder) nseg = 1;
+  // a forced count (tests, benchmarks) is taken as given
+  if (!forceSegments) nseg = Math.min(nseg, Math.max(1, Math.floor(span / (MIN_SEGMENT_RUNUPS * runup))));
+  const bounds = [];
+  for (let k = 0; k < nseg; k++) bounds.push({ from: movie.tsMin + (span * k) / nseg, to: k + 1 < nseg ? movie.tsMin + (span * (k + 1)) / nseg : end });
+  const feeders = [feeder];
+  for (let k = 1; k < nseg; k++) feeders.push(await makeFeeder());
+  const traces = bounds.map(() => ({ t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] }));
+  const counts = bounds.map(() => 0);
+  const total = Math.max(1, movie.frameCount);
+  // what the timeline can draw while the scan runs: the spans in order
+  const merged = () => {
+    const out = { t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] };
+    for (const tr of traces) for (const key of Object.keys(out)) for (const v of tr[key]) out[key].push(v);
+    return out;
+  };
+  const report = () => {
+    const count = counts.reduce((a, b) => a + b, 0);
+    if (onProgress) onProgress(count / total, merged(), count, performance.now() - started);
+    profile.reportEvery(5000, 'scan so far', count, performance.now() - started);
+  };
+  const runOne = async (k) => {
+    const f = feeders[k];
+    const { from, to } = bounds[k];
+    const tr = traces[k];
+    f.reset();
+    const collect = () => {
+      for (const r of f.records()) {
+        if (r.t < from - 1e-9) continue; // the run-up: the previous span's frames
+        tr.t.push(r.t);
+        tr.hazard.push(r.hazard);
+        tr.hazardRed.push(r.hazard_red);
+        tr.ext.push(Math.max(r.ext, r.ext_red));
+        tr.lum.push(r.lum);
+        tr.pattern.push(r.pattern);
       }
-    },
-    { cancel, raw: true, fast: true }
-  );
-  await feeder.drain();
-  collect();
+    };
+    let count = 0;
+    await decodeRange(
+      movie,
+      k === 0 ? from : Math.max(movie.tsMin, from - runup),
+      to,
+      async (frame, t) => {
+        await f.videoFrame(frame, t, false);
+        if (t >= from - 1e-9) counts[k] = ++count;
+        if (count % 30 === 0) {
+          collect();
+          report();
+        }
+      },
+      { cancel, raw: true, fast: true }
+    );
+    await f.drain();
+    collect();
+    return { from, result: f.finish(nseg > 1) };
+  };
+  let parts;
+  try {
+    parts = await Promise.all(bounds.map((_, k) => runOne(k)));
+  } finally {
+    for (let k = 1; k < feeders.length; k++) feeders[k].det.free();
+  }
+  const count = counts.reduce((a, b) => a + b, 0);
   const elapsed = performance.now() - started;
-  profile.report(`scan of ${(movie.file && movie.file.name) || 'the file'} (${movie.width}×${movie.height}, ${feeder.backend})`, count, elapsed);
-  const result = feeder.finish(false);
+  profile.report(`scan of ${(movie.file && movie.file.name) || 'the file'} (${movie.width}×${movie.height}, ${feeder.backend}${nseg > 1 ? `, ${nseg} segments` : ''})`, count, elapsed);
+  let result;
+  if (nseg === 1) {
+    result = parts[0].result;
+  } else {
+    result = JSON.parse(wasm.merge_scan_segments(config, movie.width, movie.height, JSON.stringify(parts)));
+    // the merged run's own statistics are the trace; the rest need not stay
+    result.frame_stats = {};
+  }
+  const trace = merged();
   const vjson = JSON.stringify(result.violations);
   // no keyframe snapping: the export re-encodes, so sections can follow the
   // flashing exactly instead of growing to the nearest keyframes
   const sections = JSON.parse(wasm.violations_to_sections(vjson, config, movie.tsMin, movie.tsMax, new Float64Array()));
   const summary = JSON.parse(wasm.timeline_summary(JSON.stringify(result), movie.tsMin, movie.tsMax, 1.0));
-  return { result, sections, summary, trace, frames: count, elapsedMs: elapsed, patternThresh: feeder.det.pattern_thresh() };
+  return { result, sections, summary, trace, frames: count, elapsedMs: elapsed, segments: nseg, patternThresh: feeder.det.pattern_thresh() };
 }
 
 /**

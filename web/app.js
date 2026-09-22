@@ -320,7 +320,7 @@ async function createFeeders(progress) {
   const route = routeSetting();
   const feeder = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu, externalSources, route });
   state.env = { wasm, config: state.config, feeder };
-  const live = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu, externalSources, route });
+  const live = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu, externalSources, route, batch: 1 });
   state.liveFeeder = live;
   if (feeder.note) banner(feeder.note, 'info');
   if (progress) progress(0.8, `${feeder.backend} detector at ${feeder.aw}×${feeder.ah}`);
@@ -350,7 +350,7 @@ function updateStatus() {
       const s = state.lastScan;
       const fps = (s.frames / (s.elapsedMs / 1000)).toFixed(0);
       const gbs = ((f.det.bytes_per_frame() * (s.frames / (s.elapsedMs / 1000))) / 1e9).toFixed(2);
-      parts.push(`last scan: ${s.frames} frames in ${(s.elapsedMs / 1000).toFixed(1)} s = ${fps} fps (${(fps / state.movie.fps).toFixed(1)}× realtime), ≈${gbs} GB/s of detector state traffic`);
+      parts.push(`last scan: ${s.frames} frames in ${(s.elapsedMs / 1000).toFixed(1)} s = ${fps} fps (${(fps / state.movie.fps).toFixed(1)}× realtime${s.segments > 1 ? `, ${s.segments} segments` : ''}), ≈${gbs} GB/s of detector state traffic`);
     }
   }
   if (state.project) parts.push(`caches: ${(state.project.cacheBytes() / 1048576).toFixed(0)} MB`);
@@ -359,6 +359,28 @@ function updateStatus() {
 
 // ---- scanning -------------------------------------------------------------------
 
+/**
+ * Spans a scan is cut into and scanned at once: one per two logical cores,
+ * at most four, on the GPU detector with the browser's own decoder (the
+ * built-in decoder already spreads over workers, and the CPU detector has
+ * one thread). `?segments=N` forces a count.
+ */
+function segmentsForced() {
+  return parseInt(new URLSearchParams(location.search).get('segments') || '', 10) > 0;
+}
+
+function scanSegments() {
+  const forced = parseInt(new URLSearchParams(location.search).get('segments') || '', 10);
+  if (forced > 0) return forced;
+  if (!state.env || state.env.feeder.backend !== 'webgpu' || state.decode.software) return 1;
+  return Math.min(4, Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 2)));
+}
+
+/** Another detector like the current one, for a scan segment (or a verify). */
+function makeFeeder(width, height) {
+  return createDetector(wasm, state.config, width, height, { preferGpu: preferGpuSetting(), externalSources: externalSourcesSetting(), route: routeSetting() });
+}
+
 async function scan() {
   if (!state.movie || !state.env) return;
   setLive(false);
@@ -366,6 +388,9 @@ async function scan() {
   const res = await runJob('Scanning for flashes', async (progress, cancelled) => {
     const r = await scanMovie(state.env, state.movie, {
       cancel: cancelled,
+      segments: scanSegments(),
+      forceSegments: segmentsForced(),
+      makeFeeder: () => makeFeeder(state.movie.width, state.movie.height),
       onProgress: (p, trace, count, ms) => {
         state.scanTrace = trace;
         progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`);
@@ -1539,9 +1564,15 @@ async function verifyExport() {
 async function verifyBlob(blob) {
   const res = await runJob('Verifying the exported file', async (progress, cancelled) => {
     const m = await Movie.open(blob, wasm);
-    const feeder = await createDetector(wasm, state.config, m.width, m.height, { preferGpu: preferGpuSetting(), externalSources: externalSourcesSetting(), route: routeSetting() });
+    const feeder = await makeFeeder(m.width, m.height);
     try {
-      return await scanMovie({ wasm, config: state.config, feeder }, m, { cancel: cancelled, onProgress: (p, _t, count, ms) => progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`) });
+      return await scanMovie({ wasm, config: state.config, feeder }, m, {
+        cancel: cancelled,
+        segments: scanSegments(),
+        forceSegments: segmentsForced(),
+        makeFeeder: () => makeFeeder(m.width, m.height),
+        onProgress: (p, _t, count, ms) => progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`),
+      });
     } finally {
       feeder.det.free();
     }

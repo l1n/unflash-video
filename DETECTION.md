@@ -532,6 +532,29 @@ keyframes for the sake of its stream-copy export. The browser export
 re-encodes everything, so sections are padded from the violation's onset
 and not extended to keyframes.
 
+**Frames run in batches; the moved count runs inside the batch.** The GPU
+stage converts each picture into its own slice of the input planes as it
+arrives, then runs the state-dependent passes for sixteen frames in one
+command buffer with one readback. The moved-pixel count of the held-frame
+test compares a frame with the last new picture as the *update* pass stored
+it, so it is a pass of its own inside the batch, after the previous frame's
+update, rather than part of the ingest; the pattern mask is cleared before
+each frame's pattern pass by the same command buffer. A test feeds the same
+frames to a stage with batches of one and a stage with batches of sixteen
+and requires identical statistics, captures and final state.
+
+**Parallel segments are exact.** A long scan is split into segments run at
+once, each after the first started a run-up (the section check's run-up)
+early. Everything the per-pixel and per-window state remembers is bounded by
+that run-up (the 2 s run cap, the 1 s pairing and failure windows, the 5 s
+extended window and its 1 s hold), so at the seam a segment's state equals
+the sequential run's. The segments' per-frame statistics are concatenated
+with the run-ups dropped, the internal clock and the onset times shifted so
+the clock is continuous across the seams, and the violations are then
+derived from the joined statistics by the same functions a single run uses.
+A test splits a sequence with a flash straddling the seam and requires the
+merged result to equal the sequential one.
+
 **The pattern pass is one thread per sampling line.** Eight orientations
 times the lines that cover the picture, each walking its line with the
 state machine above in registers and OR-ing its orientation's bit into a

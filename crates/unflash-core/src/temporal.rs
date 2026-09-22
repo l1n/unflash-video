@@ -186,6 +186,75 @@ impl AnalysisResult {
     }
 }
 
+/// One segment of a file scanned in parallel with the others: its result,
+/// and where its own span begins. Everything the detector saw before `from`
+/// was the segment's run-up (the run-up plus run-out a section check uses),
+/// decoded so that its state at `from` is the state a run from the start of
+/// the file would have reached; those frames belong to the previous segment.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Segment {
+    pub from: f64,
+    pub result: AnalysisResult,
+}
+
+/// Join the results of segments scanned in parallel into what one run over
+/// the whole file gives: the per-frame statistics are concatenated (run-ups
+/// dropped, the internal clock made continuous across the seams, the onsets
+/// shifted with it) and the violations are derived from them once, exactly
+/// as [`Temporal::finish`] derives them for one run. The segments must be in
+/// order and each must carry its per-frame statistics.
+pub fn merge_segments(cfg: &DetectorConfig, geom: &GridGeometry, segments: &[Segment]) -> AnalysisResult {
+    let mut stats = FrameStats::default();
+    let mut events = Vec::new();
+    let mut held = 0usize;
+    let mut anomalies = 0usize;
+    let mut last: Option<(f64, f64)> = None; // native time and clock of the last frame kept
+    for (si, seg) in segments.iter().enumerate() {
+        let s = &seg.result.frame_stats;
+        let n = s.len();
+        let first = if si == 0 { 0 } else { (0..n).find(|&i| s.t[i] >= seg.from - 1e-9).unwrap_or(n) };
+        if first >= n {
+            continue;
+        }
+        // the clock a run from the start would show at this segment's first
+        // frame: the previous frame's clock plus the native step between them
+        let shift = match last {
+            Some((lt, ltc)) => ltc + (s.t[first] - lt).max(0.0).min(cfg.max_frame_gap) - s.tc[first],
+            None => 0.0,
+        };
+        for i in first..n {
+            stats.t.push(s.t[i]);
+            stats.tc.push(s.tc[i] + shift);
+            stats.lum.push(s.lum[i]);
+            stats.up_area.push(s.up_area[i]);
+            stats.down_area.push(s.down_area[i]);
+            stats.red_area.push(s.red_area[i]);
+            stats.hazard.push(s.hazard[i]);
+            stats.hazard_red.push(s.hazard_red[i]);
+            stats.ext.push(s.ext[i]);
+            stats.ext_red.push(s.ext_red[i]);
+            stats.held.push(s.held[i]);
+            stats.hazard_onset.push(s.hazard_onset[i] + shift);
+            stats.hazard_red_onset.push(s.hazard_red_onset[i] + shift);
+            stats.pattern.push(s.pattern[i]);
+            stats.pattern_period.push(s.pattern_period[i]);
+            if s.held[i] {
+                held += 1;
+            }
+        }
+        for e in &seg.result.events {
+            if si == 0 || e.t >= seg.from - 1e-9 {
+                let mut e = e.clone();
+                e.tc += shift;
+                events.push(e);
+            }
+        }
+        anomalies += seg.result.anomalies;
+        last = Some((s.t[n - 1], s.tc[n - 1] + shift));
+    }
+    Temporal::with_outcome(cfg.clone(), geom.clone(), stats, events, held, anomalies).finish()
+}
+
 /// The internal monotonic clock that bridges source timestamp
 /// discontinuities.
 #[derive(Clone, Debug)]
@@ -691,6 +760,18 @@ impl Temporal {
             return 0.0;
         }
         interp(tc, &self.stats.tc, &self.stats.t)
+    }
+
+    /// A temporal state holding only the outcome of a run (per-frame
+    /// statistics, events, counts), enough for [`finish`](Self::finish).
+    fn with_outcome(cfg: DetectorConfig, geom: GridGeometry, stats: FrameStats, events: Vec<TransitionEvent>, held: usize, anomalies: usize) -> Self {
+        let mut t = Temporal::new(cfg, geom);
+        t.n = stats.len();
+        t.stats = stats;
+        t.events = events;
+        t.held = held;
+        t.clock.anomalies = anomalies;
+        t
     }
 
     pub fn finish(&self) -> AnalysisResult {

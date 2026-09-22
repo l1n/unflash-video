@@ -1,22 +1,20 @@
 // Pass A: source texture -> linear luminance L, red value V, saturation flag,
-// plus the count of pixels that moved (in luminance or in red value) since
-// the last new picture.
+// into this frame's slice of the inputs buffer, as pictures arrive. The
+// moved-pixel count and the pattern mask are the batch's business (moved.wgsl
+// and the clear before the pattern pass).
 //
 // The source may be any size: each analysis pixel takes the area average of
 // the source box it covers (weights are the fractional overlaps), in sRGB
 // code space, then rounds to an 8-bit code and linearises through the same
 // table the CPU uses. A source already at analysis resolution copies through
-// exactly. Also clears the pattern mask for the pattern pass.
+// exactly.
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> geo: array<u32>;
 @group(0) @binding(2) var<storage, read> lut: array<f32>;
 @group(0) @binding(3) var src: texture_2d<f32>;
 @group(0) @binding(4) var<storage, read_write> inputs: array<u32>;
-@group(0) @binding(5) var<storage, read> state: array<u32>;
-@group(0) @binding(6) var<storage, read_write> globals: array<atomic<u32>>;
-@group(0) @binding(7) var<storage, read_write> rgba: array<u32>;
-@group(0) @binding(8) var<storage, read_write> patmask: array<u32>;
+@group(0) @binding(5) var<storage, read_write> rgba: array<u32>;
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -24,7 +22,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ah = geo[GEO_AH];
     let x = gid.x;
     let y = gid.y;
-    var moved = 0u;
     if (x < aw && y < ah) {
         let sw = geo[GEO_SRC_W];
         let sh = geo[GEO_SRC_H];
@@ -67,14 +64,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         inputs[i] = bitcast<u32>(l);
         inputs[n + i] = bitcast<u32>(v);
         inputs[2u * n + i] = u32(sat);
-        patmask[i] = 0u;
-        if ((params.mode & MODE_FIRST) == 0u) {
-            let prev = bitcast<f32>(state[F_PREV_L * n + i]);
-            let prev_v = bitcast<f32>(state[F_PREV_V * n + i]);
-            moved = u32(abs(l - prev) > params.held_delta || abs(v - prev_v) > params.held_delta_v);
-        }
-    }
-    if (moved != 0u) {
-        atomicAdd(&globals[0], 1u);
     }
 }
