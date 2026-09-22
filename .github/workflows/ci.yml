@@ -14,10 +14,14 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # lavapipe runs the GPU tests; ffmpeg makes the test media and checks the
+      # muxer's output; numpy runs the Python reference. Installed once, then
+      # restored from the cache.
       - name: System packages (lavapipe, ffmpeg, numpy)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools ffmpeg python3-numpy
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: mesa-vulkan-drivers vulkan-tools ffmpeg python3-numpy
+          version: 1
       - name: Test media
         run: bash tests/media/gen.sh
       - name: Reference fixtures are up to date
@@ -34,14 +38,24 @@ jobs:
         run: cargo run --release -p unflash-gpu --example bench -- 1920x1080 0.25 200
 
   web:
-    name: WASM build and browser test
+    # the browser suite in parts, side by side (see tests/e2e/run.mjs --part)
+    name: Browser tests (${{ matrix.part }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [editing, files, gpu, routes, auto, formats]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          # one cache for every part, saved by one of them
+          shared-key: web
+          save-if: ${{ matrix.part == 'editing' }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -57,26 +71,50 @@ jobs:
           wasm-bindgen --version
       - name: Build
         run: ./build.sh release
-      - name: System packages (ffmpeg, numpy, playwright)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-numpy
-          npm install -g playwright@1.56.1
-          npx playwright@1.56.1 install --with-deps chromium
+      # the synthetic clips only change with their generator: kept in the
+      # cache, and made (with ffmpeg and numpy) only when it misses
+      - name: Synthetic videos, from the cache
+        id: clips
+        uses: actions/cache@v4
+        with:
+          path: tests/media/e2e
+          key: e2e-clips-${{ hashFiles('tests/media/gen_e2e.py') }}
+      - name: ffmpeg, numpy (only to make the clips)
+        if: steps.clips.outputs.cache-hit != 'true'
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: ffmpeg python3-numpy
+          version: 1
       - name: Synthetic videos
+        if: steps.clips.outputs.cache-hit != 'true'
         run: python3 tests/media/gen_e2e.py
-      - name: End-to-end (headless Chromium, WebGPU on SwiftShader)
-        run: node tests/e2e/run.mjs
-      - name: Smart-cut export with a stand-in H.264 encoder (headless Chromium)
-        run: node tests/e2e/splice.mjs
-      - name: Browser tests (MKV / WebM)
-        run: node tests/e2e/mkv.mjs
+      - name: Playwright's Chromium, from the cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-1.56.1-chromium-${{ runner.os }}
+      - name: Playwright
+        run: |
+          npm install -g playwright@1.56.1
+          npx playwright@1.56.1 install chromium
+          # the runner image has Chrome's libraries; fetch them only if the browser won't start
+          node --input-type=module -e "import { loadPlaywright } from './tests/e2e/playwright.mjs'; const { chromium } = await loadPlaywright(); await (await chromium.launch()).close();" || npx playwright@1.56.1 install-deps chromium
+      - name: End-to-end, ${{ matrix.part }} (headless Chromium, WebGPU on SwiftShader)
+        if: matrix.part != 'formats'
+        run: node tests/e2e/run.mjs --part=${{ matrix.part }}
+      - name: Smart-cut splice, MKV and WebM (headless Chromium)
+        if: matrix.part == 'formats'
+        run: |
+          node tests/e2e/splice.mjs
+          node tests/e2e/mkv.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: e2e-output
+          name: e2e-output-${{ matrix.part }}
           path: tests/e2e/out/
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
+        if: matrix.part == 'editing'
         with:
           name: web
           path: web/

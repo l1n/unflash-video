@@ -1,5 +1,8 @@
 // End-to-end test of the web app in headless Chromium with WebGPU (SwiftShader).
-//   node tests/e2e/run.mjs [--headed] [--keep]
+//   node tests/e2e/run.mjs [--headed] [--keep] [--part=editing,files,gpu,routes,auto]
+// The parts run in that order by default; CI runs each on its own, side by
+// side (a part that compares with the CPU scans makes them itself when it
+// runs alone).
 // The long editing flow runs on the CPU detector (SwiftShader's WebGPU is a
 // software emulation and slow); a GPU scan of the same files must then find
 // the same violations. The synthetic clips come from tests/media/gen_e2e.py;
@@ -57,6 +60,13 @@ page.on('console', (m) => {
 });
 
 const results = {};
+const partArg = (process.argv.find((a) => a.startsWith('--part=')) || '').slice('--part='.length);
+const PARTS = ['editing', 'files', 'gpu', 'routes', 'auto'];
+const parts = partArg ? partArg.split(',') : PARTS;
+for (const p of parts) if (!PARTS.includes(p)) throw new Error(`unknown part ${p}; the parts are ${PARTS.join(', ')}`);
+const runs = (p) => parts.includes(p);
+let scan;
+let t0;
 async function openFile(name) {
   await page.setInputFiles('#fileInput', path.join(MEDIA, name));
   await page.waitForFunction((n) => document.querySelector('#videoInfo').textContent.includes(n), name, { timeout: 60000 });
@@ -82,8 +92,36 @@ async function scanCurrent() {
   return { ms, project, status: await page.textContent('#status'), toast: await page.textContent('#toast') };
 }
 
+/** The app at `?query`, unless the page is there already (a part carrying on from the one before). */
+async function ensurePage(query) {
+  if (page.url().endsWith('/?' + query)) return;
+  await page.goto(`http://127.0.0.1:${port}/?${query}`);
+  await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+}
+
+/**
+ * The CPU scans later parts compare with (`cpuViolations`: flash.mp4,
+ * `stripesViolations`: stripes.mp4), made here when the parts that make
+ * them did not run.
+ */
+async function cpuReferences(keys) {
+  if (keys.every((k) => results[k])) return;
+  await ensurePage('cpu=1&auto=0');
+  for (const [name, key] of [
+    ['flash.mp4', 'cpuViolations'],
+    ['stripes.mp4', 'stripesViolations'],
+  ]) {
+    if (results[key] || !keys.includes(key)) continue;
+    await openFile(name);
+    await scanCurrent();
+    results[key] = await page.evaluate(() => window.__unflash.lastScan.result.violations);
+    console.log(`CPU reference scan of ${name}:`, JSON.stringify(results[key]));
+  }
+}
+
 try {
   // ======== the editing flow, CPU detector ==================================
+  if (runs('editing')) {
   // ?auto=0: these flows press every button themselves
   await page.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0`);
   await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
@@ -104,7 +142,7 @@ try {
     window.__titles = [];
     new MutationObserver(() => window.__titles.push(document.title)).observe(document.querySelector('title'), { childList: true, subtree: true, characterData: true });
   });
-  let scan = await scanCurrent();
+  scan = await scanCurrent();
   results.cpuScan = scan;
   console.log('cpu scan:', scan.ms, 'ms |', scan.status, '|', scan.toast);
   await page.waitForFunction(() => window.__unflash.lastAlert, null, { timeout: 10000 });
@@ -128,7 +166,7 @@ try {
   assert(red && red.start > 7.5 && red.start < 8.6 && red.end > 8.2 && red.end < 8.8, 'red flash reported at 7.9-8.5 s: ' + JSON.stringify(red));
 
   // --- open the section: it prepares itself and is checked --------------------
-  let t0 = Date.now();
+  t0 = Date.now();
   await openSectionPrepared();
   await verdictReady(page);
   results.prepareMs = Date.now() - t0;
@@ -405,20 +443,29 @@ try {
   });
   const seen = new Set();
   const until = Date.now() + 8000;
-  while (Date.now() < until) {
+  // (watching until it reports the flashing, eight seconds at most: "flashing:
+  // general flash", "1 violation so far"; "no flashing so far" is not it)
+  const reported = (set) => [...set].some((s) => /^flashing:|violations? so far/.test(s));
+  while (Date.now() < until && !reported(seen)) {
     seen.add(await page.textContent('#liveVerdict'));
     await page.waitForTimeout(200);
   }
   results.liveVerdicts = [...seen];
   results.hud = await page.textContent('#hudInfo');
   console.log('live verdicts seen:', results.liveVerdicts, '|', results.hud);
-  assert([...seen].some((s) => /flashing/.test(s)), 'the live monitor must report the flashing while it plays');
+  assert(reported(seen), 'the live monitor must report the flashing while it plays: ' + JSON.stringify([...seen]));
   // a scan of this file exists, so the meter reads it instead of detecting again
   assert(/from the scan/.test(results.hud), 'after a scan the monitor reads the scan trace: ' + results.hud);
   await page.screenshot({ path: path.join(OUT, '5-live.png') });
   await page.uncheck('#liveToggle');
   await page.evaluate(() => document.querySelector('#player').pause());
 
+  }
+
+  // ======== more files: steady, extended, red flash, stripes, the built-in decoder
+  if (runs('files')) {
+  await cpuReferences(['cpuViolations']);
+  await ensurePage('cpu=1&auto=0');
   // --- a steady file passes; an extended flash is flagged only by the default profile
   await openFile('steady.mp4');
   scan = await scanCurrent();
@@ -560,7 +607,11 @@ try {
   console.log('h264 section verdict:', results.h264Verdict);
   assert(results.h264Verdict.startsWith('fails'), 'the H.264 section fails before editing: ' + results.h264Verdict);
 
+  }
+
   // ======== the same scans on the GPU must agree ==============================
+  if (runs('gpu')) {
+  await cpuReferences(['cpuViolations', 'stripesViolations']);
   await page.goto(`http://127.0.0.1:${port}/?auto=0`);
   await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
   // the welcome page's test clips open straight into the app
@@ -674,7 +725,11 @@ try {
   assert(results.packed.n === 20 && results.packed.same && results.packed.pics, 'BGRX frames copied as they are must match RGBA: ' + JSON.stringify(results.packed));
   assert(results.packed.route === 'rgba' && /BGRX as decoded/.test(results.packed.detail), 'the BGRX frames took the packed copy: ' + JSON.stringify(results.packed));
 
+  }
+
   // ======== every route a picture can take to the GPU detector =============
+  if (runs('routes')) {
+  await cpuReferences(['cpuViolations']);
   // ?route forces one: the frame itself (videoframe), its own YUV planes
   // (yuv: what Firefox's WebGPU needs, and what the built-in decoder hands
   // over), WebCodecs' RGBA conversion (rgba), a canvas blit (canvas) or
@@ -722,13 +777,14 @@ try {
     });
     const liveSeen = new Set();
     const liveUntil = Date.now() + 8000;
-    while (Date.now() < liveUntil) {
+    const liveReported = () => [...liveSeen].some((s) => /^flashing:|violations? so far/.test(s));
+    while (Date.now() < liveUntil && !liveReported()) {
       liveSeen.add(await page.textContent('#liveVerdict'));
       await page.waitForTimeout(200);
     }
     const liveTaken = await page.evaluate(() => window.__unflash.state.liveFeeder && window.__unflash.state.liveFeeder.route);
     console.log(`live monitor with ?${query}:`, [...liveSeen], '| route', liveTaken);
-    assert([...liveSeen].some((s) => /flashing/.test(s)), `the live monitor must report the flashing with ?${query}`);
+    assert(liveReported(), `the live monitor must report the flashing with ?${query}: ` + JSON.stringify([...liveSeen]));
     assert(liveTaken === liveRoute, `the live monitor must feed the <video> as ${liveRoute} with ?${query}, not ${liveTaken}`);
     await page.uncheck('#liveToggle');
     await page.evaluate(() => document.querySelector('#player').pause());
@@ -738,7 +794,10 @@ try {
   console.log('profile summary:\n' + profileText);
   assert(/feed/.test(profileText) && /gpu.latency/.test(profileText), 'the profile knows the feed and GPU latency timings');
 
+  }
+
   // ======== auto-fix: open a file and the rest happens by itself =============
+  if (runs('auto')) {
   // (the CPU detector again: SwiftShader's WebGPU is too slow for the prepares and the export)
   await page.goto(`http://127.0.0.1:${port}/?cpu=1`);
   await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
@@ -836,6 +895,7 @@ try {
   results.autoDropped = await autoDone();
   console.log('auto-fix dropped redflash.mp4:', JSON.stringify(results.autoDropped));
   assert(results.autoDropped.steps.fix.status === 'done' && /keep dark|keep light|frame rate/.test(results.autoDropped.steps.fix.text) && results.autoDropped.steps.verify.status === 'done' && /Passes WCAG/.test(results.autoDropped.steps.verify.text), 'the dropped red-flash clip is fixed and checked: ' + JSON.stringify(results.autoDropped.steps));
+  }
 } finally {
   fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 2));
   if (errors.length) console.log('BROWSER ERRORS:\n' + errors.join('\n'));
