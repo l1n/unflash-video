@@ -776,8 +776,11 @@ try {
       return v.play();
     });
     const liveSeen = new Set();
-    const liveUntil = Date.now() + 8000;
-    const liveReported = () => [...liveSeen].some((s) => /^flashing:|violations? so far/.test(s));
+    const liveUntil = Date.now() + 12000;
+    // what matters here is that pictures reach the detector by this route: any
+    // flashing it sees will do ("flashing below the limit" too, which is all
+    // a slow software GPU may get to), but "no flashing so far" is not it
+    const liveReported = () => [...liveSeen].some((s) => /^flashing|violations? so far/.test(s));
     while (Date.now() < liveUntil && !liveReported()) {
       liveSeen.add(await page.textContent('#liveVerdict'));
       await page.waitForTimeout(200);
