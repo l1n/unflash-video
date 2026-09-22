@@ -434,8 +434,9 @@ impl Suggester {
         let e = parse_edits(edits_json)?;
         let prefer = match prefer {
             "light" => Prefer::Light,
+            "fewest" => Prefer::Fewest,
             "dark" => Prefer::Dark,
-            other => return Err(js_err(format!("prefer must be light or dark, not {other}"))),
+            other => return Err(js_err(format!("prefer must be light, dark or fewest, not {other}"))),
         };
         let only = parse_only(only_json)?;
         let keep = parse_keep(keep_json)?;

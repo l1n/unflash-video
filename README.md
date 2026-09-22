@@ -95,7 +95,11 @@ Files it reads:
    suggestions included. The section is re-checked after every change, in
    well under a second.
 4. **Suggest** gives you a first pass: *keep dark* or *keep light* removes
-   the frames that make the flashing; *reduce FPS* thins the section the way
+   the frames that make the flashing; *fewest removals* takes out
+   whichever of the light or dark frames are fewer and then puts back as
+   many flashes as the rules allow (no more than three a second, fewer
+   where the profile still objects, each try checked), so as little as
+   possible goes; *reduce FPS* thins the section the way
    an editor does it by hand, trying twice the rate that can never fail
    first and stepping down a tenth at a time until the check passes (the ▾
    menu thins to a rate you type). They choose by brightness alone, so

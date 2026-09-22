@@ -1423,6 +1423,7 @@ function wireWorkspace() {
   $('btnRedo').addEventListener('click', redo);
   $('btnSuggestLight').addEventListener('click', () => doSuggest('light'));
   $('btnSuggestDark').addEventListener('click', () => doSuggest('dark'));
+  $('btnSuggestFewest').addEventListener('click', () => doSuggest('fewest'));
   $('btnSuggestFps').addEventListener('click', () => doSuggestFps());
   $('btnFpsMenu').addEventListener('click', (e) => {
     e.stopPropagation();
@@ -1984,7 +1985,8 @@ async function doSuggest(prefer) {
   const sec = currentSection();
   if (!sec || !sec.prepared) return;
   const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
-  const res = await runJob(`Suggesting (keep ${prefer})`, async (progress) => suggestEdits(state.env, state.project, sec, prefer, only, { extS: EXT_S, onProgress: (r) => progress(0.2 + r * 0.15, `round ${r + 1}`) }));
+  const what = prefer === 'fewest' ? 'fewest removals' : `keep ${prefer}`;
+  const res = await runJob(`Suggesting (${what})`, async (progress) => suggestEdits(state.env, state.project, sec, prefer, only, { extS: EXT_S, onProgress: (r) => progress(Math.min(0.95, 0.1 + r * 0.08), `check ${r + 1}`) }));
   if (!res) return;
   applySuggestion(sec, res, only);
   await state.project.save();

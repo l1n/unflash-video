@@ -185,6 +185,24 @@ try {
   results.marks = await page.evaluate(() => Object.values(window.__unflash.currentSection().edits).filter((e) => e.removed).length);
   await page.screenshot({ path: path.join(OUT, '3-suggested.png'), fullPage: true });
 
+  // --- fewest removals from scratch: passes with fewer frames gone ---------
+  await page.click('#btnClearEdits');
+  await verdictReady(page);
+  const toastF = await page.textContent('#toast');
+  await page.click('#btnSuggestFewest');
+  await page.waitForFunction((t) => document.querySelector('#toast').textContent !== t || !document.querySelector('#banner').classList.contains('hidden'), toastF, { timeout: 300000 });
+  await noBanner(page);
+  await jobDone(page);
+  await verdictReady(page);
+  results.fewest = {
+    verdict: await page.textContent('#wsVerdict'),
+    toast: await page.textContent('#toast'),
+    removed: await page.evaluate(() => Object.values(window.__unflash.currentSection().edits).filter((e) => e.removed).length),
+  };
+  console.log('fewest removals:', JSON.stringify(results.fewest), '| keep dark removed', results.marks);
+  assert(results.fewest.verdict.startsWith('passes'), 'fewest removals makes the section pass: ' + results.fewest.verdict);
+  assert(results.fewest.removed > 0 && results.fewest.removed < results.marks, `fewest removals takes out fewer frames than keep dark (${results.fewest.removed} vs ${results.marks})`);
+
   // --- reduce FPS from scratch ---------------------------------------------
   await page.click('#btnClearEdits');
   await verdictReady(page);

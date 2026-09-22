@@ -291,6 +291,31 @@ pub fn percentile(vals: &[f32], p: f64) -> f32 {
 pub enum Prefer {
     Light,
     Dark,
+    /// Remove as few frames as possible: take out whichever of the light or
+    /// dark frames are fewer, then put back as many flashes as the rules
+    /// allow (see [`Suggester`]).
+    Fewest,
+}
+
+/// Flashes a second the fewest-removals suggester tries to leave in, in
+/// order: WCAG's three, then fewer where the profile still objects
+/// (extended flashing).
+const FEWEST_RATES: [usize; 3] = [3, 2, 1];
+
+/// The fewest-removals suggester's second phase: from a passing removal,
+/// flashes (runs of consecutive removed frames) put back.
+#[derive(Clone, Debug)]
+struct Restore {
+    /// The passing removal it started from.
+    full: BTreeSet<usize>,
+    /// Runs of consecutive frames of `full`: each is one flash taken out.
+    pulses: Vec<Vec<usize>>,
+    /// Index into FEWEST_RATES.
+    rate: usize,
+    /// Pulses put back.
+    restored: BTreeSet<usize>,
+    /// A failing try at this rate has had its failing windows taken out.
+    fixed: bool,
 }
 
 /// What a suggester run produced.
@@ -323,6 +348,9 @@ pub enum SuggestStep {
 pub struct Suggester {
     rel_pts: Vec<f64>,
     prefer: Prefer,
+    /// Remove as few frames as possible (`prefer` then holds the side kept).
+    fewest: bool,
+    restore: Option<Restore>,
     only: Option<BTreeSet<usize>>,
     /// Frames the user marked "keep": never removed, and their own marks
     /// (a hold, say) stay in force.
@@ -342,7 +370,9 @@ impl Suggester {
         let base_edits = base_marks(existing, only.as_ref(), &keep);
         Suggester {
             rel_pts,
-            prefer,
+            prefer: if prefer == Prefer::Fewest { Prefer::Dark } else { prefer },
+            fewest: prefer == Prefer::Fewest,
+            restore: None,
             only,
             keep,
             base_edits: base_edits.clone(),
@@ -426,6 +456,157 @@ impl Suggester {
         }
     }
 
+    /// For the fewest removals: keep the side with more frames in the
+    /// flashing (take out the minority), leaning to keeping the dark ones.
+    fn pick_side(&self, frames: &dyn FrameSource, result: &AnalysisResult) -> Prefer {
+        let (aw, ah) = (frames.width(), frames.height());
+        let (mut light, mut dark) = (0usize, 0usize);
+        for (s, e) in violation_spans(result, 0.3) {
+            let idxs = self.indices_in(s, e);
+            if idxs.len() < 2 {
+                continue;
+            }
+            let m = region_metric(frames, &idxs, span_bbox(result, s, e, aw, ah));
+            let cut = (percentile(&m, 85.0) + percentile(&m, 15.0)) / 2.0;
+            for (k, &i) in idxs.iter().enumerate() {
+                if self.allowed(i) {
+                    if m[k] > cut {
+                        light += 1;
+                    } else {
+                        dark += 1;
+                    }
+                }
+            }
+        }
+        // light frames are the ones removed when dark ones are kept
+        if (dark as f64) < 0.8 * light as f64 {
+            Prefer::Light
+        } else {
+            Prefer::Dark
+        }
+    }
+
+    /// Typical gap between frames, seconds.
+    fn frame_gap(&self) -> f64 {
+        let mut gaps: Vec<f64> = self.rel_pts.windows(2).map(|w| w[1] - w[0]).filter(|&g| g > 0.0).collect();
+        if gaps.is_empty() {
+            return 1.0 / 30.0;
+        }
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        gaps[gaps.len() / 2]
+    }
+
+    /// The pulses put back at the current rate: as many as leave no more
+    /// than `rate` in any second (with two frames to spare).
+    fn choose_restored(&self, r: &Restore) -> BTreeSet<usize> {
+        let per = FEWEST_RATES[r.rate];
+        let span = 1.0 + 2.0 * self.frame_gap();
+        let mut out: Vec<usize> = Vec::new();
+        for (k, p) in r.pulses.iter().enumerate() {
+            let t = self.rel_pts[p[0]];
+            let n = out.len();
+            if n < per || t - self.rel_pts[r.pulses[out[n - per]][0]] > span {
+                out.push(k);
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    fn apply_restored(&mut self) {
+        let r = self.restore.as_ref().unwrap();
+        let mut removed = r.full.clone();
+        for &k in &r.restored {
+            for i in &r.pulses[k] {
+                removed.remove(i);
+            }
+        }
+        self.removed = removed;
+    }
+
+    /// From a passing removal to the fewest removals: flashes put back.
+    fn start_restore(&mut self) -> SuggestStep {
+        let full = self.removed.clone();
+        let mut pulses: Vec<Vec<usize>> = Vec::new();
+        for &i in &full {
+            match pulses.last_mut() {
+                Some(p) if *p.last().unwrap() + 1 == i => p.push(i),
+                _ => pulses.push(vec![i]),
+            }
+        }
+        let mut r = Restore { full, pulses, rate: 0, restored: BTreeSet::new(), fixed: false };
+        r.restored = self.choose_restored(&r);
+        self.restore = Some(r);
+        self.apply_restored();
+        self.last_proposal = self.proposal();
+        SuggestStep::Simulate(self.last_proposal.clone())
+    }
+
+    fn step_restore(&mut self, result: &AnalysisResult) -> SuggestStep {
+        let failing: Vec<Violation> = result.violations.iter().filter(|v| v.kind != ViolationKind::Pattern && result.reports(v.kind)).cloned().collect();
+        let r = self.restore.as_ref().unwrap();
+        let kept_side = if self.prefer == Prefer::Light { "light" } else { "dark" };
+        if failing.is_empty() {
+            let total = r.pulses.len();
+            let back = r.restored.len();
+            let note = if back == 0 {
+                format!("Passes after removing {} frames (every flash taken out: none could stay).", self.removed.len())
+            } else {
+                format!(
+                    "Passes after removing {} frames where taking out every flash would remove {}: {back} of the {total} flashes stay, no more than {} a second{}. The {kept_side} frames are the ones kept.",
+                    self.removed.len(),
+                    r.full.len(),
+                    FEWEST_RATES[r.rate],
+                    if FEWEST_RATES[r.rate] == 3 { " (the most WCAG allows)" } else { "" }
+                )
+            };
+            return SuggestStep::Done(Suggestion { edits: self.removals(), safe: true, rounds: self.attempt, note, fps: None, safe_fps: None, guaranteed: None });
+        }
+        self.attempt += 1;
+        let mut r = self.restore.take().unwrap();
+        if !r.fixed {
+            // take back out the flashes put back inside any window that fails
+            r.fixed = true;
+            let pulses = &r.pulses;
+            let rel = &self.rel_pts;
+            let before = r.restored.len();
+            r.restored.retain(|&k| {
+                let (t0, t1) = (rel[pulses[k][0]], rel[*pulses[k].last().unwrap()]);
+                !failing.iter().any(|v| t1 >= v.onset.min(v.start) - 0.1 && t0 <= v.end + 0.1)
+            });
+            if r.restored.len() == before {
+                // nothing to blame: fewer a second everywhere
+                r.fixed = false;
+                r.rate += 1;
+                if r.rate < FEWEST_RATES.len() {
+                    r.restored = self.choose_restored(&r);
+                }
+            }
+        } else {
+            r.rate += 1;
+            r.fixed = false;
+            if r.rate < FEWEST_RATES.len() {
+                r.restored = self.choose_restored(&r);
+            }
+        }
+        // nothing left to put back at this rate: fewer a second
+        while r.restored.is_empty() && r.rate + 1 < FEWEST_RATES.len() {
+            r.rate += 1;
+            r.fixed = false;
+            r.restored = self.choose_restored(&r);
+        }
+        if r.rate >= FEWEST_RATES.len() || r.restored.is_empty() {
+            // no flash can stay: the passing removal it started from
+            self.removed = r.full.clone();
+            let note = format!("Passes after removing {} frames: every flash had to go (putting any back failed the check). The {kept_side} frames are the ones kept.", self.removed.len());
+            self.restore = Some(r);
+            return SuggestStep::Done(Suggestion { edits: self.removals(), safe: true, rounds: self.attempt, note, fps: None, safe_fps: None, guaranteed: None });
+        }
+        self.restore = Some(r);
+        self.apply_restored();
+        self.last_proposal = self.proposal();
+        SuggestStep::Simulate(self.last_proposal.clone())
+    }
+
     fn proposal(&self) -> Edits {
         let mut edits = self.base_edits.clone();
         for &i in &self.removed {
@@ -447,7 +628,14 @@ impl Suggester {
             self.last_proposal = self.base_edits.clone();
             return SuggestStep::Simulate(self.last_proposal.clone());
         };
+        if self.restore.is_some() {
+            return self.step_restore(result);
+        }
         let flashes_ok = result.violations.iter().all(|v| v.kind == ViolationKind::Pattern || !result.reports(v.kind));
+        // the fewest removals: a passing removal first, then flashes put back
+        if flashes_ok && self.fewest && self.attempt > 0 && !self.removed.is_empty() {
+            return self.start_restore();
+        }
         if flashes_ok {
             let patterns = result.violations.iter().any(|v| v.kind == ViolationKind::Pattern && result.reports(v.kind));
             let mut note = if self.attempt == 0 {
@@ -494,6 +682,9 @@ impl Suggester {
                 safe_fps: None,
                 guaranteed: None,
             });
+        }
+        if self.fewest && self.attempt == 0 {
+            self.prefer = self.pick_side(frames, result);
         }
         match self.attempt {
             0 => self.apply_percentile_pass(frames, result, false),
@@ -748,6 +939,92 @@ mod tests {
         assert!(s.proposal().contains_key(&5) && s.proposal().contains_key(&10));
         // without keep marks nothing changes: a suggestion replaces every mark
         assert!(base_marks(&existing, None, &BTreeSet::new()).is_empty());
+    }
+
+    /// A strobe, 24 fps: one light frame in three (8 flashes a second) over
+    /// half the picture, for two seconds.
+    struct Strobe {
+        frames: Vec<Vec<u8>>,
+        w: u32,
+        h: u32,
+    }
+
+    impl FrameSource for Strobe {
+        fn frame(&self, i: usize) -> &[u8] {
+            &self.frames[i]
+        }
+        fn bpp(&self) -> usize {
+            3
+        }
+        fn width(&self) -> u32 {
+            self.w
+        }
+        fn height(&self) -> u32 {
+            self.h
+        }
+    }
+
+    fn strobe(n: usize) -> Strobe {
+        let (w, h) = (64u32, 48u32);
+        let frames = (0..n)
+            .map(|i| {
+                let code = if i % 3 == 1 { 220u8 } else { 20 };
+                let mut f = vec![10u8; (w * h * 3) as usize];
+                for y in 0..h {
+                    for x in 0..w / 2 + 8 {
+                        let k = ((y * w + x) * 3) as usize;
+                        f[k..k + 3].copy_from_slice(&[code, code, code]);
+                    }
+                }
+                f
+            })
+            .collect();
+        Strobe { frames, w, h }
+    }
+
+    /// The section check the app runs, on the CPU: the edited sequence
+    /// through the detector.
+    fn simulate(src: &Strobe, pts: &[f64], edits: &Edits) -> AnalysisResult {
+        let seq = edited_sequence(pts, edits, 1.0);
+        crate::detector::CpuDetector::analyze(crate::config::Profile::Wcag.config(), src.w, src.h, seq.iter().map(|&(t, i)| (t, crate::grid::FrameInput::rgb(&src.frames[i]))))
+    }
+
+    fn run(src: &Strobe, pts: &[f64], prefer: Prefer) -> (Suggestion, usize) {
+        let mut s = Suggester::new(pts.to_vec(), &Edits::new(), prefer, None, BTreeSet::new());
+        let mut step = s.step(src, None);
+        let mut sims = 0;
+        while let SuggestStep::Simulate(e) = step {
+            let r = simulate(src, pts, &e);
+            sims += 1;
+            step = s.step(src, Some(&r));
+        }
+        match step {
+            SuggestStep::Done(d) => (d, sims),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn fewest_removals_keeps_what_the_rules_allow() {
+        let src = strobe(48);
+        let pts: Vec<f64> = (0..48).map(|i| i as f64 / 24.0).collect();
+        assert!(!simulate(&src, &pts, &Edits::new()).safe(), "the strobe fails as it is");
+        let (dark, _) = run(&src, &pts, Prefer::Dark);
+        let (few, sims) = run(&src, &pts, Prefer::Fewest);
+        assert!(dark.safe && few.safe, "{} | {}", dark.note, few.note);
+        // the result really passes, with fewer frames gone than keep-dark takes
+        assert!(simulate(&src, &pts, &few.edits).safe(), "{}", few.note);
+        assert!(few.edits.len() < dark.edits.len(), "fewest {} vs keep dark {}: {}", few.edits.len(), dark.edits.len(), few.note);
+        // the light frames are the minority: only they go
+        assert!(few.edits.keys().all(|&i| i % 3 == 1), "{:?}", few.edits.keys().collect::<Vec<_>>());
+        assert!(few.note.contains("flashes stay"), "{}", few.note);
+        eprintln!("keep dark: {} | fewest ({sims} checks): {}", dark.note, few.note);
+        assert!(sims <= 12, "{sims} simulations");
+        // no more than three flashes stay in any second
+        let stay: Vec<f64> = (0..48).filter(|i| i % 3 == 1 && !few.edits.contains_key(i)).map(|i| pts[i]).collect();
+        for w in stay.windows(4) {
+            assert!(w[3] - w[0] > 1.0, "four flashes within a second: {w:?}");
+        }
     }
 
     #[test]
