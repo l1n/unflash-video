@@ -106,28 +106,13 @@ impl Decoder {
 
     /// Feed an `AVCDecoderConfigurationRecord` (the `avcC` box payload):
     /// the parameter sets and the NAL length size of the samples.
+    /// (Records some encoders damage are repaired first, see
+    /// [`crate::rewrite::parse_avcc`].)
     pub fn configure_avcc(&mut self, avcc: &[u8]) -> Result<()> {
-        if avcc.len() < 7 || avcc[0] != 1 {
-            return Err(Error::Bitstream("bad avcC record"));
-        }
-        self.nal_length_size = (avcc[4] & 3) as usize + 1;
-        let mut p = 6;
-        let nsps = (avcc[5] & 31) as usize;
-        for _ in 0..nsps {
-            let len = u16::from_be_bytes([*avcc.get(p).ok_or(Error::Bitstream("short avcC"))?, *avcc.get(p + 1).ok_or(Error::Bitstream("short avcC"))?]) as usize;
-            p += 2;
-            let nal = avcc.get(p..p + len).ok_or(Error::Bitstream("short avcC"))?;
+        let rec = crate::rewrite::parse_avcc(avcc)?;
+        self.nal_length_size = rec.len_size;
+        for nal in rec.sps.iter().chain(rec.pps.iter()) {
             self.decode_nal(nal, 0.0)?;
-            p += len;
-        }
-        let npps = *avcc.get(p).ok_or(Error::Bitstream("short avcC"))? as usize;
-        p += 1;
-        for _ in 0..npps {
-            let len = u16::from_be_bytes([*avcc.get(p).ok_or(Error::Bitstream("short avcC"))?, *avcc.get(p + 1).ok_or(Error::Bitstream("short avcC"))?]) as usize;
-            p += 2;
-            let nal = avcc.get(p..p + len).ok_or(Error::Bitstream("short avcC"))?;
-            self.decode_nal(nal, 0.0)?;
-            p += len;
         }
         Ok(())
     }

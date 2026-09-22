@@ -1191,7 +1191,7 @@ impl AvcRewriter {
         self.inner.is_identity()
     }
 
-    pub fn rewrite_sample(&self, sample: &[u8]) -> Result<Vec<u8>, JsValue> {
+    pub fn rewrite_sample(&mut self, sample: &[u8]) -> Result<Vec<u8>, JsValue> {
         self.inner.rewrite_sample(sample).map_err(js_err)
     }
 }

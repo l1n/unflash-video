@@ -25,6 +25,7 @@ exported file.
 - [Things that are inherent, not bugs](#things-that-are-inherent-not-bugs)
 - [Command line](#command-line)
 - [The WebGPU implementation](#the-webgpu-implementation)
+- [Comparing with the original tool](#comparing-with-the-original-tool)
 
 ## What counts as a transition
 
@@ -566,3 +567,44 @@ per-pixel mask with atomics; ORs and the integer spacing sums commute, so
 the thread order cannot change a result. The rows pass counts the marked
 pixels. It costs about eight reads of the luminance plane per frame, which
 is less than the flash kernel's own traffic.
+
+## Comparing with the original tool
+
+The browser version and the original (Python, ffmpeg) tool apply the same
+rules, and they are WCAG 2.2's: relative luminance with the 2.2
+linearisation threshold (0.04045); a transition is a swing of at least 0.1
+whose darker state is below 0.8; a red transition follows 2.2's working
+definition (R/(R+G+B) ≥ 0.8 in either state, and a change of more than 20 in
+(R−G−B)×320); the area is a quarter of a 10° field, modelled as 341×256 of a
+1024×768 screen; a failure is more than three flashes in any one second. The
+detector code is a port of the original's (commit `bb2e98f`, its latest)
+and is held to it by the fixture tests. Where the two disagree about a
+video, it is for one of these reasons:
+
+- **Red flashes the original misses.** The one rule changed on purpose (see
+  *Held frames look at colour too* above): the original skips a frame whose
+  luminance did not move as a re-show of the last picture, so a saturated
+  red that alternates with a colour of similar brightness is never examined
+  there. WCAG 2.2 needs no change in luminance for a red flash, so these are
+  failures, and only this version reports them (it can also start a red
+  flash earlier for the same reason).
+- **Section edges.** The original widens every section out to the
+  keyframes around it (for its stream-copy export); this version pads a
+  section from the moment its flashing starts. The same flash therefore
+  sits in a longer section there. Compare the violations' times (the
+  section list's badges, the timeline's colours), not the section edges.
+- **Slightly different pixels.** The original decodes with ffmpeg and
+  scales with ffmpeg's area filter; this version decodes in the browser and
+  scales with its own area filter. For HD video without colour tags,
+  ffmpeg converts with the BT.601 matrix where browsers (and players) use
+  BT.709. The differences are small, but a flash that sits right at a
+  threshold (the area, the swing, the red saturation) can fall either side
+  of it, and the edges of an event can move by a frame.
+- **Stripe patterns** are reported by this version alone (the original has
+  no pattern test).
+
+Safety first: where the two disagree, treat any stretch either of them
+flags as flashing. To have this version judge a stretch the original
+flags, add a section over it (drag on the timeline, or type its times next
+to *add section*) and look at its check.
+

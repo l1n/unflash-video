@@ -333,7 +333,22 @@ When the encoder's codec cannot share a track with the source's (an HEVC
 or AV1 source, or an H.264 file exported as VP9 because the browser has no
 H.264 encoder), or with `?smartcut=0`, the whole file is re-encoded, still
 in parallel pieces cut at keyframes. The export dialog says which it will
-be, and how much is copied.
+be, and how much is copied; it offers one choice per format, each with a
+line on where it plays and whether the parts you didn't edit are copied.
+
+Firefox's H.264 encoder on Windows writes a damaged record: its avcC writer
+puts a NAL header byte in front of parameter sets that already start with
+one, so every SPS and PPS reads one byte off (`67 67 64 00 1e ...`). Such
+records are repaired when they are read (the byte after an SPS header is
+profile_idc, and 0x67 is no profile), and parameter sets an encoder repeats
+inside its samples are taken in too, under the ids the track gave them. An
+encoder that gives no record at all (WebCodecs' way of saying its stream is
+Annex B) has one made from its first keyframe's parameter sets, and its
+start codes are turned into the lengths MP4 wants.
+Should an encoder's stream still be impossible to join, the export is not
+lost: it is redone as a plain re-encode through one encoder, whose stream
+needs no joining, and says so; the console then holds the record's bytes
+for a bug report.
 
 ### What it costs
 

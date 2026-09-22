@@ -375,7 +375,7 @@ impl Rewriter {
 
     /// One NAL unit (header byte included) as the merged track needs it;
     /// None drops it.
-    pub fn rewrite_nal(&self, nal: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn rewrite_nal(&mut self, nal: &[u8]) -> Result<Option<Vec<u8>>> {
         if nal.is_empty() {
             return Ok(None);
         }
@@ -385,15 +385,41 @@ impl Rewriter {
             6 => Ok(strip_buffering_period(nal)),
             7 | 8 => match self.inband.iter().find(|(orig, _)| orig.as_slice() == nal) {
                 Some((_, out)) => Ok(Some(out.clone())),
-                None => Err(Error::Bitstream("a parameter set in a sample that the record does not have")),
+                None => self.rewrite_inband(nal).map(Some),
             },
             _ => Ok(Some(nal.to_vec())),
         }
     }
 
+    /// A parameter set sent in a sample that the record does not hold byte
+    /// for byte (a hardware encoder repeating its sets before each IDR
+    /// picture, with a different VUI say): it takes effect from here on,
+    /// under the id the record gave the set it replaces.
+    fn rewrite_inband(&mut self, nal: &[u8]) -> Result<Vec<u8>> {
+        if nal[0] & 0x1f == 7 {
+            let sps = parse_sps(&unescape(&nal[1..]))?;
+            let old = sps.id;
+            let new_id = self.sps_id(old).ok_or(Error::Bitstream("a sample sends an SPS the record has no id for"))?;
+            self.spss[old as usize] = Some(sps);
+            let out = if new_id == old { nal.to_vec() } else { renumber_sps(nal, new_id)? };
+            self.inband.push((nal.to_vec(), out.clone()));
+            Ok(out)
+        } else {
+            let pps = parse_pps(&unescape(&nal[1..]))?;
+            let old = pps.id;
+            let new_id = self.pps_map.get(old as usize).copied().flatten().ok_or(Error::Bitstream("a sample sends a PPS the record has no id for"))?;
+            let new_sps = self.sps_id(pps.sps_id).ok_or(Error::Bitstream("a sample's PPS refers to an SPS the record does not have"))?;
+            let same = new_id == old && new_sps == pps.sps_id;
+            self.ppss[old as usize] = Some(pps);
+            let out = if same { nal.to_vec() } else { renumber_pps(nal, new_id, new_sps)? };
+            self.inband.push((nal.to_vec(), out.clone()));
+            Ok(out)
+        }
+    }
+
     /// One MP4 sample (length-prefixed NAL units) as the merged track needs
     /// it.
-    pub fn rewrite_sample(&self, sample: &[u8]) -> Result<Vec<u8>> {
+    pub fn rewrite_sample(&mut self, sample: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(sample.len() + 16);
         let mut p = 0;
         let n = self.in_len;
@@ -438,6 +464,50 @@ pub struct AvcRecord {
     pub tail: Vec<u8>,
 }
 
+/// Take off what some writers leave around a parameter set in a record: an
+/// Annex B start code in front, zero bytes behind (a parameter set ends in
+/// its stop bit, so it never ends in a zero byte).
+fn trim_parameter_set(nal: &[u8]) -> &[u8] {
+    let mut n = nal;
+    for sc in [&[0u8, 0, 0, 1][..], &[0, 0, 1][..]] {
+        if n.starts_with(sc) {
+            n = &n[sc.len()..];
+            break;
+        }
+    }
+    let mut end = n.len();
+    while end > 1 && n[end - 1] == 0 {
+        end -= 1;
+    }
+    &n[..end]
+}
+
+/// Repair the parameter sets of a record some encoders write with every
+/// NAL header byte twice: Firefox's Windows encoder hands a NAL unit that
+/// already starts with its header to an avcC writer that puts one in front
+/// of it (`67 67 64 00 1e ...`). An SPS is recognisable, because the byte
+/// after its header is profile_idc and 0x67 is no profile; when every SPS
+/// shows it, the PPSs whose first two bytes repeat their header get the same
+/// repair.
+fn repair_doubled_headers(sps: &mut [Vec<u8>], pps: &mut [Vec<u8>]) -> bool {
+    let doubled = |n: &Vec<u8>, t: u8| n.len() > 2 && n[0] & 0x1f == t && n[1] == n[0];
+    if sps.is_empty() || !sps.iter().all(|n| doubled(n, 7)) {
+        return false;
+    }
+    for n in sps.iter_mut() {
+        n.remove(0);
+    }
+    for n in pps.iter_mut() {
+        if doubled(n, 8) {
+            n.remove(0);
+        }
+    }
+    true
+}
+
+/// Parse an `AVCDecoderConfigurationRecord` (the `avcC` payload), repairing
+/// the damage some encoders do to its parameter sets (see
+/// [`repair_doubled_headers`]).
 pub fn parse_avcc(avcc: &[u8]) -> Result<AvcRecord> {
     if avcc.len() < 7 || avcc[0] != 1 {
         return Err(Error::Bitstream("bad avcC record"));
@@ -449,7 +519,7 @@ pub fn parse_avcc(avcc: &[u8]) -> Result<AvcRecord> {
     for _ in 0..nsps {
         let len = u16::from_be_bytes([get(p)?, get(p + 1)?]) as usize;
         p += 2;
-        sps.push(avcc.get(p..p + len).ok_or(Error::Bitstream("short avcC"))?.to_vec());
+        sps.push(trim_parameter_set(avcc.get(p..p + len).ok_or(Error::Bitstream("short avcC"))?).to_vec());
         p += len;
     }
     let npps = get(p)? as usize;
@@ -458,9 +528,10 @@ pub fn parse_avcc(avcc: &[u8]) -> Result<AvcRecord> {
     for _ in 0..npps {
         let len = u16::from_be_bytes([get(p)?, get(p + 1)?]) as usize;
         p += 2;
-        pps.push(avcc.get(p..p + len).ok_or(Error::Bitstream("short avcC"))?.to_vec());
+        pps.push(trim_parameter_set(avcc.get(p..p + len).ok_or(Error::Bitstream("short avcC"))?).to_vec());
         p += len;
     }
+    repair_doubled_headers(&mut sps, &mut pps);
     Ok(AvcRecord { profile: avcc[1], compat: avcc[2], level: avcc[3], len_size: (avcc[4] & 3) as usize + 1, sps, pps, tail: avcc[p.min(avcc.len())..].to_vec() })
 }
 

@@ -62,7 +62,7 @@ fn renumbered_streams_decode_the_same() {
         let movie = parse_bytes(&data).unwrap();
         let track = movie.video().unwrap();
         let mut reg = AvcRegistry::new(&base_avcc).unwrap();
-        let rw = reg.register(track.description.as_ref().unwrap()).unwrap();
+        let mut rw = reg.register(track.description.as_ref().unwrap()).unwrap();
         assert!(!rw.is_identity(), "{name}: the ids collide with the base, so the stream is renumbered");
         let rec = parse_avcc(&reg.record()).unwrap();
         assert_eq!(rec.sps.len(), 2, "{name}: the base's SPS and the stream's");
@@ -104,7 +104,7 @@ fn splice(base: &str, other: &str) -> Vec<u8> {
     assert_eq!(ta.samples.len(), 40);
     assert_eq!(tb.samples.len(), 40);
     let mut reg = AvcRegistry::new(ta.description.as_ref().unwrap()).unwrap();
-    let rw = reg.register(tb.description.as_ref().unwrap()).unwrap();
+    let mut rw = reg.register(tb.description.as_ref().unwrap()).unwrap();
     assert!(!rw.is_identity());
     // decode-order runs of 10 samples are the GOPs (closed GOPs: an IDR
     // every 10 frames in both orders)
@@ -201,7 +201,7 @@ fn renumbering_changes_only_the_pps_id() {
         let track = movie.video().unwrap();
         let orig = parse_avcc(track.description.as_ref().unwrap()).unwrap();
         let mut reg = AvcRegistry::new(&base_avcc).unwrap();
-        let rw = reg.register(track.description.as_ref().unwrap()).unwrap();
+        let mut rw = reg.register(track.description.as_ref().unwrap()).unwrap();
         let merged = parse_avcc(&reg.record()).unwrap();
         let mut spss_old = vec![None; 32];
         let mut ppss_old = vec![None; 256];
@@ -261,15 +261,129 @@ fn identical_parameter_sets_share_ids() {
     let avcc_b = parse_bytes(&b).unwrap().video().unwrap().description.clone().unwrap();
     let mut reg = AvcRegistry::new(&avcc_a).unwrap();
     assert!(reg.register(&avcc_a).unwrap().is_identity());
-    let rw1 = reg.register(&avcc_b).unwrap();
+    let mut rw1 = reg.register(&avcc_b).unwrap();
     assert!(!rw1.is_identity());
     let rec = parse_avcc(&reg.record()).unwrap();
     assert_eq!((rec.sps.len(), rec.pps.len()), (2, 2));
-    let rw2 = reg.register(&avcc_b).unwrap();
+    let mut rw2 = reg.register(&avcc_b).unwrap();
     let rec2 = parse_avcc(&reg.record()).unwrap();
     assert_eq!((rec2.sps.len(), rec2.pps.len()), (2, 2), "the second encoder adds nothing");
     let track = parse_bytes(&b).unwrap().video().unwrap().clone();
     let s = &track.samples[0];
     let bytes = &b[s.offset as usize..(s.offset + s.size as u64) as usize];
     assert_eq!(rw1.rewrite_sample(bytes).unwrap(), rw2.rewrite_sample(bytes).unwrap());
+}
+
+/// The record Firefox's Windows encoder writes (its avcC writer puts a
+/// NAL header in front of parameter sets that already have one, and leaves
+/// the reserved bits of the length size and SPS count clear).
+fn firefox_style(avcc: &[u8]) -> Vec<u8> {
+    let rec = parse_avcc(avcc).unwrap();
+    let mut out = vec![1, rec.profile, rec.compat, rec.level, 3, rec.sps.len() as u8];
+    for s in &rec.sps {
+        out.extend_from_slice(&((s.len() + 1) as u16).to_be_bytes());
+        out.push(s[0]);
+        out.extend_from_slice(s);
+    }
+    out.push(rec.pps.len() as u8);
+    for p in &rec.pps {
+        out.extend_from_slice(&((p.len() + 1) as u16).to_be_bytes());
+        out.push(p[0]);
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// A sample with parameter sets sent in front of its pictures, as hardware
+/// encoders do on every IDR picture.
+fn with_inband(sample: &[u8], sets: &[Vec<u8>], len_size: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for s in sets {
+        let l = s.len();
+        for i in (0..len_size).rev() {
+            out.push((l >> (8 * i)) as u8);
+        }
+        out.extend_from_slice(s);
+    }
+    out.extend_from_slice(sample);
+    out
+}
+
+/// A record written the way Firefox writes it (every parameter set with its
+/// header byte twice) is repaired when read: this decoder decodes the stream
+/// with it, and GOPs from such an encoder splice into another stream, their
+/// IDR samples carrying their parameter sets in-band (once the record's
+/// exact bytes, once an SPS that differs from the record's, which takes
+/// effect under the id the record gave it).
+#[test]
+fn firefox_style_records_and_inband_parameter_sets() {
+    let a = read("splice_a");
+    let b = read("splice_b");
+    let ta = parse_bytes(&a).unwrap().video().unwrap().clone();
+    let tb = parse_bytes(&b).unwrap().video().unwrap().clone();
+    let b_avcc = tb.description.clone().unwrap();
+    let ff = firefox_style(&b_avcc);
+    // the damage is real: read as written, the SPS is one byte off
+    assert_eq!(&ff[8..10], &[0x67, 0x67]);
+    let repaired = parse_avcc(&ff).unwrap();
+    assert_eq!(repaired, parse_avcc(&b_avcc).unwrap(), "the repaired record is the original");
+    // the decoder takes the damaged record and decodes the stream as ffmpeg does
+    let mut dec = Decoder::new();
+    dec.configure_avcc(&ff).unwrap();
+    let want = expected("splice_b");
+    let mut frames: Vec<(i64, String)> = Vec::new();
+    let mut buf = Vec::new();
+    for s in &tb.samples {
+        let bytes = &b[s.offset as usize..(s.offset + s.size as u64) as usize];
+        if let Some(f) = dec.decode_sample(bytes, s.pts as f64).unwrap() {
+            let sps = dec.sps().unwrap();
+            let (w, h) = sps.cropped_size();
+            to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut buf);
+            frames.push((s.pts, format!("{:x}", md5::compute(&buf))));
+        }
+    }
+    frames.sort_by_key(|f| f.0);
+    assert_eq!(frames.into_iter().map(|f| f.1).collect::<Vec<_>>(), want, "decoded through the damaged record");
+
+    // splice: GOPs 1 and 3 from the Firefox-style encoder, in-band sets on its IDRs
+    let mut reg = AvcRegistry::new(ta.description.as_ref().unwrap()).unwrap();
+    let mut rw = reg.register(&ff).unwrap();
+    assert!(!rw.is_identity());
+    let rec_b = parse_avcc(&b_avcc).unwrap();
+    // an SPS that differs from the record's in a byte that changes nothing
+    // the decoder needs (level_idc), so the record doesn't hold it
+    let mut sps_other = rec_b.sps[0].clone();
+    sps_other[3] = sps_other[3].wrapping_add(1);
+    let mut payloads: Vec<(Vec<u8>, i64, bool)> = Vec::new();
+    for g in 0..4 {
+        let from_b = g % 2 == 1;
+        let (t, data) = if from_b { (&tb, &b) } else { (&ta, &a) };
+        for (k, s) in t.samples[g * 10..g * 10 + 10].iter().enumerate() {
+            let bytes = &data[s.offset as usize..(s.offset + s.size as u64) as usize];
+            let bytes = if from_b {
+                let sets = if k == 0 { vec![if g == 1 { rec_b.sps[0].clone() } else { sps_other.clone() }, rec_b.pps[0].clone()] } else { vec![] };
+                rw.rewrite_sample(&with_inband(bytes, &sets, rec_b.len_size)).unwrap()
+            } else {
+                bytes.to_vec()
+            };
+            payloads.push((bytes, s.pts, s.sync));
+        }
+    }
+    // the record is final once every encoder is registered
+    let record = reg.record();
+    let mut mx2 = Muxer::new();
+    let vt2 = mx2.add_track(TrackDesc::Video { codec: "avc1.640028".into(), width: ta.width, height: ta.height, timescale: ta.timescale, description: record });
+    let mut file = mx2.start();
+    let cts: Vec<i64> = payloads.iter().map(|p| p.1).collect();
+    for ((bytes, pts, sync), (dts, dur)) in payloads.iter().zip(dts_from_cts(&cts, ta.samples[0].duration)) {
+        file.extend_from_slice(bytes);
+        mx2.add_sample(vt2, dts, *pts, dur, *sync, bytes.len() as u32).unwrap();
+    }
+    let (moov, (at, patch)) = mx2.finish().unwrap();
+    file[at as usize..at as usize + 8].copy_from_slice(&patch);
+    file.extend_from_slice(&moov);
+    check_splice("splice_a", "splice_b", &decode(&file), "this decoder (Firefox-style record, in-band sets)");
+    if let Some(md5s) = ffmpeg_md5(&file, "firefox-style") {
+        check_splice("splice_a", "splice_b", &md5s, "ffmpeg (Firefox-style record, in-band sets)");
+    }
 }

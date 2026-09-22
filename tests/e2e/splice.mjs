@@ -67,7 +67,9 @@ const r = await page.evaluate(async () => {
   const bSamples = new Map();
   for (let i = 0; i < b.v.pts.length; i++) bSamples.set(b.v.pts[i], { bytes: (await b.reader.read(b.v.offset[i], b.v.size[i])).slice(), sync: !!b.v.sync[i] });
   const encoded = [];
-  const makeEncoder = (config, { output }) => {
+  // a stand-in encoder that hands out splice_b's samples; `desc` is the record
+  // it reports, `inband` parameter sets it puts in front of its IDR samples
+  const standIn = (desc, inband = []) => (config, { output }) => {
     let first = true;
     return {
       encodeQueueSize: 0,
@@ -76,13 +78,52 @@ const r = await page.evaluate(async () => {
         const s = bSamples.get(frame.timestamp);
         if (!s) throw new Error('no stand-in sample at ' + frame.timestamp);
         encoded.push({ t: frame.timestamp, key: !!(opts && opts.keyFrame) });
-        output({ byteLength: s.bytes.length, copyTo: (dst) => dst.set(s.bytes), timestamp: frame.timestamp, duration: frame.duration, type: s.sync ? 'key' : 'delta' }, first ? { decoderConfig: { codec: b.video.codec, description: bDesc } } : {});
+        let bytes = s.bytes;
+        if (s.sync && inband.length) {
+          const parts = [];
+          for (const n of inband) parts.push(Uint8Array.of(0, 0, (n.length >> 8) & 255, n.length & 255), n);
+          parts.push(bytes);
+          bytes = new Uint8Array(parts.reduce((a, x) => a + x.length, 0));
+          let o = 0;
+          for (const x of parts) {
+            bytes.set(x, o);
+            o += x.length;
+          }
+        }
+        output({ byteLength: bytes.length, copyTo: (dst) => dst.set(bytes), timestamp: frame.timestamp, duration: frame.duration, type: s.sync ? 'key' : 'delta' }, first ? { decoderConfig: { codec: b.video.codec, description: desc } } : {});
         first = false;
       },
       async flush() {},
       close() {},
     };
   };
+  const makeEncoder = standIn(bDesc);
+  // the record's parameter sets, and the same record written the way
+  // Firefox's Windows encoder writes it: every set with its header byte twice
+  const avccSets = (d) => {
+    const out = { sps: [], pps: [] };
+    let p = 6;
+    for (let k = 0; k < (d[5] & 31); k++) {
+      const len = (d[p] << 8) | d[p + 1];
+      out.sps.push(d.slice(p + 2, p + 2 + len));
+      p += 2 + len;
+    }
+    const npps = d[p++];
+    for (let k = 0; k < npps; k++) {
+      const len = (d[p] << 8) | d[p + 1];
+      out.pps.push(d.slice(p + 2, p + 2 + len));
+      p += 2 + len;
+    }
+    return out;
+  };
+  const bSets = avccSets(bDesc);
+  const firefoxDesc = (() => {
+    const bytes = [1, bDesc[1], bDesc[2], bDesc[3], 3, bSets.sps.length];
+    for (const n of bSets.sps) bytes.push(((n.length + 1) >> 8) & 255, (n.length + 1) & 255, n[0], ...n);
+    bytes.push(bSets.pps.length);
+    for (const n of bSets.pps) bytes.push(((n.length + 1) >> 8) & 255, (n.length + 1) & 255, n[0], ...n);
+    return Uint8Array.from(bytes);
+  })();
   const candidate = { label: 'stand-in H.264', config: { codec: 'avc1.64000A', width: a.width, height: a.height } };
   const project = { sectionsSorted: () => [], sections: [] };
   const env = { wasm, feeder: null };
@@ -96,6 +137,7 @@ const r = await page.evaluate(async () => {
     encoded.length = 0;
     const plan = await exportPlan(env, a, project, { codec: candidate.config.codec, ...opts });
     const res = await exportMovie(env, a, project, { quality: 7, candidate, makeEncoder, plan, ...opts });
+    if (res.warnings.length) console.log(name + ': ' + res.warnings.join(' | '));
     const m = await Movie.open(new File([res.blob], 'out.mp4', { type: 'video/mp4' }), wasm);
     const sup = await m.decoderSupport();
     if (!sup.supported) throw new Error(`${name}: exported file: ${sup.reason}`);
@@ -122,6 +164,38 @@ const r = await page.evaluate(async () => {
   results.two = await run('two spans', { spans: [[0.4, 0.5], [1.05, 1.1]], parallel: 2 }, (k) => (k >= 10 && k < 20) || k >= 30);
   // everything re-encoded (smart cut off), in parallel pieces
   results.full = await run('full', { smartCut: false, parallel: 2 }, () => true);
+  // Firefox's Windows encoder: a record with every header byte twice, the
+  // parameter sets again in front of each IDR sample
+  results.firefox = await run('firefox-style encoder', { spans: [[0.4, 0.5], [1.05, 1.1]], parallel: 2, makeEncoder: standIn(firefoxDesc, [...bSets.sps, ...bSets.pps]) }, (k) => (k >= 10 && k < 20) || k >= 30);
+  // a record nothing can read: the export is redone the plain way (one
+  // encoder, no joining) instead of failing
+  const garbage = Uint8Array.of(1, 0x4d, 0x40, 0x1e, 0xff, 0xe1, 0x00, 0x04, 0x67, 0xff, 0xff, 0xff, 0x01, 0x00, 0x02, 0x68, 0xff);
+  const fb = await exportMovie(env, a, project, { quality: 7, candidate, makeEncoder: standIn(garbage), spans: [[0.4, 0.5]], parallel: 2 });
+  const fbMovie = await Movie.open(new File([fb.blob], 'fallback.mp4', { type: 'video/mp4' }), wasm);
+  results.fallback = { mode: fb.mode, frames: fb.frames, copied: fb.copied, spans: fb.spans, parallel: fb.parallel, warnings: fb.warnings, samples: fbMovie.v.pts.length, record: Array.from(fbMovie.dx.track_description(fbMovie.video.index)) };
+  // an encoder that gives no record (WebCodecs' Annex B: start codes, the
+  // parameter sets in front of each IDR picture): the record is made from
+  // the first keyframe and the samples are converted, so it splices as well
+  const annexB = (config, cb) => {
+    const inner = standIn(undefined, [...bSets.sps, ...bSets.pps])(config, {
+      output: (chunk, meta) => {
+        const data = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(data);
+        // 4-byte lengths -> start codes
+        const out = [];
+        for (let p = 0; p + 4 <= data.length; ) {
+          const len = (data[p] << 24) | (data[p + 1] << 16) | (data[p + 2] << 8) | data[p + 3];
+          out.push(0, 0, 0, 1, ...data.subarray(p + 4, p + 4 + len));
+          p += 4 + len;
+        }
+        const bytes = Uint8Array.from(out);
+        cb.output({ byteLength: bytes.length, copyTo: (dst) => dst.set(bytes), timestamp: chunk.timestamp, duration: chunk.duration, type: chunk.type }, meta);
+      },
+      error: cb.error,
+    });
+    return inner;
+  };
+  results.annexB = await run('annex-b encoder', { spans: [[0.4, 0.5]], parallel: 1, makeEncoder: annexB }, (k) => k >= 10 && k < 20);
   return { software, frames: ha.length, results };
 });
 console.log(JSON.stringify(r, null, 1));
@@ -144,7 +218,19 @@ const full = r.results.full;
 assert(full.mode === 'full' && full.frames === 40 && full.copied === 0, 'full: everything re-encoded: ' + JSON.stringify(full));
 assert(full.outFrames === 40 && full.mismatches.length === 0 && full.timing, 'full: every frame is the stand-in encoder\'s: ' + JSON.stringify(full.mismatches));
 assert(full.paramSets[0] === 1 && full.paramSets[1] === 1, 'full: only the encoder\'s parameter sets: ' + full.paramSets);
+const ff = r.results.firefox;
+assert(ff.mode === 'smart' && ff.spans === 2 && ff.frames === 20 && ff.copied === 20, 'firefox-style encoder: the spans are spliced in: ' + JSON.stringify(ff));
+assert(ff.outFrames === 40 && ff.mismatches.length === 0 && ff.timing, 'firefox-style encoder: every frame decodes as its source: ' + JSON.stringify(ff.mismatches));
+assert(ff.paramSets[0] === 2 && ff.paramSets[1] === 2, 'firefox-style encoder: the repaired sets join the source\'s: ' + ff.paramSets);
+const fbr = r.results.fallback;
+assert(fbr.mode === 'full' && fbr.frames === 40 && fbr.copied === 0 && fbr.spans === 1 && fbr.parallel === 1, 'an unreadable record: the export is redone by one encoder: ' + JSON.stringify(fbr));
+assert(fbr.samples === 40 && /re-encoded by one encoder/.test(fbr.warnings[0] || ''), 'and says so: ' + JSON.stringify(fbr));
+assert(JSON.stringify(fbr.record) === JSON.stringify([1, 0x4d, 0x40, 0x1e, 0xff, 0xe1, 0x00, 0x04, 0x67, 0xff, 0xff, 0xff, 0x01, 0x00, 0x02, 0x68, 0xff]), 'the unreadable record goes in as it came: ' + JSON.stringify(fbr.record));
 assert(errors.length === 0, 'no page errors: ' + errors.join(' | '));
+const ab = r.results.annexB;
+assert(ab.mode === 'smart' && ab.frames === 10 && ab.copied === 30, 'an Annex B encoder with no record: spliced all the same: ' + JSON.stringify(ab));
+assert(ab.outFrames === 40 && ab.mismatches.length === 0 && ab.timing, 'an Annex B encoder: every frame decodes as its source: ' + JSON.stringify(ab.mismatches));
+assert(ab.paramSets[0] === 2 && ab.paramSets[1] === 2, 'an Annex B encoder: its parameter sets join the source\'s: ' + ab.paramSets);
 console.log('SPLICE OK');
 await browser.close();
 srv.close();

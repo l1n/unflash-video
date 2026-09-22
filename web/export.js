@@ -21,6 +21,56 @@ function avcLevel(w, h, fps) {
   return '34'; // 5.2
 }
 
+/** The family of a WebCodecs codec string: 'h264', 'vp9', 'av1', 'hevc' or 'other'. */
+export function codecFamily(codec) {
+  if (/^avc[13]/.test(codec)) return 'h264';
+  if (/^vp09/.test(codec)) return 'vp9';
+  if (/^av01/.test(codec)) return 'av1';
+  if (/^(hvc1|hev1)/.test(codec)) return 'hevc';
+  return 'other';
+}
+
+const FAMILY_NAME = { h264: 'H.264', vp9: 'VP9', av1: 'AV1', hevc: 'H.265 (HEVC)', other: 'other' };
+const FAMILY_WHERE = {
+  h264: 'plays everywhere: phones, QuickTime, Windows, every browser',
+  vp9: 'plays in browsers and VLC, but not in QuickTime or on older iPhones',
+  av1: 'the smallest file, but slow to make, and only newer players and browsers play it',
+  hevc: 'a small file that plays on Apple devices, but not in every browser',
+  other: '',
+};
+
+/**
+ * What an output format means for this file, in plain words: a short label
+ * for the menu and a sentence for the dialog. `copies`: the parts no section
+ * touches can be copied from the source as they are (the same format).
+ */
+export function formatInfo(cand, movie) {
+  const family = codecFamily(cand.config.codec);
+  const src = codecFamily(movie.video.codec);
+  const copies = family === src && (family === 'h264' || family === 'vp9');
+  const name = FAMILY_NAME[family] || cand.label;
+  const how = copies
+    ? 'Only the stretches around your sections are re-encoded; everything else is copied from your file as it is (fast, and no quality lost outside the sections).'
+    : `Your file is ${FAMILY_NAME[src] || src}, so every frame is re-encoded (slower, and a little quality is lost everywhere).`;
+  const short = family === 'h264' ? 'plays everywhere' : family === 'vp9' ? 'browsers and VLC' : family === 'av1' ? 'smallest, slow, newer players' : family === 'hevc' ? 'small, Apple devices' : '';
+  return { family, name, copies, label: `${name}: ${short}${copies ? ', copies what you did not edit' : ''}`, note: `${name} ${FAMILY_WHERE[family] ? `${FAMILY_WHERE[family]}. ` : ''}${how}` };
+}
+
+/**
+ * The formats worth offering, best first: one of each family (the first
+ * H.264 profile the encoder takes; Main and Baseline are only there for an
+ * encoder without High).
+ */
+export function formatChoices(cands) {
+  const seen = new Set();
+  return cands.filter((c) => {
+    const f = codecFamily(c.config.codec);
+    if (seen.has(f)) return false;
+    seen.add(f);
+    return true;
+  });
+}
+
 /** Encoder configurations to try, best first. */
 export async function encoderCandidates(width, height, fps, quality) {
   const bpp = 0.03 + (quality / 10) * 0.25;
@@ -66,6 +116,11 @@ class MemorySink {
   }
   async abort() {
     this.parts = [];
+  }
+  /** Start the file over (an export that has to be redone another way). */
+  async reset() {
+    this.parts = [];
+    this.size = 0;
   }
 }
 
@@ -143,7 +198,13 @@ class FileSink {
   async patch(offset, bytes) {
     await this.w.write({ type: 'write', position: offset, data: bytes });
   }
+  /** Start the file over: later writes go from its beginning, and close() cuts off what is left. */
+  async reset() {
+    this.size = 0;
+  }
   async close() {
+    // a file started over may hold more than was written the second time
+    await this.w.write({ type: 'truncate', size: this.size });
     await this.w.close();
     return null;
   }
@@ -465,6 +526,54 @@ export async function walkEdited(movie, piece, emit, { cancel } = {}) {
   return { softened, warnings };
 }
 
+// ---- H.264 in Annex B ----------------------------------------------------------------
+
+/** Whether H.264 data starts with an Annex B start code rather than a NAL length. */
+function startsWithStartCode(b) {
+  return b.length > 4 && b[0] === 0 && b[1] === 0 && (b[2] === 1 || (b[2] === 0 && b[3] === 1));
+}
+
+/**
+ * An Annex B access unit as MP4 wants it (every NAL unit behind a 4-byte
+ * length), with the parameter sets it carries: what an encoder that gives
+ * no avcC record (WebCodecs' way of saying its stream is Annex B) hands over.
+ */
+export function annexbToLengthPrefixed(b) {
+  const starts = [];
+  for (let i = 0; i + 2 < b.length; i++) {
+    if (b[i] === 0 && b[i + 1] === 0 && b[i + 2] === 1) {
+      starts.push(i + 3);
+      i += 2;
+    }
+  }
+  const nals = [];
+  for (let k = 0; k < starts.length; k++) {
+    let end = k + 1 < starts.length ? starts[k + 1] - 3 : b.length;
+    while (end > starts[k] && b[end - 1] === 0) end--; // the next start code's zero byte, trailing zeros
+    if (end > starts[k]) nals.push(b.subarray(starts[k], end));
+  }
+  const out = new Uint8Array(nals.reduce((a, n) => a + 4 + n.length, 0));
+  let o = 0;
+  let sps = null;
+  let pps = null;
+  for (const n of nals) {
+    out[o] = (n.length >>> 24) & 255;
+    out[o + 1] = (n.length >>> 16) & 255;
+    out[o + 2] = (n.length >>> 8) & 255;
+    out[o + 3] = n.length & 255;
+    out.set(n, o + 4);
+    o += 4 + n.length;
+    if ((n[0] & 0x1f) === 7 && !sps) sps = n;
+    if ((n[0] & 0x1f) === 8 && !pps) pps = n;
+  }
+  return { bytes: out, sps, pps };
+}
+
+/** An avcC record (4-byte NAL lengths) for one SPS and one PPS. */
+export function avcRecordOf(sps, pps) {
+  return Uint8Array.from([1, sps[1], sps[2], sps[3], 0xff, 0xe1, sps.length >> 8, sps.length & 255, ...sps, 1, pps.length >> 8, pps.length & 255, ...pps]);
+}
+
 // ---- one re-encoded piece --------------------------------------------------------
 
 /**
@@ -494,9 +603,18 @@ class PieceEncoder {
           if (meta.decoderConfig.description) this.description = new Uint8Array(meta.decoderConfig.description.slice ? meta.decoderConfig.description.slice(0) : meta.decoderConfig.description);
           if (meta.decoderConfig.codec) this.codec = meta.decoderConfig.codec;
         }
-        const buf = new Uint8Array(chunk.byteLength);
+        let buf = new Uint8Array(chunk.byteLength);
         chunk.copyTo(buf);
-        this.chunks.push({ pts: chunk.timestamp, sync: chunk.type === 'key', bytes: buf, desc: this.description, codec: this.codec });
+        // H.264 with no avcC record is Annex B (the WebCodecs rule): MP4 wants
+        // lengths in front of its NAL units, and a record, which the first
+        // keyframe's parameter sets make
+        if (/^avc[13]/.test(this.codec) && !this.description && (this.annexb || startsWithStartCode(buf))) {
+          this.annexb = true;
+          const conv = annexbToLengthPrefixed(buf);
+          buf = conv.bytes;
+          if (conv.sps && conv.pps && !this.madeDescription) this.madeDescription = avcRecordOf(conv.sps, conv.pps);
+        }
+        this.chunks.push({ pts: chunk.timestamp, sync: chunk.type === 'key', bytes: buf, desc: this.description || this.madeDescription || null, codec: this.codec });
       },
       error: (e) => {
         this.error = e;
@@ -566,7 +684,32 @@ function defaultEncoder(config, callbacks) {
  * same encoder. Tests pass their own encoder (`candidate` with its config,
  * `makeEncoder` building it) and extra `spans` to re-encode.
  */
-export async function exportMovie(env, movie, project, { encoder, quality, extS = 1.0, sink = null, onProgress, cancel, smartCut = true, parallel = 0, spans = null, makeEncoder = null, candidate = null, plan: given = null } = {}) {
+export async function exportMovie(env, movie, project, opts = {}) {
+  try {
+    return await exportOnce(env, movie, project, opts);
+  } catch (e) {
+    // the encoder's H.264 parameter sets could not be joined to the source's
+    // (or to another encoder's): do it the plain way, the whole video through
+    // one encoder, whose stream needs no joining
+    if (!(e && e.splice) || (opts.smartCut === false && opts.parallel === 1)) throw e;
+    if (opts.sink && opts.sink.reset) await opts.sink.reset();
+    const res = await exportOnce(env, movie, project, { ...opts, smartCut: false, parallel: 1, plan: null });
+    res.warnings.unshift(`This browser's H.264 encoder wrote its stream in a way Unflash could not join to the source (${e.message}), so the whole video was re-encoded by one encoder instead of copying the parts no section touches.`);
+    return res;
+  }
+}
+
+/** An error joining H.264 streams: the export is redone as a plain re-encode. */
+class SpliceError extends Error {
+  constructor(message) {
+    super(message);
+    this.splice = true;
+  }
+}
+
+const hex = (b) => Array.from(b || [], (x) => x.toString(16).padStart(2, '0')).join(' ');
+
+async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, sink = null, onProgress, cancel, smartCut = true, parallel = 0, spans = null, makeEncoder = null, candidate = null, plan: given = null } = {}) {
   const { wasm } = env;
   const fps = movie.fps;
   const cands = candidate ? [candidate] : await encoderCandidates(movie.width, movie.height, fps, quality);
@@ -624,21 +767,60 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
   const reader = movie.reader || new ChunkReader(movie.file);
   const v = movie.v;
   const MAX_RUN = 8 * 1024 * 1024;
-  let registry = null; // AvcRegistry, when H.264 samples of several origins share the track
+  // H.264: the track's parameter sets. With smart cut, the source's plus
+  // each encoder's under ids of their own (samples renumbered to match);
+  // without, the first encoder's, with any other encoder's renumbered. The
+  // records are read (and repaired, see AvcRegistry) as they come.
+  let registry = null;
+  let rawOnly = null; // a lone encoder's record that could not be read: used as it is
   const rewriters = new Map(); // description bytes -> AvcRewriter | null
   let description = null;
   let codecString = chosen.config.codec;
   let softened = 0;
   const rewriterFor = (desc) => {
-    if (!desc || !/^avc1/.test(codecString)) return null;
-    const key = Array.from(desc).join(',');
+    if (!/^avc1/.test(codecString)) return null;
+    // H.264 with no record: its samples cannot be told apart from the source's
+    if (!desc) {
+      if (plan.mode === 'smart') throw new SpliceError('the encoder gave no parameter sets');
+      return null;
+    }
+    const key = hex(desc);
     if (rewriters.has(key)) return rewriters.get(key);
-    if (!registry) registry = new wasm.AvcRegistry(plan.mode === 'smart' ? movie.dx.track_description(movie.video.index) : desc);
-    const rw = registry.register(desc);
-    const use = rw.is_identity() ? null : rw;
-    if (!use) rw.free();
-    rewriters.set(key, use);
-    return use;
+    try {
+      if (!registry && !rawOnly) {
+        if (plan.mode === 'smart') registry = new wasm.AvcRegistry(movie.dx.track_description(movie.video.index));
+        else {
+          try {
+            registry = new wasm.AvcRegistry(desc);
+          } catch (e) {
+            // one encoder's stream needs no joining: its record goes in as it came
+            console.warn(`[unflash] the H.264 encoder's record could not be read (${e && e.message ? e.message : e}); it is used as it is:`, hex(desc));
+            rawOnly = key;
+            rewriters.set(key, null);
+            return null;
+          }
+        }
+      }
+      if (rawOnly) throw new Error('a second encoder record next to one that could not be read');
+      const rw = registry.register(desc);
+      const use = rw.is_identity() ? null : rw;
+      if (!use) rw.free();
+      rewriters.set(key, use);
+      return use;
+    } catch (e) {
+      const why = e && e.message ? e.message : String(e);
+      console.warn(`[unflash] could not join the H.264 encoder's stream (${why}); its record:`, hex(desc), plan.mode === 'smart' ? '; the source record: ' + hex(movie.dx.track_description(movie.video.index)) : '');
+      throw new SpliceError(why);
+    }
+  };
+  const rewrite = (rw, bytes) => {
+    try {
+      return rw.rewrite_sample(bytes);
+    } catch (e) {
+      const why = e && e.message ? e.message : String(e);
+      console.warn(`[unflash] could not renumber an H.264 sample (${why}); its first bytes:`, hex(bytes.subarray(0, 48)));
+      throw new SpliceError(why);
+    }
   };
   try {
     for (const piece of plan.pieces) {
@@ -668,7 +850,7 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
         for (const c of pe.chunks) {
           if (c.desc && !description) description = c.desc;
           const rw = rewriterFor(c.desc);
-          const bytes = rw ? rw.rewrite_sample(c.bytes) : c.bytes;
+          const bytes = rw ? rewrite(rw, c.bytes) : c.bytes;
           await out.write(bytes);
           samples.push({ pts: c.pts, sync: c.sync, size: bytes.byteLength });
         }
@@ -692,6 +874,7 @@ export async function exportMovie(env, movie, project, { encoder, quality, extS 
   let shift = 0;
   for (let i = 0; i < samples.length; i++) shift = Math.max(shift, sorted[i] - samples[i].pts);
   if (registry) {
+    // the merged (and repaired) record, and a codec string that covers it
     description = registry.record();
     codecString = `avc1.${Array.from(description.subarray(1, 4), (b) => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
   } else if (plan.mode === 'smart' && !description) description = movie.dx.track_description(movie.video.index);

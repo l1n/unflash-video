@@ -7,7 +7,7 @@ import { createDetector } from './detector.js';
 import { profile } from './profile.js';
 import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, rateLadder, keepJson, shownPts, softenPlan } from './analysis.js';
 import { Project, projectKey, dropCaches } from './project.js';
-import { exportMovie, exportPlan, encoderCandidates, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
+import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
 
 const $ = (id) => document.getElementById(id);
@@ -230,6 +230,8 @@ async function boot() {
   $('btnDoExport').addEventListener('click', doExport);
   $('btnVerifyExport').addEventListener('click', verifyExport);
   $('exportQuality').addEventListener('input', () => ($('exportQualityText').textContent = $('exportQuality').value));
+  $('exportQuality').addEventListener('change', () => state.movie && renderExportChoice());
+  $('exportCodec').addEventListener('change', () => renderExportChoice());
   $('btnAddSection').addEventListener('click', () => {
     const s = wasm.parse_time($('addStart').value);
     const e = wasm.parse_time($('addEnd').value);
@@ -1936,25 +1938,38 @@ async function openExport() {
   });
   $('exportSummary').innerHTML = rows.length ? `<table><tr><th>section</th><th>range</th><th>edits</th><th>status</th></tr>${rows.join('')}</table>` : '<p class="hint">No sections. The export re-encodes the video unchanged.</p>';
   const sel = $('exportCodec');
+  const previous = sel.value;
   sel.innerHTML = '';
-  const cands = await encoderCandidates(state.movie.width, state.movie.height, state.movie.fps, +$('exportQuality').value);
+  const cands = formatChoices(await encoderCandidates(state.movie.width, state.movie.height, state.movie.fps, +$('exportQuality').value));
+  state.exportCands = cands;
   for (const c of cands) {
+    const info = formatInfo(c, state.movie);
     const o = document.createElement('option');
     o.value = c.label;
-    o.textContent = `${c.label} (${c.config.codec})`;
+    o.textContent = info.label + (c === cands[0] ? ' (recommended)' : '');
+    o.title = c.config.codec;
     sel.appendChild(o);
   }
-  const softened = p.sectionsSorted().filter((s) => s.soften && softenPlan(s));
-  const plan = cands.length ? await exportPlan(state.env, state.movie, state.project, { extS: EXT_S, codec: cands[0].config.codec, smartCut: smartCutSetting(), parallel: parallelSetting() }) : null;
-  state.exportPlan = plan;
-  $('exportPlan').textContent = plan ? describePlan(plan, state.movie, softened) : 'This browser has no WebCodecs video encoder, so it cannot export.';
-  const need = estimateExportBytes(state.movie, +$('exportQuality').value, plan);
-  $('exportSize').textContent = cands.length ? `About ${fmtBytes(need)}. ${window.showSaveFilePicker ? 'You will be asked where to save it.' : privateStorageAvailable() ? "It is written to the browser's private storage on disk and offered for download." : `It is assembled in memory and offered for download${need > memoryExportLimit() ? ', which is more than this browser is likely to hold' : ''}.`}` : '';
+  if (cands.some((c) => c.label === previous)) sel.value = previous;
+  await renderExportChoice();
   $('btnDoExport').disabled = !cands.length || !state.decode.supported;
   if (!state.exportBlob) $('exportResult').innerHTML = '';
   $('exportDownload').classList.toggle('hidden', !(state.exportBlob && $('exportDownload').getAttribute('href')));
   $('btnVerifyExport').disabled = !state.exportBlob;
   $('exportModal').classList.remove('hidden');
+}
+
+/** The export dialog's lines for the chosen format: what it means, what will be re-encoded, how big. */
+async function renderExportChoice() {
+  const cands = state.exportCands || [];
+  const chosen = cands.find((c) => c.label === $('exportCodec').value) || cands[0];
+  const softened = state.project.sectionsSorted().filter((s) => s.soften && softenPlan(s));
+  const plan = chosen ? await exportPlan(state.env, state.movie, state.project, { extS: EXT_S, codec: chosen.config.codec, smartCut: smartCutSetting(), parallel: parallelSetting() }) : null;
+  state.exportPlan = plan;
+  $('exportFormatNote').textContent = chosen ? formatInfo(chosen, state.movie).note : '';
+  $('exportPlan').textContent = plan ? describePlan(plan, state.movie, softened) : 'This browser has no WebCodecs video encoder, so it cannot export.';
+  const need = estimateExportBytes(state.movie, +$('exportQuality').value, plan);
+  $('exportSize').textContent = chosen ? `About ${fmtBytes(need)}. ${window.showSaveFilePicker ? 'You will be asked where to save it.' : privateStorageAvailable() ? "It is written to the browser's private storage on disk and offered for download." : `It is assembled in memory and offered for download${need > memoryExportLimit() ? ', which is more than this browser is likely to hold' : ''}.`}` : '';
 }
 
 async function doExport() {
