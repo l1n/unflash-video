@@ -1,7 +1,7 @@
 // The detector, wrapped so the rest of the app does not care whether it runs
 // on the GPU or the CPU, nor by which route a picture reaches it.
 
-import { tick, yuvLayoutWords } from './media.js';
+import { orTimeout, yuvLayoutWords } from './media.js';
 import { profile } from './profile.js';
 
 /**
@@ -145,12 +145,21 @@ export class Feeder {
     return n;
   }
 
+  /**
+   * Until the GPU has results to hand back: woken by the readback itself
+   * (a timer would crawl in a hidden tab); the timeout only guards against
+   * a readback that never ends (a lost device).
+   */
+  gpuWait() {
+    return orTimeout(this.det.gpu_wait(), 250);
+  }
+
   async waitSlot() {
     if (this.det.can_submit()) return;
     const t0 = performance.now();
     while (!this.det.can_submit()) {
       this.poll();
-      if (!this.det.can_submit()) await tick();
+      if (!this.det.can_submit()) await this.gpuWait();
     }
     profile.add('feed.wait', performance.now() - t0);
   }
@@ -227,8 +236,42 @@ export class Feeder {
     return true;
   }
 
+  /**
+   * A picture that is already 8-bit RGB of some order (Firefox on a Mac
+   * decodes to BGRX) copied as it is, the GPU putting the channels back in
+   * order: a plain copy rather than WebCodecs converting every pixel. False
+   * when the frame is not like that or the copy does not come out packed.
+   */
+  async feedPacked(frame, w, h, t, capture) {
+    const fmt = frame.format;
+    if (this.packedCopy === false || !['RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(fmt)) return false;
+    const size = frame.allocationSize();
+    if (!this.rgbaBuf || this.rgbaBuf.byteLength < size) this.rgbaBuf = new Uint8Array(size);
+    let layout;
+    const t0 = performance.now();
+    try {
+      layout = await frame.copyTo(this.rgbaBuf);
+    } catch (e) {
+      this.packedCopy = false;
+      return false;
+    }
+    profile.add('feed.copyTo', performance.now() - t0);
+    if (!layout || !layout[0] || layout[0].offset !== 0 || layout[0].stride !== w * 4) {
+      this.packedCopy = false;
+      return false;
+    }
+    const t1 = performance.now();
+    if (fmt[0] === 'B') this.det.feed_bgra(this.rgbaBuf.subarray(0, w * h * 4), w, h, t, capture);
+    else this.det.feed_rgba(this.rgbaBuf.subarray(0, w * h * 4), w, h, t, capture);
+    profile.add('feed.upload', performance.now() - t1);
+    this.rgbaDetail = `${fmt} as decoded`;
+    return true;
+  }
+
   /** WebCodecs' own RGBA conversion. False when this browser's copyTo cannot convert. */
   async feedRgba(frame, w, h, t, capture) {
+    if (await this.feedPacked(frame, w, h, t, capture)) return true;
+    this.rgbaDetail = '';
     if (this.rgbaCopy === false || typeof frame.allocationSize !== 'function') return false;
     let layout;
     const opts = { format: 'RGBA' };
@@ -297,6 +340,7 @@ export class Feeder {
               this.dropRoute(routes, route, 'copyTo cannot convert to RGBA');
               continue;
             }
+            detail = this.rgbaDetail;
             break;
           case 'canvas': {
             if (!this.gpu) {
@@ -419,7 +463,7 @@ export class Feeder {
     this.det.flush();
     while (this.det.pending() > 0) {
       this.poll();
-      if (this.det.pending() > 0) await tick();
+      if (this.det.pending() > 0) await this.gpuWait();
     }
     profile.add('drain', performance.now() - t0);
   }

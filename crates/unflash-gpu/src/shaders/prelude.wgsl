@@ -30,7 +30,7 @@ struct Params {
     pat_reg_den: u32,
     pat_enabled: u32,
     held_delta_v: f32,
-    _pad1: u32,
+    src_bgr: u32,
 };
 
 const MODE_FIRST: u32 = 1u;

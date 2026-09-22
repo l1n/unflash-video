@@ -96,9 +96,25 @@ try {
   console.log(results.videoInfo, '|', results.status);
   assert(results.status.includes('CPU'), 'with ?cpu=1 the detector must run on the CPU');
 
+  // finish alerts: with no minimum wait, the scan's end beeps (headless
+  // Chromium plays to no device, but the tone is made) and the tab title
+  // follows the job while it runs
+  await page.evaluate(() => {
+    window.__unflash.setAlerts({ beep: true, after: 0, notify: false });
+    window.__titles = [];
+    new MutationObserver(() => window.__titles.push(document.title)).observe(document.querySelector('title'), { childList: true, subtree: true, characterData: true });
+  });
   let scan = await scanCurrent();
   results.cpuScan = scan;
   console.log('cpu scan:', scan.ms, 'ms |', scan.status, '|', scan.toast);
+  await page.waitForFunction(() => window.__unflash.lastAlert, null, { timeout: 10000 });
+  results.alert = await page.evaluate(() => ({ alert: window.__unflash.lastAlert, titles: window.__titles, title: document.title }));
+  console.log('finish alert:', JSON.stringify(results.alert.alert), '| titles seen:', results.alert.titles.slice(0, 4).join(' / '), '… now:', results.alert.title);
+  assert(results.alert.alert.ok && /scanning for flashes done/i.test(results.alert.alert.title), 'the scan ends with an alert: ' + JSON.stringify(results.alert.alert));
+  assert(results.alert.alert.beeped, 'the alert beeps');
+  assert(results.alert.titles.some((t) => /^\d+% · Scanning for flashes · Unflash$/.test(t)), 'the tab title shows the progress: ' + results.alert.titles.join(' / '));
+  assert(results.alert.title === 'Unflash', 'the title is back to normal after the job (the tab is in front): ' + results.alert.title);
+  await page.evaluate(() => window.__unflash.setAlerts({ after: 60 }));
   await page.screenshot({ path: path.join(OUT, '1-scanned.png') });
   const sections = await page.$$eval('#sectionList .sec-item', (els) => els.map((e) => e.textContent));
   console.log('sections:', sections);
@@ -119,6 +135,19 @@ try {
   results.verdictBefore = await page.textContent('#wsVerdict');
   results.frameCount = await page.textContent('#frameCount');
   console.log('prepared in', results.prepareMs, 'ms; verdict:', results.verdictBefore, results.frameCount);
+  // a prepare cut into spans decoded side by side must give exactly what
+  // one pass gives: the same pictures, times and pattern figures
+  {
+    const one = await page.evaluate(() => window.__unflash.prepareDigest(window.__unflash.currentSection().id, 1));
+    const three = await page.evaluate(() => window.__unflash.prepareDigest(window.__unflash.currentSection().id, 3));
+    console.log('prepare in 1 span:', one.frames, 'frames', Math.round(one.ms), 'ms | in', three.spans, 'spans:', three.frames, 'frames', Math.round(three.ms), 'ms');
+    assert(one.spans === 1 && three.spans === 3, 'the prepares ran in 1 and 3 spans: ' + [one.spans, three.spans]);
+    assert(one.frames > 100 && one.frames === three.frames && one.lead === three.lead && one.tail === three.tail, 'span prepare frame counts: ' + JSON.stringify([one.frames, one.lead, one.tail, three.frames, three.lead, three.tail]));
+    assert(JSON.stringify(one.pts) === JSON.stringify(three.pts) && JSON.stringify(one.leadPts) === JSON.stringify(three.leadPts) && JSON.stringify(one.tailPts) === JSON.stringify(three.tailPts), 'span prepare times differ');
+    assert(JSON.stringify(one.pattern) === JSON.stringify(three.pattern), 'span prepare pattern figures differ');
+    assert(JSON.stringify(one.hash) === JSON.stringify(three.hash), 'span prepare pictures differ: ' + JSON.stringify([one.hash, three.hash]));
+    results.spanPrepare = { one: one.ms, three: three.ms };
+  }
   assert(results.verdictBefore.startsWith('fails'), 'the flashing section must fail before editing');
   assert(results.verdictBefore.includes('red flash'), 'the red flash must be named: ' + results.verdictBefore);
   await page.screenshot({ path: path.join(OUT, '2-section.png'), fullPage: true });
@@ -535,6 +564,58 @@ try {
     assert(a.kind === b.kind && Math.abs(a.start - b.start) < 1e-6 && Math.abs(a.end - b.end) < 1e-6 && Math.abs(a.onset - b.onset) < 1e-6, `segmented violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
   }
   assert(results.segScan.held === results.gpuWhole.held, `held frames ${results.segScan.held} vs ${results.gpuWhole.held}`);
+
+  // ======== a BGRX picture (what Firefox on a Mac decodes to), copied as it
+  // is and put back in order by the GPU, must be analysed exactly like the
+  // same picture handed over as RGBA
+  results.packed = await page.evaluate(async () => {
+    const wasm = await import('./pkg/unflash.js');
+    const { createDetector } = await import('./detector.js');
+    const cfg = window.__unflash.state.config;
+    const w = 320;
+    const h = 240;
+    const viaFrame = await createDetector(wasm, cfg, w, h, { route: 'rgba' });
+    const direct = await createDetector(wasm, cfg, w, h);
+    try {
+      for (let i = 0; i < 20; i++) {
+        const rgba = new Uint8Array(w * h * 4);
+        const on = Math.floor(i / 2) % 2 === 1;
+        for (let y = 0; y < h; y++)
+          for (let x = 0; x < w; x++) {
+            const k = (y * w + x) * 4;
+            const inBox = x < 200 && y < 180;
+            rgba[k] = inBox && on ? 250 : 20 + ((x * 7 + y * 3 + i) % 40);
+            rgba[k + 1] = inBox && on ? 40 : 30 + ((x + y * 5) % 50);
+            rgba[k + 2] = inBox && on ? 30 : 60 + ((x * 3 + y) % 30);
+            rgba[k + 3] = 255;
+          }
+        const bgrx = rgba.slice();
+        for (let k = 0; k < bgrx.length; k += 4) [bgrx[k], bgrx[k + 2]] = [bgrx[k + 2], bgrx[k]];
+        const t = i / 30;
+        await viaFrame.videoFrame(new VideoFrame(bgrx, { format: 'BGRX', codedWidth: w, codedHeight: h, timestamp: Math.round(t * 1e6) }), t, true);
+        await direct.waitSlot();
+        direct.det.feed_rgba(rgba, w, h, t, true);
+        direct.poll();
+      }
+      await viaFrame.drain();
+      await direct.drain();
+      const a = viaFrame.records();
+      const b = direct.records();
+      const same = a.length === b.length && a.every((r, i) => JSON.stringify(r) === JSON.stringify(b[i]));
+      const pics = a.every((r, i) => {
+        const x = viaFrame.det.take_capture(r.index);
+        const y = direct.det.take_capture(b[i].index);
+        return x && y && x.length === y.length && x.every((v, k) => v === y[k]);
+      });
+      return { n: a.length, same, pics, route: viaFrame.route, detail: viaFrame.rgbaDetail, flashes: a.filter((r) => r.hazard > 0).length };
+    } finally {
+      viaFrame.det.free();
+      direct.det.free();
+    }
+  });
+  console.log('BGRX frames as they come:', JSON.stringify(results.packed));
+  assert(results.packed.n === 20 && results.packed.same && results.packed.pics, 'BGRX frames copied as they are must match RGBA: ' + JSON.stringify(results.packed));
+  assert(results.packed.route === 'rgba' && /BGRX as decoded/.test(results.packed.detail), 'the BGRX frames took the packed copy: ' + JSON.stringify(results.packed));
 
   // ======== every route a picture can take to the GPU detector =============
   // ?route forces one: the frame itself (videoframe), its own YUV planes

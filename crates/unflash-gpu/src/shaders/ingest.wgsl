@@ -51,6 +51,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             c = acc / max(wsum, 1e-9);
         }
+        if (params.src_bgr != 0u) {
+            c = c.bgr;
+        }
         let code = clamp(vec3<i32>(round(c * 255.0)), vec3<i32>(0), vec3<i32>(255));
         let r = lut[u32(code.r)];
         let g = lut[u32(code.g)];

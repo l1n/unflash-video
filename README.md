@@ -109,6 +109,17 @@ results. Its changes to each section can be undone like any other.
 The **Guide** button opens the guide beside your work and closes it again
 (so does Esc).
 
+**🔔** (in the header) sets the finish alert: a beep when a job that ran
+for over a minute ends (the time is yours to change), and if you allow it
+a system notification while the tab is in the background. Jobs that
+follow one another, such as opening a file and its scan, or every stage of
+auto-fix, count as one wait and alert once. While a job runs the tab's
+title shows how far it has got, and one that ends while you are in another
+tab leaves a ✓ (or ✗) there. Work goes on at full speed in a background
+tab: nothing in a scan, a prepare or an export waits on a timer, which
+browsers slow to once a second in hidden tabs; the decoder, the encoder
+and the GPU's readbacks wake it instead.
+
 Profiles (**WCAG + extended flashes + stripe patterns**, **Exact WCAG
 only**, **Stricter than WCAG**), the suggesters, the safe frame-rate bound
 and the run-up/run-out logic are the reference's; see
@@ -299,7 +310,23 @@ one run. A test holds the merged result of a split run identical to the
 sequential run, frame statistics, events and violations alike. Segments are
 used with the browser's own decoder on the GPU detector (the built-in
 decoder already spreads over workers); `?segments=N` forces a count, and a
-file shorter than four run-ups per segment is scanned in one.
+file shorter than four run-ups per segment is scanned in one. Each segment
+reads the file through a window of its own (sharing one had them take
+turns re-reading it).
+
+Preparing a section works the same way without the run-ups: the range is
+cut at keyframes into as many spans as a scan would use, each decoded by
+its own decoder into its own detector, and the cached pictures joined in
+order. A picture's capture and its pattern figures depend on that picture
+alone, so the join is exact (a test holds a three-span prepare identical,
+byte for byte, to one pass), and every span after the first starts at its
+keyframe with nothing to decode before its first frame.
+
+Pictures reach the GPU by the cheapest route the browser allows: the
+decoded frame itself where WebGPU takes one (Chrome), else its own YUV
+planes, else, for a decoder that hands out RGB (Firefox on a Mac gives
+BGRX), its pixels copied as they are, the GPU swapping the channels while
+it reads them.
 
 ### Spans re-encoded, the rest copied
 

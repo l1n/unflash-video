@@ -105,6 +105,8 @@ pub enum FrameSource<'a> {
     Rgb8 { data: &'a [u8], width: u32, height: u32 },
     /// 8-bit sRGB pixels with an ignored fourth byte.
     Rgba8 { data: &'a [u8], width: u32, height: u32 },
+    /// The same in B, G, R order (WebCodecs' BGRX / BGRA pictures).
+    Bgra8 { data: &'a [u8], width: u32, height: u32 },
     /// 8-bit 4:2:0 YCbCr planes (I420 or NV12) of any size, converted to RGB
     /// on the GPU.
     Yuv420 { data: &'a [u8], width: u32, height: u32, layout: YuvLayout },
@@ -137,6 +139,14 @@ struct Slot {
     /// Results are dropped (after a reset).
     discard: bool,
 }
+
+/// Called from a readback's completion callback, once a batch's results
+/// have arrived: lets a browser wake the code waiting for them instead of
+/// polling on a timer (which a hidden tab slows to once a second).
+#[cfg(target_arch = "wasm32")]
+pub type Notify = std::rc::Rc<dyn Fn()>;
+#[cfg(not(target_arch = "wasm32"))]
+pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
 /// One completed frame.
 #[derive(Clone, Debug)]
@@ -211,6 +221,8 @@ pub struct GpuStage {
     // readback ring
     slots: Vec<Slot>,
     in_flight: VecDeque<usize>,
+    /// Told whenever a readback completes.
+    notify: Option<Notify>,
     free: Vec<usize>,
     frames_submitted: u64,
 }
@@ -542,6 +554,7 @@ impl GpuStage {
             last_pos: 0,
             slots,
             in_flight: VecDeque::new(),
+            notify: None,
             free,
             frames_submitted: 0,
         })
@@ -564,6 +577,21 @@ impl GpuStage {
     }
     pub fn capacity(&self) -> usize {
         self.slots.len()
+    }
+    /// Have `f` called whenever a batch's readback completes (see [`Notify`]).
+    pub fn set_notify(&mut self, f: Option<Notify>) {
+        self.notify = f;
+    }
+    /// Whether `poll` has something to hand out now, or nothing is in flight
+    /// to wait for.
+    pub fn ready(&self) -> bool {
+        match self.in_flight.front() {
+            None => true,
+            Some(&i) => {
+                let slot = &self.slots[i];
+                slot.next > 0 || !slot.words.is_empty() || matches!(*slot.state.lock().unwrap(), SlotState::Pending { remaining: 0, .. })
+            }
+        }
     }
     /// Room for another frame: the batch being filled has some, or a batch
     /// slot is free to start one.
@@ -639,7 +667,7 @@ impl GpuStage {
     /// (without side effects) when every batch slot is in flight; call
     /// [`poll`](Self::poll) first. With `capture`, the analysis-resolution
     /// RGBA picture comes back with the result.
-    pub fn submit(&mut self, params: KernelParams, source: FrameSource<'_>, capture: bool) -> Result<(), String> {
+    pub fn submit(&mut self, mut params: KernelParams, source: FrameSource<'_>, capture: bool) -> Result<(), String> {
         let started_here = self.current.is_none();
         let slot_idx = match self.current {
             Some(s) => s,
@@ -668,7 +696,7 @@ impl GpuStage {
                 let tex = tex.clone();
                 self.write_source(&tex, &self.rgba_scratch.clone(), width, height);
             }
-            FrameSource::Rgba8 { data, width, height } => {
+            FrameSource::Rgba8 { data, width, height } | FrameSource::Bgra8 { data, width, height } => {
                 let n = (width * height) as usize;
                 if data.len() < n * 4 {
                     if started_here {
@@ -678,6 +706,8 @@ impl GpuStage {
                 }
                 let tex = self.source_texture(width, height).clone();
                 self.write_source(&tex, data, width, height);
+                // the ingest pass swaps the channels back
+                params.src_bgr = matches!(source, FrameSource::Bgra8 { .. }) as u32;
             }
             FrameSource::SourceTexture => {
                 if self.src.is_none() {
@@ -839,10 +869,22 @@ impl GpuStage {
             }
         };
         let st = slot.state.clone();
-        slot.staging.slice(..(n * self.out_region) as u64).map_async(wgpu::MapMode::Read, move |r| done(&st, r));
+        let nt = self.notify.clone();
+        slot.staging.slice(..(n * self.out_region) as u64).map_async(wgpu::MapMode::Read, move |r| {
+            done(&st, r);
+            if let Some(f) = &nt {
+                f();
+            }
+        });
         if capture {
             let st = slot.state.clone();
-            slot.rgba_staging.as_ref().unwrap().slice(..(n * self.rgba_region) as u64).map_async(wgpu::MapMode::Read, move |r| done(&st, r));
+            let nt = self.notify.clone();
+            slot.rgba_staging.as_ref().unwrap().slice(..(n * self.rgba_region) as u64).map_async(wgpu::MapMode::Read, move |r| {
+                done(&st, r);
+                if let Some(f) = &nt {
+                    f();
+                }
+            });
         }
         self.in_flight.push_back(slot_idx);
         self.queued = 0;

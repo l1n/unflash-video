@@ -9,6 +9,7 @@ import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate
 import { Project, projectKey, dropCaches } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
+import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notifyState, systemNotify, titleProgress, titleMark } from './alerts.js';
 
 const $ = (id) => document.getElementById(id);
 const EXT_S = 1.0;
@@ -68,6 +69,7 @@ function fmt(t) {
 
 function toast(msg, ms = 3500) {
   const el = $('toast');
+  if (chain.active) chain.toast = msg;
   el.textContent = msg;
   el.classList.remove('hidden');
   clearTimeout(el._t);
@@ -105,28 +107,140 @@ async function runJob(name, fn) {
   }
   const job = { name, cancelled: false };
   state.job = job;
+  chainStart(name);
   $('jobName').textContent = name;
   $('jobBar').style.width = '0%';
   $('jobMsg').textContent = '';
   $('jobbar').classList.remove('hidden');
+  let shownPct = -1;
   const progress = (p, msg) => {
-    $('jobBar').style.width = `${Math.round(Math.min(1, Math.max(0, p)) * 100)}%`;
+    const pct = Math.round(Math.min(1, Math.max(0, p)) * 100);
+    $('jobBar').style.width = `${pct}%`;
     if (msg !== undefined) $('jobMsg').textContent = msg;
+    // the tab's title too, to be seen from another tab
+    if (pct !== shownPct) {
+      shownPct = pct;
+      titleProgress(`${pct}% · ${name} · Unflash`);
+    }
   };
+  titleProgress(`${name} · Unflash`);
+  let outcome = 'ok';
+  let message = '';
   try {
     return await withFeeder(() => fn(progress, () => job.cancelled));
   } catch (e) {
     if (job.cancelled) {
+      outcome = 'cancelled';
       toast(`${name}: cancelled`);
       return null;
     }
     console.error(e);
-    banner(`${name} failed: ${e && e.message ? e.message : e}`);
+    outcome = 'failed';
+    message = `${name} failed: ${e && e.message ? e.message : e}`;
+    banner(message);
     return null;
   } finally {
     state.job = null;
     $('jobbar').classList.add('hidden');
+    titleProgress('');
+    chainEnd(job.cancelled ? 'cancelled' : outcome, message);
   }
+}
+
+// ---- telling someone who looked away that the wait is over ----------------------
+//
+// Jobs that follow one another (opening then scanning; every stage of an
+// auto-fix run) are one wait: the beep and the notification come once, when
+// no further job has started a moment after the last one ended, and only if
+// the whole wait took longer than the setting.
+
+let alertSettings = loadAlertSettings();
+const CHAIN_GRACE_MS = 1500;
+const chain = { active: false, start: 0, end: 0, names: [], ok: true, cancelled: false, error: '', toast: '', timer: null };
+
+function chainStart(name) {
+  clearTimeout(chain.timer);
+  if (!chain.active) Object.assign(chain, { active: true, start: performance.now(), names: [], ok: true, cancelled: false, error: '', toast: '' });
+  chain.names.push(name);
+}
+
+function chainEnd(outcome, message) {
+  if (!chain.active) return;
+  if (outcome === 'failed') {
+    chain.ok = false;
+    chain.error = message;
+  } else if (outcome === 'cancelled') chain.cancelled = true;
+  chain.end = performance.now();
+  clearTimeout(chain.timer);
+  chain.timer = setTimeout(finishChain, CHAIN_GRACE_MS);
+}
+
+function fmtWait(secs) {
+  if (secs < 90) return `${Math.round(secs)} s`;
+  const m = Math.floor(secs / 60);
+  const s = Math.round(secs % 60);
+  return m < 60 ? `${m} min ${s} s` : `${Math.floor(m / 60)} h ${m % 60} min`;
+}
+
+async function finishChain() {
+  // an auto-fix run ends its own wait (its stages come with gaps)
+  if (!chain.active || state.job || (state.auto && state.auto.running)) return;
+  chain.active = false;
+  const secs = (chain.end - chain.start) / 1000;
+  // stopped by hand: whoever stopped it is looking
+  if (chain.cancelled && chain.ok) return;
+  if (secs < alertSettings.after) return;
+  const last = chain.names[chain.names.length - 1] || 'job';
+  const autoSummary = state.auto && state.auto.summary;
+  const title = chain.ok ? `Unflash: ${chain.names.length > 1 ? chain.names.join(', then ').toLowerCase() : last.toLowerCase()} done` : `Unflash: ${last.toLowerCase()} failed`;
+  const body = (chain.ok ? autoSummary || chain.toast || `Finished after ${fmtWait(secs)}.` : chain.error) + (chain.ok ? ` (${fmtWait(secs)})` : '');
+  const alert = { title, body, secs, ok: chain.ok, beeped: false, notified: false };
+  state.lastAlert = alert;
+  titleMark(chain.ok);
+  if (alertSettings.notify && (document.hidden || !document.hasFocus())) alert.notified = systemNotify(title, body);
+  if (alertSettings.beep) alert.beeped = await beep(chain.ok);
+}
+
+function renderAlertNote() {
+  const parts = ['While a job runs, the tab title shows how far it has got; one that ends while you are in another tab leaves a ✓ (or ✗) there.'];
+  const st = notifyState();
+  if (st === 'denied') parts.push('Notifications from this page are blocked in the browser; allow them in its site settings to have them.');
+  else if (st === 'unsupported') parts.push('This browser has no system notifications.');
+  $('alertNote').textContent = parts.join(' ');
+}
+
+function wireAlerts() {
+  $('alertBeep').checked = alertSettings.beep;
+  $('alertAfter').value = alertSettings.after;
+  $('alertNotify').checked = alertSettings.notify && notifyState() === 'granted';
+  const save = () => {
+    saveAlertSettings(alertSettings);
+    renderAlertNote();
+  };
+  $('btnAlerts').addEventListener('click', (e) => {
+    e.stopPropagation();
+    renderAlertNote();
+    $('alertsMenu').classList.toggle('hidden');
+  });
+  $('alertsMenu').addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', () => $('alertsMenu').classList.add('hidden'));
+  $('alertBeep').addEventListener('change', () => {
+    alertSettings.beep = $('alertBeep').checked;
+    save();
+  });
+  $('alertAfter').addEventListener('change', () => {
+    const v = parseFloat($('alertAfter').value);
+    alertSettings.after = Number.isFinite(v) && v >= 0 ? v : 60;
+    $('alertAfter').value = alertSettings.after;
+    save();
+  });
+  $('alertNotify').addEventListener('change', async () => {
+    if ($('alertNotify').checked && (await askNotifyPermission()) !== 'granted') $('alertNotify').checked = false;
+    alertSettings.notify = $('alertNotify').checked;
+    save();
+  });
+  $('btnAlertTest').addEventListener('click', () => beep(true));
+  renderAlertNote();
 }
 
 function profileConfig(name) {
@@ -250,6 +364,7 @@ async function boot() {
   });
   wireWorkspace();
   wireTimeline();
+  wireAlerts();
   window.addEventListener('resize', () => {
     drawTimeline();
     drawChart();
@@ -359,6 +474,7 @@ async function openClip(name) {
 async function createFeeders(progress) {
   const movie = state.movie;
   if (state.env && state.env.feeder) state.env.feeder.det.free();
+  if (state.env && state.env.spares) for (const f of state.env.spares) f.det.free();
   if (state.liveFeeder) state.liveFeeder.det.free();
   const preferGpu = preferGpuSetting();
   const externalSources = externalSourcesSetting();
@@ -456,6 +572,18 @@ function makeFeeder(width, height) {
   return createDetector(wasm, state.config, width, height, { preferGpu: preferGpuSetting(), externalSources: externalSourcesSetting(), route: routeSetting() });
 }
 
+/**
+ * `n` more detectors like state.env.feeder, for the spans of a scan or a
+ * prepare that run side by side: made on first use and kept (a GPU
+ * detector takes a moment to set up) until the detector is re-created.
+ */
+async function spareFeeders(n) {
+  const env = state.env;
+  env.spares = env.spares || [];
+  while (env.spares.length < n) env.spares.push(await makeFeeder(state.movie.width, state.movie.height));
+  return env.spares.slice(0, n);
+}
+
 async function scan() {
   if (!state.movie || !state.env) return;
   setLive(false);
@@ -465,7 +593,7 @@ async function scan() {
       cancel: cancelled,
       segments: scanSegments(),
       forceSegments: segmentsForced(),
-      makeFeeder: () => makeFeeder(state.movie.width, state.movie.height),
+      moreFeeders: spareFeeders,
       onProgress: (p, trace, count, ms) => {
         state.scanTrace = trace;
         progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`);
@@ -1759,7 +1887,12 @@ async function doPrepare(sec) {
   if (!state.decode.supported) return banner(`Preparing needs WebCodecs to decode ${state.movie.video.codec}: ${state.decode.reason}`);
   state.project.evictCaches(sec, cacheBudget());
   const ok = await runJob(`Preparing section #${sec.id}`, async (progress, cancelled) => {
-    await prepareSection(state.env, state.movie, sec, { cancel: cancelled, onProgress: (n) => progress(Math.min(0.95, n / Math.max(1, (sec.end - sec.start + 2 * wasm.context_seconds(state.config)) * state.movie.fps)), `${n} frames decoded`) });
+    await prepareSection(state.env, state.movie, sec, {
+      cancel: cancelled,
+      spans: scanSegments(),
+      moreFeeders: spareFeeders,
+      onProgress: (n) => progress(Math.min(0.95, n / Math.max(1, (sec.end - sec.start + 2 * wasm.context_seconds(state.config)) * state.movie.fps)), `${n} frames decoded`),
+    });
     return !cancelled();
   });
   if (!ok) {
@@ -2341,6 +2474,13 @@ async function autopilot({ rescan = false } = {}) {
   } finally {
     auto.running = false;
     if (state.auto === auto) renderAuto();
+    // the run was one wait: its alert comes now
+    if (chain.active) {
+      if (auto.steps.verify && auto.steps.verify.status === 'failed') chain.ok = false;
+      chain.end = performance.now();
+      clearTimeout(chain.timer);
+      chain.timer = setTimeout(finishChain, CHAIN_GRACE_MS);
+    }
   }
 }
 
@@ -2431,6 +2571,37 @@ window.__unflash = {
   playSection,
   undo,
   redo,
+  /**
+   * Prepare a copy of section `id` in `spans` spans and describe what came
+   * out (frame counts, times, a checksum of the cached pictures), leaving
+   * the section itself alone (tests: a prepare in spans must match one in
+   * a single pass).
+   */
+  async prepareDigest(id, spans) {
+    const sec = state.project.sections.find((s) => s.id === id);
+    const copy = { id: sec.id, start: sec.start, end: sec.end, edits: {} };
+    const t0 = performance.now();
+    await withFeeder(() => prepareSection(state.env, state.movie, copy, { spans, moreFeeders: spareFeeders }));
+    const ms = performance.now() - t0;
+    const sum = (cache) => {
+      let h = 0;
+      for (let i = 0; i < cache.len(); i++) {
+        const f = cache.frame(i);
+        for (let k = 0; k < f.length; k += 7) h = (h * 31 + f[k] + k) >>> 0;
+      }
+      return h;
+    };
+    const out = { ms, spans: copy.preparedSpans, frames: copy.cache.len(), lead: copy.ctx.lead.len(), tail: copy.ctx.tail.len(), pts: copy.pts, leadPts: copy.ctx.leadPts, tailPts: copy.ctx.tailPts, pattern: copy.pattern.counts, hash: [sum(copy.cache), sum(copy.ctx.lead), sum(copy.ctx.tail)] };
+    dropCaches(copy);
+    return out;
+  },
+  /** Change the finish-alert settings for this visit (tests). */
+  setAlerts(s) {
+    Object.assign(alertSettings, s);
+  },
+  get lastAlert() {
+    return state.lastAlert || null;
+  },
 };
 
 boot().catch((e) => {

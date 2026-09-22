@@ -89,7 +89,9 @@ pub struct KernelParams {
     pub pat_enabled: u32,
     /// Held-frame bar on the red value (see `GridGeometry::held_delta_v`).
     pub held_delta_v: f32,
-    pub _pad1: u32,
+    /// GPU ingest only: the source texture holds B, G, R in its first three
+    /// channels (a BGRX picture uploaded as it came); 0 otherwise.
+    pub src_bgr: u32,
 }
 
 impl KernelParams {
@@ -124,7 +126,7 @@ impl KernelParams {
             pat_reg_den: pat.reg_den,
             pat_enabled: cfg.flag_patterns() as u32,
             held_delta_v: geom.held_delta_v,
-            _pad1: 0,
+            src_bgr: 0,
         }
     }
 

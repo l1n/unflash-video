@@ -4,6 +4,25 @@ import { profile } from './profile.js';
 
 export const tick = () => new Promise((r) => setTimeout(r, 0));
 
+// A turn of the event loop that a hidden tab does not slow down: timers
+// there fire once a second at most (Firefox, Chrome), messages at once.
+const yieldChannel = typeof MessageChannel !== 'undefined' ? new MessageChannel() : null;
+const yieldQueue = [];
+if (yieldChannel) yieldChannel.port1.onmessage = () => yieldQueue.shift()();
+export const yieldTask = () =>
+  yieldChannel
+    ? new Promise((r) => {
+        yieldQueue.push(r);
+        yieldChannel.port2.postMessage(0);
+      })
+    : tick();
+
+/**
+ * Settles when `promise` does or after `ms`, whichever is first: a safety
+ * net for waits on events that should come but might not (a lost device).
+ */
+export const orTimeout = (promise, ms) => Promise.race([promise, new Promise((r) => setTimeout(r, ms))]);
+
 /**
  * Reads sample bytes out of a File. A file up to `wholeLimit` bytes is read
  * whole the first time and kept, so every later pass over it (prepare,
@@ -13,27 +32,43 @@ export const tick = () => new Promise((r) => setTimeout(r, 0));
  * read of a file, and that is paid once rather than per pass.
  */
 export class ChunkReader {
-  constructor(file, chunkSize = 8 * 1024 * 1024, wholeLimit = 64 * 1024 * 1024) {
+  constructor(file, chunkSize = 8 * 1024 * 1024, wholeLimit = 64 * 1024 * 1024, parent = null) {
     this.file = file;
     this.chunk = chunkSize;
     this.wholeLimit = wholeLimit;
+    this.parent = parent;
+    this.whole = null; // the whole small file, read once (a promise, so readers at the same time share it)
     this.buf = null;
     this.start = 0;
     this.end = 0;
   }
   async read(offset, size) {
+    if (this.file.size <= this.wholeLimit) {
+      const root = this.parent || this;
+      if (!root.whole) root.whole = root.file.slice(0, root.file.size).arrayBuffer().then((b) => new Uint8Array(b));
+      const all = await root.whole;
+      return all.subarray(offset, offset + size);
+    }
     if (!(this.buf && offset >= this.start && offset + size <= this.end)) {
-      const whole = this.file.size <= this.wholeLimit;
-      const start = whole ? 0 : offset;
-      const end = whole ? this.file.size : Math.min(this.file.size, Math.max(offset + size, offset + this.chunk));
+      const start = offset;
+      const end = Math.min(this.file.size, Math.max(offset + size, offset + this.chunk));
       this.buf = new Uint8Array(await this.file.slice(start, end).arrayBuffer());
       this.start = start;
       this.end = end;
     }
     return this.buf.subarray(offset - this.start, offset - this.start + size);
   }
+  /**
+   * A reader of the same file with a window of its own (a small file read
+   * whole is shared): for passes that read different parts of the file at
+   * the same time, which would otherwise take turns re-reading one window.
+   */
+  fork() {
+    return new ChunkReader(this.file, this.chunk, this.wholeLimit, this.parent || this);
+  }
   /** Forget the bytes read so far. */
   release() {
+    this.whole = null;
     this.buf = null;
     this.start = 0;
     this.end = 0;
@@ -188,22 +223,44 @@ export class Movie {
  * at the last keyframe at or before `startSec`, or at sample `fromIndex`
  * (decode order) when given.
  */
-export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null } = {}) {
-  if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, fromIndex });
+export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null } = {}) {
+  if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, fromIndex, reader });
   const cfg = movie.decoderConfig();
-  const reader = movie.reader || new ChunkReader(movie.file);
+  reader = reader || movie.reader || new ChunkReader(movie.file);
   const { pts, dts, offset, size, sync, dur } = movie.v;
   const n = pts.length;
   const startIdx = fromIndex !== null ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
   const endUs = endSec * 1e6;
   let error = null;
   const queue = [];
+  // the loop sleeps until the decoder does something: a picture out, an
+  // input taken off its queue, an error (a timer polling instead would
+  // cost the 4 ms browsers clamp repeated timeouts to, many times a second)
+  let wake = null;
+  const kick = () => {
+    if (wake) {
+      const w = wake;
+      wake = null;
+      w();
+    }
+  };
+  const settle = () =>
+    new Promise((r) => {
+      wake = r;
+      // only for a browser that sends no dequeue events
+      setTimeout(kick, 20);
+    });
   const decoder = new VideoDecoder({
-    output: (f) => queue.push(f),
+    output: (f) => {
+      queue.push(f);
+      kick();
+    },
     error: (e) => {
       error = e;
+      kick();
     },
   });
+  if ('ondequeue' in decoder) decoder.addEventListener('dequeue', kick);
   decoder.configure(cfg);
   let frames = 0;
   const pump = async () => {
@@ -222,10 +279,12 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
   try {
     while (i < n && !error && !(cancel && cancel())) {
       if (dts[i] >= endUs && pts[i] >= endUs) break;
-      while ((decoder.decodeQueueSize > 12 || queue.length > 6) && !error) {
+      const full = () => decoder.decodeQueueSize > 12 || queue.length > 6;
+      while (full() && !error) {
         await pump();
+        if (!full() || error) break;
         const tw = performance.now();
-        await tick();
+        await settle();
         profile.add('decode.wait', performance.now() - tw);
       }
       if (error) break;
@@ -238,11 +297,25 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
       await pump();
     }
     if (!error && !(cancel && cancel())) {
-      try {
-        await profile.timeAsync('decode.flush', () => decoder.flush());
-      } catch (e) {
-        error = error || e;
+      // the last pictures, handed on as they come rather than all at the end
+      const tf = performance.now();
+      let flushed = false;
+      decoder.flush().then(
+        () => {
+          flushed = true;
+          kick();
+        },
+        (e) => {
+          error = error || e;
+          flushed = true;
+          kick();
+        }
+      );
+      while (!flushed) {
+        await pump();
+        if (!flushed && !queue.length) await settle();
       }
+      profile.add('decode.flush', performance.now() - tf);
     }
     await pump();
   } finally {
@@ -327,8 +400,8 @@ export function softwarePicture(wasm, dec, timestampUs) {
  * Samples are decoded in file (decode) order and the pictures handed out in
  * presentation order once every earlier picture has been decoded.
  */
-async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null } = {}) {
-  const reader = movie.reader || new ChunkReader(movie.file);
+async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null } = {}) {
+  reader = reader || movie.reader || new ChunkReader(movie.file);
   const { pts, dts, offset, size } = movie.v;
   const n = pts.length;
   const startIdx = fromIndex !== null ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
@@ -387,7 +460,7 @@ async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, o
       i++;
       await release();
       if (onProgress && i % 30 === 0) onProgress((i - startIdx) / Math.max(1, n - startIdx));
-      if (i % 4 === 0) await tick();
+      if (i % 4 === 0) await yieldTask();
     }
     await release();
   } finally {

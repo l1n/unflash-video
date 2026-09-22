@@ -18,7 +18,7 @@ const MIN_SEGMENT_RUNUPS = 4;
  * results are then joined exactly. Returns { result, sections, summary,
  * trace, frames, elapsedMs, segments }.
  */
-export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, makeFeeder = null, forceSegments = false } = {}) {
+export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, makeFeeder = null, moreFeeders = null, forceSegments = false } = {}) {
   const { wasm, config, feeder } = env;
   profile.reset();
   const started = performance.now();
@@ -26,13 +26,15 @@ export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, 
   const end = movie.tsMax + 1;
   const span = end - movie.tsMin;
   let nseg = Math.max(1, Math.floor(segments));
-  if (!makeFeeder) nseg = 1;
+  if (!makeFeeder && !moreFeeders) nseg = 1;
   // a forced count (tests, benchmarks) is taken as given
   if (!forceSegments) nseg = Math.min(nseg, Math.max(1, Math.floor(span / (MIN_SEGMENT_RUNUPS * runup))));
   const bounds = [];
   for (let k = 0; k < nseg; k++) bounds.push({ from: movie.tsMin + (span * k) / nseg, to: k + 1 < nseg ? movie.tsMin + (span * (k + 1)) / nseg : end });
+  // detectors from `moreFeeders` are lent (kept by the caller), from `makeFeeder` made for this scan
   const feeders = [feeder];
-  for (let k = 1; k < nseg; k++) feeders.push(await makeFeeder());
+  if (nseg > 1 && moreFeeders) feeders.push(...(await moreFeeders(nseg - 1)));
+  else for (let k = 1; k < nseg; k++) feeders.push(await makeFeeder());
   const traces = bounds.map(() => ({ t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] }));
   const counts = bounds.map(() => 0);
   const total = Math.max(1, movie.frameCount);
@@ -64,6 +66,8 @@ export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, 
       }
     };
     let count = 0;
+    // segments read different parts of the file: a window each
+    const reader = k > 0 && movie.reader ? movie.reader.fork() : null;
     await decodeRange(
       movie,
       k === 0 ? from : Math.max(movie.tsMin, from - runup),
@@ -76,7 +80,7 @@ export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, 
           report();
         }
       },
-      { cancel, raw: true, fast: true }
+      { cancel, raw: true, fast: true, reader }
     );
     await f.drain();
     collect();
@@ -86,7 +90,7 @@ export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, 
   try {
     parts = await Promise.all(bounds.map((_, k) => runOne(k)));
   } finally {
-    for (let k = 1; k < feeders.length; k++) feeders[k].det.free();
+    if (!moreFeeders) for (let k = 1; k < feeders.length; k++) feeders[k].det.free();
   }
   const count = counts.reduce((a, b) => a + b, 0);
   const elapsed = performance.now() - started;
@@ -109,65 +113,105 @@ export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, 
 }
 
 /**
+ * How a decode of [from, to) splits into at most `k` spans that can run at
+ * the same time: each span after the first starts at a keyframe, so it
+ * needs no run-up of its own, and the cuts share out the samples to decode
+ * (the first span's lead-in from its keyframe included). Spans are
+ * { from, to, fromIndex } (seconds, and the sample the decode starts at).
+ */
+export function decodeSpans(movie, from, to, k) {
+  const v = movie.v;
+  const n = v.pts.length;
+  const start = movie.dx.sync_before(movie.video.index, Math.max(from, movie.tsMin));
+  const whole = [{ from, to, fromIndex: start }];
+  if (k <= 1) return whole;
+  const endUs = to * 1e6;
+  let end = start;
+  while (end < n && !(v.dts[end] >= endUs && v.pts[end] >= endUs)) end++;
+  const total = end - start;
+  // not worth a second decoder for a couple of seconds of video
+  if (total < 120) return whole;
+  const share = total / k;
+  const cuts = [];
+  let last = start;
+  for (let i = start + 1; i < end && cuts.length < k - 1; i++) {
+    if (!v.sync[i]) continue;
+    const t = v.pts[i] / 1e6;
+    if (t <= from || t >= to) continue;
+    if (i - last >= share * 0.75 && end - i >= share * 0.5) {
+      cuts.push(i);
+      last = i;
+    }
+  }
+  if (!cuts.length) return whole;
+  const out = [];
+  let prevIdx = start;
+  let prevT = from;
+  for (const c of cuts) {
+    const t = v.pts[c] / 1e6;
+    out.push({ from: prevT, to: t, fromIndex: prevIdx });
+    prevIdx = c;
+    prevT = t;
+  }
+  out.push({ from: prevT, to, fromIndex: prevIdx });
+  return out;
+}
+
+/**
  * Decode a section plus its run-up and run-out, cache the analysis-size
  * pictures, and record the frame times. Fills sec.cache / sec.ctx / sec.pts.
+ * With `spans` above one and `moreFeeders` (n => that many more detectors
+ * like env.feeder), the range is cut at keyframes into spans decoded side by
+ * side and joined in order: a picture's capture and pattern figures depend
+ * on that picture alone, so the join is exact.
  */
-export async function prepareSection(env, movie, sec, { onProgress, cancel } = {}) {
-  const { wasm, config, feeder } = env;
+export async function prepareSection(env, movie, sec, { onProgress, cancel, spans = 1, moreFeeders = null } = {}) {
+  const { wasm, config } = env;
   const need = wasm.context_seconds(config);
   const leadFrom = Math.max(movie.tsMin, sec.start - need);
   const tailTo = Math.min(movie.tsMax, sec.end + need);
-  const aw = feeder.aw;
-  const ah = feeder.ah;
-  const cache = new wasm.FrameCache(aw, ah);
-  const lead = new wasm.FrameCache(aw, ah);
-  const tail = new wasm.FrameCache(aw, ah);
-  const rawPts = [];
-  const rawPat = []; // patterned pixels per section frame
-  const rawPer = []; // mean stripe half-period per section frame (analysis px)
-  const leadPts = [];
-  const tailPts = [];
-  const pending = []; // [index, t]
-  feeder.reset();
-  const settle = () => {
-    for (const r of feeder.records()) {
-      const rgba = feeder.det.take_capture(r.index);
-      if (!rgba) continue;
-      const t = r.t;
-      if (t < sec.start - 1e-6) {
-        lead.push(rgba);
-        leadPts.push(Math.round((t - sec.start) * 1e6) / 1e6);
-      } else if (t <= sec.end + 1e-6 && t < sec.end + 1e-6) {
-        cache.push(rgba);
-        rawPts.push(t - sec.start);
-        rawPat.push(r.pattern || 0);
-        rawPer.push(r.pattern_period || 0);
-      } else {
-        tail.push(rgba);
-        tailPts.push(Math.round((t - sec.start) * 1e6) / 1e6);
-      }
+  let plan = decodeSpans(movie, leadFrom, tailTo, moreFeeders ? spans : 1);
+  let feeders = [env.feeder];
+  if (plan.length > 1) {
+    try {
+      feeders = feeders.concat(await moreFeeders(plan.length - 1));
+    } catch (e) {
+      console.warn('[unflash] preparing on one decoder: no second detector', e);
+      plan = decodeSpans(movie, leadFrom, tailTo, 1);
     }
-  };
-  let count = 0;
+  }
   profile.reset();
   const prepStarted = performance.now();
-  await decodeRange(
-    movie,
-    leadFrom,
-    tailTo,
-    async (frame, t) => {
-      await feeder.videoFrame(frame, t, true);
-      pending.push(t);
-      if (++count % 16 === 0) {
-        settle();
-        if (onProgress) onProgress(count);
-      }
-    },
-    { cancel, raw: true, fast: true }
-  );
-  await feeder.drain();
-  settle();
-  profile.report(`section prepare (${count} frames with captures)`, count, performance.now() - prepStarted);
+  let parts;
+  try {
+    parts = await prepareSpans(env, movie, sec, plan, feeders, { onProgress, cancel });
+  } catch (e) {
+    // a span that starts mid-stream can trip a decoder that one pass from
+    // the section's own keyframe does not: try that before giving up
+    if (plan.length === 1 || (cancel && cancel()) || String(e && e.message).includes('cancelled')) throw e;
+    console.warn(`[unflash] preparing in ${plan.length} spans failed (${e && e.message ? e.message : e}); preparing in one`);
+    plan = decodeSpans(movie, leadFrom, tailTo, 1);
+    parts = await prepareSpans(env, movie, sec, plan, [env.feeder], { onProgress, cancel });
+  }
+  const count = parts.reduce((a, p) => a + p.count, 0);
+  profile.report(`section prepare (${count} frames with captures${plan.length > 1 ? `, ${plan.length} spans` : ''})`, count, performance.now() - prepStarted);
+  // join the spans in order
+  const [first, ...rest] = parts;
+  const { cache, lead, tail } = first;
+  for (const p of rest) {
+    lead.append(p.lead);
+    cache.append(p.cache);
+    tail.append(p.tail);
+    p.lead.free();
+    p.cache.free();
+    p.tail.free();
+  }
+  const joined = (key) => [].concat(...parts.map((p) => p[key]));
+  const rawPts = joined('rawPts');
+  const rawPat = joined('rawPat');
+  const rawPer = joined('rawPer');
+  const leadPts = joined('leadPts');
+  const tailPts = joined('tailPts');
   if (cache.len() === 0) throw new Error('Section decoded zero frames');
   // the section works on a sanitised timeline (timestamp anomalies bridged)
   const san = JSON.parse(wasm.sanitize_deltas(Float64Array.from(rawPts), JSON.parse(config).max_frame_gap));
@@ -184,13 +228,90 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel } = {
   sec.prepared = true;
   sec.nFrames = relPts.length;
   sec.pts = relPts;
-  sec.pattern = { counts: rawPat, periods: rawPer, thresh: feeder.det.pattern_thresh() };
+  sec.pattern = { counts: rawPat, periods: rawPer, thresh: env.feeder.det.pattern_thresh() };
   sec.cache = cache;
   sec.ctx = { lead, leadPts, tail, tailPts, seconds: need };
   sec.warnings = warnings;
   sec.edits = sec.edits || {};
   sec.preparedAt = Date.now();
+  sec.preparedSpans = plan.length;
   return sec;
+}
+
+/**
+ * Decode the spans of a prepare at the same time, span k on feeders[k];
+ * returns each span's caches, times and pattern figures (freed again if
+ * any span fails).
+ */
+async function prepareSpans(env, movie, sec, plan, feeders, { onProgress, cancel }) {
+  const { wasm } = env;
+  const aw = env.feeder.aw;
+  const ah = env.feeder.ah;
+  const parts = plan.map(() => ({
+    cache: new wasm.FrameCache(aw, ah),
+    lead: new wasm.FrameCache(aw, ah),
+    tail: new wasm.FrameCache(aw, ah),
+    rawPts: [],
+    rawPat: [], // patterned pixels per section frame
+    rawPer: [], // mean stripe half-period per section frame (analysis px)
+    leadPts: [],
+    tailPts: [],
+    count: 0,
+  }));
+  const report = () => {
+    if (onProgress) onProgress(parts.reduce((a, p) => a + p.count, 0));
+  };
+  const runOne = async (k) => {
+    const f = feeders[k];
+    const part = parts[k];
+    const { from, to, fromIndex } = plan[k];
+    f.reset();
+    const settle = () => {
+      for (const r of f.records()) {
+        const rgba = f.det.take_capture(r.index);
+        if (!rgba) continue;
+        const t = r.t;
+        if (t < sec.start - 1e-6) {
+          part.lead.push(rgba);
+          part.leadPts.push(Math.round((t - sec.start) * 1e6) / 1e6);
+        } else if (t < sec.end + 1e-6) {
+          part.cache.push(rgba);
+          part.rawPts.push(t - sec.start);
+          part.rawPat.push(r.pattern || 0);
+          part.rawPer.push(r.pattern_period || 0);
+        } else {
+          part.tail.push(rgba);
+          part.tailPts.push(Math.round((t - sec.start) * 1e6) / 1e6);
+        }
+      }
+    };
+    await decodeRange(
+      movie,
+      from,
+      to,
+      async (frame, t) => {
+        await f.videoFrame(frame, t, true);
+        if (++part.count % 16 === 0) {
+          settle();
+          report();
+        }
+      },
+      { cancel, raw: true, fast: true, fromIndex, reader: k > 0 && movie.reader ? movie.reader.fork() : null }
+    );
+    await f.drain();
+    settle();
+  };
+  try {
+    await Promise.all(plan.map((_, k) => runOne(k)));
+  } catch (e) {
+    for (const p of parts) {
+      p.cache.free();
+      p.lead.free();
+      p.tail.free();
+    }
+    throw e;
+  }
+  return parts;
 }
 
 export function shownPts(wasm, sec) {

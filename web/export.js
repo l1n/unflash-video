@@ -7,7 +7,7 @@
 // video is re-encoded, still in parallel pieces. Audio is copied from the
 // source without re-encoding. The WASM muxer writes the file.
 
-import { decodeRange, ChunkReader, tick } from './media.js';
+import { decodeRange, ChunkReader, orTimeout } from './media.js';
 import { profile } from './profile.js';
 import { shownPts, softenPlan } from './analysis.js';
 
@@ -447,7 +447,7 @@ export async function exportPlan(env, movie, project, { extS = 1.0, codec = null
  * Returns `{ softened, warnings }`. The export encodes what it is handed;
  * the section player paces it onto a canvas.
  */
-export async function walkEdited(movie, piece, emit, { cancel } = {}) {
+export async function walkEdited(movie, piece, emit, { cancel, reader = null } = {}) {
   let softened = 0;
   const warnings = [];
   let offset = piece.offset || 0; // cumulative extension seconds
@@ -516,7 +516,7 @@ export async function walkEdited(movie, piece, emit, { cancel } = {}) {
           frame.close();
         }
       },
-      { cancel, fromIndex: piece.from == null ? null : piece.from }
+      { cancel, reader, fromIndex: piece.from == null ? null : piece.from }
     );
     if (cur) await endSection(cur);
   } finally {
@@ -597,8 +597,19 @@ class PieceEncoder {
   async run() {
     const { ctx, piece } = this;
     const { movie } = ctx;
+    // woken by the encoder taking a frame or handing one back, not polled
+    // (a timer crawls in a hidden tab)
+    let wake = null;
+    const kick = () => {
+      if (wake) {
+        const w = wake;
+        wake = null;
+        w();
+      }
+    };
     const enc = ctx.makeEncoder(ctx.chosen.config, {
       output: (chunk, meta) => {
+        kick();
         if (meta && meta.decoderConfig) {
           if (meta.decoderConfig.description) this.description = new Uint8Array(meta.decoderConfig.description.slice ? meta.decoderConfig.description.slice(0) : meta.decoderConfig.description);
           if (meta.decoderConfig.codec) this.codec = meta.decoderConfig.codec;
@@ -618,12 +629,21 @@ class PieceEncoder {
       },
       error: (e) => {
         this.error = e;
+        kick();
       },
     });
+    if ('ondequeue' in enc) enc.addEventListener('dequeue', kick);
     let lastKey = -Infinity;
     let pending = null; // { frame, tUs } waiting for its duration
     const encodeOne = async (frame, tUs, durUs) => {
-      while (enc.encodeQueueSize > 8 && !this.error) await tick();
+      while (enc.encodeQueueSize > 8 && !this.error) {
+        await orTimeout(
+          new Promise((r) => {
+            wake = r;
+          }),
+          50
+        );
+      }
       if (this.error) throw this.error;
       const f = new VideoFrame(frame, { timestamp: tUs, duration: durUs });
       frame.close();
@@ -644,7 +664,8 @@ class PieceEncoder {
       pending = { frame: new VideoFrame(frame, { timestamp: tUs }), tUs };
     };
     try {
-      const walked = await walkEdited(movie, piece, emit, { cancel: ctx.cancel });
+      // a reader of its own: pieces decode at the same time as the writer copies
+      const walked = await walkEdited(movie, piece, emit, { cancel: ctx.cancel, reader: movie.reader ? movie.reader.fork() : null });
       this.softened += walked.softened;
       this.warnings.push(...walked.warnings);
       if (pending) {

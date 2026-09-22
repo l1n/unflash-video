@@ -25,6 +25,16 @@
   <button id="btnScan" disabled title="Decode every frame with WebCodecs and run the detector over it, as fast as the GPU goes">Scan for flashes &amp; patterns</button>
   <label class="toggle" title="Show the meter over the player: how much of the picture is flashing on the frame on screen"><input type="checkbox" id="liveToggle" disabled> live monitor</label>
   <button id="btnExport" disabled>Export…</button>
+  <span class="alerts-wrap">
+    <button id="btnAlerts" title="A beep, and if you like a system notification, when a long job (opening, scanning, preparing, exporting, verifying) finishes">🔔</button>
+    <div id="alertsMenu" class="menu alerts-menu hidden">
+      <label class="toggle"><input type="checkbox" id="alertBeep"> beep when a job that ran for over</label>
+      <div class="fps-row"><input type="number" id="alertAfter" min="0" max="7200" step="5"><span>seconds finishes</span></div>
+      <label class="toggle"><input type="checkbox" id="alertNotify"> also a system notification while this tab is in the background</label>
+      <p id="alertNote" class="fps-note"></p>
+      <button id="btnAlertTest" class="small">test the beep</button>
+    </div>
+  </span>
 </header>
 
 <div id="banner" class="banner hidden"><div id="bannerText"></div><button id="btnCloseBanner" class="small">dismiss</button></div>

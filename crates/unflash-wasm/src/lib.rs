@@ -2,7 +2,9 @@
 //! JSON strings (small, and the app keeps the parsed objects); bulk data
 //! (frames, sample tables) crosses as typed arrays.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use serde::Serialize;
 use unflash_core::config::{DetectorConfig, Profile};
@@ -353,6 +355,24 @@ impl FrameCache {
         self.n = n;
     }
 
+    /// Move every frame of `other` (same size) onto the end of this cache,
+    /// leaving `other` empty: how the spans of a section decoded side by
+    /// side are joined in order.
+    pub fn append(&mut self, other: &mut FrameCache) -> Result<(), JsValue> {
+        if other.width != self.width || other.height != self.height {
+            return Err(js_err(format!("cannot join a {}×{} cache onto a {}×{} one", other.width, other.height, self.width, self.height)));
+        }
+        if self.n == 0 {
+            std::mem::swap(&mut self.data, &mut other.data);
+        } else {
+            self.data.append(&mut other.data);
+        }
+        self.n += other.n;
+        other.data = Vec::new();
+        other.n = 0;
+        Ok(())
+    }
+
     /// A copy of this cache with the frames whose `mask` entry is non-zero
     /// blurred (three box passes of `radius`); the others are copied as
     /// they are. A short or empty mask blurs every frame.
@@ -673,6 +693,8 @@ pub struct Detector {
     pending_capture: std::collections::VecDeque<bool>,
     /// RGBA conversion buffer of the CPU detector's YUV input
     yuv_scratch: Vec<u8>,
+    /// The resolve function of the promise `gpu_wait` handed out last.
+    waiter: Rc<RefCell<Option<js_sys::Function>>>,
 }
 
 #[wasm_bindgen]
@@ -683,7 +705,7 @@ impl Detector {
         let cfg = parse_cfg(config_json)?;
         let det = CoreDetector::for_source(cfg.clone(), src_width, src_height);
         let stage = CpuStage::new(&cfg, det.geometry().clone());
-        Ok(Detector { det, stage: Stage::Cpu(stage), records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default(), yuv_scratch: Vec::new() })
+        Ok(Detector { det, stage: Stage::Cpu(stage), records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default(), yuv_scratch: Vec::new(), waiter: Default::default() })
     }
 
     /// WebGPU detector; resolves to a `Detector` or rejects when there is no
@@ -697,8 +719,19 @@ impl Detector {
             let ctx = GpuContext::new().await.map_err(js_err)?;
             let det = CoreDetector::for_source(cfg.clone(), src_width, src_height);
             let batch = batch.map(|b| b.max(1) as usize).unwrap_or(unflash_gpu::DEFAULT_BATCH);
-            let stage = GpuStage::with_options(&ctx, &cfg, det.geometry().clone(), unflash_gpu::DEFAULT_SLOTS, batch).map_err(js_err)?;
-            let d = Detector { det, stage: Stage::Gpu(Box::new(stage)), records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default(), yuv_scratch: Vec::new() };
+            let mut stage = GpuStage::with_options(&ctx, &cfg, det.geometry().clone(), unflash_gpu::DEFAULT_SLOTS, batch).map_err(js_err)?;
+            let waiter: Rc<RefCell<Option<js_sys::Function>>> = Default::default();
+            // (in a browser; a native build of these bindings only runs tests)
+            #[cfg(target_arch = "wasm32")]
+            {
+                let w = waiter.clone();
+                stage.set_notify(Some(Rc::new(move || {
+                    if let Some(resolve) = w.borrow_mut().take() {
+                        let _ = resolve.call0(&JsValue::UNDEFINED);
+                    }
+                })));
+            }
+            let d = Detector { det, stage: Stage::Gpu(Box::new(stage)), records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default(), yuv_scratch: Vec::new(), waiter };
             Ok(JsValue::from(d))
         })
     }
@@ -744,6 +777,27 @@ impl Detector {
             Stage::Cpu(_) => true,
             Stage::Gpu(g) => g.can_submit(),
         }
+    }
+
+    /// A promise that settles once `poll` has results to collect (at once
+    /// when it already has, when nothing is in flight, or on the CPU
+    /// detector). Waiting on this instead of a timer keeps a scan going at
+    /// full speed in a hidden tab, where timers fire once a second at most.
+    pub fn gpu_wait(&self) -> js_sys::Promise {
+        let ready = match &self.stage {
+            Stage::Cpu(_) => true,
+            Stage::Gpu(g) => g.ready(),
+        };
+        if ready {
+            return js_sys::Promise::resolve(&JsValue::UNDEFINED);
+        }
+        let w = self.waiter.clone();
+        js_sys::Promise::new(&mut |resolve, _reject| {
+            // one waiter at a time: an earlier one is let go to look again
+            if let Some(old) = w.borrow_mut().replace(resolve) {
+                let _ = old.call0(&JsValue::UNDEFINED);
+            }
+        })
     }
     pub fn capacity(&self) -> u32 {
         match &self.stage {
@@ -793,6 +847,34 @@ impl Detector {
                 Ok(())
             }
         }
+    }
+
+    /// Feed a BGRX / BGRA picture (as some browsers' decoders give them) as
+    /// it came: the GPU swaps the channels while it reads them, the CPU
+    /// detector gets a swapped copy.
+    pub fn feed_bgra(&mut self, bgra: &[u8], width: u32, height: u32, t: f64, capture: bool) -> Result<(), JsValue> {
+        if bgra.len() < (width * height * 4) as usize {
+            return Err(js_err("frame data too short"));
+        }
+        if matches!(self.stage, Stage::Cpu(_)) {
+            let mut rgba = std::mem::take(&mut self.yuv_scratch);
+            rgba.clear();
+            rgba.extend_from_slice(&bgra[..(width * height * 4) as usize]);
+            for p in rgba.chunks_exact_mut(4) {
+                p.swap(0, 2);
+            }
+            let r = self.feed_rgba(&rgba, width, height, t, capture);
+            self.yuv_scratch = rgba;
+            return r;
+        }
+        let Stage::Gpu(stage) = &mut self.stage else { unreachable!() };
+        if !stage.can_submit() {
+            return Err(js_err("detector busy: poll() before submitting more frames"));
+        }
+        let params = self.det.begin_frame(t);
+        stage.submit(params, GpuSource::Bgra8 { data: bgra, width, height }, capture).map_err(js_err)?;
+        self.pending_capture.push_back(capture);
+        Ok(())
     }
 
     /// Feed 8-bit 4:2:0 planes (I420 or NV12) of any size, as WebCodecs'

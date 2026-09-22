@@ -119,6 +119,12 @@ aside#sections { width: 250px; border-right: 1px solid var(--line); background: 
 .rate { color: var(--fg2); font-size: 12px; }
 .menu { position: absolute; top: 100%; left: 0; z-index: 20; background: var(--bg2); border: 1px solid var(--line); border-radius: 6px; padding: 8px; min-width: 260px; box-shadow: 0 6px 20px rgba(0,0,0,.4); }
 .fps-row { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+.alerts-wrap { position: relative; display: inline-flex; }
+.alerts-menu { left: auto; right: 0; width: 300px; display: flex; flex-direction: column; gap: 6px; }
+.alerts-menu.hidden { display: none; }
+.alerts-menu label.toggle { display: flex; align-items: flex-start; }
+.alerts-menu input[type=number] { width: 80px; }
+.alerts-menu button { align-self: flex-start; }
 .fps-note { color: var(--fg2); font-size: 12px; margin: 6px 0 0; }
 .grid-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
 .grid-head h3 { font-size: 14px; margin: 0; }

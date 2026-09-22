@@ -463,3 +463,61 @@ fn batched_frames_match_single_frames() {
         assert_eq!(single.debug_state(), batched.debug_state(), "state after the run");
     }
 }
+
+/// A BGRX picture uploaded as it came (the channels swapped back by the
+/// ingest pass) must be analysed exactly like the same picture as RGBA, at
+/// analysis size and scaled down.
+#[test]
+fn bgra_sources_match_rgba_sources() {
+    let Some(ctx) = context() else { return };
+    let cfg = Profile::WcagExt.config();
+    for (w, h) in [(640u32, 480u32), (333, 250)] {
+        let (aw, ah) = cfg.analysis_dims(w, h);
+        let geom = GridGeometry::new(&cfg, aw, ah);
+        let mut a = GpuStage::with_options(&ctx, &cfg, geom.clone(), 2, 4).unwrap();
+        let mut b = GpuStage::with_options(&ctx, &cfg, geom.clone(), 2, 4).unwrap();
+        let tmpl = KernelParams::template(&cfg, &geom);
+        let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
+        for i in 0..24 {
+            let t = i as f64 / 30.0;
+            let mut p = tmpl;
+            p.now = secs_to_us(t);
+            p.mode = if i == 0 { MODE_FIRST } else { 0 };
+            // a source-size picture with colour in every channel (red flashes too)
+            let rgb = gen(i, t, w as usize, h as usize);
+            let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
+            let mut bgra = Vec::with_capacity(rgb.len() / 3 * 4);
+            for px in rgb.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                bgra.extend_from_slice(&[px[2], px[1], px[0], 255]);
+            }
+            for (stage, got, src) in [(&mut a, &mut got_a, FrameSource::Rgba8 { data: &rgba, width: w, height: h }), (&mut b, &mut got_b, FrameSource::Bgra8 { data: &bgra, width: w, height: h })] {
+                while !stage.can_submit() {
+                    stage.wait_idle();
+                    while let Some(r) = stage.poll() {
+                        got.push(r.unwrap());
+                    }
+                }
+                stage.submit(p, src, i % 5 == 2).unwrap();
+            }
+        }
+        for (stage, got) in [(&mut a, &mut got_a), (&mut b, &mut got_b)] {
+            stage.flush();
+            stage.wait_idle();
+            while let Some(r) = stage.poll() {
+                got.push(r.unwrap());
+            }
+        }
+        assert_eq!(got_a.len(), 24);
+        assert_eq!(got_b.len(), 24);
+        for (k, (x, y)) in got_a.iter().zip(&got_b).enumerate() {
+            assert_eq!(x.rgba, y.rgba, "{w}x{h} frame {k}: captured picture");
+            assert_eq!(x.stats.held_count, y.stats.held_count, "{w}x{h} frame {k}: moved pixels");
+            for (c, (p, q)) in x.stats.cells.iter().zip(&y.stats.cells).enumerate() {
+                assert_eq!(p.cnt, q.cnt, "{w}x{h} frame {k} cell {c}: counts");
+                assert_eq!(p.sum_l, q.sum_l, "{w}x{h} frame {k} cell {c}: sum_l");
+            }
+        }
+        assert_eq!(a.debug_state(), b.debug_state(), "{w}x{h}: state after the run");
+    }
+}
