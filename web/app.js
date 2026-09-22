@@ -410,6 +410,7 @@ async function openFile(file) {
     $('profileSel').value = project.profile;
     state.config = profileConfig(project.profile);
     await createFeeders(progress);
+    movie.decodeInWorkers = decodeWorkersSetting(state.env.feeder);
     loadPlayer(file, movie);
     $('videoInfo').textContent = `${file.name} · ${movie.width}×${movie.height} · ${movie.fps.toFixed(2)} fps · ${fmt(movie.duration)} · ${movie.video.codec}${movie.audio ? ' + ' + movie.audio.codec : ''}`;
     $('btnScan').disabled = !state.decode.supported;
@@ -510,6 +511,7 @@ function updateStatus() {
     const f = state.env.feeder;
     parts.push(`detector: <b>${f.backend === 'webgpu' ? 'WebGPU' : 'CPU (WASM)'}</b> at ${f.aw}×${f.ah} (window ${f.det.window_width()}×${f.det.window_height()}, area ≥ ${f.det.area_thresh()} px)`);
     if (state.decode.software) parts.push('decoder: <b>built-in H.264</b> (no WebCodecs decoder for this codec)');
+    else if (state.movie && state.movie.decodeInWorkers) parts.push('decoder: WebCodecs <b>in workers</b> (this WebGPU takes no decoded frame, so pictures are copied out of the decoder off the page)');
     if (state.lastScan) {
       const s = state.lastScan;
       const fps = (s.frames / (s.elapsedMs / 1000)).toFixed(0);
@@ -538,6 +540,21 @@ function scanSegments() {
   if (forced > 0) return forced;
   if (!state.env || state.env.feeder.backend !== 'webgpu' || state.decode.software) return 1;
   return Math.min(4, Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 2)));
+}
+
+/**
+ * Whether scans and prepares decode in workers: where WebGPU takes no
+ * VideoFrame (Firefox), every picture is copied out of the decoder before
+ * the GPU sees it, and that copy is better made off the page, several at
+ * once. `?decodeworkers=1` / `=0` forces it.
+ */
+function decodeWorkersSetting(feeder) {
+  const q = new URLSearchParams(location.search).get('decodeworkers');
+  if (q === '1' || q === 'on') return true;
+  if (q === '0' || q === 'off') return false;
+  // a forced picture route is one taken on the page
+  if (routeSetting()) return false;
+  return !feeder.takesFrames;
 }
 
 /** `?smartcut=0`: an export re-encodes the whole video instead of copying the GOPs no section touches. */
@@ -2259,6 +2276,7 @@ async function verifyBlob(blob) {
   const res = await runJob('Verifying the exported file', async (progress, cancelled) => {
     const m = await Movie.open(blob, wasm);
     const feeder = await makeFeeder(m.width, m.height);
+    m.decodeInWorkers = decodeWorkersSetting(feeder);
     try {
       return await scanMovie({ wasm, config: state.config, feeder }, m, {
         cancel: cancelled,
@@ -2269,6 +2287,7 @@ async function verifyBlob(blob) {
       });
     } finally {
       feeder.det.free();
+      m.close();
     }
   });
   if (!res) return null;

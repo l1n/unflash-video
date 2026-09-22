@@ -347,7 +347,14 @@ Pictures reach the GPU by the cheapest route the browser allows: the
 decoded frame itself where WebGPU takes one (Chrome), else its own YUV
 planes, else, for a decoder that hands out RGB (Firefox on a Mac gives
 BGRX), its pixels copied as they are, the GPU swapping the channels while
-it reads them.
+it reads them. Where WebGPU takes no frame (Firefox), that copy is most
+of what the page does per frame, so scans, prepares and verifications
+decode in **Web Workers** instead, one per segment or span: each worker
+decodes with WebCodecs, copies each picture out (its planes, or its RGB
+pixels) and transfers the bytes to the page, which uploads them and hands
+the buffer back to be filled again; a worker keeps at most four pictures
+waiting. The export and the players, which need real frames, decode on
+the page. `?decodeworkers=0` / `=1` overrides the choice.
 
 ### Spans re-encoded, the rest copied
 

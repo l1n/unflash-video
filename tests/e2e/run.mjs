@@ -622,15 +622,16 @@ try {
   // (yuv: what Firefox's WebGPU needs, and what the built-in decoder hands
   // over), WebCodecs' RGBA conversion (rgba), a canvas blit (canvas) or
   // canvas pixels (pixels). ?extsrc=none pretends WebGPU rejects the frame
-  // and the canvas, so the automatic choice must land on yuv. Each must find
-  // the same violations as the CPU scan, and the live monitor's <video>
-  // must work by its own routes.
+  // and the canvas, as Firefox's does, so the automatic choice must be to
+  // decode in workers, which copy each picture's planes off the page (raw).
+  // Each must find the same violations as the CPU scan, and the live
+  // monitor's <video> must work by its own routes.
   for (const [query, route, liveRoute] of [
     ['route=yuv', 'yuv', 'video'],
     ['route=rgba', 'rgba', 'video'],
     ['route=canvas', 'canvas', 'canvas'],
     ['route=pixels', 'pixels', 'pixels'],
-    ['extsrc=none', 'yuv', 'pixels'],
+    ['extsrc=none', 'raw', 'pixels'],
   ]) {
     // ?monitor=detect: the point here is the <video> routes, so the monitor must detect rather than read the scan
     await page.goto(`http://127.0.0.1:${port}/?${query}&auto=0&monitor=detect`);
@@ -643,8 +644,10 @@ try {
     scan = await scanCurrent();
     const violations = await page.evaluate(() => window.__unflash.lastScan.result.violations);
     const taken = await page.evaluate(() => window.__unflash.state.env.feeder.route);
-    console.log(`gpu scan, pictures via ${route}:`, scan.ms, 'ms |', scan.toast, '| route', taken, '|', JSON.stringify(violations));
+    const inWorkers = await page.evaluate(() => window.__unflash.state.movie.decodeInWorkers);
+    console.log(`gpu scan, pictures via ${route}:`, scan.ms, 'ms |', scan.toast, '| route', taken, inWorkers ? '(decoded in workers)' : '', '|', JSON.stringify(violations));
     assert(taken === route, `?${query} must feed pictures as ${route}, not ${taken}`);
+    assert(inWorkers === (route === 'raw'), `?${query}: decoding in workers only when WebGPU takes no frame and no route is forced`);
     assert(violations.length === results.cpuViolations.length, `the ${route} route must find the same violations as the CPU scan`);
     for (let i = 0; i < violations.length; i++) {
       const a = violations[i];

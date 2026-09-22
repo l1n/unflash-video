@@ -29,7 +29,25 @@ export async function createDetector(wasm, configJson, width, height, { preferGp
     note = 'This browser has no WebGPU; using the CPU detector';
   }
   if (!det) det = new wasm.Detector(configJson, width, height);
-  return new Feeder(wasm, det, backend, note, probe, route);
+  const feeder = new Feeder(wasm, det, backend, note, probe, route);
+  // can a decoded frame go to the GPU as it is? (a canvas-made frame asks
+  // WebGPU the same question as a decoder's)
+  feeder.takesFrames = false;
+  if (backend === 'webgpu' && probe && typeof VideoFrame !== 'undefined' && typeof OffscreenCanvas !== 'undefined' && (!route || route === 'videoframe')) {
+    try {
+      const c = new OffscreenCanvas(2, 2);
+      c.getContext('2d').fillRect(0, 0, 2, 2);
+      const f = new VideoFrame(c, { timestamp: 0 });
+      try {
+        feeder.takesFrames = probe.accepts('videoframe', f);
+      } finally {
+        f.close();
+      }
+    } catch (e) {
+      feeder.takesFrames = false;
+    }
+  }
+  return feeder;
 }
 
 /**
@@ -296,12 +314,17 @@ export class Feeder {
     return true;
   }
 
-  /** A picture from the built-in decoder: I420 planes already in memory. */
+  /**
+   * A picture already in memory: I420 planes from the built-in decoder, or
+   * what a decode worker copied (planes, or RGB pixels as they came).
+   */
   feedRaw(pic, t, capture) {
     const t0 = performance.now();
-    this.det.feed_yuv(pic.data, pic.codedWidth, pic.codedHeight, pic.layout, t, capture);
+    if (pic.kind === 'rgba') this.det.feed_rgba(pic.data, pic.codedWidth, pic.codedHeight, t, capture);
+    else if (pic.kind === 'bgra') this.det.feed_bgra(pic.data, pic.codedWidth, pic.codedHeight, t, capture);
+    else this.det.feed_yuv(pic.data, pic.codedWidth, pic.codedHeight, pic.layout, t, capture);
     profile.add('feed.upload', performance.now() - t0);
-    this.setRoute('raw', 'I420 from the built-in decoder');
+    this.setRoute('raw', pic.detail || 'I420 from the built-in decoder');
   }
 
   /** Feed a VideoFrame by the first route that works here. */

@@ -167,8 +167,23 @@ export class Movie {
       this.pool.close();
       this.pool = null;
     }
+    for (const w of this.decodeWorkers || []) w.worker.terminate();
+    this.decodeWorkers = [];
     this.poolPromise = null;
     if (this.reader) this.reader.release();
+  }
+
+  /** A WebCodecs decode worker for one pass: an idle one, or a new one (kept for the next pass). */
+  decodeWorker() {
+    this.decodeWorkers = this.decodeWorkers || [];
+    const idle = this.decodeWorkers.find((w) => !w.busy);
+    if (idle) {
+      idle.busy = true;
+      return idle;
+    }
+    const slot = { worker: new Worker(new URL('./decodeworker.js', import.meta.url), { type: 'module' }), busy: true };
+    this.decodeWorkers.push(slot);
+    return slot;
   }
 
   /**
@@ -248,6 +263,9 @@ export class Movie {
  */
 export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null } = {}) {
   if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, fromIndex, reader });
+  // pictures for the detector alone: decoded and copied in a worker where
+  // the detector would copy them on the page anyway
+  if (raw && movie.decodeInWorkers && typeof Worker !== 'undefined') return decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onProgress, fromIndex });
   const cfg = movie.decoderConfig();
   reader = reader || movie.reader || new ChunkReader(movie.file);
   const { pts, dts, offset, size, sync, dur } = movie.v;
@@ -351,6 +369,155 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
   }
   if (error) throw error instanceof Error ? error : new Error(String(error));
   return frames;
+}
+
+let workerJobs = 0;
+
+/**
+ * decodeRange through a decode worker (decodeworker.js): the worker
+ * decodes and copies, the page feeds the copies on and hands each buffer
+ * back. At most four pictures wait for the page at a time.
+ */
+async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onProgress, fromIndex = null } = {}) {
+  const { pts, dts, offset, size, sync, dur } = movie.v;
+  const n = pts.length;
+  const startIdx = fromIndex !== null ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
+  const endUs = endSec * 1e6;
+  let endIdx = startIdx;
+  while (endIdx < n && !(dts[endIdx] >= endUs && pts[endIdx] >= endUs)) endIdx++;
+  const slot = movie.decodeWorker();
+  const worker = slot.worker;
+  const id = ++workerJobs;
+  const inbox = [];
+  let done = false;
+  let failed = null;
+  let wake = null;
+  const kick = () => {
+    if (wake) {
+      const w = wake;
+      wake = null;
+      w();
+    }
+  };
+  const settle = () =>
+    new Promise((r) => {
+      wake = r;
+      setTimeout(kick, 250);
+    });
+  const onMessage = (e) => {
+    const m = e.data;
+    if (m.id !== id) return;
+    if (m.type === 'frame') inbox.push(m);
+    else if (m.type === 'done') done = true;
+    else if (m.type === 'error') failed = new Error(m.message);
+    kick();
+  };
+  const onError = (e) => {
+    failed = new Error(`the decode worker stopped: ${e.message || e}`);
+    kick();
+  };
+  worker.addEventListener('message', onMessage);
+  worker.addEventListener('error', onError);
+  worker.postMessage({
+    type: 'decode',
+    id,
+    file: movie.file,
+    config: movie.decoderConfig(),
+    offset: offset.slice(startIdx, endIdx),
+    size: size.slice(startIdx, endIdx),
+    pts: pts.slice(startIdx, endIdx),
+    dur: dur.slice(startIdx, endIdx),
+    sync: sync.slice(startIdx, endIdx),
+    startUs: startSec * 1e6,
+    endUs,
+    window: 4,
+  });
+  const credit = (buffer) => (buffer ? worker.postMessage({ type: 'credit', n: 1, buffer }, [buffer]) : worker.postMessage({ type: 'credit', n: 1 }));
+  let frames = 0;
+  let stopped = false;
+  let healthy = true;
+  const stop = () => {
+    if (!stopped) {
+      stopped = true;
+      worker.postMessage({ type: 'cancel' });
+    }
+  };
+  try {
+    for (;;) {
+      if (cancel && cancel()) stop();
+      if (inbox.length) {
+        const m = inbox.shift();
+        if (stopped) {
+          if (m.frame) m.frame.close();
+          credit(m.pic ? m.pic.data : null);
+          continue;
+        }
+        const t = (m.frame ? m.frame.timestamp : m.pic.timestamp) / 1e6;
+        if (m.frame) {
+          try {
+            await onFrame(m.frame, t);
+          } finally {
+            credit(null);
+          }
+        } else {
+          await onFrame(workerPicture(m.pic, credit), t);
+        }
+        frames++;
+        if (onProgress && frames % 30 === 0) onProgress(frames / Math.max(1, endIdx - startIdx));
+        continue;
+      }
+      if (failed) throw failed;
+      if (done) break;
+      await settle();
+    }
+  } catch (e) {
+    stop();
+    // the worker's job is waited out before it takes another
+    const until = performance.now() + 5000;
+    while (!done && !failed && performance.now() < until) {
+      while (inbox.length) {
+        const m = inbox.shift();
+        if (m.frame) m.frame.close();
+        credit(m.pic ? m.pic.data : null);
+      }
+      await settle();
+    }
+    healthy = done || !!failed;
+    throw e;
+  } finally {
+    worker.removeEventListener('message', onMessage);
+    worker.removeEventListener('error', onError);
+    if (healthy && !failed) slot.busy = false;
+    else {
+      worker.terminate();
+      movie.decodeWorkers = (movie.decodeWorkers || []).filter((w) => w !== slot);
+    }
+  }
+  return frames;
+}
+
+/** A picture a decode worker copied, shaped for Feeder.feedRaw; closing it hands the buffer back. */
+function workerPicture(p, credit) {
+  let returned = false;
+  return {
+    raw: true,
+    kind: p.kind,
+    format: p.format,
+    codedWidth: p.width,
+    codedHeight: p.height,
+    displayWidth: p.width,
+    displayHeight: p.height,
+    timestamp: p.timestamp,
+    colorSpace: p.colorSpace,
+    data: new Uint8Array(p.data, 0, p.bytes),
+    layout: p.layout,
+    detail: `${p.format}, copied in a decode worker`,
+    close() {
+      if (returned) return;
+      returned = true;
+      credit(p.data);
+    },
+  };
 }
 
 /**
