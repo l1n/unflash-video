@@ -114,8 +114,13 @@ async function runJob(name, fn) {
   $('jobMsg').textContent = '';
   $('jobbar').classList.remove('hidden');
   let shownPct = -1;
+  let shownAt = 0;
   const progress = (p, msg) => {
     const pct = Math.round(Math.min(1, Math.max(0, p)) * 100);
+    // a long scan reports thousands of times: the page shows ten a second
+    const now = performance.now();
+    if (pct === shownPct && now - shownAt < 100) return;
+    shownAt = now;
     $('jobBar').style.width = `${pct}%`;
     if (msg !== undefined) $('jobMsg').textContent = msg;
     // the tab's title too, to be seen from another tab
@@ -617,7 +622,12 @@ async function scan() {
       onProgress: (p, trace, count, ms) => {
         state.scanTrace = trace;
         progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`);
-        if (count % 300 === 0) drawTimeline();
+        // the timeline twice a second, not per so many frames
+        const now = performance.now();
+        if (!(now - (state.timelineDrawnAt || 0) < 500)) {
+          state.timelineDrawnAt = now;
+          drawTimeline();
+        }
       },
     });
     // a cancelled scan saw only part of the file: keep nothing of it
@@ -1233,26 +1243,31 @@ function drawTimeline(dragSpan = null) {
   const trace = state.live.on && !state.live.fromScan ? { t: state.live.t, h: state.live.hazard, r: state.live.hazardRed } : norm ? { t: norm.t, h: norm.h, r: norm.r } : null;
   if (trace && trace.t.length) {
     const base = H - 24;
-    g.strokeStyle = 'rgba(232,163,60,.9)';
-    g.beginPath();
+    // one bar per pixel column, the tallest there: an hour has a hundred
+    // thousand frames and the timeline a thousand pixels
+    const cols = Math.max(1, Math.ceil(W));
+    const hmax = new Float32Array(cols);
+    const rmax = new Float32Array(cols);
     for (let i = 0; i < trace.t.length; i++) {
-      const h = Math.min(1.5, trace.h[i]);
-      if (h <= 0) continue;
-      const px = x(trace.t[i]);
-      g.moveTo(px, base);
-      g.lineTo(px, base - h * 14);
+      const c = Math.floor(x(trace.t[i]));
+      if (c < 0 || c >= cols) continue;
+      if (trace.h[i] > hmax[c]) hmax[c] = trace.h[i];
+      if (trace.r[i] > rmax[c]) rmax[c] = trace.r[i];
     }
-    g.stroke();
-    g.strokeStyle = 'rgba(224,79,176,.9)';
-    g.beginPath();
-    for (let i = 0; i < trace.t.length; i++) {
-      const h = Math.min(1.5, trace.r[i]);
-      if (h <= 0) continue;
-      const px = x(trace.t[i]);
-      g.moveTo(px, base);
-      g.lineTo(px, base - h * 14);
+    for (const [col, vals] of [
+      ['rgba(232,163,60,.9)', hmax],
+      ['rgba(224,79,176,.9)', rmax],
+    ]) {
+      g.strokeStyle = col;
+      g.beginPath();
+      for (let c = 0; c < cols; c++) {
+        const h = Math.min(1.5, vals[c]);
+        if (h <= 0) continue;
+        g.moveTo(c + 0.5, base);
+        g.lineTo(c + 0.5, base - h * 14);
+      }
+      g.stroke();
     }
-    g.stroke();
   }
   // threshold line label
   g.fillStyle = '#5a6070';

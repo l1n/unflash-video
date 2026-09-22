@@ -38,15 +38,29 @@ export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, 
   const traces = bounds.map(() => ({ t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] }));
   const counts = bounds.map(() => 0);
   const total = Math.max(1, movie.frameCount);
-  // what the timeline can draw while the scan runs: the spans in order
+  // the spans' traces in order: the scan's own, made once at the end
   const merged = () => {
     const out = { t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] };
     for (const tr of traces) for (const key of Object.keys(out)) for (const v of tr[key]) out[key].push(v);
     return out;
   };
+  // what the timeline draws while the scan runs: one trace that grows by the
+  // points each span adds (in no particular order, which a drawing does not
+  // need). Merging every span afresh at each report cost time in proportion
+  // to the square of the video's length: half a minute of an hour's scan.
+  const live = { t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] };
+  const sent = bounds.map(() => 0);
+  const grown = () => {
+    for (let k = 0; k < traces.length; k++) {
+      const tr = traces[k];
+      for (const key of Object.keys(live)) for (let i = sent[k]; i < tr.t.length; i++) live[key].push(tr[key][i]);
+      sent[k] = tr.t.length;
+    }
+    return live;
+  };
   const report = () => {
     const count = counts.reduce((a, b) => a + b, 0);
-    if (onProgress) onProgress(count / total, merged(), count, performance.now() - started);
+    if (onProgress) onProgress(count / total, grown(), count, performance.now() - started);
     profile.reportEvery(5000, 'scan so far', count, performance.now() - started);
   };
   const runOne = async (k) => {
