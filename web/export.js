@@ -906,16 +906,26 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
     mx.add_sample(vt, dts, samples[i].pts, Math.max(1, dur), samples[i].sync, samples[i].size);
   }
 
-  // --- audio: stream copy ----------------------------------------------------
+  // --- audio: copied as it is when an MP4 can hold it, else re-encoded ------
   if (movie.audio && movie.a) {
-    const at = mx.add_copy_track('audio', movie.dx.track_sample_entry(movie.audio.index), movie.audio.timescale, 0, 0);
-    const a = movie.a;
-    for (let i = 0; i < a.offset.length; i++) {
-      const bytes = await reader.read(a.offset[i], a.size[i]);
-      await out.write(bytes.slice());
-      mx.add_sample(at, a.dtsTicks[i], a.ptsTicks[i], a.durTicks[i], true, a.size[i]);
+    if (movie.audio.copyable) {
+      const at = mx.add_copy_track('audio', movie.dx.track_sample_entry(movie.audio.index), movie.audio.timescale, 0, 0);
+      const a = movie.a;
+      // Matroska header stripping: the bytes every packet starts with go back in front
+      const prefix = movie.audio.prefix && movie.audio.prefix.length ? Uint8Array.from(movie.audio.prefix) : null;
+      for (let i = 0; i < a.offset.length; i++) {
+        const bytes = await reader.read(a.offset[i], a.size[i]);
+        if (prefix) await out.write(prefix);
+        await out.write(bytes.slice());
+        mx.add_sample(at, a.dtsTicks[i], a.ptsTicks[i], a.durTicks[i], true, a.size[i] + (prefix ? prefix.length : 0));
+      }
+    } else {
+      const res = await reencodeAudio(wasm, movie, reader, mx, out, { cancel: cancelled });
+      if (res.warning) warnings.push(res.warning);
     }
   }
+  if (movie.otherAudioTracks) warnings.push(`The source has ${movie.otherAudioTracks + 1} audio tracks; the export keeps the first (${movie.audio.language && movie.audio.language !== 'und' ? movie.audio.language : movie.audio.codec}).`);
+  if (movie.subtitleTracks) warnings.push(`The source's subtitle track${movie.subtitleTracks === 1 ? ' is' : 's are'} left out, as the original tool leaves them out: an MP4 export carries the picture and the sound.`);
 
   const moov = mx.finish();
   await out.patch(mx.patch_offset(), mx.patch_bytes());
@@ -927,6 +937,150 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
   const elapsedMs = performance.now() - started;
   profile.report(`export (${chosen.label}, ${plan.mode})`, encodedFrames, elapsedMs);
   return { blob, warnings, frames: encodedFrames, copied: copiedFrames, spans: encodePieces.length, mode: plan.mode, parallel: K, softened, elapsedMs, codec: codecString, encoderLabel: chosen.label };
+}
+
+/**
+ * Audio an MP4 can't hold as it is (Vorbis, PCM): decoded and encoded again
+ * with WebCodecs, AAC where this browser has an AAC encoder, else Opus, and
+ * written after the video as it comes out. Returns { warning } when the
+ * export goes without sound, or says what was done.
+ */
+async function reencodeAudio(wasm, movie, reader, mx, out, { cancel } = {}) {
+  const at = movie.audio;
+  const a = movie.a;
+  const name = at.codec;
+  if (typeof AudioDecoder === 'undefined' || typeof AudioEncoder === 'undefined') return { warning: `The audio (${name}) can't go into an MP4 as it is, and this browser can't re-encode audio, so the export has no sound.` };
+  const desc = movie.dx.track_description(at.index);
+  const dcfg = { codec: at.codec, sampleRate: at.sample_rate, numberOfChannels: at.channels };
+  if (desc.length) dcfg.description = desc;
+  let can = false;
+  try {
+    can = (await AudioDecoder.isConfigSupported(dcfg)).supported;
+  } catch (e) {
+    can = false;
+  }
+  if (!can) return { warning: `The audio (${name}) can't go into an MP4 as it is, and this browser can't decode it to re-encode it, so the export has no sound.` };
+  let ecfg = null;
+  for (const c of [
+    { codec: 'mp4a.40.2', sampleRate: at.sample_rate, numberOfChannels: at.channels, bitrate: 96000 * Math.min(2, at.channels) },
+    { codec: 'opus', sampleRate: at.sample_rate, numberOfChannels: at.channels, bitrate: 80000 * Math.min(2, at.channels) },
+  ]) {
+    try {
+      if ((await AudioEncoder.isConfigSupported(c)).supported) {
+        ecfg = c;
+        break;
+      }
+    } catch (e) {
+      /* try the next */
+    }
+  }
+  if (!ecfg) return { warning: `The audio (${name}, ${at.channels} channels) can't go into an MP4 as it is, and this browser has no encoder to re-encode it with, so the export has no sound.` };
+  let error = null;
+  let wake = null;
+  const kick = () => {
+    if (wake) {
+      const w = wake;
+      wake = null;
+      w();
+    }
+  };
+  const settle = () =>
+    orTimeout(
+      new Promise((r) => {
+        wake = r;
+      }),
+      50
+    );
+  const chunks = []; // encoded, waiting to be written
+  let outCfg = null;
+  const enc = new AudioEncoder({
+    output: (chunk, meta) => {
+      if (meta && meta.decoderConfig && !outCfg) outCfg = meta.decoderConfig;
+      const b = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(b);
+      chunks.push({ bytes: b, ts: chunk.timestamp, dur: chunk.duration || 0 });
+      kick();
+    },
+    error: (e) => {
+      error = error || e;
+      kick();
+    },
+  });
+  enc.configure(ecfg);
+  const dec = new AudioDecoder({
+    output: (data) => {
+      try {
+        enc.encode(data);
+      } catch (e) {
+        error = error || e;
+      }
+      data.close();
+      kick();
+    },
+    error: (e) => {
+      error = error || e;
+      kick();
+    },
+  });
+  dec.configure(dcfg);
+  const prefix = at.prefix && at.prefix.length ? Uint8Array.from(at.prefix) : null;
+  // the track is added once the encoder has said what it makes
+  let track = -1;
+  let rate = 0;
+  const written = [];
+  const flushOut = async (all) => {
+    // keep the last chunk back until the end: its duration comes from the next
+    while (chunks.length > (all ? 0 : 1)) {
+      if (track < 0) {
+        const cfg = outCfg || ecfg;
+        rate = (cfg && cfg.sampleRate) || (ecfg.codec === 'opus' ? 48000 : at.sample_rate);
+        const d = outCfg && outCfg.description ? new Uint8Array(outCfg.description.slice ? outCfg.description.slice(0) : outCfg.description) : new Uint8Array();
+        const entry = wasm.audio_sample_entry(ecfg.codec, d, rate, (cfg && cfg.numberOfChannels) || at.channels);
+        track = mx.add_copy_track('audio', entry, rate, 0, 0);
+      }
+      const c = chunks.shift();
+      const next = chunks[0];
+      const ticks = (us) => Math.round((us * rate) / 1e6);
+      const dur = next ? ticks(next.ts) - ticks(c.ts) : ticks(c.dur) || 1;
+      await out.write(c.bytes);
+      mx.add_sample(track, ticks(c.ts), ticks(c.ts), Math.max(1, dur), true, c.bytes.byteLength);
+      written.push(1);
+    }
+  };
+  try {
+    for (let i = 0; i < a.offset.length && !error; i++) {
+      if (cancel && cancel()) throw new Error('cancelled');
+      while ((dec.decodeQueueSize > 16 || enc.encodeQueueSize > 16) && !error) await settle();
+      let bytes = await reader.read(a.offset[i], a.size[i]);
+      if (prefix) {
+        const b = new Uint8Array(prefix.length + bytes.length);
+        b.set(prefix);
+        b.set(bytes, prefix.length);
+        bytes = b;
+      }
+      dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round((a.ptsTicks[i] * 1e6) / at.timescale), duration: Math.round((a.durTicks[i] * 1e6) / at.timescale), data: bytes.slice() }));
+      await flushOut(false);
+    }
+    if (!error) await dec.flush();
+    if (!error) await enc.flush();
+    if (error) throw error;
+    await flushOut(true);
+  } catch (e) {
+    if (String(e && e.message).includes('cancelled')) throw e;
+    return { warning: `The audio (${name}) could not be re-encoded (${e && e.message ? e.message : e})${written.length ? ', so part of it is missing' : ', so the export has no sound'}.` };
+  } finally {
+    try {
+      dec.close();
+    } catch (e) {
+      /* closed */
+    }
+    try {
+      enc.close();
+    } catch (e) {
+      /* closed */
+    }
+  }
+  return { warning: `The audio (${name}) can't go into an MP4 as it is, so it was re-encoded to ${ecfg.codec === 'opus' ? 'Opus' : 'AAC'}.` };
 }
 
 let blurCanvas = null;

@@ -387,8 +387,11 @@ async function openFile(file) {
   await stopAuto();
   if (sectionPlayer) await sectionPlayer.stop();
   const opened = await runJob('Opening video', async (progress) => {
-    progress(0.1, 'reading the index');
-    const movie = await Movie.open(file, wasm);
+    progress(0.05, 'reading the index');
+    const movie = await Movie.open(file, wasm, {
+      // a Matroska file keeps no index: it is read through once
+      onProgress: (p, container) => progress(0.05 + 0.3 * p, container === 'matroska' ? `reading through the file for its frames (MKV / WebM keep no index): ${Math.round(p * 100)}%` : 'reading the index'),
+    });
     // the last file, its unattended run and its export go only now that
     // the new one has opened
     if (state.movie) state.movie.close();
@@ -407,9 +410,7 @@ async function openFile(file) {
     $('profileSel').value = project.profile;
     state.config = profileConfig(project.profile);
     await createFeeders(progress);
-    const player = $('player');
-    if (player.src) URL.revokeObjectURL(player.src);
-    player.src = URL.createObjectURL(file);
+    loadPlayer(file, movie);
     $('videoInfo').textContent = `${file.name} · ${movie.width}×${movie.height} · ${movie.fps.toFixed(2)} fps · ${fmt(movie.duration)} · ${movie.video.codec}${movie.audio ? ' + ' + movie.audio.codec : ''}`;
     $('btnScan').disabled = !state.decode.supported;
     $('btnScan').title = state.decode.supported ? 'Decode every frame with WebCodecs and run the detector over it' : `Scanning needs WebCodecs: ${state.decode.reason}`;
@@ -562,7 +563,7 @@ function describePlan(plan, movie, softened) {
     const why = !smartCutSetting() ? 'smart cut is off' : plan.copyable ? 'the file does not start at a keyframe' : `${movie.video.codec.split('.')[0]} frames cannot be copied into a track of this encoder's codec`;
     text = `The whole video is decoded and re-encoded${plan.spans > 1 ? ` in ${plan.spans} pieces, ${Math.min(plan.parallel, plan.spans)} at a time` : ''} (${why})`;
   }
-  text += movie.audio ? '; audio is copied without re-encoding.' : '.';
+  text += !movie.audio ? '.' : movie.audio.copyable ? '; audio is copied without re-encoding.' : `; the audio (${movie.audio.codec}) can't go into an MP4 as it is, so it is re-encoded (AAC, or Opus) where this browser can.`;
   if (softened.length) text += ` Section${softened.length === 1 ? '' : 's'} ${softened.map((s) => '#' + s.id).join(', ')} ${softened.length === 1 ? 'is' : 'are'} softened (blurred) where stripes were found.`;
   return text;
 }
@@ -948,6 +949,41 @@ function setPlayerSource(mode) {
   renderPlayerWarning();
 }
 
+/**
+ * The file into the page's <video> (the whole-video player and the live
+ * monitor). A browser that turns down a Matroska file under its own type
+ * often plays it offered as WebM (the same format, narrowed); when neither
+ * works, the whole-video view says so, and the section player (which
+ * decodes with WebCodecs) still plays sections.
+ */
+function loadPlayer(file, movie) {
+  const player = $('player');
+  if (player.src) URL.revokeObjectURL(player.src);
+  const token = (state.player.loadToken = (state.player.loadToken || 0) + 1);
+  const types = movie.format === 'mp4' ? [null] : [null, 'video/webm'];
+  let k = 0;
+  state.player.playable = true;
+  const next = () => {
+    if (token !== state.player.loadToken) return;
+    if (k >= types.length) {
+      state.player.playable = false;
+      if (state.live.on && state.player.mode === 'video') setLive(false);
+      renderPlayerWarning();
+      return;
+    }
+    const t = types[k++];
+    if (player.src) URL.revokeObjectURL(player.src);
+    player.src = URL.createObjectURL(t ? new Blob([file], { type: t }) : file);
+  };
+  player.onerror = () => next();
+  player.onloadedmetadata = () => {
+    if (token !== state.player.loadToken) return;
+    state.player.playable = true;
+    renderPlayerWarning();
+  };
+  next();
+}
+
 /** The section's first picture in the section player, when nothing is playing. */
 function posterSection() {
   const sec = currentSection();
@@ -1055,6 +1091,7 @@ function renderPlayerWarning() {
   let text = '';
   let ok = false;
   if (!state.movie) text = '';
+  else if (mode === 'video' && state.player.playable === false) text = `This browser's video player can't play this ${state.movie.format === 'webm' ? 'WebM' : state.movie.format === 'matroska' ? 'MKV' : ''} file, so the whole video can't be shown here. Scanning, sections (their player shows them, marks and all) and the export work as usual.`;
   else if (mode === 'video') text = `⚠ The whole video as it is: it may flash.${dim}`;
   else if (!sec) text = '';
   else if (mode === 'original') text = `⚠ Section #${sec.id} as it is: it may flash.${dim}`;

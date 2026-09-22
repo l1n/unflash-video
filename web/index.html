@@ -11,7 +11,7 @@
 <header>
   <div class="brand" title="Unflash — WebGPU / WebAssembly">⚡̶ Unflash</div>
   <button id="btnHome" title="Show or hide the guide (it opens beside your work, and Esc closes it)">Guide</button>
-  <label class="filebtn primary"><input type="file" id="fileInput" accept="video/mp4,video/quicktime,.mp4,.m4v,.mov">Open video…</label>
+  <label class="filebtn primary"><input type="file" id="fileInput" accept="video/*,.mp4,.m4v,.mov,.mkv,.webm,.3gp">Open video…</label>
   <div id="videoInfo" class="video-info"></div>
   <div class="spacer"></div>
   <label class="profile-label">Profile
@@ -211,7 +211,7 @@
     <h1>Unflash</h1>
     <p>Find the flashing and the stripe patterns in a video that can trigger photosensitive seizures, and take them out without wrecking the footage. Everything runs in your browser, on your GPU; nothing is uploaded anywhere.</p>
     <ol>
-      <li><b>Open a video</b> (an MP4), or drop one anywhere on the page. It is scanned straight away: every frame is decoded and pushed through the detector as fast as your GPU allows, and Unflash puts a numbered <i>section</i> around every problem it finds.</li>
+      <li><b>Open a video</b> (MP4, MOV, MKV or WebM), or drop one anywhere on the page. It is scanned straight away: every frame is decoded and pushed through the detector as fast as your GPU allows, and Unflash puts a numbered <i>section</i> around every problem it finds.</li>
       <li><b>Open a section</b> (in the list on the left, or on the timeline). It prepares itself: its frames are decoded so every change can be checked the instant you make it. <b>Mark frames</b>: <b>R</b> removes a frame and shows the one before it in its place, <b>F</b> the one after, <b>E</b> holds a frame for a second. Press the same key again to take the mark off. <b>Ctrl+Z</b> undoes.</li>
       <li><b>Suggest</b> gives you a first pass to work from. <b>Keep dark</b> and <b>keep light</b> remove the frames that make the flashing; <b>reduce FPS</b> thins the section, starting at twice the rate that can never fail and stepping down until the check passes. They choose by brightness alone, so look at what they did: they can take out a line of subtitles or an image that matters. Mark such frames <b>K</b> (keep) first and the suggestions work around them.</li>
       <li><b>Watch it.</b> With a section open, the player plays that section with your marks applied, exactly as the export will render it; switch it to <i>original</i> to compare. It is small and dimmed to begin with (the size buttons and the dim switch are above it).</li>

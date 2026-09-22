@@ -1,14 +1,17 @@
-//! A small ISO base media file format (MP4) reader and writer, built for
-//! WebCodecs: the reader produces per-track codec strings, decoder
-//! descriptions and sample tables (offset, size, dts, pts, sync) from the
-//! `moov` box (and `moof` boxes of fragmented files), driven by byte ranges
-//! so a browser can serve them from a `Blob` without loading the file; the
-//! writer takes encoded chunks back and produces a playable file.
+//! Small container readers and an MP4 writer, built for WebCodecs. The
+//! readers (MP4 / QuickTime from the `moov` box and the `moof` boxes of
+//! fragmented files; Matroska / WebM from its clusters) produce per-track
+//! codec strings, decoder descriptions and sample tables (offset, size,
+//! dts, pts, sync), driven by byte ranges so a browser can serve them from
+//! a `Blob` without loading the file; the writer takes encoded chunks back
+//! and produces a playable file.
 //!
 //! Nothing here decodes media.
 
 pub mod codec;
 pub mod demux;
+pub mod entry;
+pub mod mkv;
 pub mod mux;
 mod reader;
 

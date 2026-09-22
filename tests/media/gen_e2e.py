@@ -19,6 +19,10 @@ redflash.mp4 the pan, then saturated red swapped for a grey of the same
              unsupported-codec path in a Chromium without H.264).
 flash_h264i.mp4  the flash clip as interlaced H.264 (MBAFF), for the
              built-in decoder's field / frame macroblock pairs.
+flash.mkv    flash_h264.mp4 remuxed into Matroska (H.264 + AAC, copied).
+flash.webm   flash.mp4 as WebM (VP9, the audio as Opus).
+flash_vorbis.webm  the same with Vorbis audio, which an MP4 cannot carry
+             (the export re-encodes it).
 """
 import os
 import subprocess
@@ -148,3 +152,8 @@ if __name__ == "__main__":
     encode("stripes_h264.mp4", stripes_frames(), "h264", 10)
     encode("redflash_h264.mp4", redflash_frames(), "h264", 8)
     encode("flash_h264i.mp4", flash_frames(), "h264i", 10)
+    # the same pictures in Matroska / WebM
+    for src, dst, audio in [("flash_h264.mp4", "flash.mkv", ["-c:a", "copy"]), ("flash.mp4", "flash.webm", ["-c:a", "libopus", "-b:a", "64k"]), ("flash.mp4", "flash_vorbis.webm", ["-c:a", "libvorbis", "-q:a", "3"])]:
+        path = os.path.join(OUT, dst)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", os.path.join(OUT, src), "-c:v", "copy", *audio, path], check=True)
+        print("wrote", path, os.path.getsize(path), "bytes")

@@ -373,7 +373,7 @@ fn run_length(vals: impl Iterator<Item = i64>) -> Vec<(u32, i64)> {
     out
 }
 
-fn write_video_entry(w: &mut Writer, codec: &str, width: u32, height: u32, description: &[u8]) -> Result<(), Error> {
+pub(crate) fn write_video_entry(w: &mut Writer, codec: &str, width: u32, height: u32, description: &[u8]) -> Result<(), Error> {
     let fourcc: &[u8; 4] = if codec.starts_with("avc1") || codec.starts_with("avc3") {
         b"avc1"
     } else if codec.starts_with("hvc1") || codec.starts_with("hev1") {

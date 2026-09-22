@@ -82,22 +82,40 @@ function median(arr) {
   return n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
 }
 
-/** An opened MP4: track info and sample tables. */
+/**
+ * An opened video file (MP4 / MOV / M4V, MKV / WebM): track info and sample
+ * tables. An MP4's index is read on its own; a Matroska file keeps none, so
+ * it is read through once (`onProgress(fraction)` follows that).
+ */
 export class Movie {
-  static async open(file, wasm) {
+  static async open(file, wasm, { onProgress = null } = {}) {
     const dx = new wasm.Demuxer(file.size);
     while (!dx.is_done()) {
       const need = dx.need();
       if (!need.length) break;
       const [off, len] = need;
       const buf = new Uint8Array(await file.slice(off, off + len).arrayBuffer());
-      dx.feed(off, buf);
+      try {
+        dx.feed(off, buf);
+      } catch (e) {
+        dx.free();
+        throw e instanceof Error ? e : new Error(String(e));
+      }
+      if (onProgress) onProgress(dx.progress(), dx.container());
     }
+    if (!dx.is_done()) throw new Error('The file ended before its index could be read');
     const info = JSON.parse(dx.movie_json());
     const vt = info.tracks.find((t) => t.kind === 'video' && t.samples > 0);
-    if (!vt) throw new Error('No video track found in this file');
+    if (!vt) {
+      const unusable = info.tracks.find((t) => t.kind === 'video' && t.note);
+      throw new Error(unusable ? `This file's video can't be read: ${unusable.note}` : 'No video track found in this file');
+    }
     const at = info.tracks.find((t) => t.kind === 'audio' && t.samples > 0) || null;
     const m = new Movie();
+    m.format = info.format || 'mp4';
+    // tracks an MP4 export leaves out: subtitles, other audio tracks
+    m.subtitleTracks = info.tracks.filter((t) => t.kind === 'other' && /^S_/.test(t.codec)).length;
+    m.otherAudioTracks = info.tracks.filter((t) => t.kind === 'audio' && t.samples > 0).length - (at ? 1 : 0);
     m.file = file;
     m.reader = new ChunkReader(file);
     m.name = file.name;
@@ -125,7 +143,12 @@ export class Movie {
     const pts = Array.from(m.v.pts).sort((a, b) => a - b);
     const deltas = [];
     for (let i = 1; i < pts.length; i++) deltas.push(pts[i] - pts[i - 1]);
-    const med = median(deltas.filter((d) => d > 0)) || 1e6 / 30;
+    let med = median(deltas.filter((d) => d > 0)) || 1e6 / 30;
+    // Matroska rounds times to its tick (a millisecond, usually): 29.97 fps
+    // shows as gaps of 33 and 34 ms, so the file's own frame duration, when
+    // it gives one close to the median, is the better figure
+    const nominal = vt.frame_duration > 0 ? (vt.frame_duration / vt.timescale) * 1e6 : 0;
+    if (nominal > 0 && Math.abs(nominal - med) <= 0.15 * med) med = nominal;
     m.medianDelta = med / 1e6;
     m.fps = 1e6 / med;
     m.tsMin = pts.length ? pts[0] / 1e6 : 0;

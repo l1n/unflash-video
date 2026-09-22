@@ -51,6 +51,21 @@ pub struct Track {
     /// media_time) or added (leading empty edit).
     pub edit_shift: i64,
     pub samples: Vec<Sample>,
+    /// Nominal ticks per sample (a video frame, an audio packet), 0 when
+    /// the file does not say.
+    #[serde(default)]
+    pub frame_duration: u32,
+    /// Bytes every sample starts with that the file leaves out (Matroska
+    /// header stripping): put them back in front of each sample read.
+    #[serde(default)]
+    pub prefix: Vec<u8>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub language: String,
+    /// Why the track cannot be used, when it cannot.
+    #[serde(default)]
+    pub note: String,
 }
 
 impl Track {
@@ -106,6 +121,9 @@ pub struct Movie {
     pub duration_secs: f64,
     pub fragmented: bool,
     pub brands: Vec<String>,
+    /// The container: `mp4`, `matroska` or `webm`.
+    #[serde(default)]
+    pub format: String,
     pub tracks: Vec<Track>,
 }
 
@@ -125,10 +143,154 @@ enum Stage {
     Done,
 }
 
-/// Byte-range driven parser. Loop: `need()` -> read that range -> `feed()`
-/// until `movie()` is `Some`.
-#[derive(Clone, Debug)]
+/// Byte-range driven parser for any container Unflash reads (MP4 and
+/// QuickTime, Matroska and WebM), told apart by their first bytes. Loop:
+/// `need()` -> read that range -> `feed()` until `movie()` is `Some`.
 pub struct Demuxer {
+    file_size: u64,
+    inner: Inner,
+    sniffed: u64,
+}
+
+enum Inner {
+    /// Waiting for the first bytes.
+    Sniff,
+    Mp4(Mp4Demuxer),
+    Mkv(crate::mkv::MkvDemuxer),
+}
+
+const SNIFF_LEN: u64 = 1024;
+
+/// What a file's first bytes say it is, when it is not something Unflash
+/// reads: a name for it and what to do about it.
+fn foreign(b: &[u8]) -> Option<(&'static str, &'static str)> {
+    let at = |o: usize, sig: &[u8]| b.len() >= o + sig.len() && &b[o..o + sig.len()] == sig;
+    const REMUX: &str = "If its video is H.264 (most are), remux it without re-encoding, for example with `ffmpeg -i input -c copy output.mkv`, and open that.";
+    const CONVERT: &str = "Convert it first, for example with HandBrake or `ffmpeg -i input -c:v libx264 -c:a aac output.mp4`.";
+    if at(0, b"RIFF") && at(8, b"AVI ") {
+        return Some(("an AVI file", CONVERT));
+    }
+    if at(0, b"RIFF") && at(8, b"WAVE") {
+        return Some(("a WAV audio file", "It has no video to check."));
+    }
+    if at(0, b"FLV") {
+        return Some(("a Flash video (FLV) file", REMUX));
+    }
+    if at(0, b"OggS") {
+        return Some(("an Ogg file", CONVERT));
+    }
+    if at(0, &[0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11]) {
+        return Some(("a Windows Media (WMV/ASF) file", CONVERT));
+    }
+    if at(0, &[0x00, 0x00, 0x01, 0xBA]) {
+        return Some(("an MPEG program stream (.mpg / .vob)", CONVERT));
+    }
+    // transport streams: a sync byte every 188 bytes (every 192 with a timecode)
+    for (start, step) in [(0usize, 188usize), (4, 192)] {
+        if b.len() > start + 3 * step && (0..4).all(|k| b[start + k * step] == 0x47) {
+            return Some(("an MPEG transport stream (.ts / .m2ts)", REMUX));
+        }
+    }
+    None
+}
+
+impl Demuxer {
+    pub fn new(file_size: u64) -> Self {
+        Demuxer { file_size, inner: Inner::Sniff, sniffed: 0 }
+    }
+
+    /// The (offset, length) the parser needs next, or `None` when done.
+    pub fn need(&self) -> Option<(u64, u64)> {
+        match &self.inner {
+            Inner::Sniff => (self.file_size > 0).then(|| (0, SNIFF_LEN.min(self.file_size))),
+            Inner::Mp4(d) => d.need(),
+            Inner::Mkv(d) => d.need(),
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        match &self.inner {
+            Inner::Sniff => self.file_size == 0,
+            Inner::Mp4(d) => d.is_done(),
+            Inner::Mkv(d) => d.is_done(),
+        }
+    }
+
+    /// Bytes requested so far.
+    pub fn bytes_read(&self) -> u64 {
+        self.sniffed
+            + match &self.inner {
+                Inner::Sniff => 0,
+                Inner::Mp4(d) => d.bytes_read(),
+                Inner::Mkv(d) => d.bytes_read(),
+            }
+    }
+
+    /// How far through the work of reading the index the parser is, 0 to
+    /// 1 (a Matroska file has to be read through; an MP4's index is one
+    /// box or a few).
+    pub fn progress(&self) -> f64 {
+        match &self.inner {
+            Inner::Sniff => 0.0,
+            Inner::Mp4(d) => {
+                if d.is_done() {
+                    1.0
+                } else {
+                    0.5
+                }
+            }
+            Inner::Mkv(d) => d.progress(),
+        }
+    }
+
+    /// `mp4`, `matroska`, or `` before the first bytes are seen.
+    pub fn container(&self) -> &'static str {
+        match &self.inner {
+            Inner::Sniff => "",
+            Inner::Mp4(_) => "mp4",
+            Inner::Mkv(_) => "matroska",
+        }
+    }
+
+    pub fn feed(&mut self, offset: u64, data: &[u8]) -> Result<(), Error> {
+        match &mut self.inner {
+            Inner::Sniff => {
+                self.sniffed += data.len() as u64;
+                if data.len() >= 4 && data[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+                    self.inner = Inner::Mkv(crate::mkv::MkvDemuxer::new(self.file_size));
+                } else if let Some((what, advice)) = foreign(data) {
+                    return Err(format!("This is {what}. Unflash reads MP4, MOV, M4V, MKV and WebM files. {advice}"));
+                } else {
+                    self.inner = Inner::Mp4(Mp4Demuxer::new(self.file_size));
+                }
+                let _ = offset;
+                Ok(())
+            }
+            Inner::Mp4(d) => d.feed(offset, data),
+            Inner::Mkv(d) => d.feed(offset, data),
+        }
+    }
+
+    pub fn movie(&self) -> Option<&Movie> {
+        match &self.inner {
+            Inner::Sniff => None,
+            Inner::Mp4(d) => d.movie(),
+            Inner::Mkv(d) => d.movie(),
+        }
+    }
+
+    pub fn into_movie(self) -> Option<Movie> {
+        match self.inner {
+            Inner::Sniff => None,
+            Inner::Mp4(d) => d.into_movie(),
+            Inner::Mkv(d) => d.into_movie(),
+        }
+    }
+}
+
+/// The MP4 / QuickTime parser behind [`Demuxer`].
+#[derive(Clone, Debug)]
+pub struct Mp4Demuxer {
     file_size: u64,
     at: u64,
     stage: Stage,
@@ -142,9 +304,9 @@ pub struct Demuxer {
 
 const HEADER_PEEK: u64 = 32;
 
-impl Demuxer {
+impl Mp4Demuxer {
     pub fn new(file_size: u64) -> Self {
-        let mut d = Demuxer {
+        let mut d = Mp4Demuxer {
             file_size,
             at: 0,
             stage: Stage::Header,
@@ -324,7 +486,7 @@ struct TrakParts {
 
 fn parse_moov(moov: &[u8]) -> Result<Movie, Error> {
     let body = &moov[box_header(moov)?.header_len as usize..];
-    let mut movie = Movie { timescale: 1000, duration_secs: 0.0, fragmented: false, brands: vec![], tracks: vec![] };
+    let mut movie = Movie { timescale: 1000, duration_secs: 0.0, fragmented: false, brands: vec![], format: "mp4".into(), tracks: vec![] };
     let mut traks: Vec<TrakParts> = Vec::new();
     let mut trex: Vec<(u32, Trex)> = Vec::new();
     for_each_box(body, |kind, b, _| {
@@ -380,6 +542,11 @@ fn parse_moov(moov: &[u8]) -> Result<Movie, Error> {
             sample_entry: tp.entry,
             edit_shift: 0,
             samples: Vec::new(),
+            frame_duration: 0,
+            prefix: Vec::new(),
+            name: String::new(),
+            language: String::new(),
+            note: String::new(),
         };
         track.edit_shift = edit_shift(&tp.elst, movie.timescale, track.timescale);
         track.samples = expand_samples(&tp.stbl)?;

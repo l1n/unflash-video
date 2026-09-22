@@ -51,15 +51,36 @@ Browser support:
 | Firefox 141+ (Windows), 142+ (macOS), other Firefox | WebCodecs where available | yes | WebGPU where enabled (its WebGPU takes no `VideoFrame` or `<video>` as a copy source, so pictures reach it through a canvas), otherwise the SIMD CPU kernel |
 | any of these without an H.264 decoder (Chromium builds without proprietary codecs, some Linux browsers) | the **built-in H.264 decoder** (Constrained Baseline, Main and High, progressive or interlaced) | no: the player cannot play the file | as above |
 
-\* platform dependent. Files are MP4/MOV (ISO base media); the demuxer
-handles fragmented files and edit lists. A file whose codec the browser
-cannot decode can still be watched with the live monitor; an H.264 file
-is decoded by Unflash itself when the browser cannot.
+\* platform dependent. A file whose codec the browser cannot decode can
+still be watched with the live monitor; an H.264 file is decoded by
+Unflash itself when the browser cannot.
+
+Files it reads:
+
+- **MP4, MOV, M4V, 3GP** (ISO base media), fragmented files and edit lists
+  included. Only the index is read when the file opens.
+- **MKV and WebM** (Matroska). Matroska keeps no index of its frames, so
+  opening one reads through the whole file once (the job bar shows how far;
+  the frames' contents are skipped over, not decoded). Video: H.264, HEVC,
+  VP9, AV1 and VP8, as the browser decodes them. Audio goes into the MP4
+  export as it is when an MP4 can carry it (AAC, MP3, Opus, FLAC, AC-3,
+  E-AC-3) and is re-encoded with the browser's own encoder (AAC, else
+  Opus) when it can't (Vorbis, PCM). Subtitle tracks are left out of the
+  export, as the original tool leaves them out, and of several audio tracks
+  the first (the file's default) is kept; the export says so. Live
+  recordings (clusters of unknown size), laced audio and header stripping
+  are handled, and a damaged stretch is skipped to the next cluster. A
+  browser whose `<video>` won't play the MKV (Chrome and Firefox play WebM,
+  and often MKV offered as WebM, which Unflash tries) still scans, edits,
+  plays sections and exports; only the whole-video view says it can't.
+- Anything else (AVI, MPEG-TS, FLV, WMV, MPEG program streams, Ogg) is
+  named when it is opened, with how to convert or remux it.
 
 ### The short version
 
-1. **Open video**, or drop one anywhere on the page. The file's index is
-   read (only its headers; nothing is uploaded), the detector starts on
+1. **Open video** (MP4, MOV, MKV or WebM), or drop one anywhere on the
+   page. The file's index is read (an MP4's headers only; an MKV is read
+   through once, as it keeps no index; nothing is uploaded), the detector starts on
    WebGPU or, failing that, on the CPU, the project is restored from the
    browser's storage if you have opened this file before, and the scan
    starts: every frame is decoded and pushed through the detector, and a
@@ -410,7 +431,7 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 |---|---|
 | `crates/unflash-core` | the detector: config and profiles, the per-pixel kernel (scalar and SIMD), grid reduction, temporal stage, violations, sections, editing helpers. No I/O. |
 | `crates/unflash-gpu` | the WGSL pipeline on `wgpu` (native backends and the browser's WebGPU) |
-| `crates/unflash-mp4` | a byte-range MP4 demuxer for WebCodecs (codec strings, decoder descriptions, sample tables, fragmented files, edit lists) and a muxer for the export |
+| `crates/unflash-mp4` | byte-range demuxers for WebCodecs, MP4 (fragmented files, edit lists) and Matroska / WebM (lacing, unknown sizes, header stripping), giving codec strings, decoder descriptions and sample tables; MP4 sample entries for Matroska audio; a muxer for the export |
 | `crates/unflash-h264` | the built-in H.264 decoder, for browsers whose WebCodecs has none |
 | `crates/unflash-wasm` | the `wasm-bindgen` API |
 | `web/` | the app (plain ES modules, no build step beyond the WASM) |
@@ -508,9 +529,13 @@ player's position rather than detecting again, so it never misses a frame.
 - The built-in H.264 decoder does not do 4:2:2/4:4:4, 10-bit, slice groups
   or SP/SI slices; such files need a browser with its own H.264 decoder.
   HEVC has no built-in decoder at all.
-- The export copies the audio; after an **E** hold the audio runs ahead of
-  the picture by the length of the hold. Removals (R/F) do not change
-  timing and need no audio work.
+- The export copies the audio (or re-encodes it, from an MKV whose audio an
+  MP4 can't carry); after an **E** hold the audio runs ahead of the picture
+  by the length of the hold. Removals (R/F) do not change timing and need
+  no audio work. Subtitle tracks and all but the first audio track of an
+  MKV are left out.
+- MPEG transport streams (.ts, .m2ts), AVI and the other containers above
+  are not read; remux or convert them first.
 - The export copies the untouched GOPs only when the encoder's codec is the
   source's (H.264 into H.264, VP9 into VP9); an HEVC or AV1 source, or a
   browser without an H.264 encoder, gets a full re-encode.

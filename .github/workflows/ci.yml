@@ -69,6 +69,8 @@ jobs:
         run: node tests/e2e/run.mjs
       - name: Smart-cut export with a stand-in H.264 encoder (headless Chromium)
         run: node tests/e2e/splice.mjs
+      - name: Browser tests (MKV / WebM)
+        run: node tests/e2e/mkv.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

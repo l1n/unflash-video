@@ -486,6 +486,16 @@ struct TrackSummary {
     /// applied, so a sample's composition time in the file is pts -
     /// edit_shift.
     edit_shift: i64,
+    /// Nominal ticks per sample (0: not stated).
+    frame_duration: u32,
+    /// Bytes to put in front of every sample read (Matroska header stripping).
+    prefix: Vec<u8>,
+    /// Whether an MP4 can carry the track as it is (its sample entry).
+    copyable: bool,
+    name: String,
+    language: String,
+    /// Why the track cannot be used, when it cannot.
+    note: String,
 }
 
 #[wasm_bindgen]
@@ -516,6 +526,17 @@ impl Demuxer {
         self.inner.bytes_read() as f64
     }
 
+    /// How far through reading the index, 0 to 1 (a Matroska file is read
+    /// through, an MP4 only at its index).
+    pub fn progress(&self) -> f64 {
+        self.inner.progress()
+    }
+
+    /// `mp4` or `matroska` once the first bytes are in.
+    pub fn container(&self) -> String {
+        self.inner.container().into()
+    }
+
     /// Movie summary as JSON (tracks without their sample tables).
     pub fn movie_json(&self) -> Result<String, JsValue> {
         let m = self.inner.movie().ok_or_else(|| js_err("not parsed yet"))?;
@@ -541,6 +562,12 @@ impl Demuxer {
                 first_pts_secs: t.samples.iter().map(|s| s.pts).min().map(|p| t.to_secs(p)).unwrap_or(0.0),
                 last_pts_secs: t.samples.iter().map(|s| s.pts).max().map(|p| t.to_secs(p)).unwrap_or(0.0),
                 edit_shift: t.edit_shift,
+                frame_duration: t.frame_duration,
+                prefix: t.prefix.clone(),
+                copyable: !t.sample_entry.is_empty(),
+                name: t.name.clone(),
+                language: t.language.clone(),
+                note: t.note.clone(),
             })
             .collect();
         Ok(serde_json::json!({
@@ -548,6 +575,7 @@ impl Demuxer {
             "duration_secs": m.duration_secs,
             "fragmented": m.fragmented,
             "brands": m.brands,
+            "format": m.format,
             "tracks": tracks,
         })
         .to_string())
@@ -667,6 +695,13 @@ impl Default for Muxer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// An MP4 sample entry for audio an encoder made: `codec` and
+/// `description` as WebCodecs' decoderConfig gives them (AAC, Opus, FLAC).
+#[wasm_bindgen]
+pub fn audio_sample_entry(codec: &str, description: &[u8], sample_rate: u32, channels: u32) -> Result<Vec<u8>, JsValue> {
+    unflash_mp4::entry::encoded_audio_entry(codec, description, sample_rate, channels).map_err(js_err)
 }
 
 #[wasm_bindgen]
