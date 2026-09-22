@@ -97,7 +97,10 @@ impl<'a> BitReader<'a> {
         loop {
             let chunk = self.peek(16);
             if chunk != 0 {
-                zeros += chunk.leading_zeros() - 16;
+                // the zeros of this chunk and the 1 that ends them
+                let z = chunk.leading_zeros() - 16;
+                zeros += z;
+                self.pos += z as usize + 1;
                 break;
             }
             zeros += 16;
@@ -106,7 +109,6 @@ impl<'a> BitReader<'a> {
                 return Err(Error::Bitstream("bad Exp-Golomb code"));
             }
         }
-        self.pos += zeros as usize + 1;
         if zeros == 0 {
             return Ok(0);
         }
@@ -196,6 +198,13 @@ mod tests {
         assert_eq!(r.se().unwrap(), 1); // ue 1
         assert_eq!(r.se().unwrap(), -1); // ue 2
         assert_eq!(r.se().unwrap(), 2); // ue 3
+        // codes of 16 leading zeros and more: 65535 = 16 zeros, then 1 0000000000000000; 65536 next
+        let bits = [0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x40, 0x00, 0x40];
+        let mut r = BitReader::new(&bits);
+        assert_eq!(r.ue().unwrap(), 65535);
+        assert_eq!(r.bit_pos(), 33);
+        assert_eq!(r.ue().unwrap(), 65536);
+        assert_eq!(r.bit_pos(), 66);
     }
 
     #[test]

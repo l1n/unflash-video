@@ -67,6 +67,8 @@ jobs:
         run: python3 tests/media/gen_e2e.py
       - name: End-to-end (headless Chromium, WebGPU on SwiftShader)
         run: node tests/e2e/run.mjs
+      - name: Smart-cut export with a stand-in H.264 encoder (headless Chromium)
+        run: node tests/e2e/splice.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

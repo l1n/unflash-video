@@ -37,4 +37,10 @@ gen pcm_cabac         "$NOISE" 96x64 12 -profile:v high -x264-params "qp=1"
 gen pcm_cavlc         "$NOISE" 96x64 12 -profile:v high -x264-params "qp=1:cabac=0"
 # interlaced (x264 codes MBAFF frames): decoded like the rest
 gen high_interlaced   "$T2" 96x64 20 -profile:v high -x264-params "interlaced=1"
+# the same pictures three ways with an IDR every 10 frames, for splicing GOPs of
+# one into another (the smart-cut export): High CABAC with B-frames, Main CAVLC
+# without, Main CABAC with B-frames
+gen splice_a          "$T2" 96x64 40 -profile:v high -bf 2 -x264-params "keyint=10:min-keyint=10:scenecut=0:8x8dct=1:partitions=all"
+gen splice_b          "$T2" 96x64 40 -profile:v main -bf 0 -x264-params "keyint=10:min-keyint=10:scenecut=0:cabac=0"
+gen splice_c          "$T2" 96x64 40 -profile:v main -bf 2 -x264-params "keyint=10:min-keyint=10:scenecut=0:b-pyramid=none"
 ls -la *.mp4 *.framemd5 | awk '{print $5, $9}'

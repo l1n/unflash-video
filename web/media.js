@@ -184,15 +184,17 @@ export class Movie {
  * each VideoFrame to `onFrame(frame, tSec)` (which must close it). Frames
  * arrive in presentation order. With `raw`, the built-in decoder's pictures
  * come as plain I420 buffers (see rawPicture) instead of VideoFrames; with
- * `fast` it skips the deblocking filter (statistics only).
+ * `fast` it skips the deblocking filter (statistics only). Decoding starts
+ * at the last keyframe at or before `startSec`, or at sample `fromIndex`
+ * (decode order) when given.
  */
-export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false } = {}) {
-  if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast });
+export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null } = {}) {
+  if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, fromIndex });
   const cfg = movie.decoderConfig();
   const reader = movie.reader || new ChunkReader(movie.file);
   const { pts, dts, offset, size, sync, dur } = movie.v;
   const n = pts.length;
-  const startIdx = movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
+  const startIdx = fromIndex !== null ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
   const endUs = endSec * 1e6;
   let error = null;
   const queue = [];
@@ -325,11 +327,11 @@ export function softwarePicture(wasm, dec, timestampUs) {
  * Samples are decoded in file (decode) order and the pictures handed out in
  * presentation order once every earlier picture has been decoded.
  */
-async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false } = {}) {
+async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null } = {}) {
   const reader = movie.reader || new ChunkReader(movie.file);
   const { pts, dts, offset, size } = movie.v;
   const n = pts.length;
-  const startIdx = movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
+  const startIdx = fromIndex !== null ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
   const endUs = endSec * 1e6;
   const pool = await movie.softwarePool();
   if (pool && !pool.busy) {

@@ -203,13 +203,17 @@ fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32, movie_ts: u32) -> Result<()
     w.u32(width << 16);
     w.u32(height << 16);
     w.end_box(at);
-    // edts: presentation starts at the earliest pts
-    if first_pts > first_dts || first_pts > 0 {
+    // edts: the file's decode times start at 0 (stts holds durations only),
+    // so its composition times are the caller's less the first decode time;
+    // the presentation starts at the earliest of them, skipping the
+    // reordering delay
+    let media_start = first_pts - first_dts;
+    if media_start > 0 {
         let edts = w.begin_box(b"edts");
         let at = w.begin_full_box(b"elst", 1, 0);
         w.u32(1);
         w.u64(dur_ms * movie_ts as u64 / 1000);
-        w.u64(first_pts.max(0) as u64);
+        w.u64(media_start as u64);
         w.i16(1);
         w.i16(0);
         w.end_box(at);
@@ -339,6 +343,25 @@ fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32, movie_ts: u32) -> Result<()
     Ok(())
 }
 
+/// Decode times for samples in decode order, from their composition times:
+/// the k-th decode time is the k-th smallest composition time, all moved
+/// earlier by the largest reordering delay, so no sample decodes after it
+/// is shown and the decode times rise by the presentation intervals.
+/// Returns (dts, duration) per sample; the last sample gets `last_duration`.
+/// Works for any splice of streams whose pictures are all shown, whatever
+/// each stream's own reordering.
+pub fn dts_from_cts(cts: &[i64], last_duration: u32) -> Vec<(i64, u32)> {
+    let mut sorted = cts.to_vec();
+    sorted.sort_unstable();
+    let shift = cts.iter().enumerate().map(|(i, &c)| sorted[i] - c).max().unwrap_or(0).max(0);
+    (0..cts.len())
+        .map(|i| {
+            let dur = if i + 1 < cts.len() { (sorted[i + 1] - sorted[i]).max(1) as u32 } else { last_duration };
+            (sorted[i] - shift, dur)
+        })
+        .collect()
+}
+
 fn run_length(vals: impl Iterator<Item = i64>) -> Vec<(u32, i64)> {
     let mut out: Vec<(u32, i64)> = Vec::new();
     for v in vals {
@@ -466,4 +489,25 @@ pub fn codec_of_entry(entry: &[u8]) -> Result<CodecInfo, Error> {
         _ => &body[78.min(body.len())..],
     };
     crate::codec::from_sample_entry(&h.kind, children)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_times_from_composition_times() {
+        // I0 P3 B1 B2 | I4 (no reordering) spliced after a stream with two B-frames
+        let cts = [0i64, 3, 1, 2, 4, 5, 6];
+        let out = dts_from_cts(&cts, 1);
+        let dts: Vec<i64> = out.iter().map(|o| o.0).collect();
+        assert_eq!(dts, vec![-1, 0, 1, 2, 3, 4, 5]);
+        for (i, &c) in cts.iter().enumerate() {
+            assert!(dts[i] <= c);
+        }
+        assert!(dts.windows(2).all(|w| w[1] > w[0]));
+        assert_eq!(out.iter().map(|o| o.1).collect::<Vec<_>>(), vec![1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(dts_from_cts(&[0, 2, 4], 7), vec![(0, 2), (2, 2), (4, 7)]);
+        assert!(dts_from_cts(&[], 1).is_empty());
+    }
 }

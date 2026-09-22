@@ -42,7 +42,8 @@ def scene(i):
 def encode(name, frames, codec, secs, bitrate="1200k"):
     path = os.path.join(OUT, name)
     if codec == "vp9":
-        vcodec = ["-c:v", "libvpx-vp9", "-b:v", bitrate, "-deadline", "realtime", "-cpu-used", "8", "-pix_fmt", "yuv420p"]
+        # a keyframe every second, so an export can copy the untouched GOPs
+        vcodec = ["-c:v", "libvpx-vp9", "-b:v", bitrate, "-deadline", "realtime", "-cpu-used", "8", "-pix_fmt", "yuv420p", "-g", "30"]
     elif codec == "h264i":
         # interlaced (x264 codes MBAFF frames): the built-in decoder's field / frame macroblock pairs
         vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-g", "30", "-flags", "+ildct+ilme", "-x264-params", "interlaced=1"]

@@ -185,6 +185,9 @@ try {
   }
   results.exportResult = await page.textContent('#exportResult');
   console.log('export:', results.exportMs, 'ms;', results.exportResult);
+  // VP9 into VP9: the GOPs the sections leave alone are copied, not re-encoded
+  assert(/(\d+) copied from the source/.test(results.exportResult) && +results.exportResult.match(/(\d+) copied from the source/)[1] > 0, 'the export copies the untouched GOPs: ' + results.exportResult);
+  assert(/(\d+) re-encoded/.test(results.exportResult) && +results.exportResult.match(/(\d+) re-encoded/)[1] > 0, 'and re-encodes the sections: ' + results.exportResult);
   const exported = await page.evaluate(async () => {
     const a = document.querySelector('#exportDownload');
     const blob = await (await fetch(a.href)).blob();
@@ -532,6 +535,7 @@ try {
   assert(st.fix.status === 'done' && /keep dark|keep light|frame rate/.test(st.fix.text), 'auto-fix takes the flashing out: ' + JSON.stringify(st.fix));
   assert(st.export.status === 'done' && st.verify.status === 'done', 'auto-fix exports and checks the export: ' + JSON.stringify(st));
   assert(/Passes WCAG/.test(st.verify.text), 'the exported file passes WCAG: ' + st.verify.text);
+  assert(/copied from the source/.test(st.export.text) && / re-encoded /.test(st.export.text), 'the automatic export copies the untouched GOPs and re-encodes the spans: ' + st.export.text);
   assert(results.autoFlash.download === 'flash.unflashed.mp4' && results.autoFlash.hasBlob, 'the fixed video is offered for download: ' + JSON.stringify(results.autoFlash));
   assert(/ready to download/.test(results.autoFlash.summary), 'the summary says so: ' + results.autoFlash.summary);
   const autoSections = await page.$$eval('#sectionList .sec-item', (els) => els.map((e) => e.textContent));

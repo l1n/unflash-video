@@ -460,7 +460,7 @@ fn filter_picture_mbaff(pic: &mut Picture, mbs: &[MbDeblockInfo], wm: usize, hm:
                 let mut bs_v = [[0u8; 4]; 4];
                 let mut bs_h = [[0u8; 4]; 4];
                 // ---- the left edge: the left pair's macroblock of this row, or both of them
-                let left_top = 2 * pr * wm + mx.wrapping_sub(1);
+                let left_top = (2 * pr * wm + mx).wrapping_sub(1);
                 let do_left = mx > 0 && avail(&mbs[left_top]);
                 let mixed_left = do_left && pic.mb_field[left_top] != field;
                 let mut bs_left8 = [0u8; 8];

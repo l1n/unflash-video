@@ -90,9 +90,10 @@ work with **auto-fix** unticked (or `?auto=0` in the URL):
   at a time; tick **soften stripes** and the frames that carry it are
   blurred just enough to take it under the threshold, in the check and in
   the export alike.
-- **Export**: the video is re-encoded in the browser with the edits applied
-  and the audio copied through untouched. **Verify** re-scans the exported
-  file with the same detector.
+- **Export**: the spans around the sections are re-encoded in the browser
+  with the edits applied, several at a time; every GOP no section touches
+  is copied from the source as it is, and so is the audio. **Verify**
+  re-scans the exported file with the same detector.
 
 Profiles (**WCAG + extended flashes + stripe patterns**, **Exact WCAG
 only**, **Stricter than WCAG**), the suggesters, the safe frame-rate bound
@@ -285,6 +286,40 @@ used with the browser's own decoder on the GPU detector (the built-in
 decoder already spreads over workers); `?segments=N` forces a count, and a
 file shorter than four run-ups per segment is scanned in one.
 
+### Spans re-encoded, the rest copied
+
+An export used to decode and re-encode every frame of the file. Almost all
+of them are frames no section touches, and those are now **copied from the
+source as they are**, whole GOPs at a time, with neither a decoder nor an
+encoder in the way: a smart cut. Only the spans around the sections are
+decoded, edited and re-encoded, from the last IDR picture before a section
+to the first one after it (for H.264 the sync samples are read to make sure
+they are IDR pictures, since an open-GOP I picture is marked as a sync
+sample too but the B pictures after it lean on what came before). Each span
+starts with a keyframe the decoder can pick up cold, so the spans are
+independent: the export runs several at once (one per two logical cores,
+up to four; `?parallel=N` sets the count), each with its own decoder and
+encoder, and long spans are cut at keyframes between sections so the
+workers stay busy. The writer takes the pieces in file order.
+
+Copied and re-encoded samples share one track. For VP9 that is nothing
+special: the frames carry their own headers. For H.264 the track's `avcC`
+record has to hold the parameter sets of both streams, and both number
+theirs from zero, so the encoder's are **renumbered**: the ids in its SPS
+and PPS, and the `pic_parameter_set_id` in every slice header, which moves
+the bits after it. CABAC slice data is aligned to its byte boundary again;
+CAVLC data is shifted, and for it the new id is chosen so that the shift is
+a whole byte, because I_PCM samples in CAVLC slices are aligned to the NAL
+unit's bytes. Tests decode every conformance stream after renumbering and
+splice GOPs of one encoding into another with B-frames on both sides, in
+this decoder and in ffmpeg's. The audio is copied as before.
+
+When the encoder's codec cannot share a track with the source's (an HEVC
+or AV1 source, or an H.264 file exported as VP9 because the browser has no
+H.264 encoder), or with `?smartcut=0`, the whole file is re-encoded, still
+in parallel pieces cut at keyframes. The export dialog says which it will
+be, and how much is copied.
+
 ### What it costs
 
 Per frame at the default analysis size (a 16:9 source becomes 256×144, the
@@ -354,9 +389,15 @@ hazard areas, events, violations and verdicts on all fixtures.
 of the GPU stage with the CPU kernel after every frame, and the pattern mask
 and statistics on striped frames. `crates/unflash-h264/tests/streams.rs`
 decodes the x264 test streams and requires ffmpeg's MD5 of every frame.
+`crates/unflash-h264/tests/rewrite.rs` renumbers the parameter sets of
+every conformance stream and decodes it again, and splices GOPs of one
+encoding into another and checks the result in this decoder and in ffmpeg.
 `tests/e2e/run.mjs` scans, edits, softens, exports and verifies the
 synthetic clips in headless Chromium, including the H.264 clip through the
-built-in decoder (the test browser has no H.264).
+built-in decoder (the test browser has no H.264); the VP9 exports copy
+their untouched GOPs. `tests/e2e/splice.mjs` runs the H.264 smart cut with
+a stand-in encoder that hands back a second encoding's samples, and
+requires every frame of the exported file to decode as its source did.
 
 To compare the two detectors on a real file rather than on synthetic
 frames, run both over it and line up the violations:
@@ -410,9 +451,12 @@ player's position rather than detecting again, so it never misses a frame.
 - The built-in H.264 decoder does not do 4:2:2/4:4:4, 10-bit, slice groups
   or SP/SI slices; such files need a browser with its own H.264 decoder.
   HEVC has no built-in decoder at all.
-- The export re-encodes the whole video (no smart-cut) and copies the audio;
-  after an **E** hold the audio runs ahead of the picture by the length of
-  the hold. Removals (R/F) do not change timing and need no audio work.
+- The export copies the audio; after an **E** hold the audio runs ahead of
+  the picture by the length of the hold. Removals (R/F) do not change
+  timing and need no audio work.
+- The export copies the untouched GOPs only when the encoder's codec is the
+  source's (H.264 into H.264, VP9 into VP9); an HEVC or AV1 source, or a
+  browser without an H.264 encoder, gets a full re-encode.
 - Sections and marks are stored in the browser's IndexedDB per file; frame
   caches live in memory and are rebuilt when a section is prepared again.
 - Review the flagged sections yourself before you share anything.

@@ -276,7 +276,11 @@ full-rate frames either side of it will still be reported.
 
 The point of a work section is that editing it until it passes should mean
 the exported video passes. Four things have to be true for that, and each one
-was a real bug before it was fixed.
+was a real bug before it was fixed. (One more thing helps rather than hurts:
+the export copies the frames outside the sections' spans from the source as
+they are, so they are the very frames the scan saw; only the re-encoded
+spans can differ from the check's pictures, by the encoder's quantisation,
+and the verify pass covers those.)
 
 ### A section has to contain the frames responsible for its own violation
 

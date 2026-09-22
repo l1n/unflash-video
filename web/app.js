@@ -7,7 +7,7 @@ import { createDetector } from './detector.js';
 import { profile } from './profile.js';
 import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, shownPts, softenPlan } from './analysis.js';
 import { Project, projectKey, dropCaches } from './project.js';
-import { exportMovie, encoderCandidates, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
+import { exportMovie, exportPlan, encoderCandidates, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
 
 const $ = (id) => document.getElementById(id);
 const EXT_S = 1.0;
@@ -374,6 +374,34 @@ function scanSegments() {
   if (forced > 0) return forced;
   if (!state.env || state.env.feeder.backend !== 'webgpu' || state.decode.software) return 1;
   return Math.min(4, Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 2)));
+}
+
+/** `?smartcut=0`: an export re-encodes the whole video instead of copying the GOPs no section touches. */
+function smartCutSetting() {
+  const q = new URLSearchParams(location.search).get('smartcut');
+  return !(q === '0' || q === 'off');
+}
+
+/** `?parallel=N`: how many spans an export re-encodes at once (0: by the machine). */
+function parallelSetting() {
+  return Math.max(0, parseInt(new URLSearchParams(location.search).get('parallel') || '0', 10) || 0);
+}
+
+/** The export dialog's line about what an export does with this plan. */
+function describePlan(plan, movie, softened) {
+  const secs = (t) => `${t.toFixed(1)} s`;
+  let text;
+  if (plan.mode === 'smart') {
+    text = plan.spans
+      ? `${plan.spans} span${plan.spans === 1 ? '' : 's'} around the sections (${secs(plan.encodedSeconds)}, ${plan.encoded} frames) ${plan.spans === 1 ? 'is' : 'are'} decoded and re-encoded${plan.parallel > 1 && plan.spans > 1 ? `, ${Math.min(plan.parallel, plan.spans)} at a time` : ''}; the other ${plan.copied} frames are copied from the source as they are`
+      : `Nothing to re-encode: all ${plan.copied} frames are copied from the source as they are`;
+  } else {
+    const why = !smartCutSetting() ? 'smart cut is off' : plan.copyable ? 'the file does not start at a keyframe' : `${movie.video.codec.split('.')[0]} frames cannot be copied into a track of this encoder's codec`;
+    text = `The whole video is decoded and re-encoded${plan.spans > 1 ? ` in ${plan.spans} pieces, ${Math.min(plan.parallel, plan.spans)} at a time` : ''} (${why})`;
+  }
+  text += movie.audio ? '; audio is copied without re-encoding.' : '.';
+  if (softened.length) text += ` Section${softened.length === 1 ? '' : 's'} ${softened.map((s) => '#' + s.id).join(', ')} ${softened.length === 1 ? 'is' : 'are'} softened (blurred) where stripes were found.`;
+  return text;
 }
 
 /** Another detector like the current one, for a scan segment (or a verify). */
@@ -1450,10 +1478,10 @@ async function openExport() {
     sel.appendChild(o);
   }
   const softened = p.sectionsSorted().filter((s) => s.soften && softenPlan(s));
-  $('exportPlan').textContent = cands.length
-    ? `The whole video is decoded and re-encoded in the browser${state.movie.audio ? '; audio is copied without re-encoding' : ''}.${softened.length ? ` Section${softened.length === 1 ? '' : 's'} ${softened.map((s) => '#' + s.id).join(', ')} ${softened.length === 1 ? 'is' : 'are'} softened (blurred) where stripes were found.` : ''}`
-    : 'This browser has no WebCodecs video encoder, so it cannot export.';
-  const need = estimateExportBytes(state.movie, +$('exportQuality').value);
+  const plan = cands.length ? await exportPlan(state.env, state.movie, state.project, { extS: EXT_S, codec: cands[0].config.codec, smartCut: smartCutSetting(), parallel: parallelSetting() }) : null;
+  state.exportPlan = plan;
+  $('exportPlan').textContent = plan ? describePlan(plan, state.movie, softened) : 'This browser has no WebCodecs video encoder, so it cannot export.';
+  const need = estimateExportBytes(state.movie, +$('exportQuality').value, plan);
   $('exportSize').textContent = cands.length ? `About ${fmtBytes(need)}. ${window.showSaveFilePicker ? 'You will be asked where to save it.' : privateStorageAvailable() ? "It is written to the browser's private storage on disk and offered for download." : `It is assembled in memory and offered for download${need > memoryExportLimit() ? ', which is more than this browser is likely to hold' : ''}.`}` : '';
   $('btnDoExport').disabled = !cands.length || !state.decode.supported;
   if (!state.exportBlob) $('exportResult').innerHTML = '';
@@ -1469,7 +1497,7 @@ async function doExport() {
   // storage on disk where it has that, memory as the last resort
   let sinkInfo = await pickSaveSink(exportName(movie));
   if (sinkInfo && sinkInfo.cancelled) return;
-  if (!sinkInfo) sinkInfo = await privateFileSink(estimateExportBytes(movie, quality));
+  if (!sinkInfo) sinkInfo = await privateFileSink(estimateExportBytes(movie, quality, state.exportPlan));
   $('exportModal').classList.add('hidden');
   const res = await runJob('Exporting', async (progress, cancelled) =>
     exportMovie(state.env, movie, state.project, {
@@ -1478,7 +1506,9 @@ async function doExport() {
       extS: EXT_S,
       sink: sinkInfo ? sinkInfo.sink : null,
       cancel: cancelled,
-      onProgress: (p, frames, ms) => progress(p, `${frames} frames encoded · ${(frames / (ms / 1000)).toFixed(0)} fps`),
+      smartCut: smartCutSetting(),
+      parallel: parallelSetting(),
+      onProgress: (p, frames, ms, copied) => progress(p, exportProgressText(frames, ms, copied)),
     })
   );
   $('exportModal').classList.remove('hidden');
@@ -1492,6 +1522,18 @@ async function doExport() {
     state.exportBlob = res.saved;
     $('btnVerifyExport').disabled = false;
   }
+}
+
+function exportProgressText(frames, ms, copied) {
+  return `${frames} frames encoded${copied ? ` · ${copied} copied` : ''} · ${(frames / (ms / 1000)).toFixed(0)} fps`;
+}
+
+/** What an export did, for the dialog and the auto-fix strip. */
+function exportSummary(res) {
+  const total = res.frames + (res.copied || 0);
+  const parts = [`${res.frames} re-encoded with ${res.encoderLabel} (${res.codec})${res.spans > 1 ? ` in ${res.spans} spans` : ''}`];
+  if (res.copied) parts.push(`${res.copied} copied from the source as they are`);
+  return `Exported ${total} frames in ${(res.elapsedMs / 1000).toFixed(1)} s: ${parts.join(', ')}${res.softened ? `; ${res.softened} softened` : ''}.`;
 }
 
 /**
@@ -1516,7 +1558,7 @@ function exportName(movie) {
 
 /** Show a finished export in the export dialog: what was written, a download link, and the verify button. */
 function showExportResult(res, name) {
-  const lines = [`Exported ${res.frames} frames with ${res.encoderLabel} (${res.codec}) in ${(res.elapsedMs / 1000).toFixed(1)} s${res.softened ? `, ${res.softened} of them softened` : ''}.`, ...res.warnings];
+  const lines = [exportSummary(res), ...res.warnings];
   $('exportResult').innerHTML = lines.map((l) => `<p>${l}</p>`).join('');
   // the dialog offers this export and no earlier one
   const a = $('exportDownload');
@@ -1756,7 +1798,8 @@ async function autopilot({ rescan = false } = {}) {
     }
     // to disk when the browser has private storage; in memory otherwise, and
     // only when it will fit
-    const need = estimateExportBytes(movie, quality);
+    const plan = await exportPlan(state.env, movie, project, { extS: EXT_S, codec: cands[0].config.codec, smartCut: smartCutSetting(), parallel: parallelSetting() });
+    const need = estimateExportBytes(movie, quality, plan);
     const sinkInfo = await privateFileSink(need);
     if (!sinkInfo && need > memoryExportLimit()) {
       autoStep(auto, 'export', 'skipped', `about ${fmtBytes(need)}: more than this browser can build in memory`);
@@ -1764,7 +1807,7 @@ async function autopilot({ rescan = false } = {}) {
       auto.summary = `The sections are fixed. The export would be about ${fmtBytes(need)}, more than this browser can hold in memory: ${window.showSaveFilePicker ? 'use Export… to write it to a file of your choice' : 'export from a browser with a save dialog or private storage'}.`;
       return;
     }
-    autoStep(auto, 'export', 'running', `encoding with ${cands[0].label}${sinkInfo ? ' to private storage on disk' : ''}`);
+    autoStep(auto, 'export', 'running', `${plan.mode === 'smart' ? `re-encoding ${plan.spans} span${plan.spans === 1 ? '' : 's'} with ${cands[0].label}, copying ${plan.copied} frames` : `encoding with ${cands[0].label}`}${sinkInfo ? ' to private storage on disk' : ''}`);
     const res = await runJob('Exporting', (progress, cancelled) =>
       exportMovie(state.env, movie, project, {
         encoder: cands[0].label,
@@ -1772,7 +1815,8 @@ async function autopilot({ rescan = false } = {}) {
         extS: EXT_S,
         sink: sinkInfo ? sinkInfo.sink : null,
         cancel: cancelled,
-        onProgress: (p, frames, ms) => progress(p, `${frames} frames encoded · ${(frames / (ms / 1000)).toFixed(0)} fps`),
+        plan,
+        onProgress: (p, frames, ms, copied) => progress(p, exportProgressText(frames, ms, copied)),
       })
     );
     if (!res || halted()) {
@@ -1787,7 +1831,7 @@ async function autopilot({ rescan = false } = {}) {
     dl.href = auto.blobUrl;
     dl.download = auto.fileName;
     showExportResult(res, auto.fileName);
-    autoStep(auto, 'export', 'done', `${res.frames} frames with ${res.encoderLabel} in ${(res.elapsedMs / 1000).toFixed(1)} s${res.softened ? `, ${res.softened} softened` : ''}${res.warnings.length ? ' · ' + res.warnings.join(' ') : ''}`);
+    autoStep(auto, 'export', 'done', `${exportSummary(res)}${res.warnings.length ? ' · ' + res.warnings.join(' ') : ''}`);
     // 4. verify
     if (halted()) return bail('verify', '');
     autoStep(auto, 'verify', 'running', 're-scanning the exported file');

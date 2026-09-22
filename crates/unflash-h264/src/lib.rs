@@ -26,6 +26,7 @@ pub mod intra;
 pub mod mb;
 pub mod picture;
 pub mod ps;
+pub mod rewrite;
 pub mod slice;
 pub mod tables;
 pub mod transform;
@@ -33,6 +34,7 @@ pub mod yuv;
 
 pub use decoder::{DecodedFrame, Decoder};
 pub use ps::{Pps, Sps};
+pub use rewrite::{AvcRegistry, Rewriter};
 
 /// Why a stream, a NAL unit or a picture could not be decoded.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -446,6 +446,11 @@ struct TrackSummary {
     duration_secs: f64,
     first_pts_secs: f64,
     last_pts_secs: f64,
+    /// What the edit list adds to the composition times (negative for a
+    /// media_time that skips into the track): the `pts` columns have it
+    /// applied, so a sample's composition time in the file is pts -
+    /// edit_shift.
+    edit_shift: i64,
 }
 
 #[wasm_bindgen]
@@ -500,6 +505,7 @@ impl Demuxer {
                 duration_secs: t.duration_secs(),
                 first_pts_secs: t.samples.iter().map(|s| s.pts).min().map(|p| t.to_secs(p)).unwrap_or(0.0),
                 last_pts_secs: t.samples.iter().map(|s| s.pts).max().map(|p| t.to_secs(p)).unwrap_or(0.0),
+                edit_shift: t.edit_shift,
             })
             .collect();
         Ok(serde_json::json!({
@@ -1119,6 +1125,74 @@ impl H264Decoder {
     pub fn color_json(&self) -> String {
         self.color.clone()
     }
+}
+
+// ---- H.264 parameter sets for spliced tracks ---------------------------------
+
+/// The parameter sets of an exported H.264 track that copies the source's
+/// samples and splices re-encoded spans in: starts from the source's
+/// `avcC`, takes each encoder's record in (`register`) and hands back the
+/// rewriter for that encoder's samples; `record()` is the merged `avcC`
+/// for the track.
+#[wasm_bindgen]
+pub struct AvcRegistry {
+    inner: unflash_h264::AvcRegistry,
+}
+
+#[wasm_bindgen]
+impl AvcRegistry {
+    #[wasm_bindgen(constructor)]
+    pub fn new(base_avcc: &[u8]) -> Result<AvcRegistry, JsValue> {
+        Ok(AvcRegistry { inner: unflash_h264::AvcRegistry::new(base_avcc).map_err(js_err)? })
+    }
+
+    pub fn register(&mut self, avcc: &[u8]) -> Result<AvcRewriter, JsValue> {
+        Ok(AvcRewriter { inner: self.inner.register(avcc).map_err(js_err)? })
+    }
+
+    pub fn record(&self) -> Vec<u8> {
+        self.inner.record()
+    }
+
+    pub fn sps_count(&self) -> u32 {
+        self.inner.sps_count() as u32
+    }
+
+    pub fn pps_count(&self) -> u32 {
+        self.inner.pps_count() as u32
+    }
+}
+
+/// Makes one encoder's samples fit the merged track (see `AvcRegistry`).
+#[wasm_bindgen]
+pub struct AvcRewriter {
+    inner: unflash_h264::Rewriter,
+}
+
+#[wasm_bindgen]
+impl AvcRewriter {
+    /// Whether samples pass through unchanged.
+    pub fn is_identity(&self) -> bool {
+        self.inner.is_identity()
+    }
+
+    pub fn rewrite_sample(&self, sample: &[u8]) -> Result<Vec<u8>, JsValue> {
+        self.inner.rewrite_sample(sample).map_err(js_err)
+    }
+}
+
+/// The type of the first slice NAL unit in a sample: 5 for an IDR picture
+/// (a decoder can start there cold), 1 otherwise, 0 when the bytes given
+/// hold no slice yet (read more of the sample).
+#[wasm_bindgen]
+pub fn h264_first_vcl_nal_type(sample: &[u8], nal_length_size: u32) -> u32 {
+    unflash_h264::rewrite::first_vcl_nal_type(sample, nal_length_size.clamp(1, 4) as usize) as u32
+}
+
+/// The NAL length size of an `avcC` record's samples.
+#[wasm_bindgen]
+pub fn avcc_nal_length_size(avcc: &[u8]) -> u32 {
+    avcc.get(4).map(|b| (b & 3) as u32 + 1).unwrap_or(4)
 }
 
 /// The VideoColorSpace of a sequence, from its VUI or the usual defaults
