@@ -37,8 +37,9 @@ async function bench(kind, cfgJson, w, h, n) {
     frames.push(f);
   }
   const tick = () => new Promise((r) => setTimeout(r, 0));
-  // warm up
+  // warm up (flush: the GPU stage runs frames in batches, so a lone frame has to be asked for)
   det.feed_rgba(frames[0], fw, fh, 0, false);
+  det.flush();
   while (det.pending() > 0) { det.poll(); await tick(); }
   det.reset();
   const t0 = performance.now();
@@ -50,6 +51,7 @@ async function bench(kind, cfgJson, w, h, n) {
     busy += performance.now() - a;
     det.poll();
   }
+  det.flush();
   while (det.pending() > 0) { det.poll(); await tick(); }
   const ms = performance.now() - t0;
   const res = JSON.parse(det.finish(false));

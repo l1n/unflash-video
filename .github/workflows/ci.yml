@@ -30,6 +30,7 @@ jobs:
           UNFLASH_REQUIRE_GPU: "1"
         run: cargo test --workspace --release
       - name: Benchmark (informational)
+        timeout-minutes: 15
         run: cargo run --release -p unflash-gpu --example bench -- 1920x1080 0.25 200
 
   web:

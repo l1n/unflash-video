@@ -4,7 +4,8 @@
 //!
 //! Reports ns/pixel, frames/s and the implied memory traffic for the scalar
 //! CPU kernel, the SIMD kernel and the GPU stage (whatever adapter wgpu
-//! finds; a software driver here, real hardware on a user's machine).
+//! finds; a software driver here, real hardware on a user's machine). The
+//! GPU stage runs its default batch; the last, partial batch is flushed.
 
 use std::time::Instant;
 
@@ -76,12 +77,15 @@ fn main() {
             println!("gpu adapter: {} ({:?})", ctx.info().name, ctx.info().backend);
             let mut gpu = GpuStage::new(&ctx, &cfg, geom.clone()).unwrap();
             let tmpl = unflash_core::pixel::KernelParams::template(&cfg, &geom);
-            // warm-up
+            // warm-up: one frame on its own, run at once
             let mut p = tmpl;
             p.mode = MODE_FIRST;
             gpu.submit(p, FrameSource::Rgb8 { data: &src[0], width: aw, height: ah }, false).unwrap();
+            gpu.flush();
             gpu.wait_idle();
-            while gpu.poll().is_some() {}
+            while gpu.poll().is_none() {
+                gpu.wait_idle();
+            }
             let t0 = Instant::now();
             let mut done = 0;
             let mut i = 1;
@@ -92,11 +96,17 @@ fn main() {
                     gpu.submit(p, FrameSource::Rgb8 { data: &src[i % 12], width: aw, height: ah }, false).unwrap();
                     i += 1;
                 }
+                if i > frames {
+                    // no more frames: run the partial batch rather than wait for it to fill
+                    gpu.flush();
+                }
+                let mut got = false;
                 while let Some(r) = gpu.poll() {
                     r.unwrap();
                     done += 1;
+                    got = true;
                 }
-                if done < frames && !gpu.can_submit() {
+                if done < frames && !got {
                     gpu.wait_idle();
                 }
             }

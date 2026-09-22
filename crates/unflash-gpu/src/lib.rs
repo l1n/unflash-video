@@ -163,7 +163,7 @@ pub struct GpuStage {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pixout_buf: wgpu::Buffer,
     rgba_buf: wgpu::Buffer,
-    globals_buf: wgpu::Buffer,
+    // the per-frame globals regions are reached through the bind groups only
     rowwin_buf: wgpu::Buffer,
     rowtot_buf: wgpu::Buffer,
     /// Read back only by the native debug helpers (the per-row pattern
@@ -506,7 +506,6 @@ impl GpuStage {
             state_buf,
             pixout_buf,
             rgba_buf,
-            globals_buf,
             rowwin_buf,
             rowtot_buf,
             patmask_buf,
