@@ -439,11 +439,19 @@ export async function checkSection(env, project, sec, edits, { extS = 1.0, onPro
   };
 }
 
-/** Keep-light / keep-dark suggestion. `only` is an array of ordinals or null. */
+/** The frames marked keep, as the suggesters take them (undefined: none). */
+export function keepJson(sec) {
+  return sec.keep && sec.keep.length ? JSON.stringify(sec.keep) : undefined;
+}
+
+/**
+ * Keep-light / keep-dark suggestion. `only` is an array of ordinals or null;
+ * frames marked keep are never removed.
+ */
 export async function suggestEdits(env, project, sec, prefer, only, { extS = 1.0, onProgress } = {}) {
   const { wasm } = env;
   const shown = shownPts(wasm, sec);
-  const sug = new wasm.Suggester(Float64Array.from(shown), JSON.stringify(sec.edits || {}), prefer, only ? JSON.stringify(only) : undefined);
+  const sug = new wasm.Suggester(Float64Array.from(shown), JSON.stringify(sec.edits || {}), prefer, only ? JSON.stringify(only) : undefined, keepJson(sec));
   const frames = sectionFrames(sec);
   let step = JSON.parse(sug.step(frames, undefined));
   let round = 0;
@@ -463,11 +471,56 @@ export async function suggestFrameRate(env, project, sec, only, fps, { extS = 1.
   const { wasm, config } = env;
   const shown = shownPts(wasm, sec);
   const p = JSON.parse(
-    wasm.rate_proposal(config, Float64Array.from(shown), JSON.stringify(sec.edits || {}), only ? JSON.stringify(only) : undefined, fps == null ? undefined : fps, extS)
+    wasm.rate_proposal(config, Float64Array.from(shown), JSON.stringify(sec.edits || {}), only ? JSON.stringify(only) : undefined, fps == null ? undefined : fps, extS, keepJson(sec))
   );
   const verdict = await checkSection(env, project, sec, p.edits, { extS });
   const note = wasm.rate_note(JSON.stringify(p), verdict.safe);
   return { edits: p.removals, safe: verdict.safe, rounds: 1, fps: p.fps, safe_fps: p.safe_fps, guaranteed: p.guaranteed, note, verdict };
+}
+
+/** Each step of the frame-rate search keeps this share of the last rate. */
+export const RATE_STEP = 0.9;
+
+/**
+ * The rates the frame-rate search tries, highest first: twice the
+ * guaranteed-safe rate (never more than the section's own rate), then a
+ * tenth less each time, to the guaranteed rate. A profile with no
+ * guaranteed rate (one flash already fails) goes from half the section's
+ * rate down to one picture a second.
+ */
+export function rateLadder(safe, sourceFps) {
+  const round = (r) => Math.round(r * 10) / 10;
+  const floor = safe > 0 ? safe : 1;
+  let top = safe > 0 ? 2 * safe : sourceFps / 2;
+  top = Math.min(top, sourceFps * RATE_STEP);
+  // a tenth at a time, or bigger steps where that would take more than ten checks
+  const step = Math.min(RATE_STEP, Math.pow(floor / Math.max(top, floor), 1 / 9));
+  const out = [];
+  for (let r = round(top); r > floor + 0.05; r = round(r * step)) out.push(r);
+  out.push(floor);
+  return out;
+}
+
+/**
+ * "Reduce FPS" the way an editor does it by hand: try twice the guaranteed
+ * rate and step down until the check passes, so the section keeps as many
+ * pictures as it can. Returns the first rate that passes (or the last tried)
+ * with the rates that failed before it.
+ */
+export async function searchFrameRate(env, project, sec, only, { extS = 1.0, sourceFps = 30, onProgress } = {}) {
+  const { wasm, config } = env;
+  const safe = wasm.safe_picture_rate(config);
+  const ladder = rateLadder(safe, sourceFps);
+  const failed = [];
+  let res = null;
+  for (let i = 0; i < ladder.length; i++) {
+    if (onProgress) onProgress(i / ladder.length, ladder[i]);
+    res = await suggestFrameRate(env, project, sec, only, ladder[i], { extS });
+    if (res.safe) break;
+    failed.push(ladder[i]);
+  }
+  const tried = failed.length ? ` Tried ${failed.map((r) => `${r}/s`).join(', ')} first; ${failed.length === 1 ? 'it fails' : 'they fail'}.` : '';
+  return { ...res, note: res.note + tried, ladder, failed };
 }
 
 export { tick };

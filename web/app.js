@@ -5,9 +5,10 @@ import { defaultWorkerCount } from './h264pool.js';
 import { Movie, tick } from './media.js';
 import { createDetector } from './detector.js';
 import { profile } from './profile.js';
-import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, shownPts, softenPlan } from './analysis.js';
+import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, rateLadder, keepJson, shownPts, softenPlan } from './analysis.js';
 import { Project, projectKey, dropCaches } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
+import { SectionPlayer } from './preview.js';
 
 const $ = (id) => document.getElementById(id);
 const EXT_S = 1.0;
@@ -51,7 +52,13 @@ const state = {
   scanTrace: null,
   traceNorm: null, // the scan trace as area fractions, for the timeline and the monitor
   auto: null, // the unattended scan -> fix -> export -> verify run (see autopilot)
+  // what the player shows: 'video' (the whole file) or the open section, 'edited' or 'original';
+  // gen counts requests to it, so a poster that was overtaken never draws
+  player: { mode: 'video', lastDraw: 0, gen: 0, playingTile: null, restartTimer: null },
+  history: new Map(), // section id -> { undo: [], redo: [] } of mark snapshots
 };
+
+let sectionPlayer = null;
 
 // ---- small helpers -----------------------------------------------------------
 
@@ -182,10 +189,13 @@ async function boot() {
     e.preventDefault();
     openFile(f);
   });
+  // the guide: the start page until a file is open, then a drawer beside the
+  // work that the same button, its close button or Esc put away again
   $('btnHome').addEventListener('click', () => {
-    $('welcome').classList.remove('hidden');
-    $('stage').classList.add('hidden');
+    if (!state.movie) return window.scrollTo(0, 0);
+    setGuide(!document.body.classList.contains('guide-open'));
   });
+  $('btnCloseGuide').addEventListener('click', () => setGuide(false));
   $('btnCloseBanner').addEventListener('click', () => $('banner').classList.add('hidden'));
   $('btnCancelJob').addEventListener('click', () => {
     if (state.job) state.job.cancelled = true;
@@ -199,13 +209,22 @@ async function boot() {
     } catch (e) {
       /* storage blocked: the choice lasts the session */
     }
-    if ($('autoToggle').checked && state.movie && !state.job && !(state.auto && state.auto.running)) autopilot();
+    // ticked with a file open: the run starts, once whatever job is under way (the scan, say) is done
+    if ($('autoToggle').checked && state.movie && !(state.auto && state.auto.running)) {
+      afterJobs().then(() => {
+        if ($('autoToggle').checked && state.movie && !(state.auto && state.auto.running)) autopilot();
+      });
+    }
   });
   $('btnAutoStop').addEventListener('click', () => stopAuto());
   $('btnAutoRerun').addEventListener('click', () => autopilot({ rescan: true }));
   $('liveToggle').addEventListener('change', () => setLive($('liveToggle').checked));
-  $('dimToggle').addEventListener('change', () => $('player').classList.toggle('dim', $('dimToggle').checked));
-  $('player').classList.add('dim');
+  $('dimToggle').addEventListener('change', () => {
+    applyDim();
+    renderPlayerWarning();
+  });
+  applyDim();
+  wirePlayer();
   $('btnExport').addEventListener('click', openExport);
   $('btnCloseExport').addEventListener('click', () => $('exportModal').classList.add('hidden'));
   $('btnDoExport').addEventListener('click', doExport);
@@ -236,7 +255,7 @@ async function boot() {
   const player = $('player');
   player.addEventListener('timeupdate', drawTimeline);
   player.addEventListener('play', () => {
-    if (state.live.on) startLiveLoop();
+    if (state.live.on && state.player.mode === 'video') startLiveLoop();
   });
   player.addEventListener('seeked', () => {
     drawTimeline();
@@ -249,6 +268,7 @@ async function boot() {
 async function openFile(file) {
   $('banner').classList.add('hidden');
   await stopAuto();
+  if (sectionPlayer) await sectionPlayer.stop();
   const opened = await runJob('Opening video', async (progress) => {
     progress(0.1, 'reading the index');
     const movie = await Movie.open(file, wasm);
@@ -278,7 +298,8 @@ async function openFile(file) {
     $('btnScan').title = state.decode.supported ? 'Decode every frame with WebCodecs and run the detector over it' : `Scanning needs WebCodecs: ${state.decode.reason}`;
     $('liveToggle').disabled = false;
     $('btnExport').disabled = false;
-    $('welcome').classList.add('hidden');
+    document.body.classList.add('has-movie');
+    setGuide(false);
     $('stage').classList.remove('hidden');
     $('sections').classList.remove('hidden');
     $('timelineWrap').classList.remove('hidden');
@@ -289,12 +310,34 @@ async function openFile(file) {
     }
     $('liveToggle').disabled = !!state.decode.software;
     state.current = null;
+    state.history.clear();
+    setPlayerSource('video');
     renderAll();
     updateStatus();
     return true;
   });
-  // the rest happens on its own: scan, fix, export, verify
-  if (opened && state.decode.supported && autoEnabled()) autopilot();
+  if (!opened || !state.decode.supported) return;
+  // the scan starts on its own; the fixes, the export and its check too with auto-fix on
+  if (autoEnabled()) autopilot();
+  else if (autoScanEnabled()) autoScan();
+}
+
+/** Resolves when no job is running. */
+async function afterJobs() {
+  while (state.job) await new Promise((r) => setTimeout(r, 100));
+}
+
+/** Scan a freshly opened file, unless a scan of it under this profile is stored from a previous visit. */
+async function autoScan() {
+  const project = state.project;
+  const prior = project && project.scan;
+  if (prior && prior.sig === wasm.config_signature(state.config) && prior.profile === project.profile && (prior.safe || project.sections.length)) return;
+  await scan();
+}
+
+/** Open or close the guide beside the work (with no file open it is the whole page). */
+function setGuide(open) {
+  document.body.classList.toggle('guide-open', !!open);
 }
 
 /** Open one of the test clips published next to the app. */
@@ -337,7 +380,9 @@ async function setProfile(name) {
   renderAll();
   updateStatus();
   toast('Profile changed. Sections need re-checking (they are re-checked when opened).');
-  if (state.decode.supported && autoEnabled()) autopilot({ rescan: true });
+  if (!state.decode.supported) return;
+  if (autoEnabled()) autopilot({ rescan: true });
+  else if (autoScanEnabled()) autoScan();
 }
 
 function updateStatus() {
@@ -483,6 +528,15 @@ function setLive(on) {
     v.className = 'live-verdict idle';
     v.textContent = 'monitor off';
     state.live.fromScan = false;
+    return;
+  }
+  // the section player: the meter reads the section's check (edited) or the scan (original) as it plays
+  if (state.player.mode !== 'video') {
+    state.live.fromScan = false;
+    v.className = 'live-verdict idle';
+    v.textContent = 'meter on: press play';
+    setHudBars(0, 0, 0);
+    $('hudInfo').textContent = state.player.mode === 'edited' ? 'from the section check, as it plays' : 'from the scan, as it plays';
     return;
   }
   // a finished scan of this file under this profile already holds every frame's
@@ -681,6 +735,216 @@ function drainLive() {
   }
 }
 
+// ---- the player: the whole video, or the open section edited or as it is ---------------
+
+const PLAYER_SIZES = { s: 320, m: 480, l: 720 };
+
+function playerSizeSetting() {
+  try {
+    const v = localStorage.getItem('unflash:playerSize');
+    if (v && PLAYER_SIZES[v]) return v;
+  } catch (e) {
+    /* storage blocked */
+  }
+  return 'm';
+}
+
+function setPlayerSize(size) {
+  if (!PLAYER_SIZES[size]) size = 'm';
+  $('playerBox').style.setProperty('--player-w', `${PLAYER_SIZES[size]}px`);
+  for (const b of document.querySelectorAll('.size-switch [data-size]')) b.classList.toggle('on', b.dataset.size === size);
+  try {
+    localStorage.setItem('unflash:playerSize', size);
+  } catch (e) {
+    /* the choice lasts the session */
+  }
+  drawChart();
+}
+
+function applyDim() {
+  const on = $('dimToggle').checked;
+  $('player').classList.toggle('dim', on);
+  $('preview').classList.toggle('dim', on);
+}
+
+function wirePlayer() {
+  sectionPlayer = new SectionPlayer($('preview'), { onFrame: onPreviewFrame, onState: onPreviewState });
+  setPlayerSize(playerSizeSetting());
+  for (const b of document.querySelectorAll('.size-switch [data-size]')) b.addEventListener('click', () => setPlayerSize(b.dataset.size));
+  $('playerSource').addEventListener('change', () => setPlayerSource($('playerSource').value));
+  $('btnPreviewPlay').addEventListener('click', () => {
+    if (sectionPlayer.active && !sectionPlayer.run.once && !sectionPlayer.paused) sectionPlayer.pause();
+    else if (sectionPlayer.paused) sectionPlayer.resume();
+    else playSection(state.selection.size ? Math.min(...state.selection) : 0);
+  });
+  $('btnPreviewStop').addEventListener('click', async () => {
+    state.player.gen++;
+    await sectionPlayer.stop();
+    posterSection();
+  });
+  $('previewSpeed').addEventListener('change', () => sectionPlayer.setSpeed(parseFloat($('previewSpeed').value) || 1));
+}
+
+/** Whether a section can be played: it needs the frame times its preparation records. */
+function sectionPlayable(sec) {
+  return !!(sec && sec.pts && sec.pts.length && state.decode.supported && state.env);
+}
+
+/**
+ * Put `mode` in the player: 'video' (the whole file in the <video>, where the
+ * live monitor can detect) or the open section, 'edited' (with its marks, as
+ * the export renders it) or 'original', in the section player.
+ */
+function setPlayerSource(mode) {
+  const sec = currentSection();
+  if (mode !== 'video' && !sec) mode = 'video';
+  const changed = state.player.mode !== mode;
+  state.player.mode = mode;
+  $('playerSource').value = mode;
+  for (const o of $('playerSource').options) if (o.value !== 'video') o.disabled = !sec;
+  const video = mode === 'video';
+  $('player').classList.toggle('hidden', !video);
+  $('preview').classList.toggle('hidden', video);
+  $('previewBar').classList.toggle('hidden', video);
+  if (!video) $('player').pause();
+  markPlaying(-1);
+  $('previewInfo').textContent = '';
+  if (sectionPlayer) {
+    state.player.gen++;
+    if (video) sectionPlayer.stop();
+    else posterSection();
+  }
+  if (changed && state.live.on) setLive(true);
+  renderPlayerWarning();
+}
+
+/** The section's first picture in the section player, when nothing is playing. */
+function posterSection() {
+  const sec = currentSection();
+  const canvas = $('preview');
+  if (state.player.mode === 'video') return;
+  const gen = ++state.player.gen;
+  if (!sectionPlayable(sec)) {
+    sectionPlayer.stop();
+    canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+  sectionPlayer.stop().then(() => {
+    if (gen !== state.player.gen || currentSection() !== sec || state.player.mode === 'video') return;
+    sectionPlayer.play({ env: state.env, movie: state.movie, sec, edited: state.player.mode === 'edited', extS: EXT_S, fromSlot: 0, once: true });
+  });
+}
+
+/** Play the open section in the player from slot `fromSlot` (edited unless the player is on original). */
+function playSection(fromSlot = 0) {
+  const sec = currentSection();
+  if (!sectionPlayable(sec)) return toast(sec ? 'The section plays once it is prepared.' : 'Open a section first.');
+  if (state.player.mode === 'video') setPlayerSource('edited');
+  state.player.gen++;
+  sectionPlayer.setSpeed(parseFloat($('previewSpeed').value) || 1);
+  return sectionPlayer.play({ env: state.env, movie: state.movie, sec, edited: state.player.mode === 'edited', extS: EXT_S, fromSlot, loop: () => $('previewLoop').checked });
+}
+
+/** Outline the tile of the slot on screen (-1: none). */
+function markPlaying(k) {
+  const grid = $('frameGrid');
+  const prev = state.player.playingTile;
+  if (prev != null && grid.children[prev]) grid.children[prev].classList.remove('playing');
+  state.player.playingTile = k >= 0 ? k : null;
+  if (k >= 0 && grid.children[k]) grid.children[k].classList.add('playing');
+}
+
+function onPreviewFrame(info, t, plan) {
+  const sec = currentSection();
+  if (!sec || plan.sec !== sec) return;
+  const k = info.sec ? info.slot : -1;
+  markPlaying(k);
+  const n = plan.seq.t.length;
+  const rel = t - (sec.start + plan.base + plan.seq.t[0]);
+  const total = plan.seq.t[n - 1] - plan.seq.t[0];
+  let what = '';
+  if (k >= 0) {
+    const e = state.player.mode === 'edited' ? (sec.edits || {})[k] || {} : {};
+    what = `frame ${k}${info.src !== k ? `, showing ${info.src}` : ''}${e.removed ? ' (removed)' : e.extended ? ' (held 1 s)' : ''}${info.softened ? ', softened' : ''}`;
+  }
+  $('previewInfo').textContent = `${fmt(Math.max(0, rel))} / ${fmt(total)} · ${what}`;
+  if (state.live.on) previewMeter(sec, k, t);
+  const now = performance.now();
+  if (now - state.player.lastDraw > 250) {
+    state.player.lastDraw = now;
+    drawTimeline();
+  }
+}
+
+function onPreviewState(s, detail) {
+  const b = $('btnPreviewPlay');
+  b.textContent = s === 'playing' ? '❚❚ pause' : s === 'paused' ? '▶ resume' : '▶ play';
+  if (s === 'stopped' || s === 'ended') markPlaying(-1);
+  if (s === 'error') banner(`The section player stopped: ${detail && detail.message ? detail.message : detail}`);
+}
+
+/** The meter for the frame the section player shows: the section's check (edited) or the scan (original). */
+function previewMeter(sec, k, t) {
+  const v = $('liveVerdict');
+  if (state.player.mode === 'original') {
+    if (monitorTrace()) monitorFromScan(t);
+    else {
+      v.className = 'live-verdict idle';
+      v.textContent = 'no scan to read';
+    }
+    return;
+  }
+  const c = sec.check;
+  if (!c || c.stale || !c.stats || k < 0 || k >= c.stats.hazard.length) {
+    v.className = 'live-verdict idle';
+    v.textContent = c && c.stale ? 'checking the change…' : 'not checked yet';
+    return;
+  }
+  const thr = c.area_thresh || 1;
+  const pthr = c.pattern_thresh || 1;
+  setHudBars(c.stats.hazard[k] / thr, c.stats.hazardRed[k] / thr, (c.stats.pattern[k] || 0) / pthr);
+  $('hudInfo').textContent = `from the section check · frame ${k} of ${c.stats.hazard.length}`;
+  if (c.flagged && c.flagged.includes(k)) {
+    v.className = 'live-verdict bad';
+    v.textContent = 'still failing here';
+  } else if (c.safe) {
+    v.className = 'live-verdict ok';
+    v.textContent = 'passes the check';
+  } else {
+    v.className = 'live-verdict warn';
+    v.textContent = 'fails elsewhere in the section';
+  }
+}
+
+/** The line above the player: what it shows, whether that passes, whether it is dimmed. */
+function renderPlayerWarning() {
+  const w = $('playerWarning');
+  const sec = currentSection();
+  const dim = $('dimToggle').checked ? ' Dimmed.' : ' Not dimmed: full brightness.';
+  const mode = state.player.mode;
+  let text = '';
+  let ok = false;
+  if (!state.movie) text = '';
+  else if (mode === 'video') text = `⚠ The whole video as it is: it may flash.${dim}`;
+  else if (!sec) text = '';
+  else if (mode === 'original') text = `⚠ Section #${sec.id} as it is: it may flash.${dim}`;
+  else {
+    const marked = sec.soften || Object.values(sec.edits || {}).some((e) => e.removed || e.extended);
+    const c = sec.check;
+    if (!sectionPlayable(sec)) text = `Section #${sec.id} plays here once it is prepared.`;
+    else if (!marked) text = `⚠ Section #${sec.id} has no marks yet, so this is how it is: it may flash.${dim}`;
+    else if (!c || c.stale) text = `Section #${sec.id} with your marks: not checked yet.${dim}`;
+    else if (c.safe) {
+      text = `✓ Section #${sec.id} with your marks: passes the check.${dim}`;
+      ok = true;
+    } else if (c.wcag_safe) text = `Section #${sec.id} with your marks: passes WCAG; ${remainingKinds(c).join(' and ') || 'something the profile flags'} remain${remainingKinds(c).length === 1 ? 's' : ''}.${dim}`;
+    else text = `⚠ Section #${sec.id} with your marks: still fails the check.${dim}`;
+  }
+  w.textContent = text;
+  w.classList.toggle('ok', ok);
+  $('btnPreviewPlay').disabled = mode !== 'video' && !sectionPlayable(sec);
+}
+
 // ---- timeline -------------------------------------------------------------------
 
 function wireTimeline() {
@@ -716,7 +980,10 @@ function wireTimeline() {
     const t = xToT(e.clientX);
     const hit = state.project.sectionsSorted().find((s) => t >= s.start && t <= s.end);
     if (hit) openSection(hit.id);
-    else $('player').currentTime = t;
+    else {
+      setPlayerSource('video');
+      $('player').currentTime = t;
+    }
     drawTimeline();
   });
 }
@@ -816,8 +1083,8 @@ function drawTimeline(dragSpan = null) {
     g.fillRect(x(t), H - 22, 1, 4);
     g.fillText(fmt(t), x(t) + 2, H - 12);
   }
-  // playhead
-  const ct = $('player').currentTime;
+  // playhead: the section player's, while it shows a section
+  const ct = state.player.mode !== 'video' && sectionPlayer && sectionPlayer.run && sectionPlayer.run.t != null ? sectionPlayer.run.t : $('player').currentTime;
   if (ct >= lo && ct <= hi) {
     g.fillStyle = '#fff';
     g.fillRect(x(ct), 0, 1.5, H);
@@ -906,6 +1173,7 @@ function currentSection() {
 }
 
 function openSection(id) {
+  const changed = state.current !== id;
   state.current = id;
   state.selection.clear();
   state.anchor = null;
@@ -914,8 +1182,12 @@ function openSection(id) {
     sec.usedAt = Date.now();
     $('player').currentTime = sec.start;
   }
+  // the player follows: this section, edited, from its first frame
+  if (changed || state.player.mode === 'video') setPlayerSource(sec ? 'edited' : 'video');
   renderAll();
   if (sec && sec.prepared && (!sec.check || sec.check.stale)) scheduleCheck(0);
+  // a section prepares itself when opened (unless something else holds the decoder)
+  if (sec && !sec.prepared && state.decode.supported && !state.job && !(state.auto && state.auto.running)) doPrepare(sec);
   $('workspace').scrollIntoView({ block: 'nearest' });
 }
 
@@ -952,15 +1224,19 @@ function wireWorkspace() {
   $('softenToggle').addEventListener('change', () => {
     const sec = currentSection();
     if (!sec) return;
+    pushHistory(sec);
     sec.soften = $('softenToggle').checked;
     afterEdit(sec);
   });
   $('btnClearEdits').addEventListener('click', () => {
     const sec = currentSection();
     if (!sec) return;
+    pushHistory(sec);
     sec.edits = {};
     afterEdit(sec);
   });
+  $('btnUndo').addEventListener('click', undo);
+  $('btnRedo').addEventListener('click', redo);
   $('btnSuggestLight').addEventListener('click', () => doSuggest('light'));
   $('btnSuggestDark').addEventListener('click', () => doSuggest('dark'));
   $('btnSuggestFps').addEventListener('click', () => doSuggestFps());
@@ -974,10 +1250,21 @@ function wireWorkspace() {
     $('fpsInput').value = wasm.safe_picture_rate(state.config).toString();
     updateFpsNote();
   });
+  $('btnFpsExact').addEventListener('click', () => {
+    $('fpsMenu').classList.add('hidden');
+    doSuggestFpsExact();
+  });
   $('fpsInput').addEventListener('input', updateFpsNote);
+  $('fpsInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      $('fpsMenu').classList.add('hidden');
+      doSuggestFpsExact();
+    }
+  });
   $('btnMarkRemoved').addEventListener('click', () => markSelection('R'));
   $('btnMarkRemovedNext').addEventListener('click', () => markSelection('F'));
   $('btnMarkExtended').addEventListener('click', () => markSelection('E'));
+  $('btnMarkKeep').addEventListener('click', () => markSelection('K'));
   $('btnUnmark').addEventListener('click', () => markSelection('U'));
   $('btnSelectUnsafe').addEventListener('click', () => {
     const sec = currentSection();
@@ -988,14 +1275,7 @@ function wireWorkspace() {
   const grid = $('frameGrid');
   grid.addEventListener('keydown', (e) => {
     const k = e.key.toUpperCase();
-    if (['R', 'F', 'E', 'U'].includes(k)) {
-      e.preventDefault();
-      markSelection(k);
-    } else if (e.key === 'Escape') {
-      state.selection.clear();
-      state.anchor = null;
-      renderGridMarks();
-    } else if (k === 'A' && (e.ctrlKey || e.metaKey)) {
+    if (k === 'A' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       const sec = currentSection();
       if (sec) state.selection = new Set(Array.from({ length: sec.nFrames }, (_, i) => i));
@@ -1015,6 +1295,42 @@ function wireWorkspace() {
     if (tile) tile.scrollIntoView({ block: 'nearest' });
     $('player').currentTime = sec.start + shown[i] + (sec.pts ? sec.pts[0] : 0);
   });
+  // the marking keys work anywhere on the page (as in the original tool), not
+  // only with the frame grid focused; typing in a field is left alone
+  document.addEventListener('keydown', onKey);
+}
+
+function onKey(e) {
+  const tag = e.target && e.target.tagName;
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+  if (e.key === 'Escape') {
+    if (document.body.classList.contains('guide-open')) return setGuide(false);
+    if (!$('exportModal').classList.contains('hidden')) return;
+    state.selection.clear();
+    state.anchor = null;
+    renderGridMarks();
+    return;
+  }
+  if (!$('exportModal').classList.contains('hidden')) return;
+  const sec = currentSection();
+  if (!sec || !sec.prepared) return;
+  const k = e.key.toLowerCase();
+  if (e.ctrlKey || e.metaKey) {
+    if (k === 'z') {
+      e.preventDefault();
+      if (e.shiftKey) redo();
+      else undo();
+    } else if (k === 'y') {
+      e.preventDefault();
+      redo();
+    }
+    return;
+  }
+  if (e.altKey) return;
+  if (['r', 'f', 'e', 'k', 'u'].includes(k)) {
+    e.preventDefault();
+    markSelection(k.toUpperCase());
+  }
 }
 
 function updateFpsNote() {
@@ -1024,7 +1340,12 @@ function updateFpsNote() {
   if (!(v > 0)) note.textContent = '';
   else if (wasm.rate_is_guaranteed(state.config, v)) note.textContent = `${v}/s is at or under the guaranteed-safe ${safe}/s: no arrangement of pictures at that rate can fail this profile.`;
   else note.textContent = `${v}/s is above the guaranteed-safe ${safe}/s, so the result is a proposal that the check judges, not a promise.`;
-  $('fpsShown').textContent = `(${v > 0 ? v : safe}/s)`;
+  const ladder = rateLadder(safe, state.movie ? state.movie.fps : 30);
+  $('fpsSearchNote').textContent = safe > 0
+    ? `The button tries ${ladder[0]}/s first (twice the guaranteed-safe ${safe}/s) and steps down a tenth at a time, ${ladder.join(', ')}/s, keeping the first rate that passes the check.`
+    : `This profile has no rate that can never fail, so the button tries ${ladder.join(', ')}/s in turn and keeps the first that passes the check.`;
+  const sec = currentSection();
+  $('fpsShown').textContent = sec && sec.fpsFound ? `(${sec.fpsFound}/s)` : '';
 }
 
 function renderWorkspace() {
@@ -1032,6 +1353,7 @@ function renderWorkspace() {
   const ws = $('workspace');
   if (!sec) {
     ws.classList.add('hidden');
+    if (state.player.mode !== 'video') setPlayerSource('video');
     return;
   }
   ws.classList.remove('hidden');
@@ -1048,11 +1370,13 @@ function renderWorkspace() {
   if (!$('fpsInput').value) $('fpsInput').value = wasm.safe_picture_rate(state.config).toString();
   updateFpsNote();
   renderSoften(sec);
+  renderUndo();
   if (sec.prepared) {
     $('frameCount').textContent = `(${sec.nFrames})`;
     renderGrid(sec);
   }
   drawChart();
+  renderPlayerWarning();
 }
 
 /** The "soften stripes" switch: shown when the section has a pattern. */
@@ -1091,6 +1415,7 @@ function renderVerdict(sec) {
     v.textContent = describeFailure(c);
   }
   $('btnSelectUnsafe').classList.toggle('hidden', !(c && !c.safe && c.flagged && c.flagged.length));
+  if (sec === currentSection()) renderPlayerWarning();
 }
 
 function describeFailure(c) {
@@ -1225,6 +1550,7 @@ function renderGridMarks() {
     }
   }
   const soft = new Set(sec.soften && sec.check && !sec.check.stale ? sec.check.soft_frames || [] : []);
+  const kept = new Set(sec.keep || []);
   const softBlur = soft.size && sec.cache ? `blur(${((sec.check.soft_sigma || 1) * THUMB_W) / sec.cache.width()}px)` : '';
   for (let i = 0; i < grid.children.length; i++) {
     const tile = grid.children[i];
@@ -1236,6 +1562,7 @@ function renderGridMarks() {
     tile.classList.toggle('flagged-red', redFlag.has(i));
     tile.classList.toggle('flagged-pat', patFlag.has(i) && !redFlag.has(i));
     tile.classList.toggle('soft', soft.has(i));
+    tile.classList.toggle('kept', kept.has(i));
     tile.querySelector('canvas').style.filter = soft.has(i) ? softBlur : '';
     const fb = tile.querySelector('.fb');
     if (e.removed) {
@@ -1248,15 +1575,59 @@ function renderGridMarks() {
   }
 }
 
+/**
+ * R, F, E and K toggle their own mark on the selected frames, as in the
+ * original tool: pressed on frames that already carry it (judged by the
+ * first frame selected) they take it off, otherwise they put it on. R and F
+ * each toggle their own direction, so one pressed on a removal marked the
+ * other way flips it. U takes every mark off.
+ */
 function markSelection(key) {
   const sec = currentSection();
-  if (!sec || !sec.prepared || !state.selection.size) return;
+  if (!sec || !sec.prepared) return;
+  if (!state.selection.size) return toast('Select frames first (click, or shift-click for a range)');
+  pushHistory(sec);
   sec.edits = sec.edits || {};
-  for (const i of state.selection) {
-    if (key === 'U') delete sec.edits[i];
-    else if (key === 'E') sec.edits[i] = { removed: false, extended: true, fill: 'prev' };
-    else sec.edits[i] = { removed: true, extended: false, fill: key === 'F' ? 'next' : 'prev' };
+  const keep = new Set(sec.keep || []);
+  const items = [...state.selection];
+  const first = sec.edits[items[0]] || null;
+  const removedAs = (fill) => !!(first && first.removed && ((first.fill || 'prev') === 'next') === (fill === 'next'));
+  const set = (i, removed, extended, fill) => {
+    if (!removed && !extended) delete sec.edits[i];
+    else sec.edits[i] = { removed, extended: extended && !removed, fill: fill || 'prev' };
+  };
+  if (key === 'R' || key === 'F') {
+    const fill = key === 'F' ? 'next' : 'prev';
+    const on = !removedAs(fill);
+    for (const i of items) {
+      const e = sec.edits[i] || {};
+      set(i, on, on ? false : !!e.extended, fill);
+      if (on) keep.delete(i);
+    }
+  } else if (key === 'E') {
+    const on = !(first && first.extended && !first.removed);
+    for (const i of items) {
+      const e = sec.edits[i] || {};
+      set(i, on ? false : !!e.removed, on, e.fill);
+    }
+  } else if (key === 'K') {
+    const on = !keep.has(items[0]);
+    for (const i of items) {
+      if (!on) keep.delete(i);
+      else {
+        keep.add(i);
+        // a kept frame stays on screen: a removal goes, a hold stays
+        const e = sec.edits[i];
+        if (e && e.removed) delete sec.edits[i];
+      }
+    }
+  } else {
+    for (const i of items) {
+      delete sec.edits[i];
+      keep.delete(i);
+    }
   }
+  sec.keep = [...keep].sort((a, b) => a - b);
   afterEdit(sec);
 }
 
@@ -1267,8 +1638,76 @@ function afterEdit(sec) {
   renderGridMarks();
   renderVerdict(sec);
   renderSectionList();
+  renderUndo();
+  renderPlayerWarning();
   drawChart();
   if ($('autoCheck').checked) scheduleCheck(120);
+  // a section playing edited picks the change up where it is
+  if (sec.id === state.current && state.player.mode === 'edited' && sectionPlayer && sectionPlayer.active && !sectionPlayer.paused) {
+    clearTimeout(state.player.restartTimer);
+    state.player.restartTimer = setTimeout(() => playSection(Math.max(0, sectionPlayer.slot)), 150);
+  }
+}
+
+// ---- undo / redo of a section's marks --------------------------------------------------
+
+function historyOf(sec) {
+  let h = state.history.get(sec.id);
+  if (!h) {
+    h = { undo: [], redo: [] };
+    state.history.set(sec.id, h);
+  }
+  return h;
+}
+
+function markSnapshot(sec) {
+  return JSON.stringify({ edits: sec.edits || {}, keep: sec.keep || [], soften: !!sec.soften });
+}
+
+/** Remember a section's marks before a change, for undo. */
+function pushHistory(sec) {
+  const h = historyOf(sec);
+  const snap = markSnapshot(sec);
+  if (h.undo[h.undo.length - 1] !== snap) h.undo.push(snap);
+  if (h.undo.length > 200) h.undo.shift();
+  h.redo = [];
+  renderUndo();
+}
+
+function restoreMarks(sec, snap) {
+  const o = JSON.parse(snap);
+  sec.edits = o.edits || {};
+  sec.keep = o.keep || [];
+  sec.soften = !!o.soften;
+}
+
+function undo() {
+  const sec = currentSection();
+  if (!sec || !sec.prepared) return;
+  const h = historyOf(sec);
+  if (!h.undo.length) return toast('Nothing to undo');
+  h.redo.push(markSnapshot(sec));
+  restoreMarks(sec, h.undo.pop());
+  renderSoften(sec);
+  afterEdit(sec);
+}
+
+function redo() {
+  const sec = currentSection();
+  if (!sec || !sec.prepared) return;
+  const h = historyOf(sec);
+  if (!h.redo.length) return toast('Nothing to redo');
+  h.undo.push(markSnapshot(sec));
+  restoreMarks(sec, h.redo.pop());
+  renderSoften(sec);
+  afterEdit(sec);
+}
+
+function renderUndo() {
+  const sec = currentSection();
+  const h = sec ? state.history.get(sec.id) : null;
+  $('btnUndo').disabled = !h || !h.undo.length;
+  $('btnRedo').disabled = !h || !h.redo.length;
 }
 
 // ---- checking -------------------------------------------------------------------------
@@ -1331,16 +1770,25 @@ async function doPrepare(sec) {
   await state.project.save();
   renderAll();
   updateStatus();
-  if (state.current === sec.id) scheduleCheck(0);
+  if (state.current === sec.id) {
+    scheduleCheck(0);
+    if (state.player.mode !== 'video' && !sectionPlayer.active) posterSection();
+  }
   return true;
 }
 
 
-/** Take a suggester's result into the section: its edits, its verdict (or none), and the neighbours' checks go stale. */
+/**
+ * Take a suggester's result into the section (undoably): its edits (frames
+ * marked keep keep theirs), its verdict (or none), and the neighbours'
+ * checks go stale.
+ */
 function applySuggestion(sec, res, only) {
-  sec.edits = JSON.parse(wasm.apply_suggestion(JSON.stringify(sec.edits || {}), JSON.stringify(res.edits), only ? JSON.stringify(only) : undefined));
+  pushHistory(sec);
+  sec.edits = JSON.parse(wasm.apply_suggestion(JSON.stringify(sec.edits || {}), JSON.stringify(res.edits), only ? JSON.stringify(only) : undefined, keepJson(sec)));
   sec.check = res.verdict || null;
   state.project.invalidateNeighbours(sec, wasm.context_seconds(state.config));
+  if (sec.id === state.current && state.player.mode === 'edited' && sectionPlayer && sectionPlayer.active && !sectionPlayer.paused) playSection(Math.max(0, sectionPlayer.slot));
 }
 
 async function doSuggest(prefer) {
@@ -1355,15 +1803,34 @@ async function doSuggest(prefer) {
   toast(res.note, 6000);
 }
 
+/** Reduce FPS: from twice the guaranteed-safe rate down, a tenth at a time, to the first rate that passes. */
 async function doSuggestFps() {
   const sec = currentSection();
   if (!sec || !sec.prepared) return;
   const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
-  const v = parseFloat($('fpsInput').value);
-  const fps = v > 0 ? v : null;
-  const res = await runJob('Thinning to a frame rate', async () => suggestFrameRate(state.env, state.project, sec, only, fps, { extS: EXT_S }));
+  const res = await runJob('Reducing the frame rate', async (progress) =>
+    searchFrameRate(state.env, state.project, sec, only, { extS: EXT_S, sourceFps: state.movie.fps, onProgress: (p, r) => progress(p, `checking ${r} pictures/s`) })
+  );
   if (!res) return;
   applySuggestion(sec, res, only);
+  sec.fpsFound = res.fps;
+  $('fpsInput').value = String(res.fps);
+  await state.project.save();
+  renderAll();
+  toast(res.note, 9000);
+}
+
+/** Reduce FPS to exactly the rate typed in the menu. */
+async function doSuggestFpsExact() {
+  const sec = currentSection();
+  if (!sec || !sec.prepared) return;
+  const v = parseFloat($('fpsInput').value);
+  if (!(v > 0)) return toast('Type a rate, in pictures a second');
+  const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
+  const res = await runJob(`Thinning to ${v} pictures/s`, async () => suggestFrameRate(state.env, state.project, sec, only, v, { extS: EXT_S }));
+  if (!res) return;
+  applySuggestion(sec, res, only);
+  sec.fpsFound = res.fps;
   await state.project.save();
   renderAll();
   toast(res.note, 7000);
@@ -1636,16 +2103,26 @@ async function verifyBlob(blob) {
 
 // ---- auto-fix: open a file, and the scan, the fixes, the export and its check follow -----
 
-/** The switch in the header starts as `?auto=0` / `?auto=1` says, else as it was last left. */
+/**
+ * The switch in the header starts as `?auto=0` / `?auto=1` says, else as it
+ * was last left, else off: what auto-fix makes is a starting point that
+ * hand editing beats, so it is something to ask for.
+ */
 function initialAutoSetting() {
   const q = new URLSearchParams(location.search).get('auto');
   if (q === '0' || q === 'off') return false;
   if (q === '1' || q === 'on') return true;
   try {
-    return localStorage.getItem('unflash:auto') !== '0';
+    return localStorage.getItem('unflash:auto') === '1';
   } catch (e) {
-    return true;
+    return false;
   }
+}
+
+/** Whether a file is scanned as soon as it is opened: always, except with `?auto=0` (nothing automatic at all). */
+function autoScanEnabled() {
+  const q = new URLSearchParams(location.search).get('auto');
+  return !(q === '0' || q === 'off');
 }
 
 /** Whether opening a file (or changing the profile) starts the unattended run: the switch decides. */
@@ -1744,7 +2221,7 @@ async function autopilot({ rescan = false } = {}) {
     const sig = wasm.config_signature(state.config);
     const prior = project.scan;
     if (!rescan && prior && prior.sig === sig && prior.profile === project.profile && (prior.safe || project.sections.length)) {
-      autoStep(auto, 'scan', 'done', `${describeScan(prior)} (from the last visit)`);
+      autoStep(auto, 'scan', 'done', `${describeScan(prior)} (${state.lastScan ? 'scanned when the file was opened' : 'from the last visit'})`);
     } else {
       autoStep(auto, 'scan', 'running', 'decoding every frame');
       const res = await scan();
@@ -1880,6 +2357,7 @@ async function autoFixSection(sec, auto) {
   const did = [];
   // stripes cannot be removed a frame at a time: soften them
   if (c.flag_patterns && violations(c).some((v) => v.kind === 'pattern') && !sec.soften && softenPlan(sec)) {
+    pushHistory(sec);
     sec.soften = true;
     project.invalidateNeighbours(sec, ctxS);
     did.push('softened the stripes');
@@ -1894,7 +2372,7 @@ async function autoFixSection(sec, auto) {
     const tries = [
       ['keep dark', (progress) => suggestEdits(env, project, sec, 'dark', null, { extS: EXT_S, onProgress: rounds(progress) })],
       ['keep light', (progress) => suggestEdits(env, project, sec, 'light', null, { extS: EXT_S, onProgress: rounds(progress) })],
-      ['reduce the frame rate', () => suggestFrameRate(env, project, sec, null, null, { extS: EXT_S })],
+      ['reduce the frame rate', (progress) => searchFrameRate(env, project, sec, null, { extS: EXT_S, sourceFps: state.movie.fps, onProgress: (p, r) => progress(p, `checking ${r} pictures/s`) })],
     ];
     let last = null;
     for (const [label, run] of tries) {
@@ -1931,6 +2409,13 @@ window.__unflash = {
   autopilot,
   stopAuto,
   profile,
+  get sectionPlayer() {
+    return sectionPlayer;
+  },
+  setPlayerSource,
+  playSection,
+  undo,
+  redo,
 };
 
 boot().catch((e) => {

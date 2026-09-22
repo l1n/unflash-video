@@ -324,6 +324,9 @@ pub struct Suggester {
     rel_pts: Vec<f64>,
     prefer: Prefer,
     only: Option<BTreeSet<usize>>,
+    /// Frames the user marked "keep": never removed, and their own marks
+    /// (a hold, say) stay in force.
+    keep: BTreeSet<usize>,
     base_edits: Edits,
     removed: BTreeSet<usize>,
     attempt: usize,
@@ -333,16 +336,15 @@ pub struct Suggester {
 impl Suggester {
     /// `existing` are the section's current marks; with `only` set, marks
     /// outside the selection stay in force and are included in every
-    /// simulation.
-    pub fn new(rel_pts: Vec<f64>, existing: &Edits, prefer: Prefer, only: Option<BTreeSet<usize>>) -> Self {
-        let base_edits: Edits = match &only {
-            Some(o) => existing.iter().filter(|(k, _)| !o.contains(k)).map(|(k, v)| (*k, *v)).collect(),
-            None => Edits::new(),
-        };
+    /// simulation, and so do the marks on `keep` frames, which are never
+    /// removed.
+    pub fn new(rel_pts: Vec<f64>, existing: &Edits, prefer: Prefer, only: Option<BTreeSet<usize>>, keep: BTreeSet<usize>) -> Self {
+        let base_edits = base_marks(existing, only.as_ref(), &keep);
         Suggester {
             rel_pts,
             prefer,
             only,
+            keep,
             base_edits: base_edits.clone(),
             removed: BTreeSet::new(),
             attempt: 0,
@@ -355,7 +357,7 @@ impl Suggester {
     }
 
     fn allowed(&self, i: usize) -> bool {
-        i != 0 && self.only.as_ref().map(|o| o.contains(&i)).unwrap_or(true)
+        i != 0 && self.only.as_ref().map(|o| o.contains(&i)).unwrap_or(true) && !self.keep.contains(&i)
     }
 
     fn indices_in(&self, s: f64, e: f64) -> Vec<usize> {
@@ -477,6 +479,8 @@ impl Suggester {
                 self.removed.len(),
                 if self.only.is_some() {
                     "Try widening the selection, or edit by hand."
+                } else if !self.keep.is_empty() {
+                    "The frames marked keep were left alone; unkeep some, or edit by hand."
                 } else {
                     "Edit this one by hand."
                 }
@@ -517,6 +521,8 @@ pub struct RateProposal {
     pub pool: usize,
     pub n_removed: usize,
     pub only: bool,
+    /// Frames marked keep (never removed).
+    pub kept: usize,
 }
 
 /// Build the thinning proposal. `fps = None` uses the profile's safe rate.
@@ -525,6 +531,7 @@ pub fn rate_proposal(
     rel_pts: &[f64],
     existing: &Edits,
     only: Option<&BTreeSet<usize>>,
+    keep: &BTreeSet<usize>,
     fps: Option<f64>,
     extension_seconds: f64,
 ) -> Result<RateProposal, String> {
@@ -548,13 +555,16 @@ pub fn rate_proposal(
         }
     };
     let guaranteed = rate_is_guaranteed(cfg, fps);
-    let base_edits: Edits = match only {
-        Some(o) => existing.iter().filter(|(k, _)| !o.contains(k)).map(|(k, v)| (*k, *v)).collect(),
-        None => Edits::new(),
-    };
+    let base_edits = base_marks(existing, only, keep);
     let times = picture_times(rel_pts, &base_edits, extension_seconds);
     let gone: BTreeSet<usize> = base_edits.iter().filter(|(_, e)| e.removed).map(|(k, _)| *k).collect();
-    let removed = rate_limited_removals(&times, min_gap, only, &gone);
+    // kept frames still set the pace; they are just never the ones removed
+    let scope: Option<BTreeSet<usize>> = if keep.is_empty() {
+        only.cloned()
+    } else {
+        Some((0..n).filter(|i| !keep.contains(i) && only.map(|o| o.contains(i)).unwrap_or(true)).collect())
+    };
+    let removed = rate_limited_removals(&times, min_gap, scope.as_ref(), &gone);
     let removals: Edits = removed.iter().map(|&i| (i, FrameEdit::removed(Fill::Prev))).collect();
     let mut edits = base_edits;
     edits.extend(removals.iter().map(|(k, v)| (*k, *v)));
@@ -568,7 +578,14 @@ pub fn rate_proposal(
         pool,
         n_removed: removed.len(),
         only: only.is_some(),
+        kept: keep.len(),
     })
+}
+
+/// The marks a suggestion leaves in force: those outside the selection (when
+/// there is one) and those on frames marked keep.
+fn base_marks(existing: &Edits, only: Option<&BTreeSet<usize>>, keep: &BTreeSet<usize>) -> Edits {
+    existing.iter().filter(|(k, _)| keep.contains(k) || only.map(|o| !o.contains(k)).unwrap_or(false)).map(|(k, v)| (*k, *v)).collect()
 }
 
 /// The note for a rate proposal once its simulation is in.
@@ -595,6 +612,8 @@ pub fn rate_note(p: &RateProposal, safe: bool) -> String {
             );
         } else if p.only {
             note += " Still failing. The flashing that is left runs outside the selection. Widen it, or run this on the whole section.";
+        } else if p.kept > 0 {
+            note += " Still failing. The frames marked keep were left alone, and the flashing that is left may be theirs; unkeep some, or edit by hand.";
         } else {
             note += " Still failing. The flashing that is left runs into the footage either side of this section, which nothing in here can reach.";
         }
@@ -615,12 +634,9 @@ pub fn fmt_g(x: f64) -> String {
 /// Merge suggested removals into a section's marks, replacing any previous
 /// suggestion inside the scope (the reference's behaviour: whichever
 /// suggestion ran last wins).
-pub fn apply_suggestion(existing: &Edits, suggested: &Edits, only: Option<&BTreeSet<usize>>) -> Edits {
-    let mut out: Edits = match only {
-        Some(o) => existing.iter().filter(|(k, _)| !o.contains(k)).map(|(k, v)| (*k, *v)).collect(),
-        None => Edits::new(),
-    };
-    out.extend(suggested.iter().map(|(k, v)| (*k, *v)));
+pub fn apply_suggestion(existing: &Edits, suggested: &Edits, only: Option<&BTreeSet<usize>>, keep: &BTreeSet<usize>) -> Edits {
+    let mut out = base_marks(existing, only, keep);
+    out.extend(suggested.iter().filter(|(k, _)| !keep.contains(k)).map(|(k, v)| (*k, *v)));
     out
 }
 
@@ -705,16 +721,46 @@ mod tests {
     }
 
     #[test]
+    fn kept_frames_are_never_removed_and_keep_their_marks() {
+        let cfg = DetectorConfig::default();
+        let pts: Vec<f64> = (0..48).map(|i| i as f64 / 24.0).collect();
+        let mut existing = Edits::new();
+        existing.insert(5, FrameEdit::extended());
+        existing.insert(6, FrameEdit::removed(Fill::Prev));
+        let keep: BTreeSet<usize> = [5, 7, 8, 9].into_iter().collect();
+        let p = rate_proposal(&cfg, &pts, &existing, None, &keep, None, 1.0).unwrap();
+        for k in &keep {
+            assert!(!p.removals.contains_key(k), "kept frame {k} removed");
+        }
+        // the hold on the kept frame stays in force; the removal elsewhere is replaced
+        assert_eq!(p.edits.get(&5), Some(&FrameEdit::extended()));
+        assert!(p.n_removed > 0);
+        assert_eq!(p.kept, 4);
+        let merged = apply_suggestion(&existing, &p.removals, None, &keep);
+        assert_eq!(merged.get(&5), Some(&FrameEdit::extended()));
+        assert!(keep.iter().all(|k| !merged.get(k).map(|e| e.removed).unwrap_or(false)));
+        // the suggester leaves kept frames alone too
+        let mut s = Suggester::new(pts.clone(), &existing, Prefer::Dark, None, keep.clone());
+        assert!(!s.allowed(7) && !s.allowed(0) && s.allowed(10));
+        assert_eq!(s.base_edits.get(&5), Some(&FrameEdit::extended()));
+        assert!(!s.base_edits.contains_key(&6));
+        s.removed.insert(10);
+        assert!(s.proposal().contains_key(&5) && s.proposal().contains_key(&10));
+        // without keep marks nothing changes: a suggestion replaces every mark
+        assert!(base_marks(&existing, None, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
     fn rate_proposal_defaults_to_safe_rate() {
         let cfg = DetectorConfig::default();
         let pts: Vec<f64> = (0..48).map(|i| i as f64 / 24.0).collect();
-        let p = rate_proposal(&cfg, &pts, &Edits::new(), None, None, 1.0).unwrap();
+        let p = rate_proposal(&cfg, &pts, &Edits::new(), None, &BTreeSet::new(), None, 1.0).unwrap();
         assert_eq!(p.fps, 3.80);
         assert!(p.guaranteed);
         // 2 s at 3.8/s keeps ~8 pictures
         assert!(p.pool - p.n_removed <= 9 && p.pool - p.n_removed >= 7);
         assert!(rate_note(&p, true).starts_with("Thinned to 3.8/s"));
-        assert!(rate_proposal(&cfg, &pts, &Edits::new(), None, Some(0.0), 1.0).is_err());
+        assert!(rate_proposal(&cfg, &pts, &Edits::new(), None, &BTreeSet::new(), Some(0.0), 1.0).is_err());
     }
 
     #[test]

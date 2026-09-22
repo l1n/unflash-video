@@ -60,40 +60,54 @@ is decoded by Unflash itself when the browser cannot.
 
 1. **Open video**, or drop one anywhere on the page. The file's index is
    read (only its headers; nothing is uploaded), the detector starts on
-   WebGPU or, failing that, on the CPU, and the project is restored from the
-   browser's storage if you have opened this file before.
-2. **Wait.** With **auto-fix** on (the default) the rest happens by itself,
-   and the strip under the toolbar shows where it is: *scan* decodes every
-   frame and puts a numbered *section* around each problem; *fix* prepares
-   each section and makes it pass (stripes are softened; flashing is taken
-   out by removing frames, keep-dark then keep-light, and when that isn't
-   enough by thinning the section to a rate that cannot fail); *export*
-   re-encodes the video with those edits; *verify* re-scans the export. A
-   file with nothing wrong stops after the scan. A section the suggesters
-   can't fix stops the run and is opened for editing.
-3. **Download fixed video.** The one button.
+   WebGPU or, failing that, on the CPU, the project is restored from the
+   browser's storage if you have opened this file before, and the scan
+   starts: every frame is decoded and pushed through the detector, and a
+   numbered *section* goes around each problem.
+2. **Open a section.** It prepares itself (its frames, plus a run-up and
+   run-out, are decoded into memory at analysis resolution) and is checked.
+3. **Edit it.** Mark frames: **R** removes a frame and shows the previous
+   one in its place, **F** the next one, **E** holds a frame for a second;
+   pressing the same key again takes the mark off, as in the original tool,
+   and the keys work with the focus anywhere but a text field. **Ctrl+Z**
+   undoes (and **Ctrl+Shift+Z** redoes) any change to the section's marks,
+   suggestions included. The section is re-checked after every change, in
+   well under a second.
+4. **Suggest** gives you a first pass: *keep dark* or *keep light* removes
+   the frames that make the flashing; *reduce FPS* thins the section the way
+   an editor does it by hand, trying twice the rate that can never fail
+   first and stepping down a tenth at a time until the check passes (the ▾
+   menu thins to a rate you type). They choose by brightness alone, so
+   they can take out a line of burnt-in subtitles or a frame that matters:
+   mark such frames **K** (keep) first and every suggestion works around
+   them, leaving their own marks (a hold, say) in place.
+5. **Watch it.** With a section open, the player plays that section with
+   your marks applied, rendered from the source file exactly as the export
+   will render it (removed frames showing their stand-in, holds held,
+   softened frames blurred); switch it to *original* to compare, or to the
+   *whole video*. It plays from the selected frame, loops if asked, runs at
+   ½× or ¼×, outlines the frame on screen in the grid, and with **live
+   monitor** on shows the check's meter for that frame. It starts small
+   and dimmed (S, M, L and *dim* above it), and the line above it says what
+   is on screen and whether that passes.
+6. A stripe pattern can't be removed a frame at a time; tick **soften
+   stripes** and the frames that carry it are blurred just enough to take
+   it under the threshold, in the check, the player and the export alike.
+7. **Export**: the spans around the sections are re-encoded in the browser
+   with the edits applied, several at a time; every GOP no section touches
+   is copied from the source as it is, and so is the audio. **Verify**
+   re-scans the exported file with the same detector.
 
-Everything the run did can be redone by hand, and that is also the way to
-work with **auto-fix** unticked (or `?auto=0` in the URL):
+**Auto-fix** (tick it in the header; off unless you do) does steps 2 to 7
+unattended: it softens stripes, tries keep dark, then keep light, then
+reduce FPS on every section, exports, verifies, and offers **Download fixed
+video**. A section it can't fix stops the run and is opened for editing.
+Treat what it makes as a starting point: it can't tell which frames carry
+something that matters, so editing by hand, with the player, gives better
+results. Its changes to each section can be undone like any other.
 
-- **Scan for flashes & patterns** decodes every frame with WebCodecs and
-  pushes it through the detector; the timeline shows where the problems
-  are. Or tick **live monitor** and press play: the meter above the video
-  shows how much of the picture is flashing or striped right now, and the
-  verdict flips the moment a violation lands.
-- **Prepare** a section: its frames, plus a run-up and run-out, are decoded
-  into memory at analysis resolution.
-- **Edit.** Mark frames (**R** remove and show the previous frame, **F**
-  remove and show the next, **E** hold for a second muted, **U** unmark), or
-  let **Suggest** do it. The section is re-checked automatically after every
-  change, in well under a second. A stripe pattern can't be removed a frame
-  at a time; tick **soften stripes** and the frames that carry it are
-  blurred just enough to take it under the threshold, in the check and in
-  the export alike.
-- **Export**: the spans around the sections are re-encoded in the browser
-  with the edits applied, several at a time; every GOP no section touches
-  is copied from the source as it is, and so is the audio. **Verify**
-  re-scans the exported file with the same detector.
+The **Guide** button opens the guide beside your work and closes it again
+(so does Esc).
 
 Profiles (**WCAG + extended flashes + stripe patterns**, **Exact WCAG
 only**, **Stricter than WCAG**), the suggesters, the safe frame-rate bound
@@ -143,7 +157,8 @@ what the built-in decoder hands over directly); WebCodecs' RGBA conversion;
 a canvas blit; or canvas pixels. `?route=videoframe|yuv|rgba|canvas|pixels`
 forces one, `?extsrc=canvas` (or `none`) pretends WebGPU accepts only those
 copy sources, `?workers=N` sets the number of built-in decoder workers,
-`?auto=0` keeps auto-fix from starting when a file is opened, and
+`?auto=0` keeps anything from starting when a file is opened (not even the
+scan), `?auto=1` ticks auto-fix, and
 `?monitor=detect` makes the live monitor run the detector on the player
 even when a finished scan of the file could be read instead.
 

@@ -62,6 +62,16 @@ async function openFile(name) {
   await page.waitForFunction((n) => document.querySelector('#videoInfo').textContent.includes(n), name, { timeout: 60000 });
   await page.waitForFunction(() => !document.querySelector('#status').textContent.includes('ready ·'), null, { timeout: 60000 });
 }
+// a section prepares itself when it is opened
+async function openSectionPrepared(selector = '#sectionList .sec-item', timeout = 120000) {
+  await page.click(selector);
+  await page.waitForFunction(() => !document.querySelector('#wsBody').classList.contains('hidden'), null, { timeout });
+}
+const toastChange = async (before, timeout = 300000) => {
+  await page.waitForFunction((t) => document.querySelector('#toast').textContent !== t || !document.querySelector('#banner').classList.contains('hidden'), before, { timeout });
+  await noBanner(page);
+  await jobDone(page);
+};
 async function scanCurrent() {
   const t0 = Date.now();
   await page.click('#btnScan');
@@ -101,12 +111,9 @@ try {
   assert(gen && gen.start > 3.5 && gen.start < 4.6 && gen.end > 5.2 && gen.end < 5.8, 'general flash reported at 3.9-5.5 s: ' + JSON.stringify(gen));
   assert(red && red.start > 7.5 && red.start < 8.6 && red.end > 8.2 && red.end < 8.8, 'red flash reported at 7.9-8.5 s: ' + JSON.stringify(red));
 
-  // --- open, prepare, check the section ---------------------------------------
-  await page.click('#sectionList .sec-item');
-  await page.waitForSelector('#btnPrepare', { state: 'visible' });
+  // --- open the section: it prepares itself and is checked --------------------
   let t0 = Date.now();
-  await page.click('#btnPrepare');
-  await page.waitForFunction(() => !document.querySelector('#wsBody').classList.contains('hidden'), null, { timeout: 120000 });
+  await openSectionPrepared();
   await verdictReady(page);
   results.prepareMs = Date.now() - t0;
   results.verdictBefore = await page.textContent('#wsVerdict');
@@ -164,6 +171,99 @@ try {
   console.log('reduce fps:', results.fpsVerdict, '|', results.fpsToast);
   assert(results.fpsVerdict.startsWith('passes'), 'thinning to the safe rate must pass');
   assert(results.fpsToast.includes('3.8/s'), 'the safe rate for the default profile is 3.8/s');
+  // it starts at twice the safe rate and steps down: it keeps more pictures than the safe rate would
+  results.fpsFound = await page.evaluate(() => window.__unflash.currentSection().fpsFound);
+  assert(results.fpsFound > 3.8 && results.fpsFound <= 7.6, 'reduce FPS keeps the highest rate that passes, between the safe rate and twice it: ' + results.fpsFound);
+  assert(/Thinned to 7\.6\/s|Tried 7\.6\/s/.test(results.fpsToast), 'reduce FPS tries twice the safe rate first: ' + results.fpsToast);
+  const fpsMarks = await page.evaluate(() => JSON.stringify(window.__unflash.currentSection().edits));
+
+  // --- a rate of your own, from the menu ---------------------------------------
+  await page.click('#btnFpsMenu');
+  await page.fill('#fpsInput', '3.8');
+  let toastNow = await page.textContent('#toast');
+  await page.click('#btnFpsExact');
+  await toastChange(toastNow);
+  await verdictReady(page);
+  results.fpsExactToast = await page.textContent('#toast');
+  assert(/^Thinned to 3\.8\/s/.test(results.fpsExactToast) && (await page.textContent('#wsVerdict')).startsWith('passes'), 'the menu thins to exactly the rate typed: ' + results.fpsExactToast);
+
+  // --- R, F, E toggle their own mark; undo and redo -----------------------------
+  const marksNow = () => page.evaluate(() => JSON.stringify(window.__unflash.currentSection().edits));
+  const exactMarks = await marksNow();
+  await page.click('#btnClearEdits');
+  const g0 = f0 + 2;
+  await page.click(`#frameGrid .frame:nth-child(${g0 + 1})`);
+  await page.keyboard.down('Shift');
+  await page.click(`#frameGrid .frame:nth-child(${g0 + 3})`);
+  await page.keyboard.up('Shift');
+  await page.click('#wsTitle'); // the keys work with the focus anywhere but a field
+  const marksOf = () => page.evaluate((g) => [0, 1, 2].map((k) => { const e = window.__unflash.currentSection().edits[g + k]; return e ? (e.removed ? `R${e.fill === 'next' ? 'n' : 'p'}` : e.extended ? 'E' : '?') : '-'; }).join(','), g0);
+  const seq = [];
+  for (const key of ['r', 'r', 'f', 'r', 'e', 'e']) {
+    await page.keyboard.press(key);
+    seq.push(await marksOf());
+  }
+  results.toggles = seq;
+  console.log('R R F R E E:', seq.join(' | '));
+  assert(seq.join(' | ') === 'Rp,Rp,Rp | -,-,- | Rn,Rn,Rn | Rp,Rp,Rp | E,E,E | -,-,-', 'R/F/E put their mark on and take it off again: ' + seq.join(' | '));
+  for (let k = 0; k < 6; k++) await page.keyboard.press('Control+z');
+  assert((await marksOf()) === '-,-,-', 'undo steps back through every change');
+  await page.keyboard.press('Control+z'); // the clear
+  assert((await marksNow()) === exactMarks, 'undoing the clear brings the 3.8/s marks back');
+  await page.keyboard.press('Control+z'); // the thinning to 3.8/s
+  assert((await marksNow()) === fpsMarks, "and before them the searched rate's marks");
+  await page.keyboard.press('Control+Shift+z');
+  assert((await marksNow()) === exactMarks, 'redo takes the thinning to 3.8/s again');
+  await verdictReady(page);
+  assert((await page.textContent('#wsVerdict')).startsWith('passes'), 'the section passes again');
+
+  // --- K keeps a frame out of the suggestions' reach ---------------------------
+  await page.click('#btnClearEdits');
+  const lum = await page.evaluate(() => window.__unflash.currentSection().check.stats.lum);
+  let bright = f0;
+  for (let i = f0; i < Math.min(lum.length, f0 + 30); i++) if (lum[i] > lum[bright]) bright = i;
+  await page.click(`#frameGrid .frame:nth-child(${bright + 1})`);
+  await page.keyboard.press('k');
+  toastNow = await page.textContent('#toast');
+  await page.click('#btnSuggestDark');
+  await toastChange(toastNow);
+  await verdictReady(page);
+  results.keep = await page.evaluate((b) => ({ keep: window.__unflash.currentSection().keep, mark: window.__unflash.currentSection().edits[b] || null, tile: document.querySelector(`#frameGrid .frame:nth-child(${b + 1})`).classList.contains('kept') }), bright);
+  results.keepVerdict = await page.textContent('#wsVerdict');
+  console.log('keep frame', bright, JSON.stringify(results.keep), results.keepVerdict, '|', await page.textContent('#toast'));
+  assert(results.keep.keep.includes(bright) && !(results.keep.mark && results.keep.mark.removed) && results.keep.tile, 'keep dark leaves the kept (bright) frame alone: ' + JSON.stringify(results.keep));
+  assert(results.keepVerdict.startsWith('passes'), 'and still makes the section pass: ' + results.keepVerdict);
+
+  // --- the section player plays the section with the marks applied -------------
+  assert((await page.$eval('#playerSource', (s) => s.value)) === 'edited', 'with a section open the player shows it, edited');
+  results.playerWarning = await page.textContent('#playerWarning');
+  assert(/Section #\d+ with your marks: passes the check/.test(results.playerWarning), 'the player says what it shows: ' + results.playerWarning);
+  await page.evaluate(() => {
+    window.__slots = [];
+    const orig = window.__unflash.sectionPlayer.onFrame;
+    window.__unflash.sectionPlayer.onFrame = (info, t, plan) => {
+      window.__slots.push(info.slot);
+      window.__playingTiles = Math.max(window.__playingTiles || 0, document.querySelectorAll('#frameGrid .frame.playing').length);
+      orig(info, t, plan);
+    };
+  });
+  await page.keyboard.press('Escape'); // no selection: play from the start
+  await page.click('#btnPreviewPlay');
+  await page.waitForFunction(() => window.__unflash.sectionPlayer.active, null, { timeout: 10000 });
+  await page.waitForFunction(() => !window.__unflash.sectionPlayer.active, null, { timeout: 120000 });
+  results.play = await page.evaluate(() => ({ n: window.__slots.length, first: window.__slots[0], last: window.__slots[window.__slots.length - 1], inOrder: window.__slots.every((s, i, a) => i === 0 || s === a[i - 1] + 1), tiles: document.querySelectorAll('#frameGrid .frame').length, playing: document.querySelectorAll('#frameGrid .frame.playing').length }));
+  console.log('section player:', JSON.stringify(results.play));
+  assert(results.play.first === 0 && results.play.last === results.play.tiles - 1 && results.play.inOrder, 'the section plays every frame of the section in order: ' + JSON.stringify(results.play));
+  await page.evaluate(() => (window.__unflash.sectionPlayer.onFrame = null));
+
+  // --- the guide opens beside the work and closes again -------------------------
+  await page.click('#btnHome');
+  const guideOpen = await page.evaluate(() => ({ guide: getComputedStyle(document.querySelector('#welcome')).display, stage: getComputedStyle(document.querySelector('#stage')).display }));
+  assert(guideOpen.guide !== 'none' && guideOpen.stage !== 'none', 'the guide opens beside the work, which stays: ' + JSON.stringify(guideOpen));
+  await page.click('#sectionList .sec-item');
+  assert(!(await page.$eval('#workspace', (w) => w.classList.contains('hidden'))), 'a section opens while the guide is open');
+  await page.keyboard.press('Escape');
+  assert((await page.evaluate(() => getComputedStyle(document.querySelector('#welcome')).display)) === 'none', 'Esc closes the guide');
 
   // --- export and verify -----------------------------------------------------
   await page.click('#btnExport');
@@ -209,6 +309,7 @@ try {
   await page.click('#btnCloseExport');
 
   // --- the live monitor on the original -------------------------------------
+  await page.selectOption('#playerSource', 'video');
   await page.check('#liveToggle');
   await page.evaluate(() => {
     const v = document.querySelector('#player');
@@ -280,10 +381,7 @@ try {
   assert(pats[0].start > 1.8 && pats[0].start < 2.6 && pats[pats.length - 1].end > 8.5 && pats[pats.length - 1].end < 9.4, 'the pattern runs from 2 s to 9 s: ' + JSON.stringify(pats));
   results.stripesSections = await page.$$eval('#sectionList .sec-item', (els) => els.map((e) => e.textContent));
   assert(results.stripesSections.length === 1 && results.stripesSections[0].includes('stripes'), 'one section, labeled stripes: ' + JSON.stringify(results.stripesSections));
-  await page.click('#sectionList .sec-item');
-  await page.waitForSelector('#btnPrepare', { state: 'visible' });
-  await page.click('#btnPrepare');
-  await page.waitForFunction(() => !document.querySelector('#wsBody').classList.contains('hidden'), null, { timeout: 120000 });
+  await openSectionPrepared();
   await verdictReady(page);
   results.stripesVerdict = await page.textContent('#wsVerdict');
   results.softenNote = await page.textContent('#softenNote');
@@ -370,10 +468,7 @@ try {
     scan = await scanCurrent();
   }
   // sections work through the built-in decoder too: prepare and check the flash
-  await page.click('#sectionList .sec-item');
-  await page.waitForSelector('#btnPrepare', { state: 'visible' });
-  await page.click('#btnPrepare');
-  await page.waitForFunction(() => !document.querySelector('#wsBody').classList.contains('hidden'), null, { timeout: 180000 });
+  await openSectionPrepared('#sectionList .sec-item', 180000);
   await verdictReady(page);
   results.h264Verdict = await page.textContent('#wsVerdict');
   console.log('h264 section verdict:', results.h264Verdict);
@@ -524,7 +619,15 @@ try {
       return { steps: a.steps, summary: a.summary, hasBlob: !!a.blobUrl, download: dl.classList.contains('hidden') ? null : dl.getAttribute('download') };
     });
   };
-  assert(await page.$eval('#autoToggle', (c) => c.checked), 'auto-fix is on by default');
+  assert(!(await page.$eval('#autoToggle', (c) => c.checked)), 'auto-fix is off unless asked for');
+  // with it off, opening a file still scans it, and does nothing else
+  await openFile('steady.mp4');
+  await page.waitForFunction(() => window.__unflash.state.project.scan && !window.__unflash.state.job, null, { timeout: 120000 });
+  assert(await page.evaluate(() => !window.__unflash.auto), 'no unattended run without auto-fix');
+  await page.check('#autoToggle');
+  await page.waitForFunction(() => window.__unflash.auto && !window.__unflash.auto.running, null, { timeout: 120000 });
+  results.autoTicked = await page.evaluate(() => window.__unflash.auto.steps.scan.text);
+  assert(/scanned when the file was opened/.test(results.autoTicked), 'ticked later, auto-fix takes the scan the file already had: ' + results.autoTicked);
   t0 = Date.now();
   await openFile('flash.mp4');
   results.autoFlash = await autoDone();
@@ -570,11 +673,11 @@ try {
   console.log('auto-fix flash.mp4 again:', JSON.stringify(results.autoAgain));
   assert(/last visit/.test(results.autoAgain.steps.scan.text) && /marks from before/.test(results.autoAgain.steps.fix.text) && results.autoAgain.steps.verify.status === 'done', 'the second visit reuses the scan and the marks: ' + JSON.stringify(results.autoAgain.steps));
 
-  // the switch in the header turns it off
+  // the switch in the header turns it off: the file is scanned and nothing more
   await page.uncheck('#autoToggle');
   await openFile('steady.mp4');
   await page.waitForTimeout(800);
-  assert(await page.$eval('#auto', (e) => e.classList.contains('hidden')), 'with auto-fix off, opening a file starts nothing');
+  assert(await page.$eval('#auto', (e) => e.classList.contains('hidden')), 'with auto-fix off, opening a file starts no unattended run');
   assert(await page.evaluate(() => !window.__unflash.auto), 'no run was started');
   await page.check('#autoToggle');
   await page.waitForFunction(() => window.__unflash.auto && !window.__unflash.auto.running, null, { timeout: 120000 });

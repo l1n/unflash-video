@@ -87,6 +87,7 @@ export class Project {
           ctx: null,
           check: s.check || null,
           edits: s.edits || {},
+          keep: s.keep || [],
           soften: !!s.soften,
           pattern: s.pattern || null,
         }));
@@ -104,6 +105,7 @@ export class Project {
       end: s.end,
       kinds: s.kinds || [],
       edits: s.edits || {},
+      keep: s.keep || [],
       check: s.check ? summarizeCheck(s.check) : null,
       nFrames: s.nFrames || 0,
       pts: s.pts || null,
@@ -138,6 +140,7 @@ export class Project {
       end: Math.round(end * 1e6) / 1e6,
       kinds,
       edits: {},
+      keep: [],
       prepared: false,
       cache: null,
       softCache: null,

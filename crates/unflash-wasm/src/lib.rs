@@ -47,6 +47,11 @@ fn parse_only(json: Option<String>) -> Result<Option<BTreeSet<usize>>, JsValue> 
     }
 }
 
+/// Frames marked keep, as a JSON array of ordinals (absent: none).
+fn parse_keep(json: Option<String>) -> Result<BTreeSet<usize>, JsValue> {
+    Ok(parse_only(json)?.unwrap_or_default())
+}
+
 fn parse_violations(json: &str) -> Result<Vec<Violation>, JsValue> {
     serde_json::from_str(json).map_err(|e| js_err(format!("bad violations: {e}")))
 }
@@ -213,11 +218,13 @@ pub fn rate_proposal(
     only_json: Option<String>,
     fps: Option<f64>,
     extension_seconds: f64,
+    keep_json: Option<String>,
 ) -> Result<String, JsValue> {
     let cfg = parse_cfg(config_json)?;
     let e = parse_edits(edits_json)?;
     let only = parse_only(only_json)?;
-    let p = editing::rate_proposal(&cfg, rel_pts, &e, only.as_ref(), fps, extension_seconds).map_err(js_err)?;
+    let keep = parse_keep(keep_json)?;
+    let p = editing::rate_proposal(&cfg, rel_pts, &e, only.as_ref(), &keep, fps, extension_seconds).map_err(js_err)?;
     Ok(serde_json::json!({
         "edits": p.edits,
         "removals": p.removals,
@@ -227,6 +234,7 @@ pub fn rate_proposal(
         "pool": p.pool,
         "n_removed": p.n_removed,
         "only": p.only,
+        "kept": p.kept,
     })
     .to_string())
 }
@@ -243,16 +251,20 @@ pub fn rate_note(proposal_json: &str, safe: bool) -> Result<String, JsValue> {
         pool: v["pool"].as_u64().unwrap_or(0) as usize,
         n_removed: v["n_removed"].as_u64().unwrap_or(0) as usize,
         only: v["only"].as_bool().unwrap_or(false),
+        kept: v["kept"].as_u64().unwrap_or(0) as usize,
     };
     Ok(editing::rate_note(&p, safe))
 }
 
 #[wasm_bindgen]
-pub fn apply_suggestion(existing_json: &str, suggested_json: &str, only_json: Option<String>) -> Result<String, JsValue> {
+/// Merge a suggestion into a section's marks: it replaces the marks inside
+/// its scope, except on frames marked keep, whose marks stay.
+pub fn apply_suggestion(existing_json: &str, suggested_json: &str, only_json: Option<String>, keep_json: Option<String>) -> Result<String, JsValue> {
     let ex = parse_edits(existing_json)?;
     let su = parse_edits(suggested_json)?;
     let only = parse_only(only_json)?;
-    to_json(&editing::apply_suggestion(&ex, &su, only.as_ref()))
+    let keep = parse_keep(keep_json)?;
+    to_json(&editing::apply_suggestion(&ex, &su, only.as_ref(), &keep))
 }
 
 #[wasm_bindgen]
@@ -396,7 +408,9 @@ pub struct Suggester {
 #[wasm_bindgen]
 impl Suggester {
     #[wasm_bindgen(constructor)]
-    pub fn new(rel_pts: &[f64], edits_json: &str, prefer: &str, only_json: Option<String>) -> Result<Suggester, JsValue> {
+    /// `only_json`: the ordinals it may touch (absent: all); `keep_json`:
+    /// frames it must never remove.
+    pub fn new(rel_pts: &[f64], edits_json: &str, prefer: &str, only_json: Option<String>, keep_json: Option<String>) -> Result<Suggester, JsValue> {
         let e = parse_edits(edits_json)?;
         let prefer = match prefer {
             "light" => Prefer::Light,
@@ -404,7 +418,8 @@ impl Suggester {
             other => return Err(js_err(format!("prefer must be light or dark, not {other}"))),
         };
         let only = parse_only(only_json)?;
-        Ok(Suggester { inner: editing::Suggester::new(rel_pts.to_vec(), &e, prefer, only) })
+        let keep = parse_keep(keep_json)?;
+        Ok(Suggester { inner: editing::Suggester::new(rel_pts.to_vec(), &e, prefer, only, keep) })
     }
 
     /// Returns `{"simulate": edits}` (run the check on these and call again

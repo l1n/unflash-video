@@ -164,28 +164,36 @@ class FileSink {
  * cache (dropped to save memory, or not rebuilt since the project was
  * restored): every section that was prepared once is applied.
  */
-function sectionPlans(env, movie, project, extS, warnings) {
+/**
+ * How one prepared section is rendered: its edited sequence (display time,
+ * source ordinal), where it starts, how many of its frames it shows, the
+ * seconds its holds add and the frames "soften stripes" blurs. With
+ * `edited` false, the section as it is (the section player's "original").
+ */
+export function sectionRenderPlan(env, movie, s, extS, { edited = true } = {}) {
   const { wasm } = env;
+  const tl = JSON.parse(wasm.section_timeline(Float64Array.from(s.pts), s.start, s.end));
+  const shown = shownPts(wasm, s);
+  const seq = JSON.parse(wasm.edited_sequence(Float64Array.from(shown), JSON.stringify(edited ? s.edits || {} : {}), extS));
+  const hasEdits = edited && Object.values(s.edits || {}).some((e) => e.removed || e.extended);
+  const needCount = new Map();
+  for (const src of seq.src) needCount.set(src, (needCount.get(src) || 0) + 1);
+  const extra = seq.t.length ? seq.t[seq.t.length - 1] - shown[shown.length - 1] : 0;
+  // "soften stripes": blur the patterned frames at source resolution with
+  // the σ the section's check used, scaled up from analysis pixels
+  let soft = null;
+  if (edited && s.soften) {
+    const plan = softenPlan(s);
+    if (plan) soft = { frames: plan.frames, sigma: plan.sigma * (movie.width / env.feeder.aw) };
+  }
+  return { sec: s, base: tl.base, seq, nOut: tl.n_out, hasEdits, needCount, extra, soft };
+}
+
+function sectionPlans(env, movie, project, extS, warnings) {
   const sections = project
     .sectionsSorted()
     .filter((s) => s.pts && s.pts.length)
-    .map((s) => {
-      const tl = JSON.parse(wasm.section_timeline(Float64Array.from(s.pts), s.start, s.end));
-      const shown = shownPts(wasm, s);
-      const seq = JSON.parse(wasm.edited_sequence(Float64Array.from(shown), JSON.stringify(s.edits || {}), extS));
-      const hasEdits = Object.values(s.edits || {}).some((e) => e.removed || e.extended);
-      const needCount = new Map();
-      for (const src of seq.src) needCount.set(src, (needCount.get(src) || 0) + 1);
-      const extra = seq.t.length ? seq.t[seq.t.length - 1] - shown[shown.length - 1] : 0;
-      // "soften stripes": blur the patterned frames at source resolution with
-      // the σ the section's check used, scaled up from analysis pixels
-      let soft = null;
-      if (s.soften) {
-        const plan = softenPlan(s);
-        if (plan) soft = { frames: plan.frames, sigma: plan.sigma * (movie.width / env.feeder.aw) };
-      }
-      return { sec: s, base: tl.base, seq, nOut: tl.n_out, hasEdits, needCount, extra, soft };
-    });
+    .map((s) => sectionRenderPlan(env, movie, s, extS));
   const unprepared = project.sections.filter((s) => !(s.pts && s.pts.length) && Object.values(s.edits || {}).some((e) => e.removed || e.extended));
   if (unprepared.length) warnings.push(`Sections ${unprepared.map((s) => '#' + s.id).join(', ')} have marks but were never prepared; their marks were not applied. Prepare them and export again.`);
   if (sections.some((p) => p.extra > 0) && movie.audio) warnings.push('Some frames are held for a second (E marks). The audio is copied unchanged, so it runs ahead of the picture after each hold.');
@@ -365,6 +373,98 @@ export async function exportPlan(env, movie, project, { extS = 1.0, codec = null
   return { mode, copyable, pieces, sections, spans: pieces.filter((p) => p.kind === 'encode').length, encoded: encodedFrames, copied: copiedFrames, copiedBytes, encodedSeconds, parallel: K, warnings };
 }
 
+// ---- the edited timeline, frame by frame ------------------------------------------
+
+/**
+ * Decode a piece of the source (`startSec`..`endSec`, from sample `from` when
+ * given) and hand its edited timeline to `emit(frame, tSec, info)` in order:
+ * inside a section the slots of its edited sequence (removed frames showing
+ * their stand-in, held frames held, softened frames blurred), outside the
+ * frames as they are, every time shifted by the holds before it. `emit` must
+ * not keep the frame past its return (clone it if needed). `info` is
+ * `{ sec, slot, src, softened }` (sec null and slot -1 outside a section).
+ * Returns `{ softened, warnings }`. The export encodes what it is handed;
+ * the section player paces it onto a canvas.
+ */
+export async function walkEdited(movie, piece, emit, { cancel } = {}) {
+  let softened = 0;
+  const warnings = [];
+  let offset = piece.offset || 0; // cumulative extension seconds
+  const sections = piece.sections;
+  let si = 0;
+  let cur = null;
+  const enterSection = (p) => ({ p, ordinal: 0, next: 0, frames: new Map(), need: new Map(p.needCount) });
+  const flushSection = async (st) => {
+    const { p } = st;
+    while (st.next < p.seq.t.length && st.frames.has(p.seq.src[st.next])) {
+      const src = p.seq.src[st.next];
+      const t = p.sec.start + p.base + p.seq.t[st.next] + offset;
+      if (p.soft && p.soft.frames.has(src)) {
+        const b = blurFrame(st.frames.get(src), p.soft.sigma);
+        try {
+          await emit(b, t, { sec: p.sec, slot: st.next, src, softened: true });
+        } finally {
+          b.close();
+        }
+        softened++;
+      } else await emit(st.frames.get(src), t, { sec: p.sec, slot: st.next, src, softened: false });
+      const left = st.need.get(src) - 1;
+      st.need.set(src, left);
+      if (left <= 0) {
+        st.frames.get(src).close();
+        st.frames.delete(src);
+      }
+      st.next++;
+    }
+  };
+  const endSection = async (st) => {
+    try {
+      await flushSection(st);
+    } finally {
+      for (const f of st.frames.values()) f.close();
+      st.frames.clear();
+    }
+    if (st.next < st.p.seq.t.length && !(cancel && cancel())) warnings.push(`Section #${st.p.sec.id}: ${st.p.seq.t.length - st.next} slots could not be filled (the decode returned fewer frames than when it was prepared).`);
+    offset += st.p.extra;
+    cur = null;
+  };
+  try {
+    await decodeRange(
+      movie,
+      piece.startSec,
+      piece.endSec,
+      async (frame, t) => {
+        // leave a section whose frames are exhausted
+        if (cur && (cur.ordinal >= cur.p.nOut || t >= cur.p.sec.end - 1e-9)) await endSection(cur);
+        // enter a section?
+        while (!cur && si < sections.length && t >= sections[si].sec.end - 1e-9) si++; // skipped entirely (empty)
+        if (!cur && si < sections.length && t >= sections[si].sec.start - 1e-9 && t < sections[si].sec.end - 1e-9) {
+          cur = enterSection(sections[si]);
+          si++;
+        }
+        if (cur) {
+          const j = cur.ordinal++;
+          if (cur.need.has(j) && cur.need.get(j) > 0) cur.frames.set(j, frame);
+          else frame.close();
+          await flushSection(cur);
+          return;
+        }
+        try {
+          await emit(frame, t + offset, { sec: null, slot: -1, src: -1, softened: false });
+        } finally {
+          frame.close();
+        }
+      },
+      { cancel, fromIndex: piece.from == null ? null : piece.from }
+    );
+    if (cur) await endSection(cur);
+  } finally {
+    // an error or a cancel mid-section: its held frames go too
+    if (cur) for (const f of cur.frames.values()) f.close();
+  }
+  return { softened, warnings };
+}
+
 // ---- one re-encoded piece --------------------------------------------------------
 
 /**
@@ -425,66 +525,10 @@ class PieceEncoder {
       }
       pending = { frame: new VideoFrame(frame, { timestamp: tUs }), tUs };
     };
-    // the piece's sections, in order, as the frames come by in presentation order
-    let offset = piece.offset; // cumulative extension seconds
-    const sections = piece.sections;
-    let si = 0;
-    let cur = null;
-    const enterSection = (p) => ({ p, ordinal: 0, next: 0, frames: new Map(), need: new Map(p.needCount) });
-    const flushSection = async (st) => {
-      const { p } = st;
-      while (st.next < p.seq.t.length && st.frames.has(p.seq.src[st.next])) {
-        const src = p.seq.src[st.next];
-        const t = p.sec.start + p.base + p.seq.t[st.next] + offset;
-        if (p.soft && p.soft.frames.has(src)) {
-          const b = blurFrame(st.frames.get(src), p.soft.sigma);
-          await emit(b, t);
-          b.close();
-          this.softened++;
-        } else await emit(st.frames.get(src), t);
-        const left = st.need.get(src) - 1;
-        st.need.set(src, left);
-        if (left <= 0) {
-          st.frames.get(src).close();
-          st.frames.delete(src);
-        }
-        st.next++;
-      }
-    };
-    const endSection = async (st) => {
-      await flushSection(st);
-      for (const f of st.frames.values()) f.close();
-      if (st.next < st.p.seq.t.length) this.warnings.push(`Section #${st.p.sec.id}: ${st.p.seq.t.length - st.next} slots could not be filled (the decode returned fewer frames than when it was prepared).`);
-      offset += st.p.extra;
-      cur = null;
-    };
     try {
-      await decodeRange(
-        movie,
-        piece.startSec,
-        piece.endSec,
-        async (frame, t) => {
-          // leave a section whose frames are exhausted
-          if (cur && (cur.ordinal >= cur.p.nOut || t >= cur.p.sec.end - 1e-9)) await endSection(cur);
-          // enter a section?
-          while (!cur && si < sections.length && t >= sections[si].sec.end - 1e-9) si++; // skipped entirely (empty)
-          if (!cur && si < sections.length && t >= sections[si].sec.start - 1e-9 && t < sections[si].sec.end - 1e-9) {
-            cur = enterSection(sections[si]);
-            si++;
-          }
-          if (cur) {
-            const j = cur.ordinal++;
-            if (cur.need.has(j) && cur.need.get(j) > 0) cur.frames.set(j, frame);
-            else frame.close();
-            await flushSection(cur);
-            return;
-          }
-          await emit(frame, t + offset);
-          frame.close();
-        },
-        { cancel: ctx.cancel, fromIndex: piece.from }
-      );
-      if (cur) await endSection(cur);
+      const walked = await walkEdited(movie, piece, emit, { cancel: ctx.cancel });
+      this.softened += walked.softened;
+      this.warnings.push(...walked.warnings);
       if (pending) {
         await encodeOne(pending.frame, pending.tUs, ctx.medianUs);
         pending = null;

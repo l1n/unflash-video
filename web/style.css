@@ -64,12 +64,24 @@ aside#sections { width: 250px; border-right: 1px solid var(--line); background: 
 .badge.kind-red { background: #5a2450; color: #ffb0ea; }
 .badge.kind-pattern, .badge.pat { background: #1f4a4d; color: #9fe8ec; }
 #stage { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: auto; }
-.players { display: flex; gap: 12px; padding: 12px 14px 0; }
-.player-box { flex: 0 0 46%; min-width: 320px; }
+.players { display: flex; gap: 12px; padding: 12px 14px 0; align-items: flex-start; }
+/* the player is small to begin with (S, M, L; the original tool caps it at 560 px) */
+.player-box { flex: 0 0 auto; width: var(--player-w, 480px); max-width: 100%; }
+.size-switch { display: inline-flex; gap: 0; color: var(--fg2); }
+.size-switch button { border-radius: 0; margin-left: -1px; padding: 2px 7px; }
+.size-switch button:first-child { border-radius: 5px 0 0 5px; }
+.size-switch button:last-child { border-radius: 0 5px 5px 0; }
+.size-switch button.on { background: #2b3446; border-color: var(--accent); color: white; position: relative; }
+.player-warning { font-size: 12px; color: var(--warn); margin: 0 0 4px; min-height: 1.4em; }
+.player-warning.ok { color: #8fe0aa; }
+#preview { width: 100%; height: auto; max-height: 42vh; object-fit: contain; display: block; background: black; }
+#preview.dim { filter: brightness(.45); }
+.preview-bar { display: flex; gap: 8px; align-items: center; margin-top: 5px; flex-wrap: wrap; font-size: 12px; color: var(--fg2); }
+.preview-info { font-variant-numeric: tabular-nums; }
 .player-head { display: flex; gap: 10px; align-items: center; color: var(--fg2); font-size: 12px; margin-bottom: 4px; }
 .player-wrap { position: relative; background: black; border-radius: 6px; overflow: hidden; }
 #player { width: 100%; max-height: 42vh; display: block; background: black; }
-#player.dim { filter: brightness(.55); }
+#player.dim { filter: brightness(.45); }
 .hud { position: absolute; left: 8px; top: 8px; background: rgba(15, 17, 22, .8); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 240px; font-size: 12px; pointer-events: none; }
 .hud-row { display: flex; align-items: center; gap: 8px; margin: 2px 0; }
 .hud-row.small { color: var(--fg2); font-size: 11px; }
@@ -119,6 +131,7 @@ aside#sections { width: 250px; border-right: 1px solid var(--line); background: 
 .chip.flagged-pat { border-color: var(--pat); color: #9fe8ec; }
 .chip.soft { border-color: var(--pat); color: #9fe8ec; border-style: dashed; }
 .chip.selected { border-color: var(--sel); color: var(--sel); }
+.chip.kept { border-color: var(--ok); color: #9fe8b8; }
 .grid-actions { display: flex; gap: 6px; margin-left: auto; }
 .grid-hint { color: var(--fg2); font-size: 12px; margin: 6px 0; }
 .frame-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(146px, 1fr)); gap: 6px; outline: none; }
@@ -135,7 +148,16 @@ aside#sections { width: 250px; border-right: 1px solid var(--line); background: 
 .frame.removed canvas { opacity: .45; }
 .frame.extended { border-color: var(--accent); }
 .frame.selected { outline: 2px solid var(--sel); outline-offset: -1px; }
-#welcome { flex: 1; max-width: 860px; padding: 24px 32px; color: var(--fg); }
+.frame.kept .fno { background: var(--ok); color: #0c2415; }
+.frame.kept .fno::before { content: "K "; font-weight: 700; }
+/* the slot the section player is showing */
+.frame.playing { outline: 3px solid white; outline-offset: -3px; }
+#welcome { flex: 1; max-width: 860px; padding: 24px 32px; color: var(--fg); position: relative; }
+.guide-close { display: none; float: right; }
+/* with a video open, the guide is a drawer beside the work that closes again */
+body.has-movie #welcome { display: none; }
+body.has-movie.guide-open #welcome { display: block; position: fixed; right: 0; top: 0; bottom: 0; width: min(560px, 94vw); max-width: none; overflow: auto; z-index: 45; background: var(--bg2); border-left: 1px solid var(--line); box-shadow: -10px 0 30px rgba(0,0,0,.45); padding: 18px 24px; }
+body.has-movie.guide-open .guide-close { display: inline-block; position: sticky; top: 0; z-index: 1; }
 #welcome h1 { margin-top: 0; }
 #welcome li { margin-bottom: 8px; }
 .disclaimer, .note-extended, .support { color: var(--fg2); font-size: 13px; }

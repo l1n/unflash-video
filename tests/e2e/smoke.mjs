@@ -64,8 +64,8 @@ try {
   await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash_h264.mp4') || !document.querySelector('#banner').classList.contains('hidden'), null, { timeout: 120000 });
   console.log('h264 status:', await page.textContent('#status'));
   await scan(/2 violations found/);
-  // the unattended run: open a file, and a fixed, checked export appears
-  target.searchParams.delete('auto');
+  // the unattended run (asked for: it is off unless ticked): open a file, and a fixed, checked export appears
+  target.searchParams.set('auto', '1');
   await page.goto(target.toString(), { timeout: 120000 });
   await page.waitForFunction(() => document.querySelector('#support') && document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 120000 });
   await page.setInputFiles('#fileInput', path.join(ROOT, 'tests/media/e2e/flash.mp4'));
