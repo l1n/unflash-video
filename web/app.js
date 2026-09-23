@@ -463,7 +463,8 @@ function renderChanges() {
     left -= d.items.length;
   }
   const more = count - Math.min(count, NEWS_SHOWN);
-  $('newsList').innerHTML = days.map((d) => renderDay(d)).join('') + (more ? `<p class="news-more">…and ${more} more.</p>` : '');
+  // (the headlines: each opens to say more, and What's new has them all in full)
+  $('newsList').innerHTML = days.map((d) => renderDay(d, () => false, true)).join('') + (more ? `<p class="news-more">…and ${more} more.</p>` : '');
 }
 
 /** The changes so far count as seen: the card and the dot go until there are new ones. */
@@ -746,6 +747,8 @@ async function autoScan() {
 /** Open or close the guide beside the work (with no file open it is the whole page). */
 function setGuide(open) {
   document.body.classList.toggle('guide-open', !!open);
+  // (asked for, the guide is the whole of it; the start page folds it away)
+  if (open) $('guideMore').open = true;
 }
 
 /** Open one of the test clips published next to the app. */

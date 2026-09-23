@@ -111,9 +111,23 @@ export function hadEarlierSettings() {
  * A day of changes as HTML (`isNew` marks the changes to highlight; a
  * change with a tour gets a "show me" button, `data-tour` its id).
  */
-export function renderDay(day, isNew = () => false) {
+export function renderDay(day, isNew = () => false, brief = false) {
   const items = day.items
-    .map((it) => `<li${isNew(it) ? ' class="new"' : ''}>${it.html}${it.tour ? ` <button class="small show-me" data-tour="${escapeHtml(it.tour)}" title="A short tour of this">show me</button>` : ''}</li>`)
+    .map((it) => `<li${isNew(it) ? ' class="new"' : ''}>${brief ? briefly(it.html) : it.html}${it.tour ? ` <button class="small show-me" data-tour="${escapeHtml(it.tour)}" title="A short tour of this">show me</button>` : ''}</li>`)
     .join('');
   return `<h3>${escapeHtml(day.label)}</h3><ul>${items}</ul>`;
+}
+
+/**
+ * A change as its headline, which opens to the rest: its opening bold words
+ * (the whole of it when there are none). Where the headline is not a
+ * sentence of its own, the rest is the whole change again.
+ */
+export function briefly(html) {
+  const m = /^<b>([\s\S]*?)<\/b>([\s\S]*)$/.exec(html);
+  if (!m || !m[2].trim()) return html;
+  const head = m[1];
+  const own = /[.!?]\s*$/.test(head) || /^\s*:/.test(m[2]);
+  const rest = own ? m[2].replace(/^\s*:?\s*/, '') : html;
+  return `<details class="brief"><summary>${head.replace(/[.:]\s*$/, '')}</summary>${rest}</details>`;
 }

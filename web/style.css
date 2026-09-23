@@ -317,3 +317,13 @@ table.clips td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); 
 .tour-offer { display: flex; gap: 10px; align-items: center; margin: 4px 0 14px; color: var(--fg2); }
 .show-me { margin-left: 6px; }
 .finding.run-up { border-left-style: dashed; color: var(--fg2); }
+#welcome .lead { margin: 0 0 10px; }
+.guide-more { margin: 14px 0 0; }
+.guide-more > summary { cursor: pointer; color: var(--fg2); font-size: 12px; }
+.guide-more[open] > summary { margin-bottom: 8px; }
+.changes-list details.brief { display: inline; }
+.changes-list details.brief > summary { display: inline; cursor: pointer; font-weight: 700; list-style: none; }
+.changes-list details.brief > summary::after { content: " ›"; color: var(--fg2); font-weight: 400; }
+.changes-list details.brief[open] > summary::after { content: " ‹"; }
+.changes-list details.brief[open] { display: block; color: var(--fg2); }
+.changes-list details.brief[open] > summary { color: var(--fg); }
