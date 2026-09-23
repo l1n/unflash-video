@@ -6,6 +6,7 @@ members = [
     "crates/unflash-h264",
     "crates/unflash-mp4",
     "crates/unflash-vp8",
+    "crates/unflash-vp9",
     "crates/unflash-wasm",
 ]
 

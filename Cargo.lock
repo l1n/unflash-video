@@ -1095,6 +1095,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "unflash-vp9"
+version = "0.1.0"
+dependencies = [
+ "md5",
+ "unflash-mp4",
+ "wide",
+]
+
+[[package]]
 name = "unflash-wasm"
 version = "0.1.0"
 dependencies = [
