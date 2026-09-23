@@ -322,8 +322,11 @@ class NotHoldable extends Error {}
  * were taken in, the early looks and what each lane did. For tests,
  * `chunked.sim` stands the built-in decoder, on the page, in for the
  * browser's (a browser without H.264 in WebCodecs, such as the test
- * browser, can then run a hybrid scan), and `chunked.failBuiltIn` makes the
- * built-in decoder fail at its tenth picture.
+ * browser, can then run a hybrid scan), `chunked.failBuiltIn` makes the
+ * built-in decoder fail at its tenth picture, `chunked.slow` (ms) holds
+ * back every picture of the browser's lanes, as Firefox's copies out of the
+ * GPU do, and `chunked.steal` false keeps a lane from taking over another's
+ * chunk.
  */
 async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, makeFeeder = null, moreFeeders = null, chunked }) {
   const { wasm, config, feeder } = env;
@@ -367,6 +370,14 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
       // lanes that decode on the page read different parts of the file: a window each
       reader: !builtIn && movie.reader ? movie.reader.fork() : null,
       tested: false,
+      // time spent decoding (ms; the pass under way from passT0), for its speed
+      decodeMs: 0,
+      passT0: 0,
+      // waiting for work, and work handed to it (a chunk taken over from a slower lane)
+      idle: false,
+      pending: null,
+      steals: 0,
+      stolen: 0,
     });
   }
 
@@ -447,6 +458,13 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
    */
   const pick = (lane) => {
     if (stop() || lane.failed) return null;
+    if (lane.pending) {
+      const s = lane.pending;
+      lane.pending = null;
+      lane.stretches.push(s);
+      lane.feeding++;
+      return s;
+    }
     const curFree = picker.cur < nc && !picker.taken[picker.cur];
     if (freeLookers.length && (nlanes === 1 || (!curFree && lanes.some((l) => l !== lane && l.feeding > 0)))) {
       const run = picker.hotRun(nlanes);
@@ -458,7 +476,62 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
     }
     const c = picker.ahead();
     if (c >= 0) return give(lane, c, c);
-    return c === -2 ? 'wait' : null;
+    if (c === -2) return 'wait';
+    // every chunk is taken: a lane stays while another decodes one, to take it over if that one is slow
+    return stealing && lanes.some((l) => l !== lane && l.stretches.some((s) => !s.look && !s.cut)) ? 'wait' : null;
+  };
+
+  /** A lane's pictures a second while it decodes, once there is enough to tell. */
+  const rate = (lane) => {
+    const ms = lane.decodeMs + (lane.passT0 ? now() - lane.passT0 : 0);
+    return lane.frames >= 10 && ms >= 50 ? (lane.frames * 1000) / ms : null;
+  };
+  const stealing = chunked.steal !== false;
+  let steals = 0;
+  /**
+   * Chunk `c`, the one the detector waits for, taken over from the
+   * browser's lane decoding it by an idle lane that will finish it well
+   * before: the slow lane stops at its next picture, and the other goes on
+   * from the keyframe at or before the last picture in (what it decodes
+   * again up to there is dropped, as a chunk another decoder began always
+   * is). In Firefox, whose browser lanes copy every picture out of the GPU,
+   * the built-in decoder otherwise sits idle: the pictures the slow lanes
+   * will hold have the budget, and the detector waits on them.
+   */
+  const steal = (c) => {
+    if (!stealing || stop() || c >= nc || slots[c].done) return;
+    const owner = lanes.find((l) => l.kind === 'browser' && l.stretches.length && !l.stretches[0].look && !l.stretches[0].cut && l.stretches[0].first === c);
+    const ro = owner ? rate(owner) : null;
+    if (!ro) return;
+    // the fastest idle lane; one not yet timed (kept idle by the budget
+    // from the start) only if no timed one is idle, and for a long wait
+    let thief = null;
+    let rt = 0;
+    for (const l of lanes) {
+      if (l === owner || !l.idle || l.failed || l.pending) continue;
+      const r = rate(l);
+      if (r ? r > rt : !thief) {
+        thief = l;
+        rt = r || 0;
+      }
+    }
+    if (!thief) return;
+    const slot = slots[c];
+    const fps = movie.fps || 30;
+    const resumed = slot.lastT > chunks.t[c];
+    const from = resumed ? slot.lastT : chunks.t[c];
+    const idx = resumed ? Math.max(chunks.idx[c], movie.dx.sync_before(movie.video.index, slot.lastT)) : chunks.idx[c];
+    const left = Math.max(1, (chunks.t[c + 1] - from) * fps);
+    const again = Math.max(0, (from - movie.v.pts[idx] / 1e6) * fps);
+    // (a quarter of a second for the other lane to get going)
+    const ownerLeft = left / ro;
+    if (rt ? (left + again) / rt + 0.25 > 0.7 * ownerLeft : ownerLeft < 1.5) return;
+    owner.stretches[0].cut = true;
+    owner.stolen++;
+    thief.pending = { startSec: chunks.t[c], endSec: chunks.t[c + 1], fromIndex: idx, first: c, last: c, look: null };
+    thief.steals++;
+    steals++;
+    changed();
   };
 
   /** A picture kept for the detector: a decode worker's buffer goes back to it, so that one is copied. */
@@ -490,6 +563,13 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
     partial(true);
   };
   const stretchDone = async (lane, s) => {
+    if (s.cut) {
+      // taken over: its chunk goes on with the other lane
+      lane.stretches.shift();
+      lane.feeding--;
+      changed();
+      return;
+    }
     chunksDone(s.first, s.last);
     lane.chunks += s.last - s.first + 1;
     lane.stretches.shift();
@@ -498,6 +578,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
     changed();
   };
   const onFrameFor = (lane) => async (pic, t) => {
+    if (chunked.slow && lane.kind === 'browser') await new Promise((r) => setTimeout(r, chunked.slow));
     const s = lane.stretches[0];
     const c = chunkOf(t);
     const slot = slots[c];
@@ -542,6 +623,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
       return p && p !== 'wait' ? p : null;
     };
     const onFrame = onFrameFor(lane);
+    lane.passT0 = now();
     try {
       // a browser without a decoder for the codec decodes with the built-in one, whose workers are kept busy across the pass's chunks too
       const own = lane.kind === 'built-in' ? pool : movie.software && !chunked.sim ? await movie.softwarePool() : null;
@@ -549,7 +631,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
         await decodeStretchesBuiltIn(movie, own, next, onFrame, { cancel: stop, shrink, strict: lane.kind === 'built-in', onStretchDone: (s) => stretchDone(lane, s) });
       } else {
         for (let s = next(); s; s = next()) {
-          await decodeRange(movie, s.startSec, s.endSec, onFrame, { cancel: stop, raw: true, reader: lane.reader, fromIndex: s.fromIndex, shrink, inline: !!chunked.sim, workers: true });
+          await decodeRange(movie, s.startSec, s.endSec, onFrame, { cancel: () => stop() || !!s.cut, raw: true, reader: lane.reader, fromIndex: s.fromIndex, shrink, inline: !!chunked.sim, workers: true });
           if (stop()) break;
           await stretchDone(lane, s);
         }
@@ -564,6 +646,9 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
       lane.feeding = 0;
       changed();
       throw e;
+    } finally {
+      lane.decodeMs += now() - lane.passT0;
+      lane.passT0 = 0;
     }
   };
   const laneLoop = async (lane) => {
@@ -574,7 +659,10 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
         const p = pick(lane);
         if (!p) break;
         if (p === 'wait') {
-          await whenChanged();
+          lane.idle = true;
+          steal(picker.cur);
+          if (!lane.pending) await whenChanged();
+          lane.idle = false;
           continue;
         }
         try {
@@ -631,6 +719,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
           continue;
         }
         if (slot.done) break;
+        steal(c);
         await new Promise((r) => (slot.wake = r));
       }
       slot.pics = [];
@@ -683,7 +772,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
   const vjson = JSON.stringify(result.violations);
   const sections = JSON.parse(wasm.violations_to_sections(vjson, config, movie.tsMin, movie.tsMax, new Float64Array()));
   const summary = JSON.parse(wasm.timeline_summary(JSON.stringify(result), movie.tsMin, movie.tsMax, 1.0));
-  const laneStats = lanes.map((l) => ({ kind: l.kind, workers: l.kind === 'built-in' ? pool.workers.length : 1, frames: l.frames, chunks: l.chunks, looks: l.looks, ms: l.ms, failed: l.failed }));
+  const laneStats = lanes.map((l) => ({ kind: l.kind, workers: l.kind === 'built-in' ? pool.workers.length : 1, frames: l.frames, chunks: l.chunks, looks: l.looks, ms: l.ms, failed: l.failed, steals: l.steals, stolen: l.stolen }));
   return {
     result,
     sections,
@@ -695,7 +784,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
     patternThresh: feeder.det.pattern_thresh(),
     profileText,
     profileOps,
-    chunked: { chunks: nc, chunkS, order: triage ? 'triage' : 'file', hot: triage ? triage.order.slice(0, triage.hot) : [], taken: picker.log.slice(), looks, lanes: laneStats, budget, peak },
+    chunked: { chunks: nc, chunkS, order: triage ? 'triage' : 'file', hot: triage ? triage.order.slice(0, triage.hot) : [], taken: picker.log.slice(), looks, lanes: laneStats, budget, peak, steals },
   };
 }
 

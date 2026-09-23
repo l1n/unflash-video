@@ -858,8 +858,7 @@ try {
       return { ms: Math.round(s.elapsedMs), frames: s.frames, held: s.result.held, violations: s.result.violations, chunked: s.chunked || null, partials: window.__unflash.partials, report: window.__unflash.debugReport() };
     });
   };
-  const sameAsWhole = (name, r) => {
-    const w = results.h264Whole;
+  const sameAsWhole = (name, r, w = results.h264Whole) => {
     assert(r.frames === w.frames && r.held === w.held, `${name}: frames ${r.frames} (held ${r.held}) vs ${w.frames} (held ${w.held})`);
     assert(r.violations.length > 0 && r.violations.length === w.violations.length, `${name}: the violations of the scan in one piece: ${JSON.stringify(r.violations)} vs ${JSON.stringify(w.violations)}`);
     for (let i = 0; i < r.violations.length; i++) {
@@ -875,6 +874,12 @@ try {
   results.hybridFail = await hybridScan('hybrid=sim:2,2&chunk=1&order=file&hybridfail=1');
   results.hybridTight = await hybridScan('hybrid=sim:2,0&chunk=1&order=file&hold=5');
   results.triaged = await hybridScan('hybrid=0&chunk=1');
+  // slow browser lanes (as Firefox's, which copy every picture out of the
+  // GPU) and a budget they would fill: the built-in lane, idle, takes over
+  // the chunk the detector waits for, from the last picture in. On the CPU
+  // detector, which (unlike SwiftShader's WebGPU) is faster than the lanes
+  results.h264WholeCpu = await hybridScan('cpu=1&hybrid=0');
+  results.overtaken = await hybridScan('cpu=1&hybrid=sim:4,2&chunk=1&order=file&hold=13&slowlanes=150');
   for (const [name, r] of [
     ['hybrid', results.hybrid],
     ['hybrid, the built-in decoder failing', results.hybridFail],
@@ -890,6 +895,18 @@ try {
     assert(/Scan\s+.*\n\s+chunked: \d+ chunks of about 1 s, detected in file order/.test(r.report), `${name}: the debug report shows the chunks:\n${r.report}`);
   }
   assert(results.hybrid.chunked.lanes.length === 3 && results.hybrid.chunked.lanes.every((l) => l.frames > 0 && !l.failed), 'every lane decoded part of the file: ' + JSON.stringify(results.hybrid.chunked.lanes));
+  {
+    const r = results.overtaken;
+    const h = r.chunked;
+    console.log('slow browser lanes, taken over:', r.ms, 'ms |', JSON.stringify({ steals: h.steals, lanes: h.lanes.map((l) => [l.kind, l.frames, l.chunks, l.steals, l.stolen]) }));
+    sameAsWhole('taken over', r, results.h264WholeCpu);
+    assert(h.lanes.reduce((a, l) => a + l.frames, 0) === r.frames, 'taken over: each picture decoded once: ' + JSON.stringify(h.lanes));
+    const builtIn = h.lanes.find((l) => l.kind === 'built-in');
+    assert(h.steals >= 3 && builtIn.steals === h.steals && builtIn.frames > r.frames / 2 && h.lanes.some((l) => l.stolen > 0), 'the idle built-in lane took the waited-for chunks over from the slow ones: ' + JSON.stringify(h));
+    // (without, the four slow lanes set the pace: 16 s here)
+    assert(r.ms < 9000, 'and the scan went at its pace: ' + r.ms + ' ms');
+    assert(/took over \d+ from slower lanes/.test(r.report) && /\d+ taken over by faster lanes/.test(r.report), 'the debug report tells of it:\n' + r.report);
+  }
   assert(/built-in decoder ×2/.test(results.hybrid.report), 'the debug report shows the built-in decoder:\n' + results.hybrid.report);
   const gaveUp = results.hybridFail.chunked.lanes.find((l) => l.kind === 'built-in');
   assert(gaveUp.failed && gaveUp.frames === 10, 'the built-in lane gave up at its tenth picture and the browser lanes went on from there: ' + JSON.stringify(results.hybridFail.chunked));

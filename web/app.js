@@ -857,7 +857,8 @@ function hybridPlan(movie, feeder) {
   // fails the built-in decoder's first run
   const sim = !!h && h.startsWith('sim');
   if (sim) h = h.slice(4) || '1';
-  if (!movie || (movie.software && !sim) || !feeder || feeder.backend !== 'webgpu') return null;
+  // (the simulation runs with the CPU detector too: SwiftShader's WebGPU is slower than any decoder)
+  if (!movie || (movie.software && !sim) || !feeder || (feeder.backend !== 'webgpu' && !sim)) return null;
   if (!builtInFor(movie.video.codec)) return null;
   const cores = navigator.hardwareConcurrency || 4;
   const counts = /^(\d+),(\d+)$/.exec(h || '');
@@ -884,7 +885,9 @@ function hybridPlan(movie, feeder) {
  * them), taken by the detector in file order, with early looks at the
  * chunks triage finds likeliest to flash (`?order=file`: none); a shorter
  * file, or with `?chunked=0`, as before. `?chunk=S` sets the chunks' length
- * and `?hold=MB` how much of the pictures decoded ahead may be held. `opts`
+ * and `?hold=MB` how much of the pictures decoded ahead may be held;
+ * `?steal=0` keeps a lane from taking over a slower lane's chunk, and (tests)
+ * `?slowlanes=MS` holds back every picture of the browser's lanes. `opts`
  * as scanMovie's.
  */
 async function scanWithPlan(env, movie, opts) {
@@ -906,7 +909,10 @@ async function scanWithPlan(env, movie, opts) {
   }
   const order = q.get('order') === 'file' ? 'file' : 'triage';
   try {
-    return await scanMovie(env, movie, { ...opts, chunked: { hw: plan ? plan.hw : scanSegments(), pool, chunkS, order, budget: hold > 0 ? hold * 1024 * 1024 : null, sim: !!(plan && plan.sim), failBuiltIn: !!(plan && plan.failBuiltIn) } });
+    return await scanMovie(env, movie, {
+      ...opts,
+      chunked: { hw: plan ? plan.hw : scanSegments(), pool, chunkS, order, budget: hold > 0 ? hold * 1024 * 1024 : null, sim: !!(plan && plan.sim), failBuiltIn: !!(plan && plan.failBuiltIn), slow: parseFloat(q.get('slowlanes') || '') || 0, steal: q.get('steal') !== '0' },
+    });
   } finally {
     if (pool) pool.close();
   }

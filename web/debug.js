@@ -78,7 +78,8 @@ function chunkedLines(h) {
   const lanes = h.lanes.map((l) => {
     const fps = l.frames / Math.max(0.001, l.ms / 1000);
     const looks = l.looks ? `, ${l.looks} early look${l.looks === 1 ? '' : 's'}` : '';
-    return `${l.kind === 'built-in' ? `built-in decoder ×${l.workers}` : "browser's decoder"}: ${int(l.frames)} frames, ${fps.toFixed(0)} fps, ${l.chunks} chunk${l.chunks === 1 ? '' : 's'}${looks}${l.failed ? `, gave up: ${l.failed}` : ''}`;
+    const over = `${l.steals ? `, took over ${l.steals} from slower lanes` : ''}${l.stolen ? `, ${l.stolen} taken over by faster lanes` : ''}`;
+    return `${l.kind === 'built-in' ? `built-in decoder ×${l.workers}` : "browser's decoder"}: ${int(l.frames)} frames, ${fps.toFixed(0)} fps, ${l.chunks} chunk${l.chunks === 1 ? '' : 's'}${looks}${over}${l.failed ? `, gave up: ${l.failed}` : ''}`;
   });
   const looks = h.order === 'triage' ? `, early looks at ${h.looks.length} of the ${h.hot.length} likeliest to flash` : '';
   return [`chunked: ${h.chunks} chunks of about ${h.chunkS} s, detected in file order${looks}; at most ${bytes(h.peak)} of pictures held (${bytes(h.budget)} allowed)`, ...lanes];

@@ -42,18 +42,22 @@ let waiter = null;
 // buffer of its own, so those would otherwise pile up here, one a frame)
 const spare = [];
 const SPARE = 8;
+let timer = 0;
 const wake = () => {
   if (waiter) {
     const w = waiter;
     waiter = null;
+    clearTimeout(timer);
     w();
   }
 };
-// woken by the decoder, a credit or a cancel; the timer is a safety net only
+// woken by the decoder, a credit or a cancel; the timer is a safety net
+// only, cleared once the wait is over (one left running would wake a later
+// wait for nothing)
 const wait = () =>
   new Promise((r) => {
     waiter = r;
-    setTimeout(wake, 100);
+    timer = setTimeout(wake, 100);
   });
 
 self.onmessage = (e) => {

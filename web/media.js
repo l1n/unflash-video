@@ -323,18 +323,21 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
   // input taken off its queue, an error (a timer polling instead would
   // cost the 4 ms browsers clamp repeated timeouts to, many times a second)
   let wake = null;
+  let timer = 0;
   const kick = () => {
     if (wake) {
       const w = wake;
       wake = null;
+      clearTimeout(timer);
       w();
     }
   };
+  // (the timer, cleared once the wait is over: one left running would wake a later wait for nothing)
   const settle = () =>
     new Promise((r) => {
       wake = r;
       // only for a browser that sends no dequeue events
-      setTimeout(kick, 20);
+      timer = setTimeout(kick, 20);
     });
   const decoder = new VideoDecoder({
     output: (f) => {
@@ -453,17 +456,20 @@ async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onP
   let done = false;
   let failed = null;
   let wake = null;
+  let timer = 0;
   const kick = () => {
     if (wake) {
       const w = wake;
       wake = null;
+      clearTimeout(timer);
       w();
     }
   };
+  // (the timer, cleared once the wait is over: one left running would wake a later wait for nothing)
   const settle = () =>
     new Promise((r) => {
       wake = r;
-      setTimeout(kick, 250);
+      timer = setTimeout(kick, 250);
     });
   const onMessage = (e) => {
     const m = e.data;
