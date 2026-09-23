@@ -126,7 +126,7 @@ export function debugReport({ version, state, profile, gpu, segments, hybrid = n
     const a = m.audio;
     lines.push(
       ...block('Video', [
-        [String(m.format || '?').toUpperCase(), v.codec, `${m.width}×${m.height}`, `${(m.fps || 0).toFixed(3)} fps`, duration(m.duration || 0), `${int(m.frameCount || 0)} frames`, m.file ? bytes(m.file.size) : null].filter(Boolean).join(' · '),
+        [`${String(m.format || '?').toUpperCase()}${m.info && m.info.fragmented ? ' (fragmented)' : ''}`, v.codec, `${m.width}×${m.height}`, `${(m.fps || 0).toFixed(3)} fps`, duration(m.duration || 0), `${int(m.frameCount || 0)} frames`, m.file ? bytes(m.file.size) : null].filter(Boolean).join(' · '),
         a ? `audio ${a.codec}${a.copyable === false ? ' (re-encoded on export)' : ''}` : 'no audio',
         state.decode && !state.decode.supported && state.decode.reason ? `cannot decode: ${state.decode.reason}` : null,
       ])

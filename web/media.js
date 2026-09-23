@@ -119,11 +119,16 @@ function median(arr) {
 export class Movie {
   static async open(file, wasm, { onProgress = null } = {}) {
     const dx = new wasm.Demuxer(file.size);
+    // through the reader the movie keeps: a window of the file at a time (a
+    // small file whole), not a read for each box. A fragmented MP4 keeps its
+    // index in a piece before every second or two of video; read box by box,
+    // a two-hour recording took Firefox a minute and a half to open
+    const reader = new ChunkReader(file);
     while (!dx.is_done()) {
       const need = dx.need();
       if (!need.length) break;
       const [off, len] = need;
-      const buf = new Uint8Array(await file.slice(off, off + len).arrayBuffer());
+      const buf = await reader.read(off, len);
       try {
         dx.feed(off, buf);
       } catch (e) {
@@ -146,7 +151,7 @@ export class Movie {
     m.subtitleTracks = info.tracks.filter((t) => t.kind === 'other' && /^S_/.test(t.codec)).length;
     m.otherAudioTracks = info.tracks.filter((t) => t.kind === 'audio' && t.samples > 0).length - (at ? 1 : 0);
     m.file = file;
-    m.reader = new ChunkReader(file);
+    m.reader = reader;
     m.name = file.name;
     m.wasm = wasm;
     m.software = false;
