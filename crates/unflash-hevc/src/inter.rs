@@ -134,6 +134,19 @@ mod simd {
         i
     }
 
+    /// (a + b + offset) >> shift into `d`, clipped (saturating as above).
+    #[inline(always)]
+    pub fn bi_row<P: Sample>(a: &[i16], b: &[i16], offset: i32, shift: u32, max: i32, d: &mut [P]) -> usize {
+        let mut i = 0;
+        while i + 8 <= d.len() {
+            let (p, q) = (i16x8::from_slice_unaligned(&a[i..i + 8]), i16x8::from_slice_unaligned(&b[i..i + 8]));
+            let v = p.saturating_add(q).saturating_add(i16x8::splat(offset as i16)) >> shift;
+            P::store8(v, max as i16, &mut d[i..i + 8]);
+            i += 8;
+        }
+        i
+    }
+
     /// Explicit weighting, ((s · w + 2^(sh − 1)) >> sh) + o clipped, from
     /// the 16-bit halves of the products: the high half scaled up plus the
     /// low half's rounded share (((lo >> (sh − 1)) + 1) >> 1 is the rounded
@@ -154,19 +167,6 @@ mod simd {
             let hi = i16x8::mul_keep_high(p, wv).max(low).min(high);
             let x = ((p * wv) >> (sh - 1)) & mask;
             let v = (hi << (16 - sh)).saturating_add((x >> 1) + (x & one)).saturating_add(offset);
-            P::store8(v, max as i16, &mut d[i..i + 8]);
-            i += 8;
-        }
-        i
-    }
-
-    /// (a + b + offset) >> shift into `d`, clipped (saturating as above).
-    #[inline(always)]
-    pub fn bi_row<P: Sample>(a: &[i16], b: &[i16], offset: i32, shift: u32, max: i32, d: &mut [P]) -> usize {
-        let mut i = 0;
-        while i + 8 <= d.len() {
-            let (p, q) = (i16x8::from_slice_unaligned(&a[i..i + 8]), i16x8::from_slice_unaligned(&b[i..i + 8]));
-            let v = p.saturating_add(q).saturating_add(i16x8::splat(offset as i16)) >> shift;
             P::store8(v, max as i16, &mut d[i..i + 8]);
             i += 8;
         }
