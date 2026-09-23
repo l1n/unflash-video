@@ -2,8 +2,8 @@
 # Test streams for the built-in HEVC decoder: small x265 encodes covering
 # the tools the decoder supports, each with ffmpeg's per-frame MD5 of the
 # decoded pictures (presentation order, cropped) as the oracle: yuv420p for
-# 8-bit clips, the 16-bit planes (yuv420p10le) for 10-bit ones. Needs
-# ffmpeg with libx265.
+# 8-bit clips, the 16-bit planes (yuv420p10le) for 10-bit ones and the luma
+# plane (gray) for the 4:0:0 one. Needs ffmpeg with libx265.
 set -euo pipefail
 cd "$(dirname "$0")"
 gen() {
@@ -48,6 +48,5 @@ gen odd_size         "$T2"    100x60 12 yuv420p "cbqpoffs=3:crqpoffs=-2:bframes=
 # 10-bit: B pictures, SAO, weighted prediction
 gen main10           "$T2"    96x64  20 yuv420p10le "bframes=3:ref=3"
 gen main10_wp_lossless "$FADE" 96x64 12 yuv420p10le "weightp=1:weightb=1:bframes=2:cu-lossless=1"
-# 4:0:0: a range extensions profile, but none of its coding tools (the
-# oracle hashes the luma plane only)
+# 4:0:0: a range extensions profile, but none of its coding tools
 gen mono             "$T2"    96x64  10 gray "bframes=2"
