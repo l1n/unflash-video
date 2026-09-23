@@ -42,9 +42,8 @@ pub const CS_SMPTE_240: u8 = 4;
 pub const CS_BT_2020: u8 = 5;
 pub const CS_RGB: u8 = 7;
 
-/// The largest frame the decoder accepts (each side, and in area), so that a
-/// corrupt size cannot ask for gigabytes.
-const MAX_SIDE: u32 = 16384;
+/// The largest frame the decoder accepts (in area: either side may take
+/// its full 16 bits), so that a corrupt size cannot ask for gigabytes.
 const MAX_AREA: u64 = 8192 * 8192;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -221,8 +220,8 @@ fn frame_size(r: &mut BitReader) -> Result<(u32, u32)> {
 }
 
 fn check_size(w: u32, h: u32) -> Result<()> {
-    if w > MAX_SIDE || h > MAX_SIDE || w as u64 * h as u64 > MAX_AREA {
-        return Err(Error::Unsupported("frame larger than 8192x8192"));
+    if w as u64 * h as u64 > MAX_AREA {
+        return Err(Error::Unsupported("frame area larger than 8192x8192"));
     }
     Ok(())
 }
