@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/unflash-av1",
     "crates/unflash-core",
     "crates/unflash-gpu",
     "crates/unflash-h264",
@@ -8,6 +9,8 @@ members = [
     "crates/unflash-vp8",
     "crates/unflash-vp9",
     "crates/unflash-wasm",
+    # rav1d (the Rust port of dav1d), vendored for unflash-av1: see its UNFLASH.md
+    "third_party/rav1d",
 ]
 
 [workspace.package]
@@ -33,3 +36,10 @@ debug = false
 # Fast-ish tests for the GPU crate on a software Vulkan driver.
 [profile.dev.package."*"]
 opt-level = 2
+
+# "*" is the dependencies, not the members: rav1d is one. Unoptimised, and
+# with its debug-only borrow checking (DisjointMut), it takes many minutes
+# over the AV1 decoder's tests.
+[profile.dev.package.rav1d]
+opt-level = 2
+debug-assertions = false
