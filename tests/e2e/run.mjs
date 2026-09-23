@@ -430,6 +430,11 @@ try {
       window.__playingTiles = Math.max(window.__playingTiles || 0, document.querySelectorAll('#frameGrid .frame.playing').length);
       orig(info, t, plan);
     };
+    // when the grid's mark of the frame on screen moves
+    window.__marks = [];
+    new MutationObserver((ms) => {
+      for (const m of ms) if (m.target.classList.contains('playing') && !/\bplaying\b/.test(m.oldValue || '')) window.__marks.push(performance.now());
+    }).observe(document.querySelector('#frameGrid'), { subtree: true, attributes: true, attributeFilter: ['class'], attributeOldValue: true });
   });
   await page.keyboard.press('Escape'); // no selection: play from the start
   await page.click('#btnPreviewPlay');
@@ -439,6 +444,16 @@ try {
   console.log('section player:', JSON.stringify(results.play));
   assert(results.play.first === 0 && results.play.last === results.play.tiles - 1 && results.play.inOrder, 'the section plays every frame of the section in order: ' + JSON.stringify(results.play));
   assert(results.play.blended === results.blend.marks, `the player shows the ${results.blend.marks} blended frames blended: ${results.play.blended}`);
+  // the frame on screen is marked in the grid quietly: one tile at a time,
+  // moved at most every 0.4 s (a mark running from tile to tile with every
+  // picture would flicker across the grid)
+  {
+    const marks = await page.evaluate(() => window.__marks);
+    const gaps = marks.slice(1).map((t, i) => Math.round(t - marks[i]));
+    const tiles = await page.evaluate(() => window.__playingTiles);
+    console.log('the grid mark moved', marks.length, 'times, gaps (ms):', gaps.join(' '));
+    assert(marks.length >= 3 && gaps.every((g) => g >= 380) && tiles <= 1, 'the mark of the frame on screen moves at most every 0.4 s: ' + JSON.stringify({ gaps, tiles }));
+  }
   await page.evaluate(() => (window.__unflash.sectionPlayer.onFrame = null));
 
   // --- the guide opens beside the work and closes again -------------------------

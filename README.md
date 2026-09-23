@@ -129,8 +129,8 @@ Files it reads:
    run-out, are decoded into memory at analysis resolution) and is checked.
 3. **Edit it.** Mark frames: **R** removes a frame and shows the previous
    one in its place, **F** the next one, **E** holds a frame for a second,
-   **B** blends it with the frames either side of it (lower contrast: the
-   flash is toned down rather than taken out, see below);
+   **B** blends it with the frames either side of it (the flash is toned
+   down rather than taken out, see below);
    pressing the same key again takes the mark off, as in the original tool,
    and the keys work with the focus anywhere but a text field. **Ctrl+Z**
    undoes (and **Ctrl+Shift+Z** redoes) any change to the section's marks,
@@ -150,7 +150,7 @@ Files it reads:
    second or more (a long run of removed frames), frames come back into it
    at the safe picture rate, spaced from the pictures either side too, so
    it moves at a few pictures a second instead (checked; a stretch inside a
-   window that still fails is removed again); *lower contrast* removes nothing: it blends those frames
+   window that still fails is removed again); *blend frames* removes nothing: it blends those frames
    with the frames around them instead, as little as passes; *reduce FPS*
    thins the section the way
    an editor does it by hand, trying twice the rate that can never fail
@@ -165,23 +165,32 @@ Files it reads:
    blended frames blended, softened frames blurred); switch it to
    *original* to compare, or to the
    *whole video*. It plays from the selected frame, loops if asked, runs at
-   ½× or ¼×, outlines the frame on screen in the grid, and with **live
-   monitor** on shows the check's meter for that frame. It starts small
+   ½× or ¼×, marks the frame on screen in the grid (a dim bar, moved at most
+   every 0.4 s: nothing on the page itself should flicker along with the
+   video), and with **live monitor** on shows the check's meter for that
+   frame, which falls back slowly rather than following every flash. It starts small
    and dimmed (S, M, L and *dim* above it), and the line above it says what
    is on screen and whether that passes.
 6. A stripe pattern can't be removed a frame at a time; tick **soften
    stripes** and the frames that carry it are blurred just enough to take
    it under the threshold, in the check, the player and the export alike.
 
-**Lower contrast** (Kel's "get rid of flashing by reducing contrast rather
-than removing frames"). A frame marked **B** is mixed with what the frames
+**Blend frames** (Kel's "get rid of flashing by reducing contrast rather
+than removing frames"). What it lowers is the contrast of the flash, from
+one frame to the next, not the picture's: turned down towards grey, a
+picture would lose nearly all of it before a full-screen flash passed (a
+black and white one passes only once its swing in brightness is under a
+tenth of the full range). Blending takes out only what changes from frame
+to frame, and what stays still stays sharp: the same idea as the old trick
+of laying a copy of the footage over itself, a flash later, at half
+opacity. A frame marked **B** is mixed with what the frames
 either side of it show: the nearest unmarked frame before it and the
 nearest after, weighted by where it sits between them. At 100% a run of
 blended frames becomes a crossfade between its neighbours, so the flash
 is gone but every frame and the timing stay; at less, some of the flash
 stays, and so does whatever it shows (a line of subtitles). One **blend**
 strength per section (shown once it has B marks; 80% for marks made by
-hand) sets how far. *Suggest: lower contrast* marks the frames on the
+hand) sets how far. *Suggest: blend frames* marks the frames on the
 flashing's minority side (the light frames among dark ones, or the other
 way round), adds the frames a check still flags if that is not enough at
 100%, finds the least strength that passes in 5% steps and sets a little
@@ -695,7 +704,7 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 
 | crate | what |
 |---|---|
-| `crates/unflash-core` | the detector: config and profiles, the per-pixel kernel (scalar and SIMD), grid reduction, temporal stage, violations, sections, editing helpers, the blend of lower contrast. No I/O. |
+| `crates/unflash-core` | the detector: config and profiles, the per-pixel kernel (scalar and SIMD), grid reduction, temporal stage, violations, sections, editing helpers, the blend (blend frames). No I/O. |
 | `crates/unflash-gpu` | the WGSL pipeline on `wgpu` (native backends and the browser's WebGPU) |
 | `crates/unflash-mp4` | byte-range demuxers for WebCodecs, MP4 (fragmented files, edit lists) and Matroska / WebM (lacing, unknown sizes, header stripping), giving codec strings, decoder descriptions and sample tables; MP4 sample entries for Matroska audio; a muxer for the export |
 | `crates/unflash-h264` | the built-in H.264 decoder, for browsers whose WebCodecs has none |

@@ -98,7 +98,7 @@
             <option value="original">section, original</option>
             <option value="video">whole video</option>
           </select>
-          <label class="dim-toggle" title="Darken the player. A courtesy, not a safeguard."><input type="checkbox" id="dimToggle" checked> dim</label>
+          <label class="dim-toggle" title="Darken the pictures of the video: the player, the frames in the grid and the frame at full size. A courtesy, not a safeguard."><input type="checkbox" id="dimToggle" checked> dim</label>
           <span class="size-switch" title="Player size">
             <button class="small" data-size="s" title="small player">S</button><button class="small" data-size="m" title="medium player">M</button><button class="small" data-size="l" title="large player">L</button>
           </span>
@@ -171,7 +171,7 @@
             <button id="btnSuggestLight" title="Propose removals that hold the brighter frames">Suggest: keep light</button>
             <button id="btnSuggestDark" title="Propose removals that hold the darker frames">Suggest: keep dark</button>
             <button id="btnSuggestFewest" title="Remove as few frames as it can: takes out whichever of the light or dark frames are fewer, then puts back as many flashes as the rules allow (no more than three a second, fewer if the profile still objects), and where a picture would still freeze for half a second or more, lets frames back in at a rate that cannot flash, checking each try">Suggest: fewest removals</button>
-            <button id="btnSuggestBlend" title="Take the contrast out of the flashing instead of frames out of it: the flashing frames (whichever of the light or dark ones are fewer) are blended with the frames either side of them, as little as passes the check and a little more. No frame is removed and the timing stays; removals in reach make way for it.">Suggest: lower contrast</button>
+            <button id="btnSuggestBlend" title="Blend each flashing frame (whichever of the light or dark ones are fewer) with the frames either side of it, as little as passes the check and a little more: the contrast of the flash, from frame to frame, goes down, not the picture's, so what stays still stays sharp. Nothing is removed and the timing stays; removals in reach make way for it. (Turning the picture itself down towards grey would take away nearly all of it before a full-screen flash passed.)">Suggest: blend frames</button>
             <span class="split">
               <button id="btnSuggestFps" title="Thin the section to fewer pictures a second: starts at twice the rate that can never fail and steps down a tenth at a time until the check passes">Suggest: reduce FPS <span id="fpsShown" class="rate"></span></button>
               <button id="btnFpsMenu" class="split-arrow" title="Thin to a rate of your choosing">▾</button>
@@ -216,7 +216,7 @@
             <span class="chip removed" title="Removed. The badge says which frame shows in its place.">removed</span>
             <span class="chip extended" title="Held on screen for 1 second">held 1s</span>
             <span class="chip kept" title="Marked keep: the suggestions never remove or blend it (a subtitle, an image that matters)">keep</span>
-            <span class="chip blended" title="Blended with the frames either side of it (lower contrast); the thumbnail shows the result">blended</span>
+            <span class="chip blended" title="Blended with the frames either side of it (the flash toned down, nothing removed); the thumbnail shows the result">blended</span>
             <span class="chip flagged">in flash event</span>
             <span class="chip flagged-red">in red-flash event</span>
             <span class="chip flagged-ext" title="Inside an extended flash: flashing at the limit rate for 5 seconds or more">in extended flash</span>
@@ -235,7 +235,7 @@
             <button id="btnSelectUnsafe" class="small danger hidden" title="Select the frames inside whatever is still failing">select unsafe frames</button>
           </div>
         </div>
-        <div class="grid-hint">Click to select · shift-click for everything in between · ctrl-click adds or removes one · Esc clears. <b>R</b> removes a frame and shows the one before it, <b>F</b> shows the one after, <b>E</b> holds a frame for a second, <b>K</b> keeps it out of the suggestions' reach, <b>B</b> blends it with the frames either side (lower contrast, nothing removed); press the same key again to take the mark off (<b>U</b> clears every mark). <b>Ctrl+Z</b> undoes. Every change is checked as you make it, and <b>▶ play</b> shows it.</div>
+        <div class="grid-hint">Click to select · shift-click for everything in between · ctrl-click adds or removes one · Esc clears · <b>double-click</b> (or <b>Z</b>) shows a frame at full size, decoded from the file, to read a subtitle; S to XL above make the thumbnails bigger. <b>R</b> removes a frame and shows the one before it, <b>F</b> shows the one after, <b>E</b> holds a frame for a second, <b>K</b> keeps it out of the suggestions' reach, <b>B</b> blends it with the frames either side (the flash toned down, nothing removed); press the same key again to take the mark off (<b>U</b> clears every mark). <b>Ctrl+Z</b> undoes. Every change is checked as you make it, and <b>▶ play</b> shows it.</div>
         <div id="frameGrid" class="frame-grid" tabindex="0"></div>
       </div>
     </section>
@@ -253,8 +253,8 @@
     <p>Find the flashing and the stripe patterns in a video that can trigger photosensitive seizures, and take them out without wrecking the footage. Everything runs in your browser, on your GPU; nothing is uploaded anywhere.</p>
     <ol>
       <li><b>Open a video</b> (MP4, MOV, MKV or WebM), or drop one anywhere on the page. It is scanned straight away: every frame is decoded and pushed through the detector as fast as your GPU allows, and Unflash puts a numbered <i>section</i> around every problem it finds.</li>
-      <li><b>Open a section</b> (in the list on the left, or on the timeline). It prepares itself: its frames are decoded so every change can be checked the instant you make it. <b>Mark frames</b>: <b>R</b> removes a frame and shows the one before it in its place, <b>F</b> the one after, <b>E</b> holds a frame for a second, <b>B</b> blends it with the frames either side of it (lower contrast: the flash is toned down, not taken out). Press the same key again to take the mark off. <b>Ctrl+Z</b> undoes.</li>
-      <li><b>Suggest</b> gives you a first pass to work from. <b>Keep dark</b> and <b>keep light</b> remove the frames that make the flashing, <b>fewest removals</b> as few of them as the rules allow (and where a picture would freeze for a while, lets frames back in at a rate that can't flash); <b>lower contrast</b> removes nothing and blends them with the frames around them instead, as little as passes; <b>reduce FPS</b> thins the section, starting at twice the rate that can never fail and stepping down until the check passes. They choose by brightness alone, so look at what they did: they can take out a line of subtitles or an image that matters. Mark such frames <b>K</b> (keep) first and the suggestions work around them.</li>
+      <li><b>Open a section</b> (in the list on the left, or on the timeline). It prepares itself: its frames are decoded so every change can be checked the instant you make it. <b>Mark frames</b>: <b>R</b> removes a frame and shows the one before it in its place, <b>F</b> the one after, <b>E</b> holds a frame for a second, <b>B</b> blends it with the frames either side of it (the flash is toned down, not taken out). Press the same key again to take the mark off. <b>Ctrl+Z</b> undoes.</li>
+      <li><b>Suggest</b> gives you a first pass to work from. <b>Keep dark</b> and <b>keep light</b> remove the frames that make the flashing, <b>fewest removals</b> as few of them as the rules allow (and where a picture would freeze for a while, lets frames back in at a rate that can't flash); <b>blend frames</b> removes nothing: it blends them with the frames around them, which lowers the contrast of the flash from frame to frame, not the picture's (turning the picture itself towards grey would take nearly all of it away before a full-screen flash passed), as little as passes; <b>reduce FPS</b> thins the section, starting at twice the rate that can never fail and stepping down until the check passes. They choose by brightness alone, so look at what they did: they can take out a line of subtitles or an image that matters. Mark such frames <b>K</b> (keep) first and the suggestions work around them.</li>
       <li><b>Watch it.</b> With a section open, the player plays that section with your marks applied, exactly as the export will render it; switch it to <i>original</i> to compare. It is small and dimmed to begin with (the size buttons and the dim switch are above it).</li>
       <li><b>Stripe patterns</b> (fine gratings, more than five light–dark pairs, high contrast, a quarter of the screen or more) can't be removed a frame at a time: tick <b>soften stripes</b> and the frames that carry them are blurred just enough, and only where the stripes are.</li>
       <li><b>Export</b> writes the fixed video (only the stretches around the sections are re-encoded) and <b>Verify</b> scans it again.</li>

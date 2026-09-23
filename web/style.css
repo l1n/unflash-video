@@ -136,7 +136,8 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 .live-verdict.idle { color: var(--fg2); }
 .live-verdict.ok { border-color: var(--ok); color: var(--ok); }
 .live-verdict.warn { border-color: var(--warn); color: var(--warn); }
-.live-verdict.bad { background: var(--bad); border-color: var(--bad); color: var(--lit-fg); }
+/* (outlined: it changes with the video, so no lit block to blink on and off) */
+.live-verdict.bad { border-color: var(--bad); color: var(--bad); }
 .chart-box { flex: 1; min-width: 0; }
 .chart-head { display: flex; align-items: center; gap: 8px; min-height: 22px; margin-bottom: 4px; }
 .chart-title { color: var(--fg); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
@@ -208,6 +209,8 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 .thumb-size button { padding: 1px 7px; }
 .frame { position: relative; border: 2px solid transparent; background: var(--bg2); cursor: pointer; user-select: none; }
 .frame canvas { width: 100%; display: block; image-rendering: auto; }
+/* dimmed as the player is (its dim switch): a grid of flashing frames is bright, and they appear as they scroll into view */
+.frame-grid.dim .frame canvas { filter: brightness(.45); }
 .frame .fno { position: absolute; left: 3px; top: 3px; font-size: 10px; background: rgba(0, 0, 0, .75); padding: 0 4px; }
 .frame .ft { position: absolute; right: 3px; bottom: 3px; font-size: 10px; background: rgba(0, 0, 0, .75); padding: 0 4px; color: var(--fg2); }
 .frame .fb { position: absolute; left: 3px; bottom: 3px; font-size: 10px; padding: 0 4px; background: var(--bad); color: var(--lit-fg); }
@@ -225,8 +228,9 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 .frame.selected { outline: 2px solid var(--sel); outline-offset: -1px; }
 .frame.kept .fno { background: var(--ok); color: var(--lit-fg); }
 .frame.kept .fno::before { content: "K "; font-weight: 700; }
-/* the slot the section player is showing */
-.frame.playing { outline: 3px solid var(--fg); outline-offset: -3px; }
+/* the slot the section player is showing: a dim bar along the top, moved
+   at most every 0.4 s (app.js), not a bright frame running round the grid */
+.frame.playing::before { content: ''; position: absolute; left: -2px; right: -2px; top: -2px; height: 3px; background: var(--fg2); pointer-events: none; }
 .viewer { position: fixed; inset: 0; z-index: 60; background: rgba(0, 0, 0, .9); display: flex; align-items: center; justify-content: center; }
 .viewer.hidden { display: none; }
 .viewer-box { display: flex; flex-direction: column; gap: 6px; max-width: 94vw; }

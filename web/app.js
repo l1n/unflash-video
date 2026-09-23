@@ -643,6 +643,7 @@ async function boot() {
   player.addEventListener('play', () => {
     if (state.live.on && state.player.mode === 'video') startLiveLoop();
   });
+  player.addEventListener('pause', flushVerdict);
   player.addEventListener('seeked', () => {
     drawTimeline();
     if (chartMode() === 'video') drawChart();
@@ -1094,18 +1095,15 @@ async function scan() {
 function setLive(on) {
   state.live.on = on;
   $('hud').classList.toggle('hidden', !on);
-  const v = $('liveVerdict');
   if (!on) {
-    v.className = 'live-verdict idle';
-    v.textContent = 'monitor off';
+    setVerdict('live-verdict idle', 'monitor off', true);
     state.live.fromScan = false;
     return;
   }
   // the section player: the meter reads the section's check (edited) or the scan (original) as it plays
   if (state.player.mode !== 'video') {
     state.live.fromScan = false;
-    v.className = 'live-verdict idle';
-    v.textContent = 'meter on: press play';
+    setVerdict('live-verdict idle', 'meter on: press play', true);
     setHudBars(0, 0, 0);
     $('hudInfo').textContent = state.player.mode === 'edited' ? 'from the section check, as it plays' : 'from the scan, as it plays';
     return;
@@ -1125,8 +1123,7 @@ function setLive(on) {
   state.live.hazardRed = [];
   state.live.pattern = [];
   state.live.violations = 0;
-  v.className = 'live-verdict ok';
-  v.textContent = 'watching';
+  setVerdict('live-verdict ok', 'watching', true);
   startLiveLoop();
 }
 
@@ -1222,13 +1219,57 @@ function scanReports(scan, v) {
   return true;
 }
 
+// The meter over the player rises at once and falls back slowly (a full bar
+// in a second and a quarter), as a sound meter does: bars that followed the
+// video frame by frame would flash along with it.
+const HUD_FALL_PER_S = 1.6;
+const hud = { haz: 0, red: 0, pat: 0, at: 0, streaming: false };
+
 function setHudBars(haz, red, pat) {
-  $('hudHaz').style.width = `${Math.min(100, haz * 50)}%`;
-  $('hudRed').style.width = `${Math.min(100, red * 50)}%`;
-  $('hudPat').style.width = `${Math.min(100, pat * 50)}%`;
-  $('hudHazText').textContent = `${Math.round(haz * 100)}%`;
-  $('hudRedText').textContent = `${Math.round(red * 100)}%`;
-  $('hudPatText').textContent = `${Math.round(pat * 100)}%`;
+  const now = performance.now();
+  const dt = (now - hud.at) / 1000;
+  // (a reading after a pause, a seek, is shown as it is)
+  hud.streaming = dt <= 0.3;
+  const fall = hud.streaming ? dt * HUD_FALL_PER_S : Infinity;
+  hud.at = now;
+  hud.haz = Math.max(haz, hud.haz - fall);
+  hud.red = Math.max(red, hud.red - fall);
+  hud.pat = Math.max(pat, hud.pat - fall);
+  $('hudHaz').style.width = `${Math.min(100, hud.haz * 50)}%`;
+  $('hudRed').style.width = `${Math.min(100, hud.red * 50)}%`;
+  $('hudPat').style.width = `${Math.min(100, hud.pat * 50)}%`;
+  $('hudHazText').textContent = `${Math.round(hud.haz * 100)}%`;
+  $('hudRedText').textContent = `${Math.round(hud.red * 100)}%`;
+  $('hudPatText').textContent = `${Math.round(hud.pat * 100)}%`;
+}
+
+// The monitor's verdict changes at most every 0.7 s (the live detector's
+// own pace); what it would have said meanwhile waits, the latest of it
+// shown when the time comes, at once after a pause in the readings, or when
+// the picture stops (flushVerdict).
+const VERDICT_EVERY_MS = 700;
+const verdict = { at: 0, cls: '', text: '', waiting: null };
+
+function setVerdict(cls, text, force = false) {
+  const now = performance.now();
+  verdict.waiting = null;
+  if (cls === verdict.cls && text === verdict.text) return;
+  if (!force && hud.streaming && now - verdict.at < VERDICT_EVERY_MS) {
+    verdict.waiting = { cls, text };
+    return;
+  }
+  verdict.at = now;
+  verdict.cls = cls;
+  verdict.text = text;
+  const v = $('liveVerdict');
+  v.className = cls;
+  v.textContent = text;
+}
+
+/** The verdict held back by the pace, shown now that the picture has stopped. */
+function flushVerdict() {
+  const w = verdict.waiting;
+  if (w) setVerdict(w.cls, w.text, true);
 }
 
 /** The meter and the verdict at time `t`, read from the scan. */
@@ -1253,17 +1294,13 @@ function monitorFromScan(t) {
   const viol = scan.violations.filter((v) => scanReports(scan, v));
   const inside = viol.filter((v) => v.start <= t && t <= v.end);
   const before = viol.filter((v) => v.end < t).length;
-  const v = $('liveVerdict');
   if (inside.length) {
     const k = inside[inside.length - 1].kind;
-    v.className = 'live-verdict bad';
-    v.textContent = k === 'pattern' ? 'hazardous pattern: stripes' : `flashing: ${k === 'red' ? 'red flash' : k === 'extended' ? 'extended flash' : 'general flash'}`;
+    setVerdict('live-verdict bad', k === 'pattern' ? 'hazardous pattern: stripes' : `flashing: ${k === 'red' ? 'red flash' : k === 'extended' ? 'extended flash' : 'general flash'}`);
   } else if (haz > 0 || ext >= 1 || (pat >= 1 && scan.flag_patterns)) {
-    v.className = 'live-verdict warn';
-    v.textContent = haz > 0 || ext >= 1 ? 'flashing below the limit' : 'stripes on screen';
+    setVerdict('live-verdict warn', haz > 0 || ext >= 1 ? 'flashing below the limit' : 'stripes on screen');
   } else {
-    v.className = 'live-verdict ok';
-    v.textContent = before ? `${before} violation${before === 1 ? '' : 's'} so far` : 'no flashing so far';
+    setVerdict('live-verdict ok', before ? `${before} violation${before === 1 ? '' : 's'} so far` : 'no flashing so far');
   }
   $('hudInfo').textContent = `from the scan · frame ${i + 1} of ${n.t.length}`;
 }
@@ -1297,18 +1334,14 @@ function drainLive() {
     const res = feeder.finish(false);
     const viol = res.violations.filter((v) => reported(res, v));
     L.violations = viol.length;
-    const v = $('liveVerdict');
     const recent = viol.length && viol[viol.length - 1].end >= last.t - 1.5;
     if (recent) {
       const k = viol[viol.length - 1].kind;
-      v.className = 'live-verdict bad';
-      v.textContent = k === 'pattern' ? 'hazardous pattern: stripes' : `flashing: ${k === 'red' ? 'red flash' : k === 'extended' ? 'extended flash' : 'general flash'}`;
+      setVerdict('live-verdict bad', k === 'pattern' ? 'hazardous pattern: stripes' : `flashing: ${k === 'red' ? 'red flash' : k === 'extended' ? 'extended flash' : 'general flash'}`);
     } else if (haz > 0 || ext >= 1 || (pat >= 1 && res.flag_patterns)) {
-      v.className = 'live-verdict warn';
-      v.textContent = haz > 0 || ext >= 1 ? 'flashing below the limit' : 'stripes on screen';
+      setVerdict('live-verdict warn', haz > 0 || ext >= 1 ? 'flashing below the limit' : 'stripes on screen');
     } else {
-      v.className = 'live-verdict ok';
-      v.textContent = viol.length ? `${viol.length} violation${viol.length === 1 ? '' : 's'} so far` : 'no flashing so far';
+      setVerdict('live-verdict ok', viol.length ? `${viol.length} violation${viol.length === 1 ? '' : 's'} so far` : 'no flashing so far');
     }
     $('hudInfo').textContent = `${res.frames} frames watched · ${res.held} re-shown · ${feeder.backend === 'webgpu' ? 'GPU' : 'CPU'} ${(feeder.busyNs / 1e6 / Math.max(1, feeder.fed)).toFixed(2)} ms/frame on the main thread`;
     drawTimeline();
@@ -1341,10 +1374,13 @@ function setPlayerSize(size) {
   drawChart();
 }
 
+/** The dim switch darkens every picture of the video: the player, the frames in the grid, the frame at full size. */
 function applyDim() {
   const on = $('dimToggle').checked;
   $('player').classList.toggle('dim', on);
   $('preview').classList.toggle('dim', on);
+  $('frameGrid').classList.toggle('dim', on);
+  $('viewerCanvas').classList.toggle('dim', on);
 }
 
 /** Whether the section player plays sound: off unless turned on (remembered in this browser). */
@@ -1520,13 +1556,28 @@ function playSection(fromSlot = 0) {
   return sectionPlayer.play({ env: state.env, movie: state.movie, sec, edited: state.player.mode === 'edited', extS: EXT_S, fromSlot, loop: () => $('previewLoop').checked });
 }
 
-/** Outline the tile of the slot on screen (-1: none). */
-function markPlaying(k) {
+/** How often the grid's mark of the frame on screen may move while a section plays (ms): the frame viewer's pace. */
+const MARK_EVERY_MS = 400;
+const reducedMotion = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : { matches: false };
+
+/**
+ * Mark the tile of the slot on screen (-1: none). While a section plays the
+ * mark moves at most every MARK_EVERY_MS (not at all for anyone who asks
+ * their system for less motion), and it is a dim bar, not a bright frame: a
+ * mark running from tile to tile with every picture would flicker across
+ * the grid, which is the last thing this page should do. `exact`: where
+ * the player has stopped, at once.
+ */
+function markPlaying(k, exact = false) {
+  const now = performance.now();
+  if (!exact && k >= 0 && (reducedMotion.matches || now - (state.player.markAt || 0) < MARK_EVERY_MS)) return;
   const grid = $('frameGrid');
   const prev = state.player.playingTile;
+  if (prev === k) return;
   if (prev != null && grid.children[prev]) grid.children[prev].classList.remove('playing');
   state.player.playingTile = k >= 0 ? k : null;
   if (k >= 0 && grid.children[k]) grid.children[k].classList.add('playing');
+  state.player.markAt = now;
 }
 
 function onPreviewFrame(info, t, plan) {
@@ -1554,41 +1605,34 @@ function onPreviewFrame(info, t, plan) {
 function onPreviewState(s, detail) {
   const b = $('btnPreviewPlay');
   b.textContent = s === 'playing' ? '❚❚ pause' : s === 'paused' ? '▶ resume' : '▶ play';
-  if (s === 'stopped' || s === 'ended') markPlaying(-1);
+  if (s === 'stopped' || s === 'ended') markPlaying(-1, true);
+  // paused: the mark where the picture is
+  else if (s === 'paused' && sectionPlayer.slot >= 0) markPlaying(sectionPlayer.slot, true);
+  if (s !== 'playing') flushVerdict();
   if (s === 'error') banner(`The section player stopped: ${detail && detail.message ? detail.message : detail}`);
 }
 
 /** The meter for the frame the section player shows: the section's check (edited) or the scan (original). */
 function previewMeter(sec, k, t) {
-  const v = $('liveVerdict');
   if (state.player.mode === 'original') {
     if (monitorTrace()) monitorFromScan(t);
     else {
-      v.className = 'live-verdict idle';
-      v.textContent = 'no scan to read';
+      setVerdict('live-verdict idle', 'no scan to read', true);
     }
     return;
   }
   const c = sec.check;
   if (!c || c.stale || !c.stats || k < 0 || k >= c.stats.hazard.length) {
-    v.className = 'live-verdict idle';
-    v.textContent = c && c.stale ? 'checking the change…' : 'not checked yet';
+    setVerdict('live-verdict idle', c && c.stale ? 'checking the change…' : 'not checked yet', true);
     return;
   }
   const thr = c.area_thresh || 1;
   const pthr = c.pattern_thresh || 1;
   setHudBars(c.stats.hazard[k] / thr, c.stats.hazardRed[k] / thr, (c.stats.pattern[k] || 0) / pthr);
   $('hudInfo').textContent = `from the section check · frame ${k} of ${c.stats.hazard.length}`;
-  if (c.flagged && c.flagged.includes(k)) {
-    v.className = 'live-verdict bad';
-    v.textContent = 'still failing here';
-  } else if (c.safe) {
-    v.className = 'live-verdict ok';
-    v.textContent = 'passes the check';
-  } else {
-    v.className = 'live-verdict warn';
-    v.textContent = 'fails elsewhere in the section';
-  }
+  if (c.flagged && c.flagged.includes(k)) setVerdict('live-verdict bad', 'still failing here');
+  else if (c.safe) setVerdict('live-verdict ok', 'passes the check');
+  else setVerdict('live-verdict warn', 'fails elsewhere in the section');
 }
 
 /** Whether a section has marks that change what it shows. */
@@ -2418,6 +2462,7 @@ function renderGrid(sec) {
     const tile = document.createElement('div');
     tile.className = 'frame';
     tile.dataset.i = i;
+    tile.title = `Frame ${i}: double-click (or select it and press Z) to see it at full size, decoded from the file, to read a subtitle, say`;
     const canvas = document.createElement('canvas');
     canvas.width = tw;
     canvas.height = th;
@@ -2799,12 +2844,12 @@ async function doSuggest(prefer) {
   toast(res.note, 6000);
 }
 
-/** Lower contrast: blend the flashing frames with the frames around them, as little as passes. */
+/** Blend frames ("lower contrast"): blend the flashing frames with the frames around them, as little as passes. */
 async function doSuggestBlend() {
   const sec = currentSection();
   if (!sec || !sec.prepared) return;
   const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
-  const res = await runJob('Suggesting (lower contrast)', async (progress) => suggestBlend(state.env, state.project, sec, only, { extS: EXT_S, onProgress: (r) => progress(Math.min(0.95, 0.05 + r * 0.09), `check ${r + 1}`) }));
+  const res = await runJob('Suggesting (blend frames)', async (progress) => suggestBlend(state.env, state.project, sec, only, { extS: EXT_S, onProgress: (r) => progress(Math.min(0.95, 0.05 + r * 0.09), `check ${r + 1}`) }));
   if (!res) return;
   pushHistory(sec);
   sec.edits = res.edits;
