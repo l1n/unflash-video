@@ -1149,26 +1149,30 @@ export async function checkSection(env, project, sec, edits, { extS = 1.0, onPro
   const ctx = sectionContext(env, project, sec, extS);
   const shown = shownPts(wasm, sec);
   const seq = JSON.parse(wasm.edited_sequence(Float64Array.from(shown), JSON.stringify(useEdits), extS));
+  // the frames after the section come after all of its holds, its last frame's too
+  const total = JSON.parse(wasm.section_timeline(Float64Array.from(sec.pts), sec.start, sec.end)).total;
+  const holds = JSON.parse(wasm.section_holds(Float64Array.from(shown), JSON.stringify(useEdits), extS, total));
+  const lastHold = holds.filter((h) => h.at >= total - 1e-9).reduce((sum, h) => sum + h.seconds, 0);
   const frames = sectionFrames(sec);
   feeder.reset();
   let fed = 0;
-  const total = ctx.lead.frames.length + seq.t.length + ctx.tail.frames.length;
+  const count = ctx.lead.frames.length + seq.t.length + ctx.tail.frames.length;
   for (let k = 0; k < ctx.lead.frames.length; k++) {
     await feeder.cached(ctx.lead.frames[k].cache, ctx.lead.frames[k].i, ctx.lead.times[k]);
-    if (onProgress && ++fed % 60 === 0) onProgress(fed / total);
+    if (onProgress && ++fed % 60 === 0) onProgress(fed / count);
   }
   for (let k = 0; k < seq.t.length; k++) {
     await feeder.cached(frames, seq.src[k], seq.t[k]);
-    if (onProgress && ++fed % 60 === 0) onProgress(fed / total);
+    if (onProgress && ++fed % 60 === 0) onProgress(fed / count);
   }
   const endDisp = seq.t.length ? seq.t[seq.t.length - 1] : 0;
   for (let k = 0; k < ctx.tail.frames.length; k++) {
-    await feeder.cached(ctx.tail.frames[k].cache, ctx.tail.frames[k].i, endDisp + ctx.tail.times[k]);
-    if (onProgress && ++fed % 60 === 0) onProgress(fed / total);
+    await feeder.cached(ctx.tail.frames[k].cache, ctx.tail.frames[k].i, endDisp + lastHold + ctx.tail.times[k]);
+    if (onProgress && ++fed % 60 === 0) onProgress(fed / count);
   }
   await feeder.drain();
   const result = feeder.finish(true);
-  const cls = JSON.parse(wasm.classify(JSON.stringify(result), endDisp, ctx.nextAt === null ? undefined : ctx.nextAt));
+  const cls = JSON.parse(wasm.classify(JSON.stringify(result), endDisp, ctx.nextAt === null ? undefined : ctx.nextAt + lastHold));
   const violations = [...cls.inside, ...cls.after];
   const wcagSafe = !violations.some((v) => v.kind === 'flash' || v.kind === 'red');
   const extendedBad = result.flag_extended && violations.some((v) => v.kind === 'extended');
@@ -1190,6 +1194,7 @@ export async function checkSection(env, project, sec, edits, { extS = 1.0, onPro
     red: slice(fs.red_area),
     hazard: slice(fs.hazard),
     hazardRed: slice(fs.hazard_red),
+    ext: slice(fs.ext),
     pattern: slice(fs.pattern),
   };
   return {

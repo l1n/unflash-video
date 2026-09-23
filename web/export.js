@@ -4,12 +4,15 @@
 // are decoded, edited and re-encoded with WebCodecs, several at once, each
 // from a keyframe the decoder can start at cold. When the encoder's codec
 // cannot share a track with the source's (or smart cut is off), the whole
-// video is re-encoded, still in parallel pieces. Audio is copied from the
-// source without re-encoding. The WASM muxer writes the file.
+// video is re-encoded, still in parallel pieces. The sound is copied from
+// the source as it is, unless frames are held: then it is re-encoded with
+// silence under each held frame (see sound.js). The WASM muxer writes the
+// file.
 
 import { decodeRange, ChunkReader, orTimeout } from './media.js';
 import { profile } from './profile.js';
 import { shownPts, softenPlan, blendMarks, blendStrength, blendSources, blendWeights } from './analysis.js';
+import { SoundRun, audioData } from './sound.js';
 
 function avcLevel(w, h, fps) {
   const mbs = Math.ceil(w / 16) * Math.ceil(h / 16);
@@ -227,20 +230,26 @@ class FileSink {
  */
 /**
  * How one prepared section is rendered: its edited sequence (display time,
- * source ordinal), where it starts, how many of its frames it shows, the
- * seconds its holds add and the frames "soften stripes" blurs. With
- * `edited` false, the section as it is (the section player's "original").
+ * source ordinal), where it starts and ends, how many of its frames it
+ * shows, its holds and the seconds they add, and the frames "soften
+ * stripes" blurs. With `edited` false, the section as it is (the section
+ * player's "original").
  */
 export function sectionRenderPlan(env, movie, s, extS, { edited = true } = {}) {
   const { wasm } = env;
   const tl = JSON.parse(wasm.section_timeline(Float64Array.from(s.pts), s.start, s.end));
   const shown = shownPts(wasm, s);
-  const seq = JSON.parse(wasm.edited_sequence(Float64Array.from(shown), JSON.stringify(edited ? s.edits || {} : {}), extS));
+  const edits = JSON.stringify(edited ? s.edits || {} : {});
+  const seq = JSON.parse(wasm.edited_sequence(Float64Array.from(shown), edits, extS));
+  // where the section waits for its held frames, in source seconds: the
+  // frame times above come from the same list, and so does the silence the
+  // export puts into the sound, so the two cannot disagree
+  const holds = JSON.parse(wasm.section_holds(Float64Array.from(shown), edits, extS, tl.total)).map((h) => ({ at: s.start + tl.base + h.at, seconds: h.seconds }));
+  const extra = holds.reduce((sum, h) => sum + h.seconds, 0);
   const hasEdits = edited && (Object.values(s.edits || {}).some((e) => e.removed || e.extended) || blendMarks(s).length > 0);
   const needCount = new Map();
   const need = (i) => needCount.set(i, (needCount.get(i) || 0) + 1);
   for (const src of seq.src) need(src);
-  const extra = seq.t.length ? seq.t[seq.t.length - 1] - shown[shown.length - 1] : 0;
   // "lower contrast": marked frames mixed with the unmarked frames either
   // side of them, which must be at hand when they show
   let blend = null;
@@ -264,7 +273,9 @@ export function sectionRenderPlan(env, movie, s, extS, { edited = true } = {}) {
     const plan = softenPlan(s);
     if (plan) soft = { frames: plan.frames, sigma: plan.sigma * (movie.width / env.feeder.aw) };
   }
-  return { sec: s, base: tl.base, seq, nOut: tl.n_out, hasEdits, needCount, extra, soft, blend };
+  // where the section ends on the source's clock (where its next frame would come)
+  const end = s.start + tl.base + tl.total;
+  return { sec: s, base: tl.base, seq, nOut: tl.n_out, hasEdits, needCount, holds, extra, end, soft, blend };
 }
 
 function sectionPlans(env, movie, project, extS, warnings) {
@@ -274,7 +285,6 @@ function sectionPlans(env, movie, project, extS, warnings) {
     .map((s) => sectionRenderPlan(env, movie, s, extS));
   const unprepared = project.sections.filter((s) => !(s.pts && s.pts.length) && (Object.values(s.edits || {}).some((e) => e.removed || e.extended) || (s.blend || []).length));
   if (unprepared.length) warnings.push(`Sections ${unprepared.map((s) => '#' + s.id).join(', ')} have marks but were never prepared; their marks were not applied. Prepare them and export again.`);
-  if (sections.some((p) => p.extra > 0) && movie.audio) warnings.push('Some frames are held for a second (E marks). The audio is copied unchanged, so it runs ahead of the picture after each hold.');
   return sections;
 }
 
@@ -448,7 +458,9 @@ export async function exportPlan(env, movie, project, { extS = 1.0, codec = null
       for (let i = piece.from; i < piece.to; i++) copiedBytes += v.size[i];
     } else encodedSeconds += Math.min(movie.tsMax, piece.endSec) - piece.startSec;
   }
-  return { mode, copyable, pieces, sections, spans: pieces.filter((p) => p.kind === 'encode').length, encoded: encodedFrames, copied: copiedFrames, copiedBytes, encodedSeconds, parallel: K, warnings };
+  // every held frame of the export, in source seconds and in order: the sound's silences
+  const holds = sections.flatMap((p) => p.holds).sort((x, y) => x.at - y.at);
+  return { mode, copyable, pieces, sections, holds, spans: pieces.filter((p) => p.kind === 'encode').length, encoded: encodedFrames, copied: copiedFrames, copiedBytes, encodedSeconds, parallel: K, warnings };
 }
 
 // ---- the edited timeline, frame by frame ------------------------------------------
@@ -940,15 +952,26 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
     codecString = `avc1.${Array.from(description.subarray(1, 4), (b) => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
   } else if (plan.mode === 'smart' && !description) description = movie.dx.track_description(movie.video.index);
   const vt = mx.add_video_track(codecString, movie.width, movie.height, 1000000, description || new Uint8Array());
+  // the video ends as much later as all the holds say (the last frame's own too)
+  const endUs = Math.round((movie.tsMax + plan.holds.reduce((sum, h) => sum + h.seconds, 0)) * 1e6);
   for (let i = 0; i < samples.length; i++) {
     const dts = sorted[i] - shift;
-    const dur = i + 1 < samples.length ? sorted[i + 1] - sorted[i] : medianUs;
+    const dur = i + 1 < samples.length ? sorted[i + 1] - sorted[i] : Math.max(medianUs, endUs - sorted[i]);
     mx.add_sample(vt, dts, samples[i].pts, Math.max(1, dur), samples[i].sync, samples[i].size);
   }
 
-  // --- audio: copied as it is when an MP4 can hold it, else re-encoded ------
+  // --- audio: copied as it is when an MP4 can hold it and no frame is held;
+  // else re-encoded, with silence under the held frames ------------------------
   if (movie.audio && movie.a) {
-    if (movie.audio.copyable) {
+    const holds = plan.holds;
+    let copy = movie.audio.copyable && !holds.length;
+    if (!copy) {
+      const res = await reencodeAudio(wasm, movie, reader, mx, out, { cancel: cancelled, holds });
+      if (res.warning) warnings.push(res.warning);
+      // could not re-encode at all: the sound as it is beats none
+      copy = !res.wrote && movie.audio.copyable;
+    }
+    if (copy) {
       const at = mx.add_copy_track('audio', movie.dx.track_sample_entry(movie.audio.index), movie.audio.timescale, 0, 0);
       const a = movie.a;
       // Matroska header stripping: the bytes every packet starts with go back in front
@@ -959,9 +982,6 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
         await out.write(bytes.slice());
         mx.add_sample(at, a.dtsTicks[i], a.ptsTicks[i], a.durTicks[i], true, a.size[i] + (prefix ? prefix.length : 0));
       }
-    } else {
-      const res = await reencodeAudio(wasm, movie, reader, mx, out, { cancel: cancelled });
-      if (res.warning) warnings.push(res.warning);
     }
   }
   if (movie.otherAudioTracks) warnings.push(`The source has ${movie.otherAudioTracks + 1} audio tracks; the export keeps the first (${movie.audio.language && movie.audio.language !== 'und' ? movie.audio.language : movie.audio.codec}).`);
@@ -979,17 +999,30 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
   return { blob, warnings, frames: encodedFrames, copied: copiedFrames, spans: encodePieces.length, mode: plan.mode, parallel: K, softened, blended, elapsedMs, codec: codecString, encoderLabel: chosen.label };
 }
 
+/** Seconds as the export's notes say them: "1 s", "0.5 s". */
+const secs = (x) => `${Math.round(x * 100) / 100} s`;
+
 /**
- * Audio an MP4 can't hold as it is (Vorbis, PCM): decoded and encoded again
- * with WebCodecs, AAC where this browser has an AAC encoder, else Opus, and
- * written after the video as it comes out. Returns { warning } when the
- * export goes without sound, or says what was done.
+ * The sound re-encoded with WebCodecs (AAC where this browser has an AAC
+ * encoder, else Opus) and written after the video as it comes out. Two
+ * reasons: frames are held (`holds`, the plan's, in source seconds), and
+ * each hold puts `seconds` of silence into the sound at `at`, the moment
+ * the held frame's next frame would have come, so the sound waits exactly
+ * where the picture does; or an MP4 can't hold the source's sound as it is
+ * (Vorbis, PCM). Returns `{ warning, wrote }`: what was done, or why there
+ * is no sound; `wrote` false means nothing went into the file.
  */
-async function reencodeAudio(wasm, movie, reader, mx, out, { cancel } = {}) {
+async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [] } = {}) {
   const at = movie.audio;
   const a = movie.a;
   const name = at.codec;
-  if (typeof AudioDecoder === 'undefined' || typeof AudioEncoder === 'undefined') return { warning: `The audio (${name}) can't go into an MP4 as it is, and this browser can't re-encode audio, so the export has no sound.` };
+  const held = holds.length > 0;
+  const lengths = [...new Set(holds.map((h) => h.seconds))];
+  const silence = lengths.length === 1 ? `${secs(lengths[0])} of silence` : 'silence';
+  // why the sound is re-encoded, and what happens when it can't be
+  const why = held ? `Each held frame (E mark) needs ${silence} under it` : `The audio (${name}) can't go into an MP4 as it is`;
+  const without = held && at.copyable ? `so the sound was copied as it is and runs ahead of the picture after each held frame (by ${secs(holds.reduce((s, h) => s + h.seconds, 0))} at the end)` : 'so the export has no sound';
+  if (typeof AudioDecoder === 'undefined' || typeof AudioEncoder === 'undefined') return { warning: `${why}, and this browser can't re-encode audio, ${without}.`, wrote: false };
   const desc = movie.dx.track_description(at.index);
   const dcfg = { codec: at.codec, sampleRate: at.sample_rate, numberOfChannels: at.channels };
   if (desc.length) dcfg.description = desc;
@@ -999,22 +1032,22 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel } = {}) {
   } catch (e) {
     can = false;
   }
-  if (!can) return { warning: `The audio (${name}) can't go into an MP4 as it is, and this browser can't decode it to re-encode it, so the export has no sound.` };
-  let ecfg = null;
-  for (const c of [
-    { codec: 'mp4a.40.2', sampleRate: at.sample_rate, numberOfChannels: at.channels, bitrate: 96000 * Math.min(2, at.channels) },
-    { codec: 'opus', sampleRate: at.sample_rate, numberOfChannels: at.channels, bitrate: 80000 * Math.min(2, at.channels) },
-  ]) {
-    try {
-      if ((await AudioEncoder.isConfigSupported(c)).supported) {
-        ecfg = c;
-        break;
+  if (!can) return { warning: `${why}, and this browser can't decode the audio (${name}) to re-encode it, ${without}.`, wrote: false };
+  const pick = async (rate, channels) => {
+    for (const c of [
+      { codec: 'mp4a.40.2', sampleRate: rate, numberOfChannels: channels, bitrate: 96000 * Math.min(2, channels) },
+      { codec: 'opus', sampleRate: rate, numberOfChannels: channels, bitrate: 80000 * Math.min(2, channels) },
+    ]) {
+      try {
+        if ((await AudioEncoder.isConfigSupported(c)).supported) return c;
+      } catch (e) {
+        /* try the next */
       }
-    } catch (e) {
-      /* try the next */
     }
-  }
-  if (!ecfg) return { warning: `The audio (${name}, ${at.channels} channels) can't go into an MP4 as it is, and this browser has no encoder to re-encode it with, so the export has no sound.` };
+    return null;
+  };
+  let ecfg = await pick(at.sample_rate, at.channels);
+  if (!ecfg) return { warning: `${why}, and this browser has no encoder for its ${at.channels} channels, ${without}.`, wrote: false };
   let error = null;
   let wake = null;
   const kick = () => {
@@ -1032,29 +1065,12 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel } = {}) {
       50
     );
   const chunks = []; // encoded, waiting to be written
+  const decoded = []; // decoded, waiting to be placed
   let outCfg = null;
-  const enc = new AudioEncoder({
-    output: (chunk, meta) => {
-      if (meta && meta.decoderConfig && !outCfg) outCfg = meta.decoderConfig;
-      const b = new Uint8Array(chunk.byteLength);
-      chunk.copyTo(b);
-      chunks.push({ bytes: b, ts: chunk.timestamp, dur: chunk.duration || 0 });
-      kick();
-    },
-    error: (e) => {
-      error = error || e;
-      kick();
-    },
-  });
-  enc.configure(ecfg);
+  let enc = null;
   const dec = new AudioDecoder({
     output: (data) => {
-      try {
-        enc.encode(data);
-      } catch (e) {
-        error = error || e;
-      }
-      data.close();
+      decoded.push(data);
       kick();
     },
     error: (e) => {
@@ -1067,7 +1083,7 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel } = {}) {
   // the track is added once the encoder has said what it makes
   let track = -1;
   let rate = 0;
-  const written = [];
+  let written = 0;
   const flushOut = async (all) => {
     // keep the last chunk back until the end: its duration comes from the next
     while (chunks.length > (all ? 0 : 1)) {
@@ -1084,13 +1100,54 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel } = {}) {
       const dur = next ? ticks(next.ts) - ticks(c.ts) : ticks(c.dur) || 1;
       await out.write(c.bytes);
       mx.add_sample(track, ticks(c.ts), ticks(c.ts), Math.max(1, dur), true, c.bytes.byteLength);
-      written.push(1);
+      written++;
+    }
+  };
+  // the decoded sound placed on the edited timeline (silence under the holds)
+  let run = null;
+  const place = async () => {
+    while (decoded.length && !error) {
+      const data = decoded.shift();
+      try {
+        if (!run) {
+          // the encoder takes what the decoder makes (HE-AAC decodes at twice its declared rate)
+          if (data.sampleRate !== ecfg.sampleRate || data.numberOfChannels !== ecfg.numberOfChannels) {
+            const other = await pick(data.sampleRate, data.numberOfChannels);
+            if (other) ecfg = other;
+          }
+          enc = new AudioEncoder({
+            output: (chunk, meta) => {
+              if (meta && meta.decoderConfig && !outCfg) outCfg = meta.decoderConfig;
+              const b = new Uint8Array(chunk.byteLength);
+              chunk.copyTo(b);
+              chunks.push({ bytes: b, ts: chunk.timestamp, dur: chunk.duration || 0 });
+              kick();
+            },
+            error: (e) => {
+              error = error || e;
+              kick();
+            },
+          });
+          enc.configure(ecfg);
+          run = new SoundRun(ecfg.sampleRate, ecfg.numberOfChannels, holds, (planes, n, start) => {
+            const d = audioData(planes, n, start, ecfg.sampleRate);
+            enc.encode(d);
+            d.close();
+          });
+        }
+        run.add(data);
+      } finally {
+        data.close();
+      }
     }
   };
   try {
     for (let i = 0; i < a.offset.length && !error; i++) {
       if (cancel && cancel()) throw new Error('cancelled');
-      while ((dec.decodeQueueSize > 16 || enc.encodeQueueSize > 16) && !error) await settle();
+      while ((dec.decodeQueueSize > 16 || (enc && enc.encodeQueueSize > 16)) && !error) {
+        await place();
+        await settle();
+      }
       let bytes = await reader.read(a.offset[i], a.size[i]);
       if (prefix) {
         const b = new Uint8Array(prefix.length + bytes.length);
@@ -1099,28 +1156,38 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel } = {}) {
         bytes = b;
       }
       dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round((a.ptsTicks[i] * 1e6) / at.timescale), duration: Math.round((a.durTicks[i] * 1e6) / at.timescale), data: bytes.slice() }));
+      await place();
       await flushOut(false);
     }
     if (!error) await dec.flush();
-    if (!error) await enc.flush();
+    if (!error) await place();
+    if (!error && run) run.finish();
+    if (!error && enc) await enc.flush();
     if (error) throw error;
     await flushOut(true);
   } catch (e) {
     if (String(e && e.message).includes('cancelled')) throw e;
-    return { warning: `The audio (${name}) could not be re-encoded (${e && e.message ? e.message : e})${written.length ? ', so part of it is missing' : ', so the export has no sound'}.` };
+    return { warning: `${why}, and re-encoding the sound failed (${e && e.message ? e.message : e})${written ? ', so part of it is missing' : `, ${without}`}.`, wrote: written > 0 };
   } finally {
+    for (const d of decoded) d.close();
     try {
       dec.close();
     } catch (e) {
       /* closed */
     }
     try {
-      enc.close();
+      if (enc) enc.close();
     } catch (e) {
       /* closed */
     }
   }
-  return { warning: `The audio (${name}) can't go into an MP4 as it is, so it was re-encoded to ${ecfg.codec === 'opus' ? 'Opus' : 'AAC'}.` };
+  const to = ecfg.codec === 'opus' ? 'Opus' : 'AAC';
+  const placed = run ? run.placed : 0;
+  if (held) {
+    const after = holds.length - placed;
+    return { warning: `The sound was re-encoded to ${to} to put ${silence} under each held frame (E marks), where the picture waits.${after ? ` ${after} of them come${after === 1 ? 's' : ''} after the sound ends.` : ''}`, wrote: true };
+  }
+  return { warning: `The audio (${name}) can't go into an MP4 as it is, so it was re-encoded to ${to}.`, wrote: true };
 }
 
 let blurCanvas = null;

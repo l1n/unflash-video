@@ -5,7 +5,8 @@
 // decodes the section afresh for every pass, so it plays at the file's full
 // resolution and needs nothing prepared beyond the section's frame times;
 // the marks are read when a pass starts, so an edit shows from the next
-// pass (or at once, when the caller restarts it).
+// pass (or at once, when the caller restarts it). A SectionSound, when
+// given, plays the section's sound along with it (see sound.js).
 
 import { walkEdited, sectionRenderPlan } from './export.js';
 
@@ -17,12 +18,14 @@ export class SectionPlayer {
   /**
    * `onFrame(info, t, plan)` follows every picture drawn (info as walkEdited
    * gives it); `onState(state, detail)` every change of 'playing', 'paused',
-   * 'ended', 'stopped' or 'error'.
+   * 'ended', 'stopped' or 'error'. `sound` (a SectionSound) is kept in step
+   * with the clock.
    */
-  constructor(canvas, { onFrame = null, onState = null } = {}) {
+  constructor(canvas, { onFrame = null, onState = null, sound = null } = {}) {
     this.canvas = canvas;
     this.onFrame = onFrame;
     this.onState = onState;
+    this.sound = sound;
     this.run = null;
     this.speed = 1;
   }
@@ -59,7 +62,7 @@ export class SectionPlayer {
           await this._pass(run, { env, movie, sec, edited, extS, fromSlot: from });
           if (run.cancelled || once || !loop()) break;
           from = 0;
-          run.base = null;
+          run.base = null; // the next pass sets the clock (and the sound) going at its first frame
         }
       } catch (e) {
         if (!run.cancelled) {
@@ -77,6 +80,7 @@ export class SectionPlayer {
   async stop() {
     const run = this.run;
     if (!run) return;
+    if (this.sound) this.sound.halt();
     run.cancelled = true;
     if (run.wake) run.wake();
     await run.promise;
@@ -88,6 +92,7 @@ export class SectionPlayer {
     if (!run || run.done || run.paused) return;
     run.pausedAt = this._media(run, performance.now());
     run.paused = true;
+    if (this.sound) this.sound.halt();
     this._state('paused');
   }
 
@@ -95,7 +100,7 @@ export class SectionPlayer {
     const run = this.run;
     if (!run || run.done || !run.paused) return;
     run.paused = false;
-    if (run.pausedAt != null) run.base = { wall: performance.now(), media: run.pausedAt };
+    if (run.pausedAt != null) this._setBase(run, { wall: performance.now(), media: run.pausedAt });
     if (run.wake) run.wake();
     this._state('playing');
   }
@@ -103,8 +108,37 @@ export class SectionPlayer {
   setSpeed(s) {
     const run = this.run;
     const now = performance.now();
-    if (run && run.base && !run.paused) run.base = { wall: now, media: this._media(run, now) };
+    const media = run && run.base && !run.paused ? this._media(run, now) : null;
     this.speed = s;
+    if (media !== null) this._setBase(run, { wall: now, media });
+  }
+
+  /** The clock reads `base.media` at wall time `base.wall` from now on; the sound follows. */
+  _setBase(run, base) {
+    run.base = base;
+    if (this.sound && !run.once && !run.paused) this.sound.follow(base, this.speed);
+  }
+
+  /**
+   * Wait for the moment `t` on the clock (a pause or a speed change can come
+   * meanwhile). With `slip`, a clock fallen behind (a slow decode) slips
+   * rather than rushing. False if the run was cancelled.
+   */
+  async _until(run, t, slip) {
+    for (;;) {
+      if (run.cancelled) return false;
+      if (run.paused) {
+        await new Promise((r) => (run.wake = r));
+        run.wake = null;
+        continue;
+      }
+      const now = performance.now();
+      if (!run.base) this._setBase(run, { wall: now, media: t });
+      const due = run.base.wall + ((t - run.base.media) * 1000) / this.speed;
+      if (slip && due < now - 120) this._setBase(run, { wall: now, media: t });
+      else if (due <= now + 2) return true;
+      else await sleep(Math.min(40, due - now));
+    }
   }
 
   /** Where in the source's time the clock is, at wall time `now`. */
@@ -137,6 +171,7 @@ export class SectionPlayer {
     const tFirst = sec.start + plan.base + plan.seq.t[first];
     const piece = { startSec: sec.start, endSec: sec.end, from: null, sections: [plan], offset: 0 };
     this._size(movie);
+    if (this.sound && !run.once) this.sound.use(movie, plan);
     const g = this.canvas.getContext('2d');
     await walkEdited(
       movie,
@@ -145,22 +180,8 @@ export class SectionPlayer {
         if (run.cancelled) return;
         // skipping ahead to the slot asked for: decode, don't show
         if (info.sec ? info.slot < first : t < tFirst - 1e-9) return;
-        // wait for the picture's moment (a pause or a speed change can come meanwhile)
-        for (;;) {
-          if (run.cancelled) return;
-          if (run.paused) {
-            await new Promise((r) => (run.wake = r));
-            run.wake = null;
-            continue;
-          }
-          const now = performance.now();
-          if (!run.base) run.base = { wall: now, media: t };
-          const due = run.base.wall + ((t - run.base.media) * 1000) / this.speed;
-          // fallen behind (a slow decode): let the clock slip rather than rush
-          if (due < now - 120) run.base = { wall: now, media: t };
-          if (due <= now + 2) break;
-          await sleep(Math.min(40, due - now));
-        }
+        // wait for the picture's moment
+        if (!(await this._until(run, t, true))) return;
         g.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
         run.slot = info.sec ? info.slot : -1;
         run.t = t;
@@ -169,5 +190,8 @@ export class SectionPlayer {
       },
       { cancel: () => run.cancelled }
     );
+    // the last frame stays up for its time, and for its hold if it is held
+    if (!run.cancelled && run.base) await this._until(run, plan.end + plan.extra, false);
+    if (this.sound) this.sound.halt();
   }
 }

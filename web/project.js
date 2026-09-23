@@ -1,4 +1,6 @@
-// The project: sections, marks and verdicts, persisted in IndexedDB. Frame
+// The project: sections, marks and verdicts, persisted in IndexedDB as the
+// work goes on, and to a project file on request (to move it to another
+// browser or computer, or keep it past clearing the site's data). Frame
 // caches live in memory only and are rebuilt by preparing a section again.
 
 const DB_NAME = 'unflash';
@@ -53,8 +55,35 @@ export async function lastSavedAt() {
   });
 }
 
+/**
+ * The most recently saved project whose key starts with `prefix`, as
+ * { key, value }, or null: the same file under another modified time (a
+ * copy, a download again).
+ */
+async function idbLatestLike(prefix) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly');
+    let best = null;
+    const req = tx.objectStore(STORE).openCursor();
+    req.onsuccess = () => {
+      const cur = req.result;
+      if (!cur) return resolve(best);
+      if (typeof cur.key === 'string' && cur.key.startsWith(prefix) && (!best || (cur.value && cur.value.savedAt) > (best.value.savedAt || 0))) best = { key: cur.key, value: cur.value };
+      cur.continue();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
 export function projectKey(file) {
   return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
+/** The same file whatever its modified time: its name and size. */
+function projectKeyPrefix(key) {
+  const parts = key.split(':');
+  return parts.length >= 3 ? parts.slice(0, -1).join(':') + ':' : null;
 }
 
 /**
@@ -92,37 +121,63 @@ export class Project {
     this.notifyMinutes = 0;
   }
 
+  /**
+   * The project saved in this browser for this file; when there is none
+   * under its exact key, the latest saved for the same name and size (the
+   * file copied or downloaded again: `restoredFrom` says so).
+   */
   static async load(key, bounds, keyframes) {
     const p = new Project(key, bounds, keyframes);
     try {
-      const saved = await idbGet(key);
-      if (saved) {
-        p.profile = saved.profile || 'wcag_ext';
-        p.nextId = saved.nextId || 1;
-        p.scan = saved.scan || null;
-        p.sections = (saved.sections || []).map((s) => ({
-          ...s,
-          prepared: false,
-          cache: null,
-          softCache: null,
-          blendCache: null,
-          ctx: null,
-          check: s.check || null,
-          edits: s.edits || {},
-          keep: s.keep || [],
-          blend: s.blend || [],
-          blendStrength: s.blendStrength == null ? null : s.blendStrength,
-          soften: !!s.soften,
-          pattern: s.pattern || null,
-        }));
+      let saved = await idbGet(key);
+      if (!saved) {
+        const prefix = projectKeyPrefix(key);
+        const like = prefix ? await idbLatestLike(prefix) : null;
+        if (like && like.value) {
+          saved = like.value;
+          p.restoredFrom = like.key;
+        }
       }
+      if (saved) p.restore(saved);
     } catch (e) {
       console.warn('could not load project', e);
     }
     return p;
   }
 
+  /** Take on what `toSaved` made (from this browser or a project file). */
+  restore(saved) {
+    this.profile = saved.profile || 'wcag_ext';
+    this.nextId = saved.nextId || 1;
+    this.scan = saved.scan || null;
+    this.sections = (saved.sections || []).map((s) => ({
+      ...s,
+      prepared: false,
+      cache: null,
+      softCache: null,
+      blendCache: null,
+      ctx: null,
+      check: s.check || null,
+      edits: s.edits || {},
+      keep: s.keep || [],
+      blend: s.blend || [],
+      blendStrength: s.blendStrength == null ? null : s.blendStrength,
+      soften: !!s.soften,
+      pattern: s.pattern || null,
+    }));
+    this.nextId = Math.max(this.nextId, ...this.sections.map((s) => s.id + 1));
+  }
+
   async save() {
+    try {
+      await idbPut(this.key, this.toSaved());
+    } catch (e) {
+      console.warn('could not save project', e);
+    }
+  }
+
+  /** What is kept of the project: everything but the decoded frames. */
+  toSaved() {
     const sections = this.sections.map((s) => ({
       id: s.id,
       start: s.start,
@@ -140,11 +195,7 @@ export class Project {
       soften: !!s.soften,
       pattern: s.pattern || null,
     }));
-    try {
-      await idbPut(this.key, { profile: this.profile, nextId: this.nextId, scan: this.scan, sections, savedAt: Date.now() });
-    } catch (e) {
-      console.warn('could not save project', e);
-    }
+    return { profile: this.profile, nextId: this.nextId, scan: this.scan, sections, savedAt: Date.now() };
   }
 
   section(id) {
@@ -244,4 +295,84 @@ export function summarizeCheck(c) {
     frames: c.frames,
     stale: !!c.stale,
   };
+}
+
+// ---- project files ------------------------------------------------------------
+
+const FILE_KIND = 'unflash-project';
+const FILE_VERSION = 1;
+const TYPED = { Float64Array, Float32Array, Uint32Array, Int32Array, Uint16Array, Int16Array, Uint8Array };
+
+function toBase64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+function fromBase64(b64) {
+  const s = atob(b64);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+
+/** What identifies the video a project belongs to. */
+export function videoFingerprint(movie, file) {
+  return {
+    name: file ? file.name : movie.name,
+    size: file ? file.size : movie.file && movie.file.size,
+    lastModified: file ? file.lastModified : movie.file && movie.file.lastModified,
+    frames: movie.frameCount,
+    duration: Math.round(movie.duration * 1e6) / 1e6,
+    width: movie.width,
+    height: movie.height,
+    codec: movie.video && movie.video.codec,
+  };
+}
+
+/**
+ * The project as a file's text: JSON, the video it belongs to, and the
+ * project as the browser keeps it (typed arrays, such as the scan's
+ * per-frame trace, as base64 of their bytes).
+ */
+export function projectFileText(project, movie, file) {
+  const doc = { kind: FILE_KIND, version: FILE_VERSION, saved: new Date().toISOString(), video: videoFingerprint(movie, file), project: project.toSaved() };
+  return JSON.stringify(doc, (k, v) => (ArrayBuffer.isView(v) && !(v instanceof DataView) ? { $typed: v.constructor.name, b64: toBase64(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) } : v));
+}
+
+/** A project file's text read back: { video, saved } (saved as `toSaved` makes it). Throws with a message on anything else. */
+export function readProjectFile(text) {
+  let doc;
+  try {
+    doc = JSON.parse(text, (k, v) => {
+      if (v && typeof v === 'object' && typeof v.$typed === 'string' && typeof v.b64 === 'string') {
+        const T = TYPED[v.$typed];
+        if (!T) throw new Error(`an array of an unknown type (${v.$typed})`);
+        const bytes = fromBase64(v.b64);
+        return new T(bytes.buffer, 0, bytes.byteLength / T.BYTES_PER_ELEMENT);
+      }
+      return v;
+    });
+  } catch (e) {
+    throw new Error(`This is not an Unflash project file (${e.message}).`);
+  }
+  if (!doc || doc.kind !== FILE_KIND || !doc.project || !doc.video) throw new Error('This is not an Unflash project file.');
+  if (doc.version > FILE_VERSION) throw new Error('This project file comes from a newer Unflash; reload the page to get the newest, then load it again.');
+  if (!Array.isArray(doc.project.sections)) throw new Error('This project file has no sections list.');
+  return { video: doc.video, saved: doc.project };
+}
+
+/**
+ * Whether a project file's video is the open one: its frames and length must
+ * match (the marks are on frames); the name and the size only say whether it
+ * is the very same file. Returns { ok, same, why }.
+ */
+export function matchVideo(fp, movie, file) {
+  const here = videoFingerprint(movie, file);
+  const oneFrame = movie.medianDelta || 1 / 30;
+  const framesOk = fp.frames === here.frames;
+  const lengthOk = Math.abs((fp.duration || 0) - here.duration) <= oneFrame;
+  const same = fp.name === here.name && fp.size === here.size;
+  if (framesOk && lengthOk) return { ok: true, same };
+  return { ok: false, same, why: `The project is for ${fp.name} (${fp.frames} frames, ${(fp.duration || 0).toFixed(3)} s); the open video has ${here.frames} frames and lasts ${here.duration.toFixed(3)} s. Open the video it was made for, then load it again.` };
 }

@@ -7,9 +7,10 @@ import { Movie, tick } from './media.js';
 import { createDetector, gpuAdapter } from './detector.js';
 import { profile } from './profile.js';
 import { scanMovie, scanChunks, CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, BLEND_DEFAULT } from './analysis.js';
-import { Project, projectKey, dropCaches, lastSavedAt } from './project.js';
+import { Project, projectKey, dropCaches, lastSavedAt, projectFileText, readProjectFile, matchVideo } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
+import { SectionSound } from './sound.js';
 import { FrameViewer } from './viewer.js';
 import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notifyState, systemNotify, titleProgress, titleMark } from './alerts.js';
 import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay } from './changes.js';
@@ -63,10 +64,13 @@ const state = {
   // gen counts requests to it, so a poster that was overtaken never draws
   player: { mode: 'video', lastDraw: 0, gen: 0, playingTile: null, restartTimer: null },
   history: new Map(), // section id -> { undo: [], redo: [] } of mark snapshots
+  // seconds of the whole video the chart shows around the playhead (0: all of it)
+  chartSpan: 30,
   changes: null, // what's new: { log, newest, seen } (see initChanges)
 };
 
 let sectionPlayer = null;
+const sectionSound = new SectionSound();
 
 // read before this visit writes settings of its own: were they here already?
 const EARLIER_SETTINGS = hadEarlierSettings();
@@ -500,6 +504,7 @@ async function boot() {
   applyDim();
   wirePlayer();
   $('btnExport').addEventListener('click', openExport);
+  wireProjectMenu();
   $('btnCloseExport').addEventListener('click', () => $('exportModal').classList.add('hidden'));
   $('btnDoExport').addEventListener('click', doExport);
   $('btnVerifyExport').addEventListener('click', verifyExport);
@@ -530,12 +535,16 @@ async function boot() {
     drawChart();
   });
   const player = $('player');
-  player.addEventListener('timeupdate', drawTimeline);
+  player.addEventListener('timeupdate', () => {
+    drawTimeline();
+    if (chartMode() === 'video') drawChart();
+  });
   player.addEventListener('play', () => {
     if (state.live.on && state.player.mode === 'video') startLiveLoop();
   });
   player.addEventListener('seeked', () => {
     drawTimeline();
+    if (chartMode() === 'video') drawChart();
     if (state.live.on && state.live.fromScan) monitorFromScan(player.currentTime);
   });
 }
@@ -577,10 +586,13 @@ async function openFile(file) {
     movie.shrinkInWorkers = shrinkSetting();
     loadPlayer(file, movie);
     $('videoInfo').textContent = `${file.name} · ${movie.width}×${movie.height} · ${movie.fps.toFixed(2)} fps · ${fmt(movie.duration)} · ${movie.video.codec}${movie.audio ? ' + ' + movie.audio.codec : ''}`;
+    sectionSound.failed = null;
+    renderSoundButton();
     $('btnScan').disabled = !state.decode.supported;
     $('btnScan').title = state.decode.supported ? 'Decode every frame with WebCodecs and run the detector over it' : `Scanning needs WebCodecs: ${state.decode.reason}`;
     $('liveToggle').disabled = false;
     $('btnExport').disabled = false;
+    $('btnProject').disabled = false;
     document.body.classList.add('has-movie');
     setGuide(false);
     $('stage').classList.remove('hidden');
@@ -602,6 +614,11 @@ async function openFile(file) {
     updateStatus();
     return true;
   });
+  if (opened && state.project.restoredFrom) {
+    // the same name and size under another modified time: a copy, or the file downloaded again
+    toast(`Restored the project saved for ${state.project.restoredFrom.split(':')[0]} (the same name and size) in this browser.`, 8000);
+    state.project.save();
+  }
   if (!opened || !state.decode.supported) return;
   // the scan starts on its own; the fixes, the export and its check too with auto-fix on
   if (autoEnabled()) autopilot();
@@ -840,7 +857,14 @@ function describePlan(plan, movie, softened, blended = []) {
     const why = !smartCutSetting() ? 'smart cut is off' : plan.copyable ? 'the file does not start at a keyframe' : `${movie.video.codec.split('.')[0]} frames cannot be copied into a track of this encoder's codec`;
     text = `The whole video is decoded and re-encoded${plan.spans > 1 ? ` in ${plan.spans} pieces, ${Math.min(plan.parallel, plan.spans)} at a time` : ''} (${why})`;
   }
-  text += !movie.audio ? '.' : movie.audio.copyable ? '; audio is copied without re-encoding.' : `; the audio (${movie.audio.codec}) can't go into an MP4 as it is, so it is re-encoded (AAC, or Opus) where this browser can.`;
+  const held = (plan.holds || []).length;
+  text += !movie.audio
+    ? '.'
+    : held
+      ? `; the sound is re-encoded (AAC, or Opus) to put silence under the ${held === 1 ? 'held frame' : `${held} held frames`} (E marks), where the picture waits.`
+      : movie.audio.copyable
+        ? '; audio is copied without re-encoding.'
+        : `; the audio (${movie.audio.codec}) can't go into an MP4 as it is, so it is re-encoded (AAC, or Opus) where this browser can.`;
   if (softened.length) text += ` Section${softened.length === 1 ? '' : 's'} ${softened.map((s) => '#' + s.id).join(', ')} ${softened.length === 1 ? 'is' : 'are'} softened (blurred) where stripes were found.`;
   if (blended.length) text += ` In section${blended.length === 1 ? '' : 's'} ${blended.map((s) => '#' + s.id).join(', ')} the frames marked B are blended with the frames around them.`;
   return text;
@@ -892,6 +916,7 @@ async function scan() {
         if (!(now - (state.timelineDrawnAt || 0) < 500)) {
           state.timelineDrawnAt = now;
           drawTimeline();
+          if (chartMode() === 'video') drawChart();
         }
       },
     });
@@ -1041,17 +1066,26 @@ function normTrace() {
   if (!tr || !state.env) return null;
   let n = state.traceNorm;
   if (!n || n.src !== tr) {
-    n = { src: tr, t: [], h: [], r: [], e: [], p: [] };
+    // (peaks: the highest general / red / at-the-limit level anywhere, and when)
+    n = { src: tr, t: [], h: [], r: [], e: [], p: [], l: [], peak: { h: [0, 0], r: [0, 0], e: [0, 0] } };
     state.traceNorm = n;
   }
   const thresh = state.env.feeder.det.area_thresh() || 1;
   const pthresh = state.env.feeder.det.pattern_thresh() || 1;
   for (let i = n.t.length; i < tr.t.length; i++) {
-    n.t.push(tr.t[i]);
-    n.h.push(tr.hazard[i] / thresh);
-    n.r.push(tr.hazardRed[i] / thresh);
-    n.e.push(tr.ext[i] / thresh);
+    const t = tr.t[i];
+    const h = tr.hazard[i] / thresh;
+    const r = tr.hazardRed[i] / thresh;
+    const e = tr.ext[i] / thresh;
+    n.t.push(t);
+    n.h.push(h);
+    n.r.push(r);
+    n.e.push(e);
     n.p.push(tr.pattern[i] / pthresh);
+    n.l.push(tr.lum ? tr.lum[i] : 0);
+    if (h > n.peak.h[0]) n.peak.h = [h, t];
+    if (r > n.peak.r[0]) n.peak.r = [r, t];
+    if (e > n.peak.e[0]) n.peak.e = [e, t];
   }
   return n;
 }
@@ -1196,8 +1230,46 @@ function applyDim() {
   $('preview').classList.toggle('dim', on);
 }
 
+/** Whether the section player plays sound: off unless turned on (remembered in this browser). */
+function soundSetting() {
+  try {
+    return localStorage.getItem('unflash.sectionSound') === '1';
+  } catch (e) {
+    return false;
+  }
+}
+
+/** The section player's sound button, as the sound stands. */
+function renderSoundButton() {
+  const b = $('btnPreviewSound');
+  const movie = state.movie;
+  b.classList.toggle('hidden', !movie || !movie.audio);
+  if (!movie || !movie.audio) return;
+  const on = soundSetting();
+  const slow = (parseFloat($('previewSpeed').value) || 1) !== 1;
+  b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  b.textContent = on ? '🔊 sound on' : '🔇 sound off';
+  b.title = sectionSound.failed
+    ? `No sound: ${sectionSound.failed}.`
+    : on
+      ? `The section's sound plays along${slow ? ' at 1× (not at this speed)' : ''}; held frames are silent while they wait, as in the export. Click to turn it off.`
+      : "Play the section's sound too (off to start with). Held frames are silent while they wait, as in the export.";
+  b.classList.toggle('warn', !!sectionSound.failed && on);
+}
+
 function wirePlayer() {
-  sectionPlayer = new SectionPlayer($('preview'), { onFrame: onPreviewFrame, onState: onPreviewState });
+  sectionPlayer = new SectionPlayer($('preview'), { onFrame: onPreviewFrame, onState: onPreviewState, sound: sectionSound });
+  $('btnPreviewSound').addEventListener('click', async () => {
+    const on = !soundSetting();
+    try {
+      localStorage.setItem('unflash.sectionSound', on ? '1' : '0');
+    } catch (e) {
+      /* not kept */
+    }
+    sectionSound.failed = null;
+    renderSoundButton();
+    await sectionSound.setOn(on);
+  });
   frameViewer = new FrameViewer($('viewerCanvas'), {
     onShown: (i) => {
       // (the draws are kept for tests: how often a new picture came)
@@ -1217,6 +1289,8 @@ function wirePlayer() {
   for (const b of document.querySelectorAll('.size-switch [data-size]')) b.addEventListener('click', () => setPlayerSize(b.dataset.size));
   $('playerSource').addEventListener('change', () => setPlayerSource($('playerSource').value));
   $('btnPreviewPlay').addEventListener('click', () => {
+    // sound starts only after a click: this one, when it was left on
+    if (soundSetting() && !sectionSound.on) sectionSound.setOn(true);
     if (sectionPlayer.active && !sectionPlayer.run.once && !sectionPlayer.paused) sectionPlayer.pause();
     else if (sectionPlayer.paused) sectionPlayer.resume();
     else playSection(state.selection.size ? Math.min(...state.selection) : 0);
@@ -1226,7 +1300,11 @@ function wirePlayer() {
     await sectionPlayer.stop();
     posterSection();
   });
-  $('previewSpeed').addEventListener('change', () => sectionPlayer.setSpeed(parseFloat($('previewSpeed').value) || 1));
+  $('previewSpeed').addEventListener('change', () => {
+    sectionPlayer.setSpeed(parseFloat($('previewSpeed').value) || 1);
+    renderSoundButton();
+  });
+  sectionSound.onFail = () => renderSoundButton();
 }
 
 /** Whether a section can be played: it needs the frame times its preparation records. */
@@ -1260,6 +1338,7 @@ function setPlayerSource(mode) {
   }
   if (changed && state.live.on) setLive(true);
   renderPlayerWarning();
+  drawChart();
 }
 
 /**
@@ -1631,9 +1710,28 @@ function remainingKinds(c) {
   return out;
 }
 
+/** Back to the whole video: no section open, the player on the file, the chart around the playhead. */
+function openWholeVideo() {
+  if (state.current != null) closeViewer();
+  state.current = null;
+  state.selection.clear();
+  state.anchor = null;
+  setPlayerSource('video');
+  renderAll();
+}
+
 function renderSectionList() {
   const list = $('sectionList');
   list.innerHTML = '';
+  const st = scanStatus();
+  const [lo, hi] = state.project.bounds;
+  const whole = document.createElement('div');
+  // (its own class: .sec-item are the sections)
+  whole.className = 'sec-whole' + (state.current == null ? ' current' : '');
+  whole.title = 'The whole video in the player, and its flashing charted around the playhead (under the limit too)';
+  whole.innerHTML = `<div class="sec-title">Whole video ${st ? st.badge : ''}</div><div class="sec-times">${fmt(lo)} – ${fmt(hi)}${st ? ` · ${st.text}` : ''}</div>`;
+  whole.addEventListener('click', openWholeVideo);
+  list.appendChild(whole);
   for (const s of state.project.sectionsSorted()) {
     const el = document.createElement('div');
     el.className = 'sec-item' + (state.current === s.id ? ' current' : '');
@@ -1643,7 +1741,13 @@ function renderSectionList() {
     el.addEventListener('click', () => openSection(s.id));
     list.appendChild(el);
   }
-  if (!state.project.sections.length) list.innerHTML = `<div class="sec-item" style="color:var(--fg2)">No sections yet. Scan the video, or drag on the timeline.</div>`;
+  if (!state.project.sections.length) {
+    const none = document.createElement('div');
+    none.className = 'sec-item';
+    none.style.color = 'var(--fg2)';
+    none.textContent = st && st.safe ? 'No sections: the scan found nothing to fix. To look at a stretch anyway, drag over it on the timeline.' : 'No sections yet. Scan the video, or drag on the timeline.';
+    list.appendChild(none);
+  }
 }
 
 function renderAll() {
@@ -1790,8 +1894,14 @@ function wireWorkspace() {
   $('btnSelectUnsafe').addEventListener('click', () => {
     const sec = currentSection();
     if (!sec || !sec.check) return;
-    state.selection = new Set(sec.check.flagged || []);
-    renderGridMarks();
+    selectFrames(sec, sec.check.flagged || [], 'everything still failing');
+  });
+  $('wsFindings').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-finding]');
+    const sec = currentSection();
+    if (!b || !sec || !sec.check) return;
+    const f = findings(sec)[+b.dataset.finding];
+    if (f) selectFrames(sec, f.frames, f.label);
   });
   const grid = $('frameGrid');
   grid.addEventListener('keydown', (e) => {
@@ -1804,6 +1914,15 @@ function wireWorkspace() {
     }
   });
   $('chart').addEventListener('click', (e) => {
+    if (chartMode() === 'video') {
+      if (!state.project) return;
+      const r = $('chart').getBoundingClientRect();
+      const [t0, t1] = videoChartRange();
+      $('player').currentTime = t0 + ((e.clientX - r.left) / r.width) * (t1 - t0);
+      drawTimeline();
+      drawChart();
+      return;
+    }
     const sec = currentSection();
     if (!sec || !sec.prepared) return;
     const r = $('chart').getBoundingClientRect();
@@ -1816,6 +1935,10 @@ function wireWorkspace() {
     if (tile) tile.scrollIntoView({ block: 'nearest' });
     $('player').currentTime = sec.start + shown[i] + (sec.pts ? sec.pts[0] : 0);
   });
+  $('chart').addEventListener('mousemove', chartTip);
+  $('chart').addEventListener('mouseleave', () => $('chartTip').classList.add('hidden'));
+  setChartSpan(chartSpanSetting(), false);
+  for (const b of document.querySelectorAll('#chartSpan [data-span]')) b.addEventListener('click', () => setChartSpan(+b.dataset.span));
   // the marking keys work anywhere on the page (as in the original tool), not
   // only with the frame grid focused; typing in a field is left alone
   document.addEventListener('keydown', onKey);
@@ -1901,6 +2024,7 @@ function renderWorkspace() {
   if (!sec) {
     ws.classList.add('hidden');
     if (state.player.mode !== 'video') setPlayerSource('video');
+    drawChart();
     return;
   }
   ws.classList.remove('hidden');
@@ -1973,7 +2097,61 @@ function renderVerdict(sec) {
     v.textContent = describeFailure(c);
   }
   $('btnSelectUnsafe').classList.toggle('hidden', !(c && !c.safe && c.flagged && c.flagged.length));
+  renderFindings(sec);
   if (sec === currentSection()) renderPlayerWarning();
+}
+
+/**
+ * What a section's check still objects to inside it, one entry per
+ * violation: its kind, the frames it covers (in the edited sequence, the
+ * grid's numbering) and when, for the list under the verdict.
+ */
+function findings(sec) {
+  const c = sec.check;
+  if (!c || c.stale || !c.seq || !c.seq.t) return [];
+  const t = c.seq.t;
+  const out = [];
+  for (const v of (c.inside || []).filter((v) => c[`flag_${v.kind === 'pattern' ? 'patterns' : v.kind}`] !== false)) {
+    const lo = Math.min(v.onset, v.start);
+    const frames = [];
+    for (let i = 0; i < t.length; i++) if (lo - 0.05 <= t[i] && t[i] <= v.end + 0.05) frames.push(i);
+    if (!frames.length) continue;
+    out.push({ v, kind: v.kind, frames, first: frames[0], last: frames[frames.length - 1], label: `the ${KIND_LABEL[v.kind] || v.kind} at frames ${frames[0]}–${frames[frames.length - 1]}` });
+  }
+  return out;
+}
+
+/** Select `frames`, bring the first into view and say what was selected. */
+function selectFrames(sec, frames, what) {
+  if (!frames.length) return toast('Nothing to select: the last check found nothing failing in this section.');
+  state.selection = new Set(frames);
+  state.anchor = frames[0];
+  renderGridMarks();
+  const tile = $('frameGrid').children[frames[0]];
+  if (tile) tile.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  toast(`Selected ${frames.length} frame${frames.length === 1 ? '' : 's'}: ${what}. A Suggest button with "selection only" ticked works on just these.`, 6000);
+  drawChart();
+}
+
+/** The list under the verdict: each remaining problem, where it is, and what fixes it. */
+function renderFindings(sec) {
+  const box = $('wsFindings');
+  const list = sec.prepared ? findings(sec) : [];
+  box.classList.toggle('hidden', !list.length);
+  if (!list.length) {
+    box.innerHTML = '';
+    return;
+  }
+  const dur = (f) => `${fmt(sec.check.seq.t[f.first])} – ${fmt(sec.check.seq.t[f.last])} into the section`;
+  const how = {
+    flash: 'Flashing faster than 3 times a second over enough of the screen: remove (R, F) or blend (B) frames, or let a Suggest button pick them.',
+    red: 'Red flashing faster than 3 times a second: remove or blend frames, or let a Suggest button pick them.',
+    extended: 'Flashing at the limit rate (3 a second) for 5 seconds or more. WCAG allows it; this profile flags it because long runs of it affect some viewers. It clears once the flashing is broken into stretches shorter than 5 seconds by pauses of more than a second (remove or hold frames), or once its contrast is low enough: select it, tick "selection only" and use a Suggest button.',
+    pattern: 'A stationary stripe pattern over a quarter of the screen: tick "soften stripes" above.',
+  };
+  box.innerHTML = list
+    .map((f, k) => `<div class="finding ${f.kind}"><b>${(KIND_LABEL[f.kind] || f.kind).replace(/^./, (m) => m.toUpperCase())}</b>, frames ${f.first}–${f.last} (${dur(f)}, ${(sec.check.seq.t[f.last] - sec.check.seq.t[f.first]).toFixed(1)} s)<button class="small" data-finding="${k}">select these frames</button><div class="how">${how[f.kind] || ''}</div></div>`)
+    .join('');
 }
 
 function describeFailure(c) {
@@ -2185,13 +2363,24 @@ function renderGridMarks() {
   const flagged = new Set(sec.check && !sec.check.stale ? sec.check.flagged || [] : []);
   const redFlag = new Set();
   const patFlag = new Set();
+  const extFlag = new Set();
   if (sec.check && sec.check.inside) {
     const seqT = sec.check.seq ? sec.check.seq.t : null;
     if (seqT) {
       for (const v of sec.check.inside) {
-        if (v.kind !== 'red' && v.kind !== 'pattern') continue;
-        for (let i = 0; i < seqT.length; i++) if (Math.min(v.onset, v.start) - 0.05 <= seqT[i] && seqT[i] <= v.end + 0.05) (v.kind === 'red' ? redFlag : patFlag).add(i);
+        const into = v.kind === 'red' ? redFlag : v.kind === 'pattern' ? patFlag : v.kind === 'extended' ? extFlag : null;
+        if (!into) continue;
+        for (let i = 0; i < seqT.length; i++) if (Math.min(v.onset, v.start) - 0.05 <= seqT[i] && seqT[i] <= v.end + 0.05) into.add(i);
       }
+    }
+  }
+  // (a frame in a flash too shows the flash: that is the one to fix first)
+  const genFlag = new Set([...flagged].filter((i) => !extFlag.has(i)));
+  if (sec.check && sec.check.inside) {
+    const seqT = sec.check.seq ? sec.check.seq.t : null;
+    for (const v of sec.check.inside) {
+      if (v.kind !== 'flash' || !seqT) continue;
+      for (let i = 0; i < seqT.length; i++) if (Math.min(v.onset, v.start) - 0.05 <= seqT[i] && seqT[i] <= v.end + 0.05) genFlag.add(i);
     }
   }
   const soft = new Set(sec.soften && sec.check && !sec.check.stale ? sec.check.soft_frames || [] : []);
@@ -2207,9 +2396,10 @@ function renderGridMarks() {
     tile.classList.toggle('removed', !!e.removed);
     tile.classList.toggle('extended', !!e.extended && !e.removed);
     tile.classList.toggle('selected', state.selection.has(i));
-    tile.classList.toggle('flagged', flagged.has(i) && !redFlag.has(i) && !patFlag.has(i));
+    tile.classList.toggle('flagged', genFlag.has(i) && !redFlag.has(i) && !patFlag.has(i));
     tile.classList.toggle('flagged-red', redFlag.has(i));
     tile.classList.toggle('flagged-pat', patFlag.has(i) && !redFlag.has(i));
+    tile.classList.toggle('flagged-ext', extFlag.has(i) && !genFlag.has(i) && !redFlag.has(i) && !patFlag.has(i));
     tile.classList.toggle('soft', soft.has(i));
     tile.classList.toggle('kept', kept.has(i));
     const blended = blendSet.has(i) && !e.removed;
@@ -2543,6 +2733,74 @@ async function doSuggestFpsExact() {
 
 // ---- chart -------------------------------------------------------------------------------
 
+/**
+ * What the chart shows: the open section while the player plays it, else
+ * the whole video around the playhead.
+ */
+function chartMode() {
+  return currentSection() && state.player.mode !== 'video' ? 'section' : 'video';
+}
+
+const CHART_SPANS = [10, 30, 120, 0];
+
+function chartSpanSetting() {
+  try {
+    const v = localStorage.getItem('unflash.chartSpan');
+    if (v !== null && CHART_SPANS.includes(+v)) return +v;
+  } catch (e) {
+    /* no storage */
+  }
+  return 30;
+}
+
+function setChartSpan(span, redraw = true) {
+  state.chartSpan = span;
+  try {
+    localStorage.setItem('unflash.chartSpan', String(span));
+  } catch (e) {
+    /* no storage */
+  }
+  for (const b of document.querySelectorAll('#chartSpan [data-span]')) b.classList.toggle('on', +b.dataset.span === span);
+  if (redraw) drawChart();
+}
+
+/** The stretch of the video the whole-video chart shows: `chartSpan` seconds around the playhead, or all of it. */
+function videoChartRange() {
+  const [lo, hi] = state.project.bounds;
+  const span = state.chartSpan;
+  if (!span || span >= hi - lo) return [lo, hi];
+  const ct = $('player').currentTime || lo;
+  const t0 = Math.max(lo, Math.min(ct - span / 2, hi - span));
+  return [t0, t0 + span];
+}
+
+/** Index of the first of `ts` (ascending) at or after `t`. */
+function lowerBound(ts, t) {
+  let lo = 0;
+  let hi = ts.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (ts[mid] < t) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+const KIND_COLOUR = { flash: '#e8a33c', red: '#e04fb0', extended: '#7f9bff' };
+
+/** The scan's verdict on the whole video, for the section list and the chart. */
+function scanStatus() {
+  const p = state.project;
+  if (!p) return null;
+  if (state.job && state.job.name === 'Scanning for flashes') return { badge: '<span class="badge">scanning…</span>', text: 'scanning…' };
+  const s = p.scan;
+  if (!s) return { badge: '<span class="badge">not scanned</span>', text: state.decode.supported ? 'not scanned yet' : 'this browser cannot scan it' };
+  if (s.sig !== wasm.config_signature(state.config)) return { badge: '<span class="badge stale">scan again</span>', text: 'scanned under another profile: scan again' };
+  const kinds = `flashing${s.flag_extended ? ' (extended flashes included)' : ''}${s.flag_patterns ? ' or stripe patterns' : ''}`;
+  if (s.safe) return { badge: '<span class="badge safe">nothing found</span>', text: `✓ no ${kinds} found in ${s.frames} frames`, safe: true, kinds };
+  return { badge: `<span class="badge unsafe">${s.counted} found</span>`, text: `${s.counted} violation${s.counted === 1 ? '' : 's'} found in ${s.frames} frames` };
+}
+
 function drawChart() {
   const c = $('chart');
   const sec = currentSection();
@@ -2556,8 +2814,12 @@ function drawChart() {
   const g = c.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, W, H);
-  if (!sec || !sec.prepared || !sec.check || !sec.check.stats || !sec.check.stats.t.length) {
-    $('chartHint').textContent = sec ? 'The chart appears once the section has been checked.' : 'Open a section to see its brightness and flash area per frame.';
+  const video = chartMode() === 'video';
+  $('chartSpan').classList.toggle('hidden', !video || !state.project);
+  if (video) return drawVideoChart(g, W, H);
+  $('chartTitle').textContent = `Section #${sec.id}, frame by frame`;
+  if (!sec.prepared || !sec.check || !sec.check.stats || !sec.check.stats.t.length) {
+    $('chartHint').textContent = 'The chart appears once the section has been checked.';
     return;
   }
   const st = sec.check.stats;
@@ -2565,8 +2827,13 @@ function drawChart() {
   const thresh = sec.check.area_thresh || 1;
   const mid = H * 0.62;
   const bw = W / n;
-  $('chartHint').textContent = 'Brightness (line) and how much of the window is changing (bars: brightening up, darkening down, magenta for red, orange when the flash rate is over the limit). The teal line is how much of the picture is a stripe pattern. Red shading is removed, blue is held, violet is blended. Click to jump to a frame.';
+  $('chartHint').textContent = 'Brightness (line) and how much of the window is changing (bars: brightening up, darkening down, magenta for red, orange when the flash rate is over the limit). The blue line is flashing at the limit rate (extended flashes are made of it; shaded blue where one is), the teal line how much of the picture is a stripe pattern. Red shading is removed, blue is held, violet is blended. Click to jump to a frame.';
   const blendSet = new Set(blendMarks(sec));
+  // frames only an extended flash flags
+  const extOnly = new Set();
+  const inFlash = new Set();
+  for (const f of findings(sec)) for (const i of f.frames) (f.kind === 'extended' ? extOnly : inFlash).add(i);
+  for (const i of inFlash) extOnly.delete(i);
   for (let i = 0; i < n; i++) {
     const e = (sec.edits || {})[i] || {};
     if (blendSet.has(i) && !e.removed) {
@@ -2581,7 +2848,7 @@ function drawChart() {
       g.fillRect(i * bw, 0, bw + 0.5, H);
     }
     if (sec.check.flagged && sec.check.flagged.includes(i)) {
-      g.fillStyle = 'rgba(232,163,60,.12)';
+      g.fillStyle = extOnly.has(i) ? 'rgba(127,155,255,.14)' : 'rgba(232,163,60,.12)';
       g.fillRect(i * bw, 0, bw + 0.5, H);
     }
   }
@@ -2615,6 +2882,17 @@ function drawChart() {
     else g.lineTo(i * bw + bw / 2, y);
   }
   g.stroke();
+  if (st.ext && st.ext.length === n) {
+    g.strokeStyle = '#7f9bff';
+    g.lineWidth = 1.2;
+    g.beginPath();
+    for (let i = 0; i < n; i++) {
+      const yv = mid - st.ext[i] * scale;
+      if (i === 0) g.moveTo(i * bw + bw / 2, yv);
+      else g.lineTo(i * bw + bw / 2, yv);
+    }
+    g.stroke();
+  }
   if (st.pattern && st.pattern.length === n && sec.check.pattern_thresh) {
     const pt = sec.check.pattern_thresh;
     g.strokeStyle = PATTERN_COLOUR;
@@ -2631,6 +2909,206 @@ function drawChart() {
     g.fillStyle = 'rgba(255,216,79,.35)';
     g.fillRect(i * bw, 0, bw + 0.5, H);
   }
+}
+
+/**
+ * The whole video around the playhead, from the scan: per pixel column, how
+ * much of the screen flashed faster than the limit (bars; general and red,
+ * as a share of the area limit), how much flashed at the limit rate (the
+ * blue line: extended flashes are built from it), the stripes (teal) and
+ * the brightness (grey), under the sections and what the scan found. It
+ * shows the flashing that stays under the limit too, to see what is close
+ * to a section or close to failing.
+ */
+function drawVideoChart(g, W, H) {
+  const hint = $('chartHint');
+  const title = $('chartTitle');
+  if (!state.project || !state.movie) {
+    title.textContent = '';
+    hint.textContent = 'Open a video to see its flashing over time.';
+    return;
+  }
+  const [t0, t1] = videoChartRange();
+  const span = Math.max(1e-6, t1 - t0);
+  const x = (t) => ((t - t0) / span) * W;
+  const scan = state.project.scan;
+  const [lo, hi] = state.project.bounds;
+  title.textContent = t0 <= lo + 1e-6 && t1 >= hi - 1e-6 ? 'Whole video' : `Whole video, ${fmt(t0)} – ${fmt(t1)}`;
+  const top = 13;
+  const bottom = H - 16;
+  const plotH = bottom - top;
+  // per column of the chart: the most any frame showing in it reached, and
+  // its mean brightness (a frame fills the columns it is on screen for, so a
+  // short video draws unbroken lines)
+  const n = normTrace();
+  const cols = Math.max(1, Math.floor(W));
+  const hmax = new Float32Array(cols);
+  const rmax = new Float32Array(cols);
+  const emax = new Float32Array(cols);
+  const pmax = new Float32Array(cols);
+  const lsum = new Float32Array(cols);
+  const lcnt = new Uint32Array(cols);
+  let peak = 0;
+  if (n && n.t.length) {
+    const med = state.movie.medianDelta || 1 / 30;
+    const first = Math.max(0, lowerBound(n.t, t0) - 1);
+    const env = limitRateEnvelope(n, first, t1);
+    for (let i = first; i < n.t.length && n.t[i] <= t1; i++) {
+      const ta = n.t[i];
+      const tb = i + 1 < n.t.length ? Math.min(n.t[i + 1], ta + 1) : ta + med;
+      const c0 = Math.max(0, Math.floor(x(ta)));
+      const c1 = Math.min(cols - 1, Math.max(c0, Math.ceil(x(tb)) - 1));
+      const e = env[i - first];
+      for (let c = c0; c <= c1; c++) {
+        if (n.h[i] > hmax[c]) hmax[c] = n.h[i];
+        if (n.r[i] > rmax[c]) rmax[c] = n.r[i];
+        if (e > emax[c]) emax[c] = e;
+        if (n.p[i] > pmax[c]) pmax[c] = n.p[i];
+        lsum[c] += n.l[i];
+        lcnt[c]++;
+      }
+      peak = Math.max(peak, n.h[i], n.r[i], e, scan && scan.flag_patterns ? n.p[i] : 0);
+    }
+  }
+  // levels as shares of the limit: room for the highest in view, up to eight times it
+  const MAXL = Math.min(8, Math.max(1.5, peak * 1.1));
+  const y = (lev) => bottom - (Math.min(MAXL, Math.max(0, lev)) / MAXL) * plotH;
+  // the sections
+  g.font = '10px system-ui';
+  for (const s of state.project.sectionsSorted()) {
+    if (s.end < t0 || s.start > t1) continue;
+    const x0 = Math.max(0, x(s.start));
+    const x1 = Math.min(W, Math.max(x0 + 2, x(s.end)));
+    g.fillStyle = state.current === s.id ? 'rgba(79,140,255,.2)' : 'rgba(255,255,255,.07)';
+    g.fillRect(x0, top, x1 - x0, plotH);
+    g.fillStyle = '#9aa0ad';
+    g.fillText(`#${s.id}`, x0 + 3, top + 10);
+  }
+  // what the scan found, along the top
+  const found = state.provisional || (scan ? scan.violations.filter((v) => scanReports(scan, v)) : []);
+  for (const v of found) {
+    if (v.end < t0 || v.start > t1) continue;
+    g.fillStyle = KIND_COLOUR[v.kind] || PATTERN_COLOUR;
+    const x0 = Math.max(0, x(v.start));
+    g.fillRect(x0, 2, Math.max(2, Math.min(W, x(v.end)) - x0), 7);
+  }
+  if (n && n.t.length) {
+    // bars: flashing faster than the limit, general then red
+    for (let c = 0; c < cols; c++) {
+      if (hmax[c] > 0) {
+        g.fillStyle = hmax[c] >= 1 ? '#e8a33c' : 'rgba(232,163,60,.55)';
+        g.fillRect(c, y(hmax[c]), 1, bottom - y(hmax[c]));
+      }
+      if (rmax[c] > 0) {
+        g.fillStyle = rmax[c] >= 1 ? '#e04fb0' : 'rgba(224,79,176,.6)';
+        g.fillRect(c, y(rmax[c]), 1, bottom - y(rmax[c]));
+      }
+    }
+    // lines: brightness, flashing at the limit rate, stripes
+    const line = (vals, colour, level, cnt = null) => {
+      g.strokeStyle = colour;
+      g.lineWidth = 1.2;
+      g.beginPath();
+      let on = false;
+      for (let c = 0; c < cols; c++) {
+        if (cnt && !cnt[c]) {
+          on = false;
+          continue;
+        }
+        const v = level(vals[c], c);
+        if (v == null) {
+          on = false;
+          continue;
+        }
+        if (on) g.lineTo(c + 0.5, v);
+        else g.moveTo(c + 0.5, v);
+        on = true;
+      }
+      g.stroke();
+    };
+    line(lsum, 'rgba(200,205,215,.45)', (v, c) => bottom - (v / lcnt[c]) * plotH * 0.9, lcnt);
+    line(emax, '#7f9bff', (v) => y(v), lcnt);
+    if (scan && scan.flag_patterns) line(pmax, PATTERN_COLOUR, (v) => y(v), lcnt);
+  }
+  // the limit
+  g.save();
+  g.setLineDash([4, 3]);
+  g.strokeStyle = 'rgba(255,255,255,.45)';
+  g.beginPath();
+  g.moveTo(0, y(1) + 0.5);
+  g.lineTo(W, y(1) + 0.5);
+  g.stroke();
+  g.restore();
+  g.fillStyle = 'rgba(255,255,255,.6)';
+  g.fillText(MAXL > 1.6 ? `limit (top: ${Math.round(MAXL * 10) / 10}×)` : 'limit', W - (MAXL > 1.6 ? 92 : 26), y(1) - 3);
+  // time ticks and the playhead
+  g.fillStyle = '#7d8494';
+  const step = niceStep(span / Math.max(2, W / 90));
+  for (let t = Math.ceil(t0 / step) * step; t <= t1; t += step) {
+    g.fillRect(x(t), bottom, 1, 3);
+    g.fillText(fmt(t), x(t) + 2, H - 3);
+  }
+  const ct = $('player').currentTime;
+  if (ct >= t0 && ct <= t1) {
+    g.fillStyle = '#fff';
+    g.fillRect(x(ct), 0, 1.5, H);
+  }
+  // the words under it
+  const st = scanStatus();
+  let lead = '';
+  if (!n || !n.t.length) lead = st && st.text === 'scanning…' ? 'Scanning… ' : 'Scan the video to chart its flashing. ';
+  else if (st && st.safe) {
+    const pk = n.peak;
+    const worst = pk.h[0] >= pk.r[0] ? ['general', pk.h] : ['red', pk.r];
+    lead = `<span class="found-none">✓ No ${st.kinds} found.</span> ${worst[1][0] > 0 ? `The closest it came: ${Math.round(worst[1][0] * 100)}% of the area limit (${worst[0]} flashing, at ${fmt(worst[1][1])}). ` : 'Nothing flashes faster than the limit anywhere. '}`;
+  }
+  hint.innerHTML = `${lead}Bars: how much of the screen flashes faster than the limit (orange; magenta for red), as a share of the area limit (the dashed line). Blue: flashing at the limit rate, which extended flashes are made of; grey: brightness${scan && scan.flag_patterns ? '; teal: stripes' : ''}. Boxes are sections; the strip along the top is what the scan found. Click to play from there.`;
+}
+
+/** Seconds either side over which "flashing at the limit rate" is read: it comes in spikes, one per transition. */
+const ENVELOPE_S = 0.25;
+
+/**
+ * The trace's flashing at the limit rate as an envelope, from frame `first`
+ * to the last at or before `t1`: at each frame the most within
+ * ENVELOPE_S either side, so a stretch of it reads as one.
+ */
+function limitRateEnvelope(n, first, t1) {
+  const out = [];
+  const q = []; // frames in the window, their values falling
+  let hi = first;
+  let lo = first;
+  for (let i = first; i < n.t.length && n.t[i] <= t1; i++) {
+    while (hi < n.t.length && n.t[hi] <= n.t[i] + ENVELOPE_S) {
+      while (q.length && n.e[q[q.length - 1]] <= n.e[hi]) q.pop();
+      q.push(hi++);
+    }
+    while (lo < i && n.t[lo] < n.t[i] - ENVELOPE_S) lo++;
+    while (q.length && q[0] < lo) q.shift();
+    // (frames before `first` count too)
+    let e = q.length ? n.e[q[0]] : 0;
+    for (let j = first - 1; j >= 0 && n.t[j] >= n.t[i] - ENVELOPE_S; j--) e = Math.max(e, n.e[j]);
+    out.push(e);
+  }
+  return out;
+}
+
+/** The readout under the pointer on the whole-video chart. */
+function chartTip(e) {
+  const tip = $('chartTip');
+  const n = chartMode() === 'video' && state.project ? normTrace() : null;
+  if (!n || !n.t.length) return tip.classList.add('hidden');
+  const r = $('chart').getBoundingClientRect();
+  const [t0, t1] = videoChartRange();
+  const t = t0 + ((e.clientX - r.left) / r.width) * (t1 - t0);
+  const i = Math.min(n.t.length - 1, lowerBound(n.t, t));
+  const pct = (v) => `${Math.round(v * 100)}%`;
+  const sec = state.project.sectionsSorted().find((s) => t >= s.start && t <= s.end);
+  const atLimit = limitRateEnvelope(n, i, n.t[i])[0];
+  tip.textContent = `${fmt(n.t[i])} · faster than the limit ${pct(n.h[i])}${n.r[i] > 0 ? `, red ${pct(n.r[i])}` : ''} · at the limit rate ${pct(atLimit)}${n.p[i] > 0 ? ` · stripes ${pct(n.p[i])}` : ''}${sec ? ` · section #${sec.id}` : ''}`;
+  tip.classList.remove('hidden');
+  const w = tip.offsetWidth;
+  tip.style.left = `${Math.max(2, Math.min(r.width - w - 2, e.clientX - r.left + 10))}px`;
 }
 
 // ---- export ----------------------------------------------------------------------------
@@ -2745,6 +3223,91 @@ async function readBackExport(res, sinkInfo) {
 
 function exportName(movie) {
   return movie.name.replace(/\.[^.]+$/, '') + '.unflashed.mp4';
+}
+
+// ---- project files ------------------------------------------------------------
+
+function wireProjectMenu() {
+  $('btnProject').addEventListener('click', (e) => {
+    e.stopPropagation();
+    $('alertsMenu').classList.add('hidden');
+    $('projectMenu').classList.toggle('hidden');
+    renderProjectNote();
+  });
+  $('projectMenu').addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', () => $('projectMenu').classList.add('hidden'));
+  $('btnProjectSave').addEventListener('click', saveProjectFile);
+  $('projectInput').addEventListener('change', async () => {
+    const f = $('projectInput').files[0];
+    $('projectInput').value = '';
+    $('projectMenu').classList.add('hidden');
+    if (f) await loadProjectFile(f);
+  });
+}
+
+/** What the project here holds, under the menu's buttons. */
+function renderProjectNote() {
+  const p = state.project;
+  if (!p) return ($('projectNote').textContent = '');
+  const marks = p.sections.reduce((n, s) => n + Object.values(s.edits || {}).filter((e) => e.removed || e.extended).length + (s.blend || []).length, 0);
+  $('projectNote').textContent = `Here now: ${p.sections.length} section${p.sections.length === 1 ? '' : 's'}${marks ? `, ${marks} marks` : ''}${p.scan ? ', a scan' : ''}.`;
+}
+
+/** Download the project as a file. */
+async function saveProjectFile() {
+  const p = state.project;
+  if (!p || !state.movie) return;
+  $('projectMenu').classList.add('hidden');
+  await p.save();
+  const blob = new Blob([projectFileText(p, state.movie, state.movie.file)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = state.movie.name.replace(/\.[^.]+$/, '') + '.unflash.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  state.lastProjectFile = blob; // (tests read it back)
+  toast(`Saved the project (${p.sections.length} section${p.sections.length === 1 ? '' : 's'}) as ${a.download}.`);
+}
+
+/** Load a project file for the open video: its sections, marks and scan replace the ones here. */
+async function loadProjectFile(f) {
+  const p = state.project;
+  if (!p || !state.movie) return toast('Open the video the project is for, then load the project.');
+  let doc;
+  try {
+    doc = readProjectFile(await f.text());
+  } catch (e) {
+    return banner(e.message);
+  }
+  const m = matchVideo(doc.video, state.movie, state.movie.file);
+  if (!m.ok) return banner(m.why);
+  const n = doc.saved.sections.length;
+  const here = p.sections.length;
+  if (here && !confirm(`Replace the ${here} section${here === 1 ? '' : 's'} here (and their marks) with the ${n} in ${f.name}?`)) return;
+  await stopAuto();
+  if (state.job) return toast('Wait for the job under way to finish (or cancel it), then load the project.');
+  if (sectionPlayer) await sectionPlayer.stop();
+  closeViewer();
+  for (const s of p.sections) dropCaches(s);
+  const before = p.profile;
+  p.restore(doc.saved);
+  state.current = null;
+  state.history.clear();
+  state.lastScan = null;
+  state.scanTrace = p.scan && p.scan.trace ? p.scan.trace : null;
+  state.traceNorm = null;
+  if (p.profile !== before) {
+    $('profileSel').value = p.profile;
+    state.config = profileConfig(p.profile);
+    await withFeeder(() => createFeeders());
+  }
+  await p.save();
+  setPlayerSource('video');
+  renderAll();
+  updateStatus();
+  toast(`Loaded ${f.name}: ${n} section${n === 1 ? '' : 's'}${p.scan ? ' and the scan' : ''}${m.same ? '' : '. It was saved for another copy of this video (its frames match)'}. Sections are prepared again when opened.`, 8000);
 }
 
 /** Show a finished export in the export dialog: what was written, a download link, and the verify button. */
@@ -3147,6 +3710,11 @@ window.__unflash = {
   profile,
   get sectionPlayer() {
     return sectionPlayer;
+  },
+  sectionSound,
+  loadProjectFile,
+  get lastProjectFile() {
+    return state.lastProjectFile;
   },
   get changes() {
     return state.changes;

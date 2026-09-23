@@ -89,20 +89,57 @@ pub fn replacement_map(edits: &Edits, n: usize) -> Vec<usize> {
         .collect()
 }
 
+/// A held frame's extra time. The picture of a frame marked E stays up for
+/// `seconds` more from `at` (section-relative source time, as `rel_pts`:
+/// the moment its next frame would have come), and everything from `at`
+/// on comes that much later, picture and sound alike.
+///
+/// The edited timeline's frame times ([`edited_sequence`]) are computed
+/// from this list, and the export's audio puts `seconds` of silence at
+/// `at` from the same list, so the picture and the sound cannot disagree
+/// about where a hold is. (The original tool built the two separately and
+/// put the silence at the end of the section.)
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Hold {
+    pub at: f64,
+    pub seconds: f64,
+}
+
+/// The holds of a section's marks, in order: one for each frame marked E
+/// (and not removed), at its next frame's time, or at `end` (the
+/// section's length) for its last frame.
+pub fn holds(rel_pts: &[f64], edits: &Edits, extension_seconds: f64, end: f64) -> Vec<Hold> {
+    let n = rel_pts.len();
+    edits
+        .range(..n)
+        .filter(|(_, e)| e.extended && !e.removed)
+        .map(|(&i, _)| Hold { at: if i + 1 < n { rel_pts[i + 1] } else { end }, seconds: extension_seconds })
+        .collect()
+}
+
+/// How much later `holds` make a moment `t` of the source: the seconds of
+/// every hold at or before it.
+pub fn held_before(holds: &[Hold], t: f64) -> f64 {
+    holds.iter().take_while(|h| h.at <= t).map(|h| h.seconds).sum()
+}
+
 /// The section's edited timeline as (display_time, source_ordinal).
-/// Removed frames stand in for the survivor `replacement_map` picks and
-/// extended ones push everything after them later.
+/// Removed frames stand in for the survivor `replacement_map` picks; each
+/// frame comes as much later as the [`holds`] before it say.
 pub fn edited_sequence(rel_pts: &[f64], edits: &Edits, extension_seconds: f64) -> Vec<(f64, usize)> {
     let n = rel_pts.len();
     let rep = replacement_map(edits, n);
+    // (the last frame's hold comes after every frame of the section)
+    let hs = holds(rel_pts, edits, extension_seconds, f64::INFINITY);
+    let mut k = 0;
     let mut offset = 0.0;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let e = edits.get(&i).copied().unwrap_or_default();
-        out.push((rel_pts[i] + offset, rep[i]));
-        if e.extended && !e.removed {
-            offset += extension_seconds;
+        while k < hs.len() && hs[k].at <= rel_pts[i] {
+            offset += hs[k].seconds;
+            k += 1;
         }
+        out.push((rel_pts[i] + offset, rep[i]));
     }
     out
 }
@@ -1014,6 +1051,30 @@ mod tests {
         assert_eq!(replacement_map(&e, 4), vec![0, 0, 3, 3]);
         let all: Edits = (0..3).map(removed).collect();
         assert_eq!(replacement_map(&all, 3), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn holds_are_where_the_sequence_waits() {
+        let pts: Vec<f64> = (0..12).map(|i| i as f64 / 30.0).collect();
+        let mut e = Edits::new();
+        e.insert(2, FrameEdit::extended());
+        e.insert(5, FrameEdit::removed(Fill::Prev));
+        e.insert(6, FrameEdit { removed: true, extended: true, fill: Fill::Next });
+        e.insert(9, FrameEdit::extended());
+        e.insert(11, FrameEdit::extended());
+        let end = 12.0 / 30.0;
+        let hs = holds(&pts, &e, 1.0, end);
+        // frame 2 holds until frame 3's time, 9 until 10's, the last until the end; a removed frame holds nothing
+        assert_eq!(hs, vec![Hold { at: pts[3], seconds: 1.0 }, Hold { at: pts[10], seconds: 1.0 }, Hold { at: end, seconds: 1.0 }]);
+        let seq = edited_sequence(&pts, &e, 1.0);
+        for (i, &(t, _)) in seq.iter().enumerate() {
+            assert_eq!(t, pts[i] + held_before(&hs, pts[i]), "frame {i}");
+        }
+        assert_eq!(seq[3].0 - seq[2].0, 1.0 + 1.0 / 30.0);
+        // the last frame's hold is counted: everything after the section comes three seconds late
+        assert_eq!(hs.iter().map(|h| h.seconds).sum::<f64>(), 3.0);
+        assert_eq!(held_before(&hs, end), 3.0);
+        assert_eq!(held_before(&hs, pts[3] - 1e-9), 0.0);
     }
 
     #[test]

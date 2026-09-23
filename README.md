@@ -163,8 +163,10 @@ frame shows it twice, faintly (a ghost), which is the price of keeping the
 frame.
 7. **Export**: the spans around the sections are re-encoded in the browser
    with the edits applied, several at a time; every GOP no section touches
-   is copied from the source as it is, and so is the audio. **Verify**
-   re-scans the exported file with the same detector.
+   is copied from the source as it is, and so is the audio, unless frames
+   are held (**E**): then the sound is re-encoded with a second of silence
+   under each held frame (see below). **Verify** re-scans the exported
+   file with the same detector.
 
 **Auto-fix** (tick it in the header; off unless you do) does steps 2 to 7
 unattended: it softens stripes, tries the fewest removals (which end by
@@ -773,15 +775,21 @@ player's position rather than detecting again, so it never misses a frame.
   4:4:4 and 12-bit are not decoded either. Such files need a browser with
   its own decoder for them.
 - The export copies the audio (or re-encodes it, from an MKV whose audio an
-  MP4 can't carry); after an **E** hold the audio runs ahead of the picture
-  by the length of the hold. Removals (R/F) do not change timing and need
-  no audio work. Subtitle tracks and all but the first audio track of an
-  MKV are left out.
+  MP4 can't carry). Where frames are held (**E**), it re-encodes the sound
+  (AAC where the browser has an AAC encoder, else Opus) with silence under
+  each held frame; a browser that can't re-encode audio copies it as it
+  is, and the sound then runs ahead of the picture after each hold (the
+  export says so). Removals (R/F) do not change timing and need no audio
+  work. Subtitle tracks and all but the first audio track of an MKV are
+  left out.
 - MPEG transport streams (.ts, .m2ts), AVI and the other containers above
   are not read; remux or convert them first.
 - The export copies the untouched GOPs only when the encoder's codec is the
   source's (H.264 into H.264, VP9 into VP9); an HEVC or AV1 source, or a
   browser without an H.264 encoder, gets a full re-encode.
-- Sections and marks are stored in the browser's IndexedDB per file; frame
-  caches live in memory and are rebuilt when a section is prepared again.
+- Sections, marks and the scan are stored in the browser's IndexedDB per
+  file (found again for a copy of the file with the same name and size);
+  **Project…** in the header saves them to a file (JSON) and loads one back,
+  for another browser or computer. Frame caches live in memory and are
+  rebuilt when a section is prepared again.
 - Review the flagged sections yourself before you share anything.

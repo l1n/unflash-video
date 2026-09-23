@@ -193,6 +193,15 @@ pub fn edited_sequence(rel_pts: &[f64], edits_json: &str, extension_seconds: f64
     Ok(serde_json::json!({ "t": t, "src": src }).to_string())
 }
 
+/// A section's holds (see `editing::holds`) as JSON `[{at, seconds}]`, in
+/// the section's relative time; `end` is its length (where its last
+/// frame's hold goes).
+#[wasm_bindgen]
+pub fn section_holds(rel_pts: &[f64], edits_json: &str, extension_seconds: f64, end: f64) -> Result<String, JsValue> {
+    let e = parse_edits(edits_json)?;
+    serde_json::to_string(&editing::holds(rel_pts, &e, extension_seconds, end)).map_err(js_err)
+}
+
 #[wasm_bindgen]
 pub fn picture_times(rel_pts: &[f64], edits_json: &str, extension_seconds: f64) -> Result<Vec<f64>, JsValue> {
     let e = parse_edits(edits_json)?;

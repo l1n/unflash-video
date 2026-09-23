@@ -27,6 +27,15 @@
   <label class="toggle" title="Show the meter over the player: how much of the picture is flashing on the frame on screen"><input type="checkbox" id="liveToggle" disabled> live monitor</label>
   <button id="btnExport" disabled>Export…</button>
   <span class="alerts-wrap">
+    <button id="btnProject" disabled title="Save the project (sections, marks, the scan) to a file, or load one">Project…</button>
+    <div id="projectMenu" class="menu project-menu hidden">
+      <p class="fps-note">Sections, marks and the scan are kept in this browser as you work, and come back when you open the same video here again. A project file keeps them anywhere: another browser or computer, or after this site's data is cleared.</p>
+      <button id="btnProjectSave" class="small" title="Download the project as a file (JSON) you can load later">save a project file…</button>
+      <label class="filebtn small" title="Load a project file saved for the open video: its sections and marks replace the ones here">load a project file…<input type="file" id="projectInput" accept=".json,application/json"></label>
+      <p id="projectNote" class="fps-note"></p>
+    </div>
+  </span>
+  <span class="alerts-wrap">
     <button id="btnAlerts" title="A beep, and if you like a system notification, when a long job (opening, scanning, preparing, exporting, verifying) finishes">🔔</button>
     <div id="alertsMenu" class="menu alerts-menu hidden">
       <label class="toggle"><input type="checkbox" id="alertBeep"> beep when a job that ran for over</label>
@@ -116,12 +125,23 @@
             <option value="0.5">½×</option>
             <option value="0.25">¼×</option>
           </select>
+          <button id="btnPreviewSound" class="small sound-toggle" aria-pressed="false" title="Play the section's sound too (off to start with). Held frames are silent while they wait, as in the export.">🔇 sound off</button>
           <span id="previewInfo" class="preview-info"></span>
         </div>
       </div>
       <div class="chart-box">
-        <canvas id="chart" height="200"></canvas>
-        <div class="chart-hint" id="chartHint">Open a section to see its brightness and flash area per frame. Click a frame in the chart to jump to it.</div>
+        <div class="chart-head">
+          <span id="chartTitle" class="chart-title"></span>
+          <span class="spacer"></span>
+          <span id="chartSpan" class="size-switch chart-span hidden" title="How much of the video the chart shows, around the playhead">
+            <button class="small" data-span="10">10 s</button><button class="small" data-span="30">30 s</button><button class="small" data-span="120">2 min</button><button class="small" data-span="0">all</button>
+          </span>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="chart" height="200"></canvas>
+          <div id="chartTip" class="chart-tip hidden"></div>
+        </div>
+        <div class="chart-hint" id="chartHint">Open a video to see its flashing over time.</div>
       </div>
     </div>
 
@@ -140,6 +160,7 @@
         <button id="btnDeleteSection" class="small danger">delete section</button>
       </div>
       <div id="wsWarnings" class="ws-warnings hidden"></div>
+      <div id="wsFindings" class="ws-findings hidden"></div>
       <div id="wsUnprepared" class="panel hidden">
         <p>This section isn't prepared yet. Preparing decodes its frames (plus a run-up and run-out) into memory so every edit can be checked instantly.</p>
         <button id="btnPrepare" class="primary">Prepare section</button>
@@ -198,6 +219,7 @@
             <span class="chip blended" title="Blended with the frames either side of it (lower contrast); the thumbnail shows the result">blended</span>
             <span class="chip flagged">in flash event</span>
             <span class="chip flagged-red">in red-flash event</span>
+            <span class="chip flagged-ext" title="Inside an extended flash: flashing at the limit rate for 5 seconds or more">in extended flash</span>
             <span class="chip flagged-pat" title="Inside a hazardous stripe pattern">stripes</span>
             <span class="chip soft" title="Blurred by the soften-stripes option; the thumbnail shows roughly how much">softened</span>
             <span class="chip selected">selected</span>
