@@ -137,6 +137,19 @@ fn main10_weighted_lossless() {
 }
 
 #[test]
+fn monochrome() {
+    let got = decode("mono", false).unwrap();
+    let want = expected("mono");
+    assert_eq!(got.len(), want.len(), "mono: frame count");
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!(!g.damaged, "mono: damaged frame {i}");
+        assert!(g.u.iter().chain(&g.v).all(|&c| c == 128), "mono: frame {i} is not grey");
+        // ffmpeg's gray frames have the luma plane only
+        assert_eq!(&format!("{:x}", md5::compute(&g.y)), w, "mono: frame {i} differs from ffmpeg");
+    }
+}
+
+#[test]
 fn ten_bit_frames_carry_rounded_eight_bit_planes() {
     for f in decode("main10", false).unwrap() {
         assert_eq!(f.bit_depth, 10);
@@ -171,7 +184,7 @@ impl Lcg {
 /// and repeated samples; errors and damaged pictures are fine.
 #[test]
 fn damaged_streams_do_not_panic() {
-    let names = ["intra_filters", "b_pyramid", "weighted", "amp_rect", "tskip_scaling", "slices", "wpp", "cu_lossless", "open_gop", "odd_size", "main10_wp_lossless"];
+    let names = ["intra_filters", "b_pyramid", "weighted", "amp_rect", "tskip_scaling", "slices", "wpp", "cu_lossless", "open_gop", "odd_size", "main10_wp_lossless", "mono"];
     let mut rng = Lcg(1);
     for name in names {
         let (config, samples) = samples(name);

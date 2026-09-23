@@ -48,3 +48,6 @@ gen odd_size         "$T2"    100x60 12 yuv420p "cbqpoffs=3:crqpoffs=-2:bframes=
 # 10-bit: B pictures, SAO, weighted prediction
 gen main10           "$T2"    96x64  20 yuv420p10le "bframes=3:ref=3"
 gen main10_wp_lossless "$FADE" 96x64 12 yuv420p10le "weightp=1:weightb=1:bframes=2:cu-lossless=1"
+# 4:0:0: a range extensions profile, but none of its coding tools (the
+# oracle hashes the luma plane only)
+gen mono             "$T2"    96x64  10 gray "bframes=2"
