@@ -3185,6 +3185,29 @@ window.__unflash = {
     dropCaches(small);
     return out;
   },
+  /**
+   * Show the frame at `t` in the (paused) player and have the live monitor
+   * watch it: after the player's `seeked`, the picture waits for a free
+   * detector slot instead of being skipped as it is while playing, and its
+   * result is in before this resolves, with the verdict it gives. Tests step
+   * through a clip this way, so that every frame is seen however slow the
+   * GPU is.
+   */
+  async liveStep(t) {
+    const player = $('player');
+    const feeder = state.liveFeeder;
+    if (!feeder || !state.live.on || state.live.fromScan) throw new Error('the live monitor is not detecting');
+    player.pause();
+    await new Promise((resolve) => {
+      player.addEventListener('seeked', resolve, { once: true });
+      player.currentTime = t;
+    });
+    await feeder.videoElement(player, player.currentTime, false);
+    await feeder.drain();
+    state.live.lastCheck = 0;
+    drainLive();
+    return $('liveVerdict').textContent;
+  },
   /** Change the finish-alert settings for this visit (tests). */
   setAlerts(s) {
     Object.assign(alertSettings, s);
