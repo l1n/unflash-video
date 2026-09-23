@@ -17,6 +17,11 @@
 //! Specification (v0.6/v0.7) and tested bit-exact against ffmpeg's decoder
 //! on libvpx streams that exercise these tools (`tests/`), and against the
 //! libvpx test vectors (`examples/conformance.rs`).
+//!
+//! With the `simd` feature (the default), the interpolation, the loop
+//! filter and, where 32-bit lanes multiply natively, the 8-bit inverse
+//! transforms run in SIMD lanes through `wide`; tests hold each of these
+//! kernels to its portable twin.
 
 pub mod bits;
 pub mod booldec;
