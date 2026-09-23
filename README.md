@@ -332,15 +332,18 @@ prepares take the pictures as I420 planes straight into the detector (no
 The decoding runs in parallel Web Workers (`web/h264pool.js`, one group of
 pictures per worker, split at sync samples), with eight-lane SIMD row
 kernels (wasm simd128, SSE2 or NEON through `wide`) for the interpolation,
-averaging and weighting of blocks at least eight samples wide, and, for
-statistics, in a **fast mode** that leaves out the in-loop deblocking
-filter: about a quarter of the decoding time. A full reconstruction is still needed (H.264 predicts
-every macroblock from its neighbours and from earlier pictures, so there is
-no DC-only or low-resolution shortcut as for MPEG-2), but the filter only
-touches block edges: measured on a 1080p clip, at the 256×144 analysis
-resolution 99.7 % of the cells differ by at most one luma code from the
-full decode and the mean difference is 0.07 codes, far below anything the
-flash thresholds react to. The export uses the full decode. Natively the
+averaging and weighting of blocks at least eight samples wide. A full
+reconstruction is needed (H.264 predicts every macroblock from its
+neighbours and from earlier pictures, so there is no DC-only or
+low-resolution shortcut as for MPEG-2). The decoder has a **fast mode**
+that leaves out the in-loop deblocking filter (11–15 % of the decoding
+time), but nothing that gives a verdict uses it any more: the filter only
+touches block edges, yet later pictures are predicted from the unfiltered
+ones, so the difference grows through each GOP. On a 1080p clip at CRF 26
+with 10 s GOPs, the means of 8×8 luma blocks (about the detector's cells at
+1080p) were off by 0.4 codes on average, but by up to 11.6 codes by the end
+of a GOP (99th percentile 4.0): about 4.5 % of full luminance, against a
+flash threshold of 10 %. Natively the
 decoder does about 65 fps at 1080p (80 fast); in WebAssembly about 50 fps
 single-threaded (60 fast) and 125 fps with four workers, and 400–550 fps
 at 640×360: well above real time for the analysis but slower than a

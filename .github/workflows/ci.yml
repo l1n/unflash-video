@@ -101,6 +101,22 @@ jobs:
         with:
           packages: ffmpeg python3-numpy
           version: 1
+      # as in the Rust job: the restored packages miss the BLAS and LAPACK
+      # links their install scripts make, which numpy and ffmpeg load
+      - name: ffmpeg, numpy work
+        if: steps.clips.outputs.cache-hit != 'true'
+        run: |
+          dir=/usr/lib/x86_64-linux-gnu
+          for lib in blas lapack; do
+            if [ ! -e "$dir/lib$lib.so.3" ] && [ -e "$dir/$lib/lib$lib.so.3" ]; then sudo ln -s "$dir/$lib/lib$lib.so.3" "$dir/lib$lib.so.3"; fi
+          done
+          sudo ldconfig
+          if ! { ffmpeg -version && python3 -c 'import numpy'; } > /dev/null; then
+            echo "::warning::the cached packages do not work as restored; installing them"
+            sudo apt-get update -q
+            sudo apt-get install -y -q ffmpeg python3-numpy
+          fi
+          ffmpeg -hide_banner -encoders | grep -E 'libx265|libvpx |libsvtav1|libaom-av1' || true
       - name: Synthetic videos
         if: steps.clips.outputs.cache-hit != 'true'
         run: python3 tests/media/gen_e2e.py
