@@ -163,8 +163,10 @@ try {
   await p2.keyboard.press('Escape');
   // "show me" in What's new: a section's tour, with no video open, waits for its place
   await p2.waitForFunction(() => !document.querySelector('.tour'));
-  // (the card on the start page lists the newest few; everything that changed, the rest)
-  assert((await p2.$$eval('#newsList .show-me', (b) => b.length)) >= 1, 'the card of what is new offers "show me"');
+  // (the card on the start page lists the newest few, and those with a tour
+  // among them have their "show me"; everything that changed has the rest)
+  const onCard = await p2.$$eval('#newsList .show-me', (b) => b.map((x) => x.dataset.tour));
+  assert(onCard.every((id) => before.tours.includes(id)), 'the card of what is new offers "show me" for tours there are: ' + onCard);
   await p2.click('#btnNewsAll');
   const showMe = await p2.$$eval('#changesList .show-me', (b) => b.map((x) => x.dataset.tour));
   assert(['tours', 'section-sound', 'whole-video', 'findings', 'project-files'].every((id) => showMe.includes(id)), 'What\'s new offers "show me" beside each: ' + showMe);
