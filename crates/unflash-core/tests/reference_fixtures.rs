@@ -272,6 +272,22 @@ fn scenario(name: &str) -> (Vec<f64>, Vec<Vec<u8>>) {
                 .collect();
             (ts, fr)
         }
+        "red_darkred" | "red_green" => {
+            // the whole picture swapping between two colours: red against a
+            // darker red (one chromaticity: no red flash under WCAG 2.2), and
+            // red against a green of the same luminance (a red flash only)
+            let (a, b) = if name == "red_darkred" { ([255, 0, 0], [110, 0, 0]) } else { ([200, 0, 0], [0, 116, 0]) };
+            let ts = times_2997(n2997(5.0));
+            let fr = ts
+                .iter()
+                .map(|&t| {
+                    let mut f = solid(0);
+                    fill_rect(&mut f, 0, 0, W, H, if phase(t, 4.0) == 0 { a } else { b });
+                    f
+                })
+                .collect();
+            (ts, fr)
+        }
         other => panic!("unknown scenario {other}"),
     }
 }

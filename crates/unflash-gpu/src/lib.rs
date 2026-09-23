@@ -1101,14 +1101,14 @@ impl GpuStage {
 
     /// The L / V / sat planes of the last frame ingested (native, for tests).
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn debug_inputs(&self) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
+    pub fn debug_inputs(&self) -> (Vec<f32>, Vec<f32>, Vec<u32>) {
         let all = self.read_buffer_words(&self.inputs_buf);
         let w = &all[self.last_pos * self.inputs_region / 4..];
         let n = self.geom.npix();
         (
             w[..n].iter().map(|&b| f32::from_bits(b)).collect(),
             w[n..2 * n].iter().map(|&b| f32::from_bits(b)).collect(),
-            w[2 * n..3 * n].iter().map(|&b| b as u8).collect(),
+            w[2 * n..3 * n].to_vec(),
         )
     }
 

@@ -1,5 +1,6 @@
-// Pass A: source texture -> linear luminance L, red value V, saturation flag,
-// into this frame's slice of the inputs buffer, as pictures arrive. The
+// Pass A: source texture -> linear luminance L, distance from red S and the
+// packed chromaticity C (core::lut::red_values), into this frame's slice of
+// the inputs buffer, as pictures arrive. The
 // moved-pixel count and the pattern mask are the batch's business (moved.wgsl
 // and the clear before the pattern pass).
 //
@@ -59,13 +60,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let g = lut[u32(code.g)];
         let b = lut[u32(code.b)];
         let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        let total = r + g + b;
-        let sat = total > 1e-5 && r >= params.red_saturation * total;
-        let v = max(r - g - b, 0.0) * 320.0;
+        // WCAG 2.2's red quantities, in the CPU's order (core::lut::red_values)
+        let rf = r + params.red_flare;
+        let gf = g + params.red_flare;
+        let bf = b + params.red_flare;
+        let cx = 0.4124 * rf + 0.3576 * gf + 0.1805 * bf;
+        let cy = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
+        let cz = 0.0193 * rf + 0.1192 * gf + 0.9505 * bf;
+        let d = cx + 15.0 * cy + 3.0 * cz;
+        let u = 4.0 * cx / d;
+        let v = 9.0 * cy / d;
+        let du = u - RED_U;
+        let dv = v - RED_V;
+        let s = sqrt(du * du + dv * dv);
+        let sat = rf >= params.red_saturation * (rf + gf + bf);
+        let qu = min(u32(floor(u * QU + 0.5)), 0x7fffu);
+        let qv = min(u32(floor(v * QV + 0.5)), 0xffffu);
+        let chroma = select(0u, SAT_BIT, sat) | (qu << 16u) | qv;
         let i = y * aw + x;
         rgba[i] = u32(code.r) | (u32(code.g) << 8u) | (u32(code.b) << 16u) | 0xff000000u;
         inputs[i] = bitcast<u32>(l);
-        inputs[n + i] = bitcast<u32>(v);
-        inputs[2u * n + i] = u32(sat);
+        inputs[n + i] = bitcast<u32>(s);
+        inputs[2u * n + i] = chroma;
     }
 }

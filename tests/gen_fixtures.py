@@ -126,6 +126,18 @@ def scenario_red_equilum(secs, hz):
     return ts, frames
 
 
+def scenario_red_pair(secs, hz, a, b):
+    """The whole picture swapping between two colours."""
+    n = int(round(secs * 30000 / 1001))
+    ts = times_2997(n)
+    frames = []
+    for t in ts:
+        f = np.empty((H, W, 3), np.uint8)
+        f[...] = a if phase(t, hz) == 0 else b
+        frames.append(f)
+    return ts, frames
+
+
 def scenario_pan_bar(secs):
     n = int(round(secs * 30000 / 1001))
     ts = times_2997(n)
@@ -209,6 +221,11 @@ SCENARIOS = {
     "partial15": (lambda: scenario_partial(6.0, 4.0, 33, 25), ["wcag"]),
     "partial35": (lambda: scenario_partial(6.0, 4.0, 50, 38), ["wcag"]),
     "red_noise": (lambda: scenario_red_noise(6.0, 4.0, 8), ["wcag_ext"]),
+    # red against a darker red: one chromaticity, so no red flash under WCAG
+    # 2.2 (2.0's formula called it one); it flashes in luminance
+    "red_darkred": (lambda: scenario_red_pair(5.0, 4.0, (255, 0, 0), (110, 0, 0)), ["wcag"]),
+    # red against a green of the same luminance: a red flash only
+    "red_green": (lambda: scenario_red_pair(5.0, 4.0, (200, 0, 0), (0, 116, 0)), ["wcag"]),
 }
 
 

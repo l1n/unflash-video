@@ -31,6 +31,10 @@ struct Params {
     pat_enabled: u32,
     held_delta_v: f32,
     src_bgr: u32,
+    red_flare: f32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 };
 
 const MODE_FIRST: u32 = 1u;
@@ -74,6 +78,9 @@ const F_POOL_GEN_T: u32 = 11u + 4u * K;
 const F_POOL_RED_T: u32 = 12u + 4u * K;
 const F_PREV_L: u32 = 13u + 4u * K;
 const F_PREV_V: u32 = 14u + 4u * K;
+// the red run's chromaticity at its base and extremum (core::lut::red_values)
+const F_RED_BASE_C: u32 = 15u + 4u * K;
+const F_RED_EXT_C: u32 = 16u + 4u * K;
 
 // mask bits
 const MASK_STROBE_GEN: u32 = 1u;
@@ -88,8 +95,6 @@ const MASK_POOL_RED_DN: u32 = 128u;
 // flags word layout
 const LUM_DIR_SHIFT: u32 = 0u;
 const RED_DIR_SHIFT: u32 = 2u;
-const RED_AUX_BASE: u32 = 16u;
-const RED_AUX_EXT: u32 = 32u;
 const GEN_PEND_SHIFT: u32 = 6u;
 const RED_PEND_SHIFT: u32 = 8u;
 const POOL_GEN_SHIFT: u32 = 10u;
@@ -103,6 +108,22 @@ const DN: u32 = 2u;
 // per grid cell
 const OUT_HEADER: u32 = 8u;
 const CELL_WORDS: u32 = 12u;
+
+// WCAG 2.2's red flash (core::lut): sRGB's red primary in u'v', and a
+// state's chromaticity packed as u' (15 bits) | v' (16 bits) | saturated (top bit)
+const RED_U: f32 = 0.4507966;
+const RED_V: f32 = 0.5228869;
+const QU: f32 = 32768.0;
+const QV: f32 = 65536.0;
+const SAT_BIT: u32 = 0x80000000u;
+
+// Whether a red run's two ends make a red transition: either end saturated
+// red, and the ends more than `delta` apart in u'v'.
+fn red_transition(a: u32, b: u32, delta: f32) -> bool {
+    let du = (f32((a >> 16u) & 0x7fffu) - f32((b >> 16u) & 0x7fffu)) / QU;
+    let dv = (f32(a & 0xffffu) - f32(b & 0xffffu)) / QV;
+    return ((a | b) & SAT_BIT) != 0u && du * du + dv * dv > delta * delta;
+}
 
 fn age(now: u32, t: u32) -> u32 {
     return now - t;

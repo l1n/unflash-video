@@ -1,5 +1,5 @@
 // Pass A2: the pixels that moved since the last new picture (in luminance
-// or in red value), counted for the held-frame test. Runs inside the batch,
+// or in distance from red), counted for the held-frame test. Runs inside the batch,
 // after the previous frame's update has stored what it compares against;
 // the ingest pass, which runs as pictures arrive, cannot read that yet.
 

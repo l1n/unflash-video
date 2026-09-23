@@ -17,7 +17,7 @@ use crate::grid::{
     GridGeometry, MASK_EXT_GEN, MASK_EXT_RED, MASK_POOL_GEN_DN, MASK_POOL_GEN_UP,
     MASK_POOL_RED_DN, MASK_POOL_RED_UP, MASK_STROBE_GEN, MASK_STROBE_RED,
 };
-use crate::lut::{lut, pixel_values};
+use crate::lut::{lut, pixel_values, red_transition, red_values};
 use crate::time::{age, dur_to_us, never, saturate};
 
 /// How long a pixel may go on accumulating one monotonic run before the run
@@ -32,8 +32,6 @@ pub const MODE_SATURATE: u32 = 4;
 // `flags` word layout. dir / pol: 0 = flat / none, 1 = up (+1), 2 = down (-1).
 pub(crate) const LUM_DIR_SHIFT: u32 = 0;
 pub(crate) const RED_DIR_SHIFT: u32 = 2;
-pub(crate) const RED_AUX_BASE: u32 = 1 << 4;
-pub(crate) const RED_AUX_EXT: u32 = 1 << 5;
 pub(crate) const GEN_PEND_SHIFT: u32 = 6;
 pub(crate) const RED_PEND_SHIFT: u32 = 8;
 pub(crate) const POOL_GEN_SHIFT: u32 = 10;
@@ -43,7 +41,7 @@ pub(crate) const UP: u32 = 1;
 pub(crate) const DN: u32 = 2;
 
 /// Everything the kernels need per frame, `repr(C)` so it doubles as the
-/// GPU uniform block (112 bytes).
+/// GPU uniform block (128 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct KernelParams {
@@ -55,10 +53,11 @@ pub struct KernelParams {
     pub width: u32,
     /// Luminance deadband.
     pub eps_l: f32,
-    /// Red-scale deadband.
+    /// Deadband on the distance from red (u′v′).
     pub eps_v: f32,
     pub swing: f32,
     pub dark: f32,
+    /// u′v′ distance between the ends of a red transition.
     pub red_delta: f32,
     /// Run cap, µs.
     pub max_run: u32,
@@ -87,11 +86,14 @@ pub struct KernelParams {
     pub pat_reg_den: u32,
     /// 0 = skip the pattern pass.
     pub pat_enabled: u32,
-    /// Held-frame bar on the red value (see `GridGeometry::held_delta_v`).
+    /// Held-frame bar on the distance from red (see `GridGeometry::held_delta_v`).
     pub held_delta_v: f32,
     /// GPU ingest only: the source texture holds B, G, R in its first three
     /// channels (a BGRX picture uploaded as it came); 0 otherwise.
     pub src_bgr: u32,
+    /// Share of white added before a colour's chromaticity is taken.
+    pub red_flare: f32,
+    pub _pad: [u32; 3],
 }
 
 impl KernelParams {
@@ -127,6 +129,8 @@ impl KernelParams {
             pat_enabled: cfg.flag_patterns() as u32,
             held_delta_v: geom.held_delta_v,
             src_bgr: 0,
+            red_flare: cfg.red_flare,
+            _pad: [0; 3],
         }
     }
 
@@ -211,9 +215,16 @@ impl StateLayout {
     pub fn prev_v(&self) -> usize {
         self.prev_l() + 1
     }
+    /// The chromaticity (and saturation) at the red run's base and extremum.
+    pub fn red_base_c(&self) -> usize {
+        self.prev_v() + 1
+    }
+    pub fn red_ext_c(&self) -> usize {
+        self.red_base_c() + 1
+    }
     /// Number of `npix`-sized runs in the state buffer.
     pub fn fields(&self) -> usize {
-        self.prev_v() + 1
+        self.red_ext_c() + 1
     }
 }
 
@@ -225,9 +236,14 @@ pub struct PixelState {
     pub lum_base: Vec<f32>,
     pub lum_ext: Vec<f32>,
     pub lum_t: Vec<u32>,
+    /// The red run: distance from red at its base and extremum...
     pub red_base: Vec<f32>,
     pub red_ext: Vec<f32>,
     pub red_t: Vec<u32>,
+    /// ... and the chromaticity there, packed with the saturated-red flag
+    /// (see `lut::red_values`).
+    pub red_base_c: Vec<u32>,
+    pub red_ext_c: Vec<u32>,
     pub flags: Vec<u32>,
     /// Slot-major: `ring[s * n + i]` is slot `s` (0 = most recent) of pixel `i`.
     pub gen_ring: Vec<u32>,
@@ -240,7 +256,7 @@ pub struct PixelState {
     pub red_pend_t: Vec<u32>,
     pub pool_gen_t: Vec<u32>,
     pub pool_red_t: Vec<u32>,
-    /// luminance and red value of the last frame that was not held
+    /// luminance and distance from red of the last frame that was not held
     pub prev_l: Vec<f32>,
     pub prev_v: Vec<f32>,
 }
@@ -257,6 +273,8 @@ impl PixelState {
             red_base: vec![0.0; n],
             red_ext: vec![0.0; n],
             red_t: vec![0; n],
+            red_base_c: vec![0; n],
+            red_ext_c: vec![0; n],
             flags: vec![0; n],
             gen_ring: vec![0; n * k],
             gen_open: vec![0; n * k],
@@ -306,6 +324,8 @@ impl PixelState {
         put_u(&mut out, lay.pool_red_t(), &self.pool_red_t);
         put_f(&mut out, lay.prev_l(), &self.prev_l);
         put_f(&mut out, lay.prev_v(), &self.prev_v);
+        put_u(&mut out, lay.red_base_c(), &self.red_base_c);
+        put_u(&mut out, lay.red_ext_c(), &self.red_ext_c);
         out
     }
 }
@@ -313,19 +333,21 @@ impl PixelState {
 /// Linearised planes of one analysis-resolution frame.
 #[derive(Clone, Debug, Default)]
 pub struct FramePlanes {
+    /// Relative luminance.
     pub l: Vec<f32>,
+    /// Distance from sRGB's red primary in u′v′ (see `lut::red_values`).
     pub v: Vec<f32>,
-    /// 1 where the pixel is saturated red.
-    pub sat: Vec<u8>,
+    /// Chromaticity packed with the saturated-red flag (`lut::red_values`).
+    pub c: Vec<u32>,
 }
 
 impl FramePlanes {
     pub fn new(n: usize) -> Self {
-        FramePlanes { l: vec![0.0; n], v: vec![0.0; n], sat: vec![0; n] }
+        FramePlanes { l: vec![0.0; n], v: vec![0.0; n], c: vec![0; n] }
     }
 
-    /// 8-bit sRGB (3 or 4 bytes per pixel) -> L, V, sat.
-    pub fn ingest(&mut self, data: &[u8], bpp: usize, red_saturation: f32) {
+    /// 8-bit sRGB (3 or 4 bytes per pixel) -> L, distance from red, chromaticity.
+    pub fn ingest(&mut self, data: &[u8], bpp: usize, red_saturation: f32, red_flare: f32) {
         let n = self.l.len();
         assert!(data.len() >= n * bpp, "frame too short: {} < {}", data.len(), n * bpp);
         let t = lut();
@@ -333,9 +355,9 @@ impl FramePlanes {
             let p = &data[i * bpp..i * bpp + 3];
             let (r, g, b) = (t[p[0] as usize], t[p[1] as usize], t[p[2] as usize]);
             self.l[i] = 0.2126f32 * r + 0.7152f32 * g + 0.0722f32 * b;
-            let total = r + g + b;
-            self.sat[i] = (total > 1e-5 && r >= red_saturation * total) as u8;
-            self.v[i] = (r - g - b).max(0.0) * 320.0;
+            let (s, c) = red_values(r, g, b, red_saturation, red_flare);
+            self.v[i] = s;
+            self.c[i] = c;
         }
         let _ = pixel_values; // same arithmetic, kept as the documented form
     }
@@ -357,14 +379,16 @@ impl PixelOutputs {
     }
 }
 
-/// Pixels whose luminance moved more than `delta` or whose red value moved
-/// more than `delta_v` since the last new picture.
+/// Pixels whose luminance moved more than `delta` or whose distance from red
+/// moved more than `delta_v` since the last new picture.
 pub fn held_count(l: &[f32], prev_l: &[f32], delta: f32, v: &[f32], prev_v: &[f32], delta_v: f32) -> u32 {
     l.iter().zip(prev_l).zip(v.iter().zip(prev_v)).filter(|((a, b), (c, d))| (**a - **b).abs() > delta || (**c - **d).abs() > delta_v).count() as u32
 }
 
-/// One monotonic-run tracker step. Returns (reversed_up, reversed_down,
-/// base_snapshot, ext_snapshot, aux_base_snapshot, aux_ext_snapshot).
+/// One monotonic-run tracker step. `aux` rides along with the value (the
+/// red run's chromaticity: what the colour was at the run's ends). Returns
+/// (reversed_up, reversed_down, base_snapshot, ext_snapshot,
+/// aux_base_snapshot, aux_ext_snapshot).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn tracker_feed(
@@ -372,14 +396,14 @@ fn tracker_feed(
     base: &mut f32,
     ext: &mut f32,
     base_t: &mut u32,
-    aux_base: &mut bool,
-    aux_ext: &mut bool,
+    aux_base: &mut u32,
+    aux_ext: &mut u32,
     x: f32,
-    aux: bool,
+    aux: u32,
     now: u32,
     eps: f32,
     max_run: u32,
-) -> (bool, bool, f32, f32, bool, bool) {
+) -> (bool, bool, f32, f32, u32, u32) {
     let mut rev_up = false;
     let mut rev_dn = false;
     if *dir == UP {
@@ -500,14 +524,16 @@ pub(crate) fn run_range_scalar(
         for i in lo..hi {
             let l = planes.l[i];
             let v = planes.v[i];
-            let sat = planes.sat[i] != 0;
+            let c = planes.c[i];
             st.lum_base[i] = l;
             st.lum_ext[i] = l;
             st.lum_t[i] = now;
             st.red_base[i] = v;
             st.red_ext[i] = v;
             st.red_t[i] = now;
-            st.flags[i] = if sat { RED_AUX_BASE | RED_AUX_EXT } else { 0 };
+            st.red_base_c[i] = c;
+            st.red_ext_c[i] = c;
+            st.flags[i] = 0;
             for s in 0..k {
                 st.gen_ring[s * n + i] = nv;
                 st.gen_open[s * n + i] = nv;
@@ -559,9 +585,7 @@ pub(crate) fn run_range_scalar(
             if age(now, st.red_t[i]) > p.max_run {
                 st.red_base[i] = st.red_ext[i];
                 st.red_t[i] = now;
-                let f = st.flags[i];
-                let aux_ext = f & RED_AUX_EXT != 0;
-                st.flags[i] = (f & !RED_AUX_BASE) | if aux_ext { RED_AUX_BASE } else { 0 };
+                st.red_base_c[i] = st.red_ext_c[i];
             }
             out.mask[i] = 0;
             out.onset_gen[i] = 0;
@@ -575,14 +599,14 @@ pub(crate) fn run_range_scalar(
     for i in lo..hi {
         let l = planes.l[i];
         let v = planes.v[i];
-        let sat = planes.sat[i] != 0;
+        let c = planes.c[i];
         st.prev_l[i] = l;
         st.prev_v[i] = v;
         let mut flags = st.flags[i];
 
         // --- luminance run tracker ------------------------------------
         let mut dir = (flags >> LUM_DIR_SHIFT) & DIR_MASK;
-        let (mut aux_b, mut aux_e) = (false, false);
+        let (mut aux_b, mut aux_e) = (0u32, 0u32);
         let (rev_up, rev_dn, base, ext, _, _) = tracker_feed(
             &mut dir,
             &mut st.lum_base[i],
@@ -591,7 +615,7 @@ pub(crate) fn run_range_scalar(
             &mut aux_b,
             &mut aux_e,
             l,
-            false,
+            0,
             now,
             p.eps_l,
             p.max_run,
@@ -602,30 +626,27 @@ pub(crate) fn run_range_scalar(
         let q_dn = rev_dn && (base - ext) >= p.swing && ext < p.dark;
 
         // --- red run tracker ------------------------------------------
+        // (runs of the distance from red; the chromaticity rides along)
         let mut rdir = (flags >> RED_DIR_SHIFT) & DIR_MASK;
-        let mut raux_b = flags & RED_AUX_BASE != 0;
-        let mut raux_e = flags & RED_AUX_EXT != 0;
-        let (r_up, r_dn, rbase, rext, rab, rae) = tracker_feed(
+        let (r_up, r_dn, _, _, rcb, rce) = tracker_feed(
             &mut rdir,
             &mut st.red_base[i],
             &mut st.red_ext[i],
             &mut st.red_t[i],
-            &mut raux_b,
-            &mut raux_e,
+            &mut st.red_base_c[i],
+            &mut st.red_ext_c[i],
             v,
-            sat,
+            c,
             now,
             p.eps_v,
             p.max_run,
         );
-        flags = (flags & !((DIR_MASK << RED_DIR_SHIFT) | RED_AUX_BASE | RED_AUX_EXT))
-            | (rdir << RED_DIR_SHIFT)
-            | if raux_b { RED_AUX_BASE } else { 0 }
-            | if raux_e { RED_AUX_EXT } else { 0 };
-        // the transition must go INTO or OUT OF saturated red
-        let sat_changed = rab != rae;
-        let rq_up = r_up && (rext - rbase) > p.red_delta && sat_changed;
-        let rq_dn = r_dn && (rbase - rext) > p.red_delta && sat_changed;
+        flags = (flags & !(DIR_MASK << RED_DIR_SHIFT)) | (rdir << RED_DIR_SHIFT);
+        // WCAG 2.2: to or from saturated red, the two states more than 0.2
+        // apart in u′v′
+        let red_q = red_transition(rcb, rce, p.red_delta);
+        let rq_up = r_up && red_q;
+        let rq_dn = r_dn && red_q;
 
         let mut mask = 0u32;
 
@@ -806,15 +827,54 @@ mod tests {
         assert!(!strobe_frames(&seq, 41_667).is_empty());
     }
 
+    /// Feed a single-pixel colour sequence and return the frames on which
+    /// the pixel strobes red at the failure rate.
+    fn red_strobe_frames(colours: &[(u8, u8, u8)], dt_us: u32) -> Vec<usize> {
+        let n = 16;
+        let cfg = DetectorConfig::default();
+        let mut st = PixelState::new(n, 4);
+        let mut planes = FramePlanes::new(n);
+        let mut out = PixelOutputs::new(n);
+        let mut hits = vec![];
+        for (f, &(r, g, b)) in colours.iter().enumerate() {
+            let px = pixel_values(r, g, b, cfg.red_saturation, cfg.red_flare);
+            planes.l.iter_mut().for_each(|p| *p = px.l);
+            planes.v.iter_mut().for_each(|p| *p = px.s);
+            planes.c.iter_mut().for_each(|p| *p = px.c);
+            let mode = if f == 0 { MODE_FIRST } else { 0 };
+            run_frame_scalar(&mut st, &planes, &params((f as u32) * dt_us, mode), &mut out);
+            if out.mask[0] & MASK_STROBE_RED != 0 {
+                hits.push(f);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn red_flashes_are_wcag_2_2s() {
+        // 5 Hz at 30 fps: a swap every 3 frames
+        let alternate = |a: (u8, u8, u8), b: (u8, u8, u8)| -> Vec<(u8, u8, u8)> { (0..90).map(|f| if (f / 3) % 2 == 0 { a } else { b }).collect() };
+        // red against a grey of the same luminance: no luminance moves, a red flash
+        assert!(!red_strobe_frames(&alternate((255, 0, 0), (127, 127, 127)), 33_333).is_empty());
+        // red against black, and against green
+        assert!(!red_strobe_frames(&alternate((255, 0, 0), (0, 0, 0)), 33_333).is_empty());
+        assert!(!red_strobe_frames(&alternate((200, 0, 0), (0, 160, 0)), 33_333).is_empty());
+        // red against a darker red: the same chromaticity (WCAG 2.0's
+        // formula called it red; 2.2 leaves it to the general-flash test)
+        assert!(red_strobe_frames(&alternate((255, 0, 0), (110, 0, 0)), 33_333).is_empty());
+        // green against blue: no saturated red at either end
+        assert!(red_strobe_frames(&alternate((0, 255, 0), (0, 0, 255)), 33_333).is_empty());
+    }
+
     #[test]
     fn held_frames_only_age() {
         let n = 4;
         let mut st = PixelState::new(n, 4);
-        let planes = FramePlanes { l: vec![0.3; n], v: vec![0.0; n], sat: vec![0; n] };
+        let planes = FramePlanes { l: vec![0.3; n], v: vec![0.0; n], c: vec![0; n] };
         let mut out = PixelOutputs::new(n);
         run_frame_scalar(&mut st, &planes, &params(0, MODE_FIRST), &mut out);
         // start an upward run
-        let up = FramePlanes { l: vec![0.5; n], v: vec![0.0; n], sat: vec![0; n] };
+        let up = FramePlanes { l: vec![0.5; n], v: vec![0.0; n], c: vec![0; n] };
         run_frame_scalar(&mut st, &up, &params(40_000, 0), &mut out);
         assert_eq!(st.lum_ext[0], 0.5);
         assert_eq!(st.lum_base[0], 0.3);
@@ -843,8 +903,8 @@ mod tests {
     #[test]
     fn layout_is_consistent() {
         let lay = StateLayout { k: 4 };
-        assert_eq!(lay.fields(), 31);
+        assert_eq!(lay.fields(), 33);
         let st = PixelState::new(3, 4);
-        assert_eq!(st.to_flat().len(), 93);
+        assert_eq!(st.to_flat().len(), 99);
     }
 }

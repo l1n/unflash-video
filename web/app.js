@@ -3177,7 +3177,7 @@ async function doExport() {
       cancel: cancelled,
       smartCut: smartCutSetting(),
       parallel: parallelSetting(),
-      onProgress: (p, frames, ms, copied) => progress(p, exportProgressText(frames, ms, copied)),
+      onProgress: (p, frames, ms, copied, sound) => progress(p, exportProgressText(frames, ms, copied, sound)),
     })
   );
   $('exportModal').classList.remove('hidden');
@@ -3193,8 +3193,8 @@ async function doExport() {
   }
 }
 
-function exportProgressText(frames, ms, copied) {
-  return `${frames} frames encoded${copied ? ` · ${copied} copied` : ''} · ${(frames / (ms / 1000)).toFixed(0)} fps`;
+function exportProgressText(frames, ms, copied, sound) {
+  return `${frames} frames encoded${copied ? ` · ${copied} copied` : ''} · ${(frames / (ms / 1000)).toFixed(0)} fps${sound != null ? ` · the sound, re-encoded: ${Math.round(sound * 100)}%` : ''}`;
 }
 
 /** What an export did, for the dialog and the auto-fix strip. */
@@ -3582,7 +3582,7 @@ async function autopilot({ rescan = false } = {}) {
         sink: sinkInfo ? sinkInfo.sink : null,
         cancel: cancelled,
         plan,
-        onProgress: (p, frames, ms, copied) => progress(p, exportProgressText(frames, ms, copied)),
+        onProgress: (p, frames, ms, copied, sound) => progress(p, exportProgressText(frames, ms, copied, sound)),
       })
     );
     if (!res || halted()) {

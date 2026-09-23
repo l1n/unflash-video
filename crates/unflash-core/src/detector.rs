@@ -135,7 +135,6 @@ pub struct CpuStage {
     planes: FramePlanes,
     out: PixelOutputs,
     cells: Vec<GridCell>,
-    red_saturation: f32,
     pat_mask: Vec<u32>,
     pub use_simd: bool,
 }
@@ -149,7 +148,6 @@ impl CpuStage {
             planes: FramePlanes::new(n),
             out: PixelOutputs::new(n),
             cells: Vec::new(),
-            red_saturation: cfg.red_saturation,
             pat_mask: vec![0; n],
             use_simd: cfg!(feature = "simd"),
             geom,
@@ -231,7 +229,7 @@ impl PixelStage for CpuStage {
     }
 
     fn run(&mut self, params: KernelParams, frame: FrameInput<'_>) -> GridStats {
-        self.planes.ingest(frame.data, frame.bpp, self.red_saturation);
+        self.planes.ingest(frame.data, frame.bpp, params.red_saturation, params.red_flare);
         self.run_planes(params)
     }
 }

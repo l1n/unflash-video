@@ -234,15 +234,19 @@ fn compare_with(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, n
         } else {
             assert!(gf.rgba.is_none());
         }
-        let (l, v, sat) = gpu.debug_inputs();
+        let (l, v, c) = gpu.debug_inputs();
 
         // the GPU's own ingest must match the CPU's ingest of the same bytes
+        // (the GPU's division and square root may be a few ulps off, so the
+        // chromaticity may round one step the other way)
         let _ = cpu_own.run(p, FrameInput::rgb(&frame));
         let own = cpu_own.planes();
         for j in 0..n {
             assert!((l[j] - own.l[j]).abs() <= 2e-6, "f{i} px{j}: L {} vs {}", l[j], own.l[j]);
-            assert!((v[j] - own.v[j]).abs() <= 1e-3, "f{i} px{j}: V {} vs {}", v[j], own.v[j]);
-            assert_eq!(sat[j], own.sat[j], "f{i} px{j}: sat");
+            assert!((v[j] - own.v[j]).abs() <= 2e-6, "f{i} px{j}: distance from red {} vs {}", v[j], own.v[j]);
+            let (a, b) = (c[j], own.c[j]);
+            assert_eq!(a >> 31, b >> 31, "f{i} px{j}: saturated red");
+            assert!((((a >> 16) & 0x7fff) as i32 - ((b >> 16) & 0x7fff) as i32).abs() <= 1 && ((a & 0xffff) as i32 - (b & 0xffff) as i32).abs() <= 1, "f{i} px{j}: chromaticity {a:#x} vs {b:#x}");
         }
 
         // the kernel, run on the GPU's planes, must match exactly
@@ -250,7 +254,7 @@ fn compare_with(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, n
             let pm = cpu.planes_mut();
             pm.l = l;
             pm.v = v;
-            pm.sat = sat;
+            pm.c = c;
         }
         let cs = cpu.run_planes(p);
         assert_eq!(gs.held_count, cs.held_count, "f{i}: moved-pixel count");

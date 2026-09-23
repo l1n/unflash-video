@@ -719,11 +719,14 @@ try {
     assert(s.times.length >= 20 && s.untimed === 0, `every change in CHANGELOG.md says when it went live (${s.untimed} do not)`);
     const sorted = [...s.times].sort((a, b) => b - a);
     const newer = (t) => sorted.filter((x) => x > t).length;
-    // back after a visit: the changes since, until "Got it"
-    await p.evaluate((t) => localStorage.setItem('unflash:changesSeen', String(t)), sorted[2]);
+    // back after a visit: the changes since, until "Got it" (changes that
+    // went live together share a time, so the visit is the third-newest time)
+    const distinct = [...new Set(sorted)];
+    const seenAt = distinct[Math.min(2, distinct.length - 1)];
+    await p.evaluate((t) => localStorage.setItem('unflash:changesSeen', String(t)), seenAt);
     await visit();
     s = await shown();
-    assert(s.card && s.dot && s.items === newer(sorted[2]) && !s.more, `back after a visit, the ${newer(sorted[2])} changes since: ` + JSON.stringify({ card: s.card, dot: s.dot, items: s.items }));
+    assert(s.card && s.dot && s.items === Math.min(6, newer(seenAt)) && (newer(seenAt) > 6) === !!s.more, `back after a visit, the ${newer(seenAt)} changes since: ` + JSON.stringify({ card: s.card, dot: s.dot, items: s.items, more: s.more }));
     await p.screenshot({ path: path.join(OUT, '8-whats-new.png') });
     await p.click('#btnNewsSeen');
     s = await shown();

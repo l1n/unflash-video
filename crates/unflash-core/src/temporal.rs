@@ -536,7 +536,8 @@ impl Temporal {
     pub fn new(cfg: DetectorConfig, geom: GridGeometry) -> Self {
         let ng = geom.ncells();
         let mean_swing = (cfg.swing_threshold * cfg.area_fraction as f32).max(0.02);
-        let mean_swing_red = cfg.red_delta_threshold * cfg.area_fraction as f32;
+        // (a window whose area share of pixels made the least qualifying red swing)
+        let mean_swing_red = crate::lut::RED_LEAST_SWING * cfg.area_fraction as f32;
         let k = cfg.k_fail() as usize;
         Temporal {
             clock: Clock::new(cfg.max_frame_gap),

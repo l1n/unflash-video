@@ -4,8 +4,9 @@
 //!  - general flash: pair of opposing relative-luminance changes >= 0.10 of
 //!    max, darker state < 0.80, covering >= 1/4 of any 341x256 window at
 //!    1024x768
-//!  - red flash: pair of opposing transitions where either state has
-//!    R/(R+G+B) >= 0.8 and |delta (R-G-B)*320| > 20
+//!  - red flash (WCAG 2.2, and 2.1 as now published): pair of opposing
+//!    transitions, each to or from a state with R/(R+G+B) >= 0.8, whose
+//!    states are more than 0.2 apart in the CIE 1976 UCS diagram (u′v′)
 //!  - failure: more than 3 flashes (of either kind) in any 1-second period
 //!  - extended flash: >= 5 s of flashing that meets every failure criterion
 //!    except the rate — it runs *at* the permitted rate rather than above it.
@@ -33,10 +34,16 @@ pub struct DetectorConfig {
     pub area_fraction: f64,
     /// Fail when flashes per second exceed this.
     pub flash_limit: f64,
-    /// On the (R-G-B)*320 scale.
+    /// Distance in the CIE 1976 UCS diagram (u′v′) between the two states
+    /// of a red transition.
     pub red_delta_threshold: f32,
     /// R/(R+G+B) at or above this is saturated red.
     pub red_saturation: f32,
+    /// Share of white added to every channel before a colour's
+    /// chromaticity is taken (a screen's black is never black; black itself
+    /// has no chromaticity). 0.0035 makes pure red count against black from
+    /// where WCAG 2.0's formula counts it (linear 0.0625, code 71).
+    pub red_flare: f32,
     // --- extended flash ---
     pub extended_mode: ExtendedMode,
     /// Of the failure area (1.0 = same).
@@ -70,7 +77,9 @@ pub struct DetectorConfig {
     pub analysis_scale: f64,
     /// Deadband for luminance extrema.
     pub noise_eps: f32,
-    /// Deadband on the 0..320 red scale.
+    /// Deadband on the distance from the red primary in u′v′ (the red
+    /// tracker's value). A qualifying red transition moves it by 0.085 at
+    /// the least.
     pub red_noise_eps: f32,
     /// Seconds to pool transition area (a flash ramping over several frames
     /// completes per-pixel at slightly different times).
@@ -92,8 +101,9 @@ impl Default for DetectorConfig {
             dark_threshold: 0.80,
             area_fraction: 0.25,
             flash_limit: 3.0,
-            red_delta_threshold: 20.0,
+            red_delta_threshold: 0.2,
             red_saturation: 0.80,
+            red_flare: 0.0035,
             extended_mode: ExtendedMode::Section,
             extended_area_ratio: 1.0,
             extended_hold: 1.0,
@@ -112,7 +122,7 @@ impl Default for DetectorConfig {
             window_h: 256,
             analysis_scale: 0.25,
             noise_eps: 0.02,
-            red_noise_eps: 4.0,
+            red_noise_eps: 0.04,
             area_accum_window: 0.125,
             max_frame_gap: 5.0,
             section_pad: 1.5,

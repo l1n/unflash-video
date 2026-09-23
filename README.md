@@ -261,18 +261,22 @@ even when a finished scan of the file could be read instead.
    cached RGBA frames ───┘   stage    └── per-pixel state stays on the GPU ┘   (Rust, on the CPU)
 ```
 
-The detector is split in two.
+Flashes are judged by WCAG 2.2's definitions, the red flash included (a
+change of more than 0.2 in CIE 1976 u′v′ to or from a saturated red); see
+[DETECTION.md](DETECTION.md#which-wcag) for how that differs from WCAG 2.0
+and from the original tool. The detector is split in two.
 
 The **pixel stage** owns the per-pixel state machine of the reference
 (`_ExtremaTracker`, `_FlashCounter`, `_Pool`): a monotonic-run tracker for
-luminance and one for the red value, flash pairing, a ring of the last K flash
-times and their opening times, and the pooling timers, about 120 bytes per
-pixel. It is written once, as a plain per-pixel function in Rust
+luminance and one for the colour's distance from red (carrying the colour's
+chromaticity at the run's two ends), flash pairing, a ring of the last K
+flash times and their opening times, and the pooling timers, about 130 bytes
+per pixel. It is written once, as a plain per-pixel function in Rust
 (`crates/unflash-core/src/pixel.rs`), and restated twice: as a WGSL compute
 shader and as an 8-lane SIMD kernel. All three are held bit-for-bit
 identical by tests. Per frame the stage reads and partially writes that
 record for every analysis pixel and reduces the frame to one 48-byte cell
-per sliding-window position: window sums of luminance and red value, the
+per sliding-window position: window sums of luminance and distance from red, the
 count of pixels in each of eight mask classes (strobing at the failure rate,
 strobing at the permitted rate, pooled transitions), and the age of the
 oldest transition still feeding a failure window. That is the whole

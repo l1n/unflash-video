@@ -7,13 +7,14 @@
 @group(0) @binding(3) var<storage, read_write> pixout: array<u32>;
 @group(0) @binding(4) var<storage, read> globals: array<u32>;
 
+// (aux: what rides along with the value -- the red run's chromaticity)
 struct Tr {
     dir: u32,
     base: f32,
     ext: f32,
     base_t: u32,
-    aux_base: bool,
-    aux_ext: bool,
+    aux_base: u32,
+    aux_ext: u32,
 };
 
 struct TrOut {
@@ -22,11 +23,11 @@ struct TrOut {
     rev_dn: bool,
     sbase: f32,
     sext: f32,
-    sab: bool,
-    sae: bool,
+    sab: u32,
+    sae: u32,
 };
 
-fn tracker_feed(t0: Tr, x: f32, aux: bool, now: u32, eps: f32, max_run: u32) -> TrOut {
+fn tracker_feed(t0: Tr, x: f32, aux: u32, now: u32, eps: f32, max_run: u32) -> TrOut {
     var t = t0;
     var rev_up = false;
     var rev_dn = false;
@@ -114,7 +115,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let held = !first && globals[0] < params.held_bar;
     let l = bitcast<f32>(inputs[i]);
     let v = bitcast<f32>(inputs[n + i]);
-    let sat = inputs[2u * n + i] != 0u;
+    let c = inputs[2u * n + i];
 
     if (first) {
         let nv = never(now);
@@ -124,7 +125,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         state[F_RED_BASE * n + i] = bitcast<u32>(v);
         state[F_RED_EXT * n + i] = bitcast<u32>(v);
         state[F_RED_T * n + i] = now;
-        state[F_FLAGS * n + i] = select(0u, RED_AUX_BASE | RED_AUX_EXT, sat);
+        state[F_RED_BASE_C * n + i] = c;
+        state[F_RED_EXT_C * n + i] = c;
+        state[F_FLAGS * n + i] = 0u;
         for (var s = 0u; s < K; s = s + 1u) {
             state[(F_GEN_RING + s) * n + i] = nv;
             state[(F_GEN_OPEN + s) * n + i] = nv;
@@ -173,9 +176,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (age(now, state[F_RED_T * n + i]) > params.max_run) {
             state[F_RED_BASE * n + i] = state[F_RED_EXT * n + i];
             state[F_RED_T * n + i] = now;
-            let aux_ext = (flags & RED_AUX_EXT) != 0u;
-            flags = (flags & ~RED_AUX_BASE) | select(0u, RED_AUX_BASE, aux_ext);
-            state[F_FLAGS * n + i] = flags;
+            state[F_RED_BASE_C * n + i] = state[F_RED_EXT_C * n + i];
         }
         pixout[i] = 0u;
         pixout[n + i] = 0u;
@@ -192,9 +193,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     lt.base = bitcast<f32>(state[F_LUM_BASE * n + i]);
     lt.ext = bitcast<f32>(state[F_LUM_EXT * n + i]);
     lt.base_t = state[F_LUM_T * n + i];
-    lt.aux_base = false;
-    lt.aux_ext = false;
-    let lo = tracker_feed(lt, l, false, now, params.eps_l, params.max_run);
+    lt.aux_base = 0u;
+    lt.aux_ext = 0u;
+    let lo = tracker_feed(lt, l, 0u, now, params.eps_l, params.max_run);
     state[F_LUM_BASE * n + i] = bitcast<u32>(lo.tr.base);
     state[F_LUM_EXT * n + i] = bitcast<u32>(lo.tr.ext);
     state[F_LUM_T * n + i] = lo.tr.base_t;
@@ -202,25 +203,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let q_up = lo.rev_up && (lo.sext - lo.sbase) >= params.swing && lo.sbase < params.dark;
     let q_dn = lo.rev_dn && (lo.sbase - lo.sext) >= params.swing && lo.sext < params.dark;
 
-    // --- red run tracker --------------------------------------------------
+    // --- red run tracker (the chromaticity rides along) --------------------
     var rt: Tr;
     rt.dir = (flags >> RED_DIR_SHIFT) & DIR_MASK;
     rt.base = bitcast<f32>(state[F_RED_BASE * n + i]);
     rt.ext = bitcast<f32>(state[F_RED_EXT * n + i]);
     rt.base_t = state[F_RED_T * n + i];
-    rt.aux_base = (flags & RED_AUX_BASE) != 0u;
-    rt.aux_ext = (flags & RED_AUX_EXT) != 0u;
-    let ro = tracker_feed(rt, v, sat, now, params.eps_v, params.max_run);
+    rt.aux_base = state[F_RED_BASE_C * n + i];
+    rt.aux_ext = state[F_RED_EXT_C * n + i];
+    let ro = tracker_feed(rt, v, c, now, params.eps_v, params.max_run);
     state[F_RED_BASE * n + i] = bitcast<u32>(ro.tr.base);
     state[F_RED_EXT * n + i] = bitcast<u32>(ro.tr.ext);
     state[F_RED_T * n + i] = ro.tr.base_t;
-    flags = (flags & ~((DIR_MASK << RED_DIR_SHIFT) | RED_AUX_BASE | RED_AUX_EXT))
-        | (ro.tr.dir << RED_DIR_SHIFT)
-        | select(0u, RED_AUX_BASE, ro.tr.aux_base)
-        | select(0u, RED_AUX_EXT, ro.tr.aux_ext);
-    let sat_changed = ro.sab != ro.sae;
-    let rq_up = ro.rev_up && (ro.sext - ro.sbase) > params.red_delta && sat_changed;
-    let rq_dn = ro.rev_dn && (ro.sbase - ro.sext) > params.red_delta && sat_changed;
+    state[F_RED_BASE_C * n + i] = ro.tr.aux_base;
+    state[F_RED_EXT_C * n + i] = ro.tr.aux_ext;
+    flags = (flags & ~(DIR_MASK << RED_DIR_SHIFT)) | (ro.tr.dir << RED_DIR_SHIFT);
+    // WCAG 2.2: to or from saturated red, the two states more than 0.2 apart in u'v'
+    let red_q = red_transition(ro.sab, ro.sae, params.red_delta);
+    let rq_up = ro.rev_up && red_q;
+    let rq_dn = ro.rev_dn && red_q;
 
     var mask = 0u;
     let kf = params.k_fail - 1u;

@@ -4,15 +4,16 @@ This is the supplement to [README.md](README.md), for anyone who wants to
 check the reasoning rather than take the verdict on trust. Nothing here is
 needed to use the tool.
 
-Unflash implements the WCAG 2.x / PEAT definitions of general flash and red
-flash, adds an optional test for sustained flashing at the legal limit and
-one for hazardous stationary stripe patterns, and tries hard to make sure
-that a section which passes its own check also passes when you re-scan the
-exported file.
+Unflash implements WCAG 2.2's definitions of general flash and red flash
+(see [Which WCAG](#which-wcag)), adds an optional test for sustained
+flashing at the legal limit and one for hazardous stationary stripe
+patterns, and tries hard to make sure that a section which passes its own
+check also passes when you re-scan the exported file.
 
 ## Contents
 
 - [What counts as a transition](#what-counts-as-a-transition)
+- [Which WCAG](#which-wcag)
 - [What counts as a failure](#what-counts-as-a-failure)
 - [Applying a 1024x768 rule to other shapes](#applying-a-1024x768-rule-to-other-shapes)
 - [Calibration](#calibration)
@@ -34,11 +35,35 @@ makes a qualifying **luminance transition** when its accumulated monotonic
 change in luminance reaches 10% of maximum luminance or more, and the darker
 of the two states is below 0.80.
 
-A qualifying **red transition** needs `|Δ(R−G−B) × 320| > 20` *and* the pixel
-entering or leaving the saturated-red state `R/(R+G+B) >= 0.8`. Requiring the
-saturation change as well as the amplitude is deliberate: brightness wobble
-inside a scene that is continuously red is not a red flash. Red flashing
-against dark is still caught, by the ordinary luminance criterion.
+A qualifying **red transition** follows WCAG 2.2's working definition: it
+goes to or from a saturated red (`R/(R+G+B) >= 0.8`), and its two states are
+more than 0.2 apart in the CIE 1976 UCS chromaticity diagram (u′v′). Red
+swapped for grey, white, black, green or blue is one; red growing brighter
+or darker is not (its chromaticity stays put; if the brightness changes
+enough, that is a general flash). Two saturated reds are never 0.2 apart:
+the saturated reds all lie within 0.143 of the red primary.
+
+How it is measured, per pixel:
+
+- **The colour's chromaticity.** R, G and B are linearised, a small *flare*
+  (0.35% of white) is added to each, and the result goes through the sRGB
+  matrix to XYZ and on to (u′, v′). Black has no chromaticity, and no
+  screen shows perfect black: the flare is the light a screen and its room
+  add. With it black sits at the white point (like any grey), and dim reds
+  drift toward it. 0.35% puts the dimmest pure red that counts against
+  black at code 71, exactly where WCAG 2.0's formula ((R−G−B)×320 > 20)
+  puts it; the sRGB standard's 1% viewing flare would put it at code 118.
+- **The run.** A flash is a pair of *opposing* transitions, and in a plane
+  "opposing" needs a direction. The tracker follows the colour's distance
+  from sRGB's red primary (towards red, away from red), with a deadband of
+  0.04, and keeps the colour's chromaticity at the two ends of the run.
+  When the run turns, its two ends are tested as above. A transition that
+  qualifies moves that distance by 0.085 at least (one end is saturated,
+  the ends are 0.2 apart, and the sRGB gamut is a 60° wedge at the red
+  primary), so the deadband never hides one.
+- **Both transitions of a pair qualify**, as WCAG 2.0 spells out ("both
+  transitions in a pair must satisfy these requirements") and as the
+  general flash requires of its own two changes.
 
 A pixel **flashes** when it completes a pair of opposing qualifying
 transitions within one second.
@@ -48,6 +73,30 @@ three or four frames count as one transition rather than several small ones
 that each fall short. It also means a pixel can be part-way through a run for
 a long time, which matters later (see
 [finite memory](#a-run-up-only-works-if-the-detectors-memory-is-finite)).
+
+## Which WCAG
+
+WCAG 2.0, 2.1 and 2.2 give the same flash thresholds (success criteria
+2.3.1 and 2.3.2) and differ in two details of the definitions:
+
+- **Relative luminance.** 2.0 linearises sRGB below 0.03928, 2.1 and 2.2
+  below 0.04045 (the sRGB standard's own figure). No 8-bit code falls
+  between the two (10/255 = 0.0392, 11/255 = 0.0431), so for video they are
+  the same; Unflash uses 0.04045.
+- **Red flash.** 2.0's working definition: either state has
+  `R/(R+G+B) >= 0.8`, and `(R−G−B)×320` changes by more than 20 (negative
+  values set to 0), for both transitions (Harding and Binnie). 2.2's, which
+  2.1 as now published also carries: a transition to or from a state with
+  `R/(R+G+B) >= 0.8`, whose states are more than 0.2 apart in the CIE 1976
+  UCS diagram (ISO 9241-391). The two disagree mostly about red against a
+  darker red (2.0: a red flash; 2.2: not, being one chromaticity) and about
+  dim reds (2.0 needs linear R−G−B above 0.0625; 2.2 needs the colours to
+  differ, see the flare above).
+
+Unflash follows 2.2 in both. The original tool followed 2.2 for luminance
+and 2.0's formula for red, with a rule of its own on top (exactly one
+state saturated, where both versions ask for either or both), so its red
+test was neither version's.
 
 ## What counts as a failure
 
@@ -529,8 +578,9 @@ hazard tests themselves always used the grid.
 
 **Held frames look at colour too.** A frame counts as a re-show of the
 previous picture when fewer than a tenth of the area a flash needs moved,
-in luminance (by half the general swing) *or* in red value (by half the red
-swing, on the R−G−B scale), against the last frame that was not held. The
+in luminance (by half the general swing) *or* in its distance from red (by
+half the least a red transition moves it, 0.04 in u′v′), against the last
+frame that was not held. The
 reference and earlier versions compared luminance alone, so a saturated red
 swapped for a grey of the same luminance (a textbook red flash) was taken
 for a held picture and never examined.
@@ -586,16 +636,23 @@ is less than the flash kernel's own traffic.
 ## Comparing with the original tool
 
 The browser version and the original (Python, ffmpeg) tool apply the same
-rules, and they are WCAG 2.2's: relative luminance with the 2.2
-linearisation threshold (0.04045); a transition is a swing of at least 0.1
-whose darker state is below 0.8; a red transition follows 2.2's working
-definition (R/(R+G+B) ≥ 0.8 in either state, and a change of more than 20 in
-(R−G−B)×320); the area is a quarter of a 10° field, modelled as 341×256 of a
-1024×768 screen; a failure is more than three flashes in any one second. The
-detector code is a port of the original's (commit `bb2e98f`, its latest)
-and is held to it by the fixture tests. Where the two disagree about a
-video, it is for one of these reasons:
+general-flash rules: relative luminance with the 2.2 linearisation
+threshold (0.04045); a transition is a swing of at least 0.1 whose darker
+state is below 0.8; the area is a quarter of a 10° field, modelled as
+341×256 of a 1024×768 screen; a failure is more than three flashes in any
+one second. The detector code is a port of the original's (commit
+`bb2e98f`, its latest) and is held to it by the fixture tests, which run a
+copy of the original brought up to WCAG 2.2's red flash. Where the two
+disagree about a video, it is for one of these reasons:
 
+- **Red flashes are WCAG 2.2's here.** The original measures red with WCAG
+  2.0's formula (a change of more than 20 in (R−G−B)×320) and, on top of
+  it, counts a red transition only when exactly one of its two states is
+  saturated red, a rule neither version of WCAG has (see
+  [Which WCAG](#which-wcag)). So a red swapped for a darker red is a red
+  flash there and a general flash here (when bright enough to be one), and
+  a flash between two colours that are both saturated red can only be one
+  here.
 - **Red flashes the original misses.** The one rule changed on purpose (see
   *Held frames look at colour too* above): the original skips a frame whose
   luminance did not move as a re-show of the last picture, so a saturated

@@ -7,7 +7,7 @@
 //! inputs); the frame's tail (`n % 8` pixels) runs through the scalar code.
 
 use bytemuck::cast;
-use wide::{f32x8, u32x8, CmpGe, CmpGt, CmpLe, CmpLt};
+use wide::{f32x8, i32x8, u32x8, CmpGe, CmpGt, CmpLe, CmpLt};
 
 use crate::grid::{
     MASK_EXT_GEN, MASK_EXT_RED, MASK_POOL_GEN_DN, MASK_POOL_GEN_UP, MASK_POOL_RED_DN, MASK_POOL_RED_UP,
@@ -15,8 +15,9 @@ use crate::grid::{
 };
 use crate::pixel::{
     run_range_scalar, FramePlanes, KernelParams, PixelOutputs, PixelState, DIR_MASK, DN, GEN_PEND_SHIFT,
-    LUM_DIR_SHIFT, POOL_GEN_SHIFT, POOL_RED_SHIFT, RED_AUX_BASE, RED_AUX_EXT, RED_DIR_SHIFT, RED_PEND_SHIFT, UP,
+    LUM_DIR_SHIFT, POOL_GEN_SHIFT, POOL_RED_SHIFT, RED_DIR_SHIFT, RED_PEND_SHIFT, UP,
 };
+use crate::lut::{QU, QV, SAT_BIT};
 use crate::time::AGE_MAX;
 
 const LANES: usize = 8;
@@ -61,6 +62,25 @@ fn age_gt(now: u32x8, t: u32x8, limit: u32x8) -> u32x8 {
 #[inline(always)]
 fn age_lt(now: u32x8, t: u32x8, limit: u32x8) -> u32x8 {
     (now - t).cmp_lt(limit)
+}
+
+/// [`crate::lut::red_transition`] on eight pairs of packed states: either
+/// end saturated red, the ends more than `delta` apart in u′v′.
+#[inline(always)]
+fn red_transition8(a: u32x8, b: u32x8, delta: f32x8) -> u32x8 {
+    let zero = u32x8::splat(0);
+    let sat = !((a | b) & u32x8::splat(SAT_BIT)).cmp_eq(zero);
+    let m15 = u32x8::splat(0x7fff);
+    let m16 = u32x8::splat(0xffff);
+    let ia: i32x8 = cast((a >> 16) & m15);
+    let ib: i32x8 = cast((b >> 16) & m15);
+    let va: i32x8 = cast(a & m16);
+    let vb: i32x8 = cast(b & m16);
+    // the same operations as the scalar code: each coordinate to f32, the
+    // difference, then the scale
+    let du = (f32x8::from_i32x8(ia) - f32x8::from_i32x8(ib)) / f32x8::splat(QU);
+    let dv = (f32x8::from_i32x8(va) - f32x8::from_i32x8(vb)) / f32x8::splat(QV);
+    sat & fm((du * du + dv * dv).cmp_gt(delta * delta))
 }
 
 struct Tr8 {
@@ -225,11 +245,8 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
             let rb = bl_f(rstale, ld_f(&st.red_ext, i), ld_f(&st.red_base, i));
             st_f(&mut st.red_base, i, rb);
             st_u(&mut st.red_t, i, bl_u(rstale, now, rt));
-            let flags = ld_u(&st.flags, i);
-            let aux_ext = (flags & u32x8::splat(RED_AUX_EXT)).cmp_eq(zero);
-            let aux_base_new = bl_u(aux_ext, zero, u32x8::splat(RED_AUX_BASE));
-            let nf = (flags & !u32x8::splat(RED_AUX_BASE)) | aux_base_new;
-            st_u(&mut st.flags, i, bl_u(rstale, nf, flags));
+            let cb = bl_u(rstale, ld_u(&st.red_ext_c, i), ld_u(&st.red_base_c, i));
+            st_u(&mut st.red_base_c, i, cb);
             st_u(&mut out.mask, i, zero);
             st_u(&mut out.onset_gen, i, zero);
             st_u(&mut out.onset_red, i, zero);
@@ -262,8 +279,7 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
     while i < main {
         let l = ld_f(&planes.l, i);
         let v = ld_f(&planes.v, i);
-        let sat_arr: [u32; 8] = std::array::from_fn(|j| if planes.sat[i + j] != 0 { !0u32 } else { 0 });
-        let sat = u32x8::from(sat_arr);
+        let c = ld_u(&planes.c, i);
         st_f(&mut st.prev_l, i, l);
         st_f(&mut st.prev_v, i, v);
         let mut flags = ld_u(&st.flags, i);
@@ -285,26 +301,25 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
         let q_up = lo.rev_up & fm((lo.sext - lo.sbase).cmp_ge(swing)) & fm(lo.sbase.cmp_lt(dark));
         let q_dn = lo.rev_dn & fm((lo.sbase - lo.sext).cmp_ge(swing)) & fm(lo.sext.cmp_lt(dark));
 
-        // --- red run tracker --------------------------------------------
+        // --- red run tracker (the chromaticity rides along) --------------
         let mut rt = Tr8 {
             dir: (flags >> RED_DIR_SHIFT) & dir_mask,
             base: ld_f(&st.red_base, i),
             ext: ld_f(&st.red_ext, i),
             base_t: ld_u(&st.red_t, i),
-            aux_base: !(flags & u32x8::splat(RED_AUX_BASE)).cmp_eq(zero),
-            aux_ext: !(flags & u32x8::splat(RED_AUX_EXT)).cmp_eq(zero),
+            aux_base: ld_u(&st.red_base_c, i),
+            aux_ext: ld_u(&st.red_ext_c, i),
         };
-        let ro = tracker_feed8(&mut rt, v, sat, now, eps_v, max_run);
+        let ro = tracker_feed8(&mut rt, v, c, now, eps_v, max_run);
         st_f(&mut st.red_base, i, rt.base);
         st_f(&mut st.red_ext, i, rt.ext);
         st_u(&mut st.red_t, i, rt.base_t);
-        flags = (flags & !((dir_mask << RED_DIR_SHIFT) | u32x8::splat(RED_AUX_BASE | RED_AUX_EXT)))
-            | (rt.dir << RED_DIR_SHIFT)
-            | (rt.aux_base & u32x8::splat(RED_AUX_BASE))
-            | (rt.aux_ext & u32x8::splat(RED_AUX_EXT));
-        let sat_changed = !ro.sab.cmp_eq(ro.sae);
-        let rq_up = ro.rev_up & fm((ro.sext - ro.sbase).cmp_gt(red_delta)) & sat_changed;
-        let rq_dn = ro.rev_dn & fm((ro.sbase - ro.sext).cmp_gt(red_delta)) & sat_changed;
+        st_u(&mut st.red_base_c, i, rt.aux_base);
+        st_u(&mut st.red_ext_c, i, rt.aux_ext);
+        flags = (flags & !(dir_mask << RED_DIR_SHIFT)) | (rt.dir << RED_DIR_SHIFT);
+        let red_q = red_transition8(ro.sab, ro.sae, red_delta);
+        let rq_up = ro.rev_up & red_q;
+        let rq_dn = ro.rev_dn & red_q;
 
         let mut mask = zero;
 
@@ -394,8 +409,19 @@ mod tests {
                     let flick = if (f / 3) % 2 == 0 { 0.05 } else { 0.5 };
                     let noise = (r % 1000) as f32 / 1000.0 * 0.06;
                     planes.l[i] = if i % 4 == 0 { flick + noise } else { (r % 1000) as f32 / 1000.0 };
-                    planes.v[i] = if i % 5 == 0 { if (f / 3) % 2 == 0 { 0.0 } else { 300.0 } } else { (r % 400) as f32 };
-                    planes.sat[i] = (planes.v[i] > 100.0) as u8;
+                    // red against grey on every fifth pixel, random colours elsewhere
+                    let (cr, cg, cb) = if i % 5 == 0 {
+                        if (f / 3) % 2 == 0 {
+                            (255, 0, 0)
+                        } else {
+                            (128, 128, 128)
+                        }
+                    } else {
+                        ((r % 256) as u8, ((r >> 8) % 256) as u8, ((r >> 16) % 256) as u8)
+                    };
+                    let px = crate::lut::pixel_values(cr, cg, cb, cfg.red_saturation, cfg.red_flare);
+                    planes.v[i] = px.s;
+                    planes.c[i] = px.c;
                 }
                 let mut p = KernelParams::template(&cfg, &geom);
                 now = now.wrapping_add(20_000 + lcg(&mut seed) % 40_000);

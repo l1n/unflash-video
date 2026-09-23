@@ -966,7 +966,9 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
     const holds = plan.holds;
     let copy = movie.audio.copyable && !holds.length;
     if (!copy) {
-      const res = await reencodeAudio(wasm, movie, reader, mx, out, { cancel: cancelled, holds });
+      // (the frames are done by now: the sound has a progress figure of its own)
+      const onSound = (f) => onProgress && onProgress(1, encodedFrames, performance.now() - started, copiedFrames, f);
+      const res = await reencodeAudio(wasm, movie, reader, mx, out, { cancel: cancelled, holds, onProgress: onSound });
       if (res.warning) warnings.push(res.warning);
       // could not re-encode at all: the sound as it is beats none
       copy = !res.wrote && movie.audio.copyable;
@@ -1012,7 +1014,7 @@ const secs = (x) => `${Math.round(x * 100) / 100} s`;
  * (Vorbis, PCM). Returns `{ warning, wrote }`: what was done, or why there
  * is no sound; `wrote` false means nothing went into the file.
  */
-async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [] } = {}) {
+async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [], onProgress = null } = {}) {
   const at = movie.audio;
   const a = movie.a;
   const name = at.codec;
@@ -1158,6 +1160,7 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [] 
       dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round((a.ptsTicks[i] * 1e6) / at.timescale), duration: Math.round((a.durTicks[i] * 1e6) / at.timescale), data: bytes.slice() }));
       await place();
       await flushOut(false);
+      if (onProgress && i % 200 === 0) onProgress(i / a.offset.length);
     }
     if (!error) await dec.flush();
     if (!error) await place();

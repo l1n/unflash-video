@@ -3,7 +3,7 @@
 //!
 //! Both pixel stages (CPU kernels here, WGSL in `unflash-gpu`) reduce every
 //! frame to one [`GridCell`] per window position: the window's summed
-//! luminance and red value (for the coherence gate), the count of pixels in
+//! luminance and distance from red (for the coherence gate), the count of pixels in
 //! each of the eight per-pixel mask classes, and the age of the oldest
 //! opening transition still feeding a failure window (for the violation's
 //! onset). Everything the detector does after that is a few hundred
@@ -37,7 +37,7 @@ pub struct GridGeometry {
     pub gys: Vec<u32>,
     /// Luminance delta that counts as "moved" for the held-frame test.
     pub held_delta: f32,
-    /// A pixel whose red value (R−G−B scale) moved this much has moved too.
+    /// A pixel whose distance from red (u′v′) moved this much has moved too.
     pub held_delta_v: f32,
     /// Fewer moved pixels than this and the frame is a re-show.
     pub held_bar: f64,
@@ -69,7 +69,7 @@ impl GridGeometry {
             gxs,
             gys,
             held_delta: HELD_DELTA_RATIO * cfg.swing_threshold,
-            held_delta_v: HELD_DELTA_RATIO * cfg.red_delta_threshold,
+            held_delta_v: HELD_DELTA_RATIO * crate::lut::RED_LEAST_SWING,
             held_bar: (HELD_AREA_RATIO * area_thresh as f64).max(1.0),
         }
     }
