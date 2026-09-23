@@ -152,7 +152,7 @@ mod simd {
 
     /// Eight samples as 16-bit lanes.
     #[inline(always)]
-    pub fn load8(s: &[u8]) -> i16x8 {
+    fn load8(s: &[u8]) -> i16x8 {
         let mut a = [0u8; 16];
         a[..8].copy_from_slice(&s[..8]);
         i16x8::from_u8x16_low(u8x16::from(a))
@@ -160,13 +160,14 @@ mod simd {
 
     /// Eight lanes (already 0..=255) into `d[..8]`.
     #[inline(always)]
-    pub fn store8(v: i16x8, d: &mut [u8]) {
+    fn store8(v: i16x8, d: &mut [u8]) {
         d[..8].copy_from_slice(&u8x16::narrow_i16x8(v, v).as_array_ref()[..8]);
     }
 
     /// Filter eight positions: `t` holds p3, p2, p1, p0, q0, q1, q2, q3.
+    /// Returns whether any position is filtered.
     #[inline(always)]
-    pub fn filter(t: &mut [i16x8; 8], kind: Kind) {
+    fn filter(t: &mut [i16x8; 8], kind: Kind) -> bool {
         let [p3, p2, p1, p0, q0, q1, q2, q3] = *t;
         let (edge_limit, interior, hev) = match kind {
             Kind::Simple { edge_limit } => (edge_limit, 255, 255),
@@ -178,7 +179,7 @@ mod simd {
             mask = mask & at_most(steps, interior);
         }
         if mask.none() {
-            return;
+            return false;
         }
         let high = if matches!(kind, Kind::Simple { .. }) { splat(-1) } else { (p1 - p0).abs().max((q1 - q0).abs()).cmp_gt(splat(hev)) };
         let outer = clamp_s8(p1 - q1);
@@ -188,49 +189,72 @@ mod simd {
         let a = clamp_s8((outer & high) + step);
         let f1 = (a + 4i16).min(splat(127)) >> 3;
         let f2 = (a + 3i16).min(splat(127)) >> 3;
-        let mut np0 = clamp_u8(p0 + f2);
-        let mut nq0 = clamp_u8(q0 - f1);
-        let (mut np1, mut nq1, mut np2, mut nq2) = (p1, q1, p2, q2);
+        let np0 = clamp_u8(p0 + f2);
+        let nq0 = clamp_u8(q0 - f1);
         match kind {
-            Kind::Simple { .. } => {}
+            Kind::Simple { .. } => {
+                t[3] = mask.blend(np0, p0);
+                t[4] = mask.blend(nq0, q0);
+            }
             Kind::Inner { .. } => {
                 // without high variance p1 and q1 move half as far
                 let a = ((f1 + 1i16) >> 1) & !high;
-                np1 = clamp_u8(p1 + a);
-                nq1 = clamp_u8(q1 - a);
+                t[2] = mask.blend(clamp_u8(p1 + a), p1);
+                t[3] = mask.blend(np0, p0);
+                t[4] = mask.blend(nq0, q0);
+                t[5] = mask.blend(clamp_u8(q1 - a), q1);
             }
             Kind::Mb { .. } => {
-                // without high variance the macroblock filter proper
+                // without high variance the macroblock filter proper; the
+                // masks pick: unfiltered, high variance, or this
                 let w = clamp_s8(outer + step);
                 let a0 = (w * 27i16 + 63i16) >> 7;
                 let a1 = (w * 18i16 + 63i16) >> 7;
                 let a2 = (w * 9i16 + 63i16) >> 7;
-                np0 = high.blend(np0, clamp_u8(p0 + a0));
-                nq0 = high.blend(nq0, clamp_u8(q0 - a0));
-                np1 = high.blend(p1, clamp_u8(p1 + a1));
-                nq1 = high.blend(q1, clamp_u8(q1 - a1));
-                np2 = high.blend(p2, clamp_u8(p2 + a2));
-                nq2 = high.blend(q2, clamp_u8(q2 - a2));
+                let low = mask & !high;
+                let high = mask & high;
+                t[1] = low.blend(clamp_u8(p2 + a2), p2);
+                t[2] = low.blend(clamp_u8(p1 + a1), p1);
+                t[3] = low.blend(clamp_u8(p0 + a0), high.blend(np0, p0));
+                t[4] = low.blend(clamp_u8(q0 - a0), high.blend(nq0, q0));
+                t[5] = low.blend(clamp_u8(q1 - a1), q1);
+                t[6] = low.blend(clamp_u8(q2 - a2), q2);
             }
         }
-        t[1] = mask.blend(np2, p2);
-        t[2] = mask.blend(np1, p1);
-        t[3] = mask.blend(np0, p0);
-        t[4] = mask.blend(nq0, q0);
-        t[5] = mask.blend(nq1, q1);
-        t[6] = mask.blend(nq2, q2);
+        true
     }
 
-    /// Eight positions of a horizontal edge (columns `at` .. `at + 8`).
+    /// Positions `at` .. `at + 16` of a horizontal edge, as two halves.
     #[inline(always)]
-    pub fn horizontal(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
+    pub fn horizontal16(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
         let base = at - 4 * stride;
-        let mut t: [i16x8; 8] = std::array::from_fn(|r| load8(&buf[base + r * stride..]));
-        let before = t;
-        filter(&mut t, kind);
-        for r in 1..7 {
-            if t[r] != before[r] {
-                store8(t[r], &mut buf[base + r * stride..]);
+        let rows = &mut buf[base..base + 7 * stride + 16];
+        let mut lo = [i16x8::ZERO; 8];
+        let mut hi = [i16x8::ZERO; 8];
+        for r in 0..8 {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&rows[r * stride..r * stride + 16]);
+            let v = u8x16::from(a);
+            lo[r] = i16x8::from_u8x16_low(v);
+            hi[r] = i16x8::from_u8x16_high(v);
+        }
+        let changed = filter(&mut lo, kind) | filter(&mut hi, kind);
+        if changed {
+            for r in 1..7 {
+                rows[r * stride..r * stride + 16].copy_from_slice(u8x16::narrow_i16x8(lo[r], hi[r]).as_array_ref());
+            }
+        }
+    }
+
+    /// Positions `at` .. `at + 8` of a horizontal edge.
+    #[inline(always)]
+    pub fn horizontal8(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
+        let base = at - 4 * stride;
+        let rows = &mut buf[base..base + 7 * stride + 8];
+        let mut t: [i16x8; 8] = std::array::from_fn(|r| load8(&rows[r * stride..]));
+        if filter(&mut t, kind) {
+            for r in 1..7 {
+                store8(t[r], &mut rows[r * stride..]);
             }
         }
     }
@@ -238,17 +262,13 @@ mod simd {
     /// Eight positions of a vertical edge (rows `at` down): the rows are
     /// transposed so each lane is a row.
     #[inline(always)]
-    pub fn vertical(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
-        let rows: [i16x8; 8] = std::array::from_fn(|r| load8(&buf[at + r * stride - 4..]));
-        let mut t = i16x8::transpose(rows);
-        let before = t;
-        filter(&mut t, kind);
-        if t == before {
-            return;
-        }
-        let rows = i16x8::transpose(t);
-        for (r, row) in rows.iter().enumerate() {
-            store8(*row, &mut buf[at + r * stride - 4..]);
+    pub fn vertical8(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
+        let rows = &mut buf[at - 4..at + 7 * stride + 4];
+        let mut t = i16x8::transpose(std::array::from_fn(|r| load8(&rows[r * stride..])));
+        if filter(&mut t, kind) {
+            for (r, row) in i16x8::transpose(t).iter().enumerate() {
+                store8(*row, &mut rows[r * stride..]);
+            }
         }
     }
 }
@@ -260,12 +280,15 @@ mod simd {
 fn filter_edge(buf: &mut [u8], at: usize, step: usize, along: usize, count: usize, kind: Kind) {
     #[cfg(feature = "simd")]
     {
-        for k in (0..count).step_by(8) {
-            if step == 1 {
-                simd::vertical(buf, at + k * along, along, kind);
-            } else {
-                simd::horizontal(buf, at + k, step, kind);
+        if step == 1 {
+            simd::vertical8(buf, at, along, kind);
+            if count == 16 {
+                simd::vertical8(buf, at + 8 * along, along, kind);
             }
+        } else if count == 16 {
+            simd::horizontal16(buf, at, step, kind);
+        } else {
+            simd::horizontal8(buf, at, step, kind);
         }
     }
     #[cfg(not(feature = "simd"))]

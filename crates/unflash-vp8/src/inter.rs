@@ -59,18 +59,19 @@ mod simd {
     /// block and holds W + 5 samples.
     #[inline(always)]
     pub fn sixtap_h<const W: usize>(r: &[u8], f: &[i32; 6], o: &mut [u8]) {
-        for k in (0..W).step_by(8) {
-            let s = std::array::from_fn(|t| load8(&r[k + t..]));
-            store8(taps(s, f), &mut o[k..]);
+        for k in 0..W / 8 {
+            let s: &[u8; 13] = r[8 * k..8 * k + 13].try_into().unwrap();
+            let v = taps(std::array::from_fn(|t| load8(&s[t..t + 8])), f);
+            store8(v, &mut o[8 * k..8 * k + 8]);
         }
     }
 
     /// Vertical six-tap of one row from the six rows around it.
     #[inline(always)]
     pub fn sixtap_v<const W: usize>(r: [&[u8]; 6], f: &[i32; 6], o: &mut [u8]) {
-        for k in (0..W).step_by(8) {
-            let s = std::array::from_fn(|t| load8(&r[t][k..]));
-            store8(taps(s, f), &mut o[k..]);
+        for k in 0..W / 8 {
+            let v = taps(std::array::from_fn(|t| load8(&r[t][8 * k..8 * k + 8])), f);
+            store8(v, &mut o[8 * k..8 * k + 8]);
         }
     }
 
@@ -78,9 +79,9 @@ mod simd {
     #[inline(always)]
     pub fn bilinear<const W: usize>(a: &[u8], b: &[u8], f: usize, o: &mut [u8]) {
         let (wa, wb) = ((8 - f) as i16, f as i16);
-        for k in (0..W).step_by(8) {
-            let v = load8(&a[k..]) * wa + load8(&b[k..]) * wb;
-            store8((v + 4i16) >> 3, &mut o[k..]);
+        for k in 0..W / 8 {
+            let v = load8(&a[8 * k..8 * k + 8]) * wa + load8(&b[8 * k..8 * k + 8]) * wb;
+            store8((v + 4i16) >> 3, &mut o[8 * k..8 * k + 8]);
         }
     }
 }
@@ -224,13 +225,21 @@ pub fn predict(src: &[u8], ps: usize, pw: usize, ph: usize, x: i32, y: i32, fx: 
         filter_any(src, y as usize * ps + x as usize, ps, fx, fy, w, h, filter, dst, ds);
         return;
     }
+    // the columns of the window that fall inside the plane, the rest
+    // repeating its first or last sample
+    let x0 = x - 2;
+    let n = w as i32 + 5;
+    let (in0, in1) = (x0.clamp(0, pw as i32), (x0 + n).clamp(0, pw as i32));
+    // where they are in the window
+    let (a, b) = ((in0 - x0).clamp(0, n) as usize, (in1 - x0).clamp(0, n) as usize);
     let mut win = [0u8; WIN * WIN];
     for j in 0..h + 5 {
         let sy = (y + j as i32 - 2).clamp(0, ph as i32 - 1) as usize;
         let row = &src[sy * ps..sy * ps + pw];
-        for (i, v) in win[j * WIN..j * WIN + w + 5].iter_mut().enumerate() {
-            *v = row[(x + i as i32 - 2).clamp(0, pw as i32 - 1) as usize];
-        }
+        let out = &mut win[j * WIN..j * WIN + n as usize];
+        out[..a].fill(row[0]);
+        out[a..b].copy_from_slice(&row[in0 as usize..in0 as usize + (b - a)]);
+        out[b..].fill(row[pw - 1]);
     }
     filter_any(&win, 2 * WIN + 2, WIN, fx, fy, w, h, filter, dst, ds);
 }
