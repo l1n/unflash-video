@@ -261,11 +261,12 @@ export class Movie {
  * at the last keyframe at or before `startSec`, or at sample `fromIndex`
  * (decode order) when given.
  */
-export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null } = {}) {
+export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null, shrink = null } = {}) {
   if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, fromIndex, reader });
   // pictures for the detector alone: decoded and copied in a worker where
-  // the detector would copy them on the page anyway
-  if (raw && movie.decodeInWorkers && typeof Worker !== 'undefined') return decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onProgress, fromIndex });
+  // the detector would copy them on the page anyway (and, with `shrink`
+  // ({aw, ah}), made that small there)
+  if (raw && movie.decodeInWorkers && typeof Worker !== 'undefined') return decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onProgress, fromIndex, shrink });
   const cfg = movie.decoderConfig();
   reader = reader || movie.reader || new ChunkReader(movie.file);
   const { pts, dts, offset, size, sync, dur } = movie.v;
@@ -378,7 +379,7 @@ let workerJobs = 0;
  * decodes and copies, the page feeds the copies on and hands each buffer
  * back. At most four pictures wait for the page at a time.
  */
-async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onProgress, fromIndex = null } = {}) {
+async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onProgress, fromIndex = null, shrink = null } = {}) {
   const { pts, dts, offset, size, sync, dur } = movie.v;
   const n = pts.length;
   const startIdx = fromIndex !== null ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
@@ -431,6 +432,7 @@ async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onP
     startUs: startSec * 1e6,
     endUs,
     window: 4,
+    shrink: shrink && shrink.aw > 0 && shrink.ah > 0 ? { aw: shrink.aw, ah: shrink.ah } : null,
   });
   const credit = (buffer) => (buffer ? worker.postMessage({ type: 'credit', n: 1, buffer }, [buffer]) : worker.postMessage({ type: 'credit', n: 1 }));
   let frames = 0;
@@ -468,7 +470,10 @@ async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onP
       }
       if (failed) throw failed;
       if (done) break;
+      // the page waiting for the worker (decoding is what holds it up)
+      const t0 = performance.now();
       await settle();
+      profile.add('worker.wait', performance.now() - t0);
     }
   } catch (e) {
     stop();
@@ -499,6 +504,10 @@ async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onP
 /** A picture a decode worker copied, shaped for Feeder.feedRaw; closing it hands the buffer back. */
 function workerPicture(p, credit) {
   let returned = false;
+  if (p.shrunk) {
+    profile.add('worker.copy', p.shrunk.copyMs);
+    profile.add('worker.shrink', p.shrunk.shrinkMs);
+  }
   return {
     raw: true,
     kind: p.kind,
@@ -511,7 +520,7 @@ function workerPicture(p, credit) {
     colorSpace: p.colorSpace,
     data: new Uint8Array(p.data, 0, p.bytes),
     layout: p.layout,
-    detail: `${p.format}, copied in a decode worker`,
+    detail: p.shrunk ? `${p.format} ${p.shrunk.from[0]}×${p.shrunk.from[1]}, made ${p.width}×${p.height} in a decode worker` : `${p.format}, copied in a decode worker`,
     close() {
       if (returned) return;
       returned = true;

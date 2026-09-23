@@ -113,7 +113,7 @@ async function runJob(name, fn) {
     toast('Another job is running');
     return null;
   }
-  const job = { name, cancelled: false };
+  const job = { name, cancelled: false, t0: performance.now(), pct: 0 };
   state.job = job;
   const ended = noteJob(name);
   chainStart(name);
@@ -125,6 +125,7 @@ async function runJob(name, fn) {
   let shownAt = 0;
   const progress = (p, msg) => {
     const pct = Math.round(Math.min(1, Math.max(0, p)) * 100);
+    job.pct = pct;
     // a long scan reports thousands of times: the page shows ten a second
     const now = performance.now();
     if (pct === shownPct && now - shownAt < 100) return;
@@ -569,6 +570,7 @@ async function openFile(file) {
     state.config = profileConfig(project.profile);
     await createFeeders(progress);
     movie.decodeInWorkers = decodeWorkersSetting(state.env.feeder);
+    movie.shrinkInWorkers = shrinkSetting();
     loadPlayer(file, movie);
     $('videoInfo').textContent = `${file.name} · ${movie.width}×${movie.height} · ${movie.fps.toFixed(2)} fps · ${fmt(movie.duration)} · ${movie.video.codec}${movie.audio ? ' + ' + movie.audio.codec : ''}`;
     $('btnScan').disabled = !state.decode.supported;
@@ -687,7 +689,8 @@ function updateStatus() {
  * Spans a scan is cut into and scanned at once: one per two logical cores,
  * at most four, on the GPU detector with the browser's own decoder (the
  * built-in decoder already spreads over workers, and the CPU detector has
- * one thread). `?segments=N` forces a count.
+ * one thread); decoding in workers, all but two cores, at most six.
+ * `?segments=N` forces a count.
  */
 function segmentsForced() {
   return parseInt(new URLSearchParams(location.search).get('segments') || '', 10) > 0;
@@ -697,7 +700,11 @@ function scanSegments() {
   const forced = parseInt(new URLSearchParams(location.search).get('segments') || '', 10);
   if (forced > 0) return forced;
   if (!state.env || state.env.feeder.backend !== 'webgpu' || state.decode.software) return 1;
-  return Math.min(4, Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 2)));
+  const cores = navigator.hardwareConcurrency || 4;
+  // decoding in workers, each segment's pictures are copied and made small
+  // on a core of its own, and the page does little per frame: more of them
+  if (state.movie && state.movie.decodeInWorkers) return Math.min(6, Math.max(1, cores - 2));
+  return Math.min(4, Math.max(1, Math.floor(cores / 2)));
 }
 
 /**
@@ -713,6 +720,12 @@ function decodeWorkersSetting(feeder) {
   // a forced picture route is one taken on the page
   if (routeSetting()) return false;
   return !feeder.takesFrames;
+}
+
+/** `?shrink=0`: pictures decoded in workers reach the page at full size (the detector shrinks them) rather than at its size. */
+function shrinkSetting() {
+  const q = new URLSearchParams(location.search).get('shrink');
+  return !(q === '0' || q === 'off');
 }
 
 /** `?smartcut=0`: an export re-encodes the whole video instead of copying the GOPs no section touches. */
@@ -2669,6 +2682,7 @@ async function verifyBlob(blob) {
     const m = await Movie.open(blob, wasm);
     const feeder = await makeFeeder(m.width, m.height);
     m.decodeInWorkers = decodeWorkersSetting(feeder);
+    m.shrinkInWorkers = shrinkSetting();
     try {
       return await scanMovie({ wasm, config: state.config, feeder }, m, {
         cancel: cancelled,
@@ -3047,6 +3061,50 @@ window.__unflash = {
     };
     const out = { ms, spans: copy.preparedSpans, frames: copy.cache.len(), lead: copy.ctx.lead.len(), tail: copy.ctx.tail.len(), pts: copy.pts, leadPts: copy.ctx.leadPts, tailPts: copy.ctx.tailPts, pattern: copy.pattern.counts, hash: [sum(copy.cache), sum(copy.ctx.lead), sum(copy.ctx.tail)] };
     dropCaches(copy);
+    return out;
+  },
+  /**
+   * Prepare a copy of section `id` through the decode workers twice, the
+   * pictures made small there and made small by the detector, and compare
+   * the cached pictures (tests: the workers' shrink is the GPU's, to a code).
+   */
+  async compareShrink(id) {
+    const sec = state.project.sections.find((s) => s.id === id);
+    const m = state.movie;
+    const was = { workers: m.decodeInWorkers, shrink: m.shrinkInWorkers };
+    const prepare = async (shrink) => {
+      const copy = { id: sec.id, start: sec.start, end: sec.end, edits: {} };
+      m.decodeInWorkers = true;
+      m.shrinkInWorkers = shrink;
+      try {
+        await withFeeder(() => prepareSection(state.env, m, copy, { spans: 1 }));
+      } finally {
+        m.decodeInWorkers = was.workers;
+        m.shrinkInWorkers = was.shrink;
+      }
+      return copy;
+    };
+    const big = await prepare(false);
+    const bigRoute = state.env.feeder.routeDetail;
+    const small = await prepare(true);
+    const smallRoute = state.env.feeder.routeDetail;
+    let n = 0;
+    let differ = 0;
+    let max = 0;
+    for (let i = 0; i < Math.min(big.cache.len(), small.cache.len()); i++) {
+      const a = big.cache.frame(i);
+      const b = small.cache.frame(i);
+      for (let k = 0; k < a.length; k++) {
+        if ((k & 3) === 3) continue;
+        const d = Math.abs(a[k] - b[k]);
+        n++;
+        if (d) differ++;
+        if (d > max) max = d;
+      }
+    }
+    const out = { frames: [big.cache.len(), small.cache.len()], n, differ, max, routes: [bigRoute, smallRoute] };
+    dropCaches(big);
+    dropCaches(small);
     return out;
   },
   /** Change the finish-alert settings for this visit (tests). */

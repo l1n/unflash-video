@@ -499,6 +499,64 @@ impl Suggester {
     }
 }
 
+// ---- pictures made small off the page -------------------------------------
+
+/// Shrinks decoded pictures to the detector's analysis size where they are
+/// decoded (a decode worker), so the page and the GPU never handle the
+/// full-size picture: `input` hands out room in this module's memory to copy
+/// a picture into (`VideoFrame.copyTo` straight into it), `packed` / `yuv`
+/// shrink what is there to RGBA8 (see `unflash_core::resample::Shrink`).
+#[wasm_bindgen]
+pub struct Shrinker {
+    inner: unflash_core::resample::Shrink,
+    input: Vec<u8>,
+    out: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl Shrinker {
+    #[wasm_bindgen(constructor)]
+    pub fn new(width: u32, height: u32, analysis_width: u32, analysis_height: u32) -> Shrinker {
+        Shrinker { inner: unflash_core::resample::Shrink::new(width, height, analysis_width, analysis_height), input: Vec::new(), out: Vec::new() }
+    }
+
+    /// Whether it was made for these sizes.
+    pub fn fits(&self, width: u32, height: u32, analysis_width: u32, analysis_height: u32) -> bool {
+        self.inner.fits(width, height, analysis_width, analysis_height)
+    }
+
+    /// Room for `len` bytes of picture: its address in this module's memory
+    /// (valid until the next call that may grow the memory).
+    pub fn input(&mut self, len: usize) -> usize {
+        if self.input.len() < len {
+            self.input.resize(len, 0);
+        }
+        self.input.as_ptr() as usize
+    }
+
+    /// The packed picture in the input (four bytes a pixel, B first with
+    /// `bgr`), rows `stride` bytes apart from `offset`: RGBA8 at the analysis size.
+    pub fn packed(&mut self, offset: usize, stride: usize, bgr: bool) -> Result<Vec<u8>, JsValue> {
+        let (w, h) = self.inner.source_size();
+        if h == 0 || stride < w * 4 || self.input.len() < offset + (h - 1) * stride + w * 4 {
+            return Err(js_err("picture data too short for its size"));
+        }
+        self.inner.packed(&self.input, offset, stride, bgr, &mut self.out);
+        Ok(self.out.clone())
+    }
+
+    /// The 4:2:0 picture in the input (`layout`: the words Detector.feed_yuv takes).
+    pub fn yuv(&mut self, layout: &[u32]) -> Result<Vec<u8>, JsValue> {
+        let layout = unflash_core::yuv::YuvLayout::from_words(layout).ok_or_else(|| js_err("bad picture layout"))?;
+        let (w, h) = self.inner.source_size();
+        if !layout.fits(self.input.len(), w, h) {
+            return Err(js_err("picture data too short for its layout"));
+        }
+        self.inner.yuv420(&self.input, &layout, &mut self.out);
+        Ok(self.out.clone())
+    }
+}
+
 // ---- demuxer ---------------------------------------------------------------
 
 #[wasm_bindgen]

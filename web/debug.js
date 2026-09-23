@@ -100,7 +100,7 @@ export function debugReport({ version, state, profile, gpu, segments }) {
     const f = env.feeder;
     const det = [];
     det.push(`${f.backend === 'webgpu' ? 'WebGPU' : 'CPU (WebAssembly)'} at ${f.aw}×${f.ah}${f.note ? ` (${f.note})` : ''}`);
-    det.push(`pictures reach it as: ${f.route || 'nothing yet'}${f.takesFrames === false && f.backend === 'webgpu' ? ' (this WebGPU takes no decoded frame)' : ''}`);
+    det.push(`pictures reach it as: ${f.route || 'nothing yet'}${f.routeDetail ? ` (${f.routeDetail})` : ''}${f.takesFrames === false && f.backend === 'webgpu' ? ' · this WebGPU takes no decoded frame' : ''}`);
     const m = state.movie;
     det.push(`decoding: ${state.decode && state.decode.software ? 'the built-in H.264 decoder' : m && m.decodeInWorkers ? 'WebCodecs, in workers' : 'WebCodecs, on the page'} · scans in ${segments > 1 ? `up to ${segments} segments` : 'one piece'}`);
     lines.push(...block('Detector', det));
@@ -123,6 +123,8 @@ export function debugReport({ version, state, profile, gpu, segments }) {
     lines.push(...block('Scan', [`${int(s.frames)} frames in ${secs(s.elapsedMs)} = ${fps.toFixed(0)} fps${m && m.fps ? ` (${(fps / m.fps).toFixed(1)}× real time)` : ''} · ${s.segments || 1} segment${(s.segments || 1) === 1 ? '' : 's'}`]));
   }
   lines.push(...block('Jobs', jobs.map((j) => `${clock(j.at)} ${j.name}: ${secs(j.ms)} ${j.outcome}${j.hidden > 500 ? ` (${secs(j.hidden)} of it out of sight)` : ''}`)));
+  const job = state.job;
+  if (job) lines.push(...block('Running', [`${job.name}: ${secs(performance.now() - (job.t0 || performance.now()))} so far, ${job.pct || 0}% done (the report of it comes when it ends)`]));
   if (state.project) {
     const n = state.project.sections.length;
     lines.push(...block('Project', [`${n} section${n === 1 ? '' : 's'} · caches ${bytes(state.project.cacheBytes())}`]));

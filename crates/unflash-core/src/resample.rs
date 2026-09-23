@@ -50,6 +50,232 @@ pub fn area_downsample(src: &[u8], bpp: usize, sw: u32, sh: u32, aw: u32, ah: u3
     out
 }
 
+/// One axis of an area-average: for each output sample, the first source
+/// sample its box covers and the integer weights of the samples it covers
+/// (overlaps in units of `gcd(src, out) / out` source samples, so every box
+/// weighs `src / gcd` in all).
+#[derive(Clone, Debug)]
+struct Axis {
+    boxes: Vec<(usize, Vec<u32>)>,
+    total: u32,
+}
+
+impl Axis {
+    fn new(src: usize, out: usize) -> Axis {
+        fn gcd(a: usize, b: usize) -> usize {
+            if b == 0 { a } else { gcd(b, a % b) }
+        }
+        let g = gcd(src, out).max(1);
+        // box k is [k·src, (k+1)·src) and sample i is [i·out, (i+1)·out), in 1/out units
+        let boxes = (0..out)
+            .map(|k| {
+                let (lo, hi) = (k * src, (k + 1) * src);
+                let first = lo / out;
+                let last = (hi - 1) / out;
+                let w = (first..=last).map(|i| ((hi.min((i + 1) * out) - lo.max(i * out)) / g) as u32).collect();
+                (first, w)
+            })
+            .collect();
+        Axis { boxes, total: (src / g) as u32 }
+    }
+}
+
+/// Area-average downsampling to the analysis size in exact integer
+/// arithmetic, for pictures made small before they reach the detector (in
+/// the browser's decode workers, so the page never handles the full-size
+/// picture): the boxes of [`area_downsample`] and the GPU ingest pass, whose
+/// float sums can land either side of an exact half, so a code can differ
+/// by one there; here the exact average is rounded half to even, as WGSL
+/// rounds. Rows are summed first (a straight run over each row, which the
+/// compiler vectorises), then columns, on one output row's sums at a time.
+#[derive(Clone, Debug)]
+pub struct Shrink {
+    sw: usize,
+    sh: usize,
+    aw: usize,
+    ah: usize,
+    cols: Axis,
+    rows: Axis,
+    acc: Vec<u32>,
+    acc16: Vec<u16>,
+    rgba: Vec<u8>,
+}
+
+impl Shrink {
+    pub fn new(sw: u32, sh: u32, aw: u32, ah: u32) -> Shrink {
+        let (sw, sh, aw, ah) = (sw as usize, sh as usize, aw.max(1) as usize, ah.max(1) as usize);
+        Shrink { sw, sh, aw, ah, cols: Axis::new(sw, aw), rows: Axis::new(sh, ah), acc: Vec::new(), acc16: Vec::new(), rgba: Vec::new() }
+    }
+
+    /// The size of the pictures it takes.
+    pub fn source_size(&self) -> (usize, usize) {
+        (self.sw, self.sh)
+    }
+
+    /// The same sizes as this one was made for.
+    pub fn fits(&self, sw: u32, sh: u32, aw: u32, ah: u32) -> bool {
+        (self.sw, self.sh, self.aw, self.ah) == (sw as usize, sh as usize, aw as usize, ah as usize)
+    }
+
+    /// A picture of four bytes a pixel (R, G, B and one ignored, or B, G, R
+    /// and one ignored with `bgr`), its first row at `offset` and each
+    /// `stride` bytes after the one before, to RGBA8 at the analysis size.
+    pub fn packed(&mut self, src: &[u8], offset: usize, stride: usize, bgr: bool, out: &mut Vec<u8>) {
+        let len = self.sw * 4;
+        assert!(stride >= len && src.len() >= offset + (self.sh - 1) * stride + len, "picture data too short for its size");
+        self.shrink_rows(&mut Packed { src, offset, stride, len }, bgr, out);
+    }
+
+    /// A 4:2:0 picture: each row converted to RGB pixel by pixel as the GPU
+    /// converts it (the arithmetic of [`crate::yuv::to_rgba`]), then summed.
+    pub fn yuv420(&mut self, data: &[u8], layout: &crate::yuv::YuvLayout, out: &mut Vec<u8>) {
+        assert!(layout.fits(data.len(), self.sw, self.sh), "picture data too short for its layout");
+        let buf = std::mem::take(&mut self.rgba);
+        let mut rows = YuvRows { data, l: layout, width: self.sw, buf, last: usize::MAX };
+        self.shrink_rows(&mut rows, false, out);
+        self.rgba = rows.buf;
+    }
+
+    fn shrink_rows<R: Rows>(&mut self, rows: &mut R, bgr: bool, out: &mut Vec<u8>) {
+        let (sw, aw, ah) = (self.sw, self.aw, self.ah);
+        out.clear();
+        out.resize(aw * ah * 4, 255);
+        let total = self.cols.total as u64 * self.rows.total as u64;
+        let (ri, bi) = if bgr { (2, 0) } else { (0, 2) };
+        // a row box's sums in 16 bits when they fit (twice the lanes)
+        let narrow = self.rows.total as usize * 255 <= u16::MAX as usize;
+        // a pixel's whole sum in 32 bits unless the boxes are huge
+        let wide = total * 255 > u32::MAX as u64;
+        macro_rules! shrink_with {
+            ($acc:expr, $t:ty) => {{
+                let acc = &mut $acc[..sw * 4];
+                for (y, (first, wy)) in self.rows.boxes.iter().enumerate() {
+                    acc.fill(0);
+                    for (k, &w) in wy.iter().enumerate() {
+                        let row = rows.row(first + k);
+                        let w = w as $t;
+                        for (a, &p) in acc.iter_mut().zip(row) {
+                            *a += w * p as $t;
+                        }
+                    }
+                    let orow = &mut out[y * aw * 4..(y + 1) * aw * 4];
+                    for (x, (first, wx)) in self.cols.boxes.iter().enumerate() {
+                        let o = &mut orow[x * 4..x * 4 + 3];
+                        if wide {
+                            let mut sum = [0u64; 3];
+                            for (k, &w) in wx.iter().enumerate() {
+                                let p = &acc[(first + k) * 4..][..3];
+                                sum[0] += w as u64 * p[0] as u64;
+                                sum[1] += w as u64 * p[1] as u64;
+                                sum[2] += w as u64 * p[2] as u64;
+                            }
+                            o[0] = round_div(sum[ri], total);
+                            o[1] = round_div(sum[1], total);
+                            o[2] = round_div(sum[bi], total);
+                        } else {
+                            let mut sum = [0u32; 3];
+                            for (k, &w) in wx.iter().enumerate() {
+                                let p = &acc[(first + k) * 4..][..3];
+                                sum[0] += w * p[0] as u32;
+                                sum[1] += w * p[1] as u32;
+                                sum[2] += w * p[2] as u32;
+                            }
+                            o[0] = round_div(sum[ri] as u64, total);
+                            o[1] = round_div(sum[1] as u64, total);
+                            o[2] = round_div(sum[bi] as u64, total);
+                        }
+                    }
+                }
+            }};
+        }
+        if narrow {
+            let mut acc = std::mem::take(&mut self.acc16);
+            acc.resize(sw * 4, 0);
+            shrink_with!(acc, u16);
+            self.acc16 = acc;
+        } else {
+            let mut acc = std::mem::take(&mut self.acc);
+            acc.resize(sw * 4, 0);
+            shrink_with!(acc, u32);
+            self.acc = acc;
+        }
+    }
+}
+
+/// Where [`Shrink`] reads a picture's rows, four bytes a pixel.
+trait Rows {
+    fn row(&mut self, y: usize) -> &[u8];
+}
+
+struct Packed<'a> {
+    src: &'a [u8],
+    offset: usize,
+    stride: usize,
+    len: usize,
+}
+
+impl Rows for Packed<'_> {
+    fn row(&mut self, y: usize) -> &[u8] {
+        &self.src[self.offset + y * self.stride..][..self.len]
+    }
+}
+
+/// A 4:2:0 picture's rows converted to RGBX one at a time (a row two boxes
+/// share is converted once).
+struct YuvRows<'a> {
+    data: &'a [u8],
+    l: &'a crate::yuv::YuvLayout,
+    width: usize,
+    buf: Vec<u8>,
+    last: usize,
+}
+
+impl Rows for YuvRows<'_> {
+    fn row(&mut self, y: usize) -> &[u8] {
+        if self.last != y {
+            self.last = y;
+            let (l, w) = (self.l, self.width);
+            self.buf.resize(w * 4, 255);
+            let [ky, kr, kgu, kgv, kb, yoff] = l.coefficients();
+            let yrow = &self.data[l.y_off + y * l.y_stride..][..w];
+            let cy = y / 2;
+            let cw = w.div_ceil(2);
+            let out = &mut self.buf[..w * 4];
+            // the chroma terms once for the two pixels that share them
+            let mut pair = |cx: usize, u: i32, v: i32| {
+                let (cr, cg, cb) = (kr * v + 32768, -kgu * u - kgv * v + 32768, kb * u + 32768);
+                for x in 2 * cx..(2 * cx + 2).min(w) {
+                    let yy = (yrow[x] as i32 - yoff) * ky;
+                    let o = &mut out[x * 4..x * 4 + 3];
+                    o[0] = ((yy + cr) >> 16).clamp(0, 255) as u8;
+                    o[1] = ((yy + cg) >> 16).clamp(0, 255) as u8;
+                    o[2] = ((yy + cb) >> 16).clamp(0, 255) as u8;
+                }
+            };
+            if l.nv12 {
+                let crow = &self.data[l.u_off + cy * l.u_stride..][..2 * cw];
+                for cx in 0..cw {
+                    pair(cx, crow[2 * cx] as i32 - 128, crow[2 * cx + 1] as i32 - 128);
+                }
+            } else {
+                let urow = &self.data[l.u_off + cy * l.u_stride..][..cw];
+                let vrow = &self.data[l.v_off + cy * l.v_stride..][..cw];
+                for cx in 0..cw {
+                    pair(cx, urow[cx] as i32 - 128, vrow[cx] as i32 - 128);
+                }
+            }
+        }
+        &self.buf
+    }
+}
+
+/// `n / d` rounded to the nearest integer, halves to even, capped at 255.
+fn round_div(n: u64, d: u64) -> u8 {
+    let (q, r) = (n / d, n % d);
+    let q = if 2 * r > d || (2 * r == d && q % 2 == 1) { q + 1 } else { q };
+    q.min(255) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +309,91 @@ mod tests {
         // left box covers px0 (w1) + half of px1 (w0.5): (0*1 + 90*0.5)/1.5 = 30
         assert_eq!(out[0], 30);
         assert_eq!(out[4], 150);
+    }
+
+    /// A picture of pseudo-random pixels (smooth enough to look like video
+    /// in places, noisy in others).
+    fn picture(w: usize, h: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(2654435761) | 1;
+        (0..w * h * 4)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                let smooth = ((i / 4 % w) * 255 / w.max(1)) as u32;
+                (if (i / 4 / w) % 3 == 0 { smooth } else { x % 256 }) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shrink_matches_the_float_area_average() {
+        for &(sw, sh, aw, ah) in &[(1920u32, 960u32, 256u32, 128u32), (1920, 1080, 256, 144), (1280, 720, 256, 144), (3840, 2160, 256, 144), (1918, 1078, 256, 143), (640, 360, 256, 144), (256, 144, 256, 144), (97, 61, 13, 7)] {
+            let src = picture(sw as usize, sh as usize, sw ^ sh);
+            let want = area_downsample(&src, 4, sw, sh, aw, ah);
+            let mut sh_ = Shrink::new(sw, sh, aw, ah);
+            let mut got = Vec::new();
+            sh_.packed(&src, 0, sw as usize * 4, false, &mut got);
+            assert_eq!(got.len(), want.len());
+            let diff: Vec<i32> = got.iter().zip(&want).map(|(&a, &b)| a as i32 - b as i32).collect();
+            let off = diff.iter().filter(|&&d| d != 0).count();
+            assert!(diff.iter().all(|d| d.abs() <= 1), "{sw}x{sh} -> {aw}x{ah}: a code off by more than one");
+            // only exact halves can round differently
+            assert!(off * 1000 <= diff.len(), "{sw}x{sh} -> {aw}x{ah}: {off} of {} codes differ", diff.len());
+            if (sw, sh) == (aw, ah) {
+                assert_eq!(off, 0, "the same size copies through");
+            }
+        }
+    }
+
+    #[test]
+    fn shrink_reads_bgr_strided_and_yuv_pictures() {
+        let (sw, sh, aw, ah) = (60usize, 40usize, 16u32, 10u32);
+        let src = picture(sw, sh, 7);
+        let mut plain = Vec::new();
+        let mut s = Shrink::new(sw as u32, sh as u32, aw, ah);
+        s.packed(&src, 0, sw * 4, false, &mut plain);
+        // the same pixels as B, G, R, X, rows padded to 256 bytes, 32 bytes in
+        let stride = 256;
+        let mut bgr = vec![0u8; 32 + sh * stride];
+        for y in 0..sh {
+            for x in 0..sw {
+                let p = &src[(y * sw + x) * 4..];
+                bgr[32 + y * stride + x * 4..][..4].copy_from_slice(&[p[2], p[1], p[0], 9]);
+            }
+        }
+        let mut got = Vec::new();
+        s.packed(&bgr, 32, stride, true, &mut got);
+        assert_eq!(got, plain);
+        // 4:2:0: as its RGB conversion shrunk
+        let l = crate::yuv::YuvLayout::packed_i420(sw, sh, true, false);
+        let yuv: Vec<u8> = (0..sw * sh * 3 / 2).map(|i| (i * 37 % 220 + 16) as u8).collect();
+        let mut rgba = Vec::new();
+        crate::yuv::to_rgba(&yuv, sw, sh, &l, &mut rgba);
+        let mut want = Vec::new();
+        s.packed(&rgba, 0, sw * 4, false, &mut want);
+        s.yuv420(&yuv, &l, &mut got);
+        assert_eq!(got, want);
+        assert!(s.fits(sw as u32, sh as u32, aw, ah) && !s.fits(sw as u32, sh as u32, aw, ah + 1));
+        // NV12 of an odd size, rows padded
+        let (w, h) = (37usize, 23usize);
+        let cw = w.div_ceil(2);
+        let l = crate::yuv::YuvLayout { nv12: true, y_off: 0, y_stride: 40, u_off: 40 * h, u_stride: 2 * cw + 2, v_off: 0, v_stride: 0, bt709: false, full_range: true };
+        let data: Vec<u8> = (0..40 * h + (2 * cw + 2) * h.div_ceil(2)).map(|i| (i * 53 % 251) as u8).collect();
+        let mut rgba = Vec::new();
+        crate::yuv::to_rgba(&data, w, h, &l, &mut rgba);
+        let mut s = Shrink::new(w as u32, h as u32, 9, 5);
+        s.packed(&rgba, 0, w * 4, false, &mut want);
+        s.yuv420(&data, &l, &mut got);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn halves_round_to_even() {
+        assert_eq!(round_div(5, 2), 2);
+        assert_eq!(round_div(7, 2), 4);
+        assert_eq!(round_div(8, 3), 3);
+        assert_eq!(round_div(700, 1), 255);
     }
 }
 

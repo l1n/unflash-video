@@ -198,6 +198,7 @@ export class Feeder {
 
   setRoute(route, detail = '') {
     this.route = route;
+    this.routeDetail = detail;
     if (route !== this.reported) {
       this.reported = route;
       profile.note('route', route + (detail ? ` (${detail})` : ''));

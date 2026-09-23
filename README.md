@@ -407,10 +407,18 @@ it reads them. Where WebGPU takes no frame (Firefox), that copy is most
 of what the page does per frame, so scans, prepares and verifications
 decode in **Web Workers** instead, one per segment or span: each worker
 decodes with WebCodecs, copies each picture out (its planes, or its RGB
-pixels) and transfers the bytes to the page, which uploads them and hands
-the buffer back to be filled again; a worker keeps at most four pictures
-waiting. The export and the players, which need real frames, decode on
-the page. `?decodeworkers=0` / `=1` overrides the choice.
+pixels) straight into the WebAssembly module's memory and makes it the
+detector's size there (`resample::Shrink`: the boxes of the GPU's ingest
+pass, summed exactly in integers, rows first so the sums vectorise, YUV
+converted a row at a time with the GPU's arithmetic), and the page gets
+128 KB a frame instead of the whole picture. That upload was most of a
+scan in Firefox, where it also crosses to a separate GPU process: an hour
+of 1920×960 took 172 s of a 269 s scan uploading 7 MB pictures. The
+browser test prepares a section both ways and requires the same cached
+pictures (they are identical there). A worker keeps at most four
+pictures waiting. The export and the players, which need real frames,
+decode on the page. `?decodeworkers=0` / `=1` overrides the choice, and
+`?shrink=0` hands the pictures over whole.
 
 ### Spans re-encoded, the rest copied
 

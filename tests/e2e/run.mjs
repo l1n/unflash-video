@@ -954,6 +954,15 @@ try {
     await page.uncheck('#liveToggle');
     await page.evaluate(() => document.querySelector('#player').pause());
   }
+  // the last route (?extsrc=none) decodes in workers, which make the pictures
+  // small there: the same pictures as the detector makes them, to a code
+  {
+    const cmp = await page.evaluate(() => window.__unflash.compareShrink(window.__unflash.state.project.sections[0].id));
+    console.log('pictures made small in the decode workers vs by the detector:', JSON.stringify(cmp));
+    assert(cmp.frames[0] > 100 && cmp.frames[0] === cmp.frames[1], 'both prepares cache every frame: ' + JSON.stringify(cmp.frames));
+    assert(/copied in a decode worker/.test(cmp.routes[0]) && /made \d+×\d+ in a decode worker/.test(cmp.routes[1]), 'one prepare hands over whole pictures, the other small ones: ' + JSON.stringify(cmp.routes));
+    assert(cmp.max <= 1 && cmp.differ <= cmp.n / 100, `the workers' small pictures are the detector's, to a code: ${cmp.differ} of ${cmp.n} values differ, by at most ${cmp.max}`);
+  }
   // the profiling summary is on the console at debug level
   const profileText = await page.evaluate(() => window.__unflash.profile.summary(1));
   console.log('profile summary:\n' + profileText);

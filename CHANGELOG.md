@@ -12,6 +12,7 @@ internals. -->
 
 ## 2026-09-23
 
+- <!-- 01:25 --> **Much faster scans in Firefox.** The background decoders now shrink each picture to the size the detector works at before handing it over, instead of the page sending every full-size picture to the GPU (for a 1920×960 film that was 7 MB a frame, and most of an hour-long scan). Section prepares and the check of an export get the same speed-up. The *debug info* report also shows a job that is still running.
 - <!-- 01:00 --> **Fewest removals don't freeze the picture.** Where taking the flashing out would still leave a picture frozen for half a second or more, some frames come back into that stretch at 3.8 a second (a rate that can't flash by itself), each try checked. **Auto-fix** now tries the fewest removals first, then keep dark, keep light and reduce FPS.
 - <!-- 00:40 --> **What's new** (this list): when you come back, the changes since your last visit are waiting on the start page, and the *What's new* button in the header has them all.
 - <!-- 00:40 --> **🐞 debug info**, bottom right: what your browser, GPU and video are and how long each job took (a scan step by step), ready to paste into a message when something is slow or goes wrong. It names no files.

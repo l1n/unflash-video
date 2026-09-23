@@ -94,7 +94,9 @@ export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, 
           report();
         }
       },
-      { cancel, raw: true, fast: true, reader }
+      // the detector needs only its analysis size: pictures decoded in
+      // workers are made that small there
+      { cancel, raw: true, fast: true, reader, shrink: movie.shrinkInWorkers === false ? null : { aw: f.aw, ah: f.ah } }
     );
     await f.drain();
     collect();
@@ -313,7 +315,7 @@ async function prepareSpans(env, movie, sec, plan, feeders, { onProgress, cancel
           report();
         }
       },
-      { cancel, raw: true, fast: true, fromIndex, reader: k > 0 && movie.reader ? movie.reader.fork() : null }
+      { cancel, raw: true, fast: true, fromIndex, reader: k > 0 && movie.reader ? movie.reader.fork() : null, shrink: movie.shrinkInWorkers === false ? null : { aw: f.aw, ah: f.ah } }
     );
     await f.drain();
     settle();
