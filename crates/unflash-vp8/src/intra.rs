@@ -22,7 +22,6 @@ fn avg3(a: u8, b: u8, c: u8) -> u8 {
 /// `above[0]` is the above-left sample and `above[1..=N]` the row above;
 /// `left` is the column to the left. The DC mode averages only the edges
 /// inside the picture (`have_above`, `have_left`).
-#[allow(clippy::too_many_arguments)]
 pub fn predict_block<const N: usize>(mode: u8, above: &[u8], left: &[u8], have_above: bool, have_left: bool, dst: &mut [u8], stride: usize) {
     let top = &above[1..=N];
     match mode {

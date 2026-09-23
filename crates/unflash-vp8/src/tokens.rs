@@ -98,7 +98,6 @@ fn read_block(bd: &mut BoolDecoder, probs: &[[[u8; 11]; 3]; 8], ctx: usize, firs
 /// updating the contexts above and to the left. `y2` says whether the luma
 /// DCs have their own block (every mode but `B_PRED` and `SPLITMV`).
 /// Returns whether any block has coefficients.
-#[allow(clippy::too_many_arguments)]
 pub fn read_mb(bd: &mut BoolDecoder, probs: &[[[[u8; 11]; 3]; 8]; 4], y2: bool, dq: &Dequant, above: &mut NonZero, left: &mut NonZero, out: &mut Coeffs) -> bool {
     let mut any = 0;
     let (first, luma) = if y2 {

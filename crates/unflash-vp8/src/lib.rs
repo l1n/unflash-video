@@ -8,12 +8,14 @@
 //! loop filters with sharpness and reference / mode deltas, one to eight
 //! token partitions, probability updates kept or discarded per frame
 //! (`refresh_entropy_probs`), every intra mode, six-tap and bilinear inter
-//! prediction (the version field chooses, version 3 with full-sample
+//! prediction (the version field chooses, version 3 with whole-sample
 //! chroma), split motion vectors, the golden and alt-ref frames with their
 //! sign bias and buffer copies, invisible frames, and frames of any size
 //! (a key frame may change it; the scaling bits are informational). A
-//! frame whose data runs out part way is decoded as far as it goes and
-//! the rest copied from the previous picture, marked damaged.
+//! frame whose data runs out part way is decoded as far as it goes, the
+//! rest copied from the last frame, and returned marked damaged; malformed
+//! headers are errors, and nothing in any input makes the decoder panic.
+//! Only a picture too large to allocate is refused as unsupported.
 //!
 //! The decoder follows the RFC's reference decoder and is tested bit-exact
 //! against ffmpeg's VP8 decoder on libvpx streams that exercise these tools
