@@ -316,3 +316,4 @@ table.clips td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); 
 .tour-arrow.left { display: block; right: -7px; border-bottom: none; border-left: none; }
 .tour-offer { display: flex; gap: 10px; align-items: center; margin: 4px 0 14px; color: var(--fg2); }
 .show-me { margin-left: 6px; }
+.finding.run-up { border-left-style: dashed; color: var(--fg2); }

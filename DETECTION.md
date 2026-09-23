@@ -170,6 +170,14 @@ WCAG passes that. ITC/Ofcom guidance treats sustained flashing at the limit
 as a hazard, and it does still affect some viewers, so the default profile
 reports it.
 
+"No gap longer than a second" is a hold: each qualifying moment counts as
+flashing for the second after it, so moments a second apart join up, and
+the 5-second window has to be 80% covered. The hold is how the flashing is
+measured, not flashing, so a report ends at its last qualifying moment.
+(It used to end a second later, where the hold ran out, and flashing that
+stopped where a section began was then blamed on that section's first
+second.)
+
 The rate test is what keeps this honest. Everything the failure test rejects
 as motion rather than flashing (pans, cuts between light and dark shots,
 scrolling credits, blinks, mouth-flaps) gets rejected here for the same
@@ -368,6 +376,18 @@ decided by where its *flashing* is, never by how far its onset reaches back.
 The onset exists to widen a section; letting it decide ownership blames a
 section for flashing that starts after its last frame and then offers its
 final frames as the fix.
+
+The run-up's flashing gets the same care at the other end. Flashing that runs
+up to a section's first frame reaches into it by the change into its first
+picture: when that picture differs enough from the last one before it, the
+change completes one more flash, which counts for the detector's pooling
+window (an eighth of a second) after. The section has to start with some
+picture of its own, so a flash or an extended flash that is already flashing
+before it and reaches no further than that is the run-up's. The check lists
+it as the section before's (or as the video's before it, where no section
+covers it) and leaves it out of this section's verdict. Flashing that goes on
+in the section's own frames is the section's, and its finding says where
+before the section it started.
 
 One side effect: because a section's check reads its neighbors' edits,
 editing one section clears the recorded verdict of any section close enough

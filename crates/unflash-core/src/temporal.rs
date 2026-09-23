@@ -954,9 +954,14 @@ impl Temporal {
                 });
             }
             let peak = best.map(|b| b.1).unwrap_or(s);
+            // The lit spans run on for the hold after each hit, which is how
+            // hits a second apart join up; the flashing itself stops at the
+            // last hit. Reported to the hold's end, flashing that stops where
+            // a section begins reads as a second of that section's own.
+            let last = hits[hits.partition_point(|&h| h <= e).max(1) - 1].max(s);
             out.push(Violation {
                 start: self.to_native(s),
-                end: self.to_native(e),
+                end: self.to_native(last),
                 kind: ViolationKind::Extended,
                 count: frac,
                 onset: self.to_native(s),

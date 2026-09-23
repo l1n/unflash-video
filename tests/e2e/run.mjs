@@ -554,6 +554,44 @@ try {
   results.extendedSections = await page.$$eval('#sectionList .sec-item', (els) => els.map((e) => e.textContent));
   console.log('extended (wcag_ext):', results.extendedSections);
   assert(results.extendedSections.some((s) => s.includes('extended flash')), 'the 3 Hz file must produce an extended-flash section under the default profile');
+  // the report ends where the flashing does (9 s), not a second on, where
+  // each moment's hold (which joins moments a second apart) runs out
+  const extViol = await page.evaluate(() => window.__unflash.lastScan.result.violations.filter((v) => v.kind === 'extended'));
+  assert(extViol.length === 1 && extViol[0].end > 8.9 && extViol[0].end < 9.4, 'the extended flash ends with its last flash: ' + JSON.stringify(extViol));
+  // cut in two by hand at 5 s: the second half's own flashing goes on from
+  // the first half's, and its finding says so; once none of its frames
+  // flash, the flashing before it is the first half's to fix, not its own
+  page.once('dialog', (d) => d.accept());
+  await page.click('#btnDeleteAll');
+  const addByHand = async (a, b) => {
+    await page.fill('#addStart', String(a));
+    await page.fill('#addEnd', String(b));
+    await page.click('#btnAddSection');
+    await page.waitForFunction((a) => { const s = window.__unflash.currentSection(); return s && Math.abs(s.start - a) < 1e-6 && s.prepared; }, a, { timeout: 120000 });
+    await jobDone(page);
+    await verdictReady(page);
+  };
+  await addByHand(0, 5);
+  await addByHand(5, 10);
+  const firstHalf = await page.evaluate(() => window.__unflash.state.project.sections.find((s) => s.start === 0).id);
+  const halfFindings = () => page.$$eval('#wsFindings .finding', (els) => els.map((e) => ({ run: e.classList.contains('run-up'), text: e.textContent })));
+  results.extendedSecondHalf = await halfFindings();
+  console.log('extended, second half:', JSON.stringify(results.extendedSecondHalf));
+  assert(results.extendedSecondHalf.length === 1 && !results.extendedSecondHalf[0].run && results.extendedSecondHalf[0].text.includes(`starts 3.0 s before this section, in section #${firstHalf}`), 'the second half\'s extended flash says where it starts: ' + JSON.stringify(results.extendedSecondHalf));
+  const halfFrames = await page.evaluate(() => window.__unflash.currentSection().nFrames);
+  await page.evaluate((n) => {
+    const u = window.__unflash;
+    u.state.selection = new Set(Array.from({ length: n - 1 }, (_, i) => i));
+  }, halfFrames);
+  await page.keyboard.press('r');
+  await page.waitForFunction((n) => Object.values(window.__unflash.currentSection().edits || {}).filter((e) => e.removed).length === n - 1, halfFrames, { timeout: 30000 });
+  await page.waitForFunction(() => { const c = window.__unflash.currentSection().check; return c && !c.stale; }, null, { timeout: 60000 });
+  await verdictReady(page);
+  results.extendedHalfCleared = { verdict: await page.textContent('#wsVerdict'), findings: await halfFindings() };
+  console.log('extended, second half with none of its frames flashing:', JSON.stringify(results.extendedHalfCleared));
+  assert(results.extendedHalfCleared.verdict === 'passes' && results.extendedHalfCleared.findings.length === 1 && results.extendedHalfCleared.findings[0].run && results.extendedHalfCleared.findings[0].text.includes(`up to its first picture, in section #${firstHalf}`), 'flashing that only reaches its first picture is the section before\'s: ' + JSON.stringify(results.extendedHalfCleared));
+  await page.click(`#wsFindings button[data-open-section="${firstHalf}"]`);
+  await page.waitForFunction((id) => window.__unflash.currentSection().id === id, firstHalf, { timeout: 5000 });
   page.once('dialog', (d) => d.accept());
   await page.click('#btnDeleteAll');
   await page.waitForFunction(() => document.querySelectorAll('#sectionList .sec-item').length === 1);

@@ -216,13 +216,24 @@ pub struct Classified {
 
 /// Which side of the boundary a violation falls on is decided by `start`
 /// and `end` -- where the flashing actually is -- never by `onset`.
-pub fn classify(result: &AnalysisResult, end_disp: f64, next_at: Option<f64>) -> Classified {
+///
+/// Flashing that runs up to the section's first frame reaches into it by
+/// the change into its first picture, which completes one more flash when
+/// that picture differs enough from the last one before it, and a flash
+/// completed counts for `boundary` seconds after (the detector's pooling
+/// window). The section has to start with some picture of its own, so a
+/// flash or an extended flash that is already flashing before it and
+/// reaches no further than that is the run-up's, not something its edits
+/// can clear. (A pattern is on the frames that show it: one reaching the
+/// section is on its frames.)
+pub fn classify(result: &AnalysisResult, end_disp: f64, next_at: Option<f64>, boundary: f64) -> Classified {
     let mut c = Classified::default();
     for v in &result.violations {
         if !result.reports(v.kind) {
             continue;
         }
-        if v.end < -1e-6 {
+        let run_up = v.kind != ViolationKind::Pattern && v.start < -1e-6 && v.end <= boundary + 1e-6;
+        if v.end < -1e-6 || run_up {
             c.before.push(v.clone());
         } else if v.start > end_disp + 1e-6 {
             match next_at {
@@ -1111,13 +1122,39 @@ mod tests {
             ..Default::default()
         };
         // next section starts 2.5 s after the section's last frame
-        let c = classify(&res, 2.0, Some(2.5));
+        let c = classify(&res, 2.0, Some(2.5), 0.125);
         assert_eq!(c.before.len(), 1);
         assert_eq!(c.inside.len(), 1);
         assert_eq!(c.after.len(), 1);
         assert_eq!(c.elsewhere.len(), 1);
-        let c = classify(&res, 2.0, None);
+        let c = classify(&res, 2.0, None, 0.125);
         assert_eq!(c.after.len(), 2);
+    }
+
+    #[test]
+    fn flashing_that_only_reaches_the_first_picture_is_the_run_ups() {
+        let v = |kind: ViolationKind, s: f64, e: f64| Violation { start: s, end: e, kind, count: 1.0, onset: s, peak: s };
+        let res = AnalysisResult {
+            violations: vec![
+                // flashing before the section whose last flash the change into its first picture completes
+                v(ViolationKind::Extended, -4.0, 0.0),
+                v(ViolationKind::Flash, -1.0, 0.1),
+                // ... and flashing that goes on in the section's own frames
+                v(ViolationKind::Extended, -4.0, 0.5),
+                v(ViolationKind::Red, -1.0, 0.2),
+                // flashing that starts at the section's first frame is its own
+                v(ViolationKind::Flash, 0.0, 0.1),
+                // stripes reaching the section are on its frames
+                v(ViolationKind::Pattern, -2.0, 0.05),
+            ],
+            flag_extended: true,
+            flag_patterns: true,
+            ..Default::default()
+        };
+        let c = classify(&res, 5.0, None, 0.125);
+        let ends = |vs: &[Violation]| vs.iter().map(|v| (v.kind, v.end)).collect::<Vec<_>>();
+        assert_eq!(ends(&c.before), vec![(ViolationKind::Extended, 0.0), (ViolationKind::Flash, 0.1)]);
+        assert_eq!(ends(&c.inside), vec![(ViolationKind::Extended, 0.5), (ViolationKind::Red, 0.2), (ViolationKind::Flash, 0.1), (ViolationKind::Pattern, 0.05)]);
     }
 
     #[test]

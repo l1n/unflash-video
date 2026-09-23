@@ -215,10 +215,12 @@ pub fn flagged_frames(seq_times: &[f64], violations_json: &str) -> Result<Vec<u3
     Ok(editing::flagged_frames(&seq, &v).into_iter().map(|x| x as u32).collect())
 }
 
+/// A section check's violations by where they land (see `editing::classify`).
 #[wasm_bindgen]
-pub fn classify(result_json: &str, end_disp: f64, next_at: Option<f64>) -> Result<String, JsValue> {
+pub fn classify(config_json: &str, result_json: &str, end_disp: f64, next_at: Option<f64>) -> Result<String, JsValue> {
+    let cfg = parse_cfg(config_json)?;
     let r = parse_result(result_json)?;
-    let c = editing::classify(&r, end_disp, next_at);
+    let c = editing::classify(&r, end_disp, next_at, cfg.area_accum_window);
     Ok(serde_json::json!({ "inside": c.inside, "after": c.after, "elsewhere": c.elsewhere, "before": c.before }).to_string())
 }
 

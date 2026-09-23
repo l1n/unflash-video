@@ -928,8 +928,15 @@ class FlashDetector:
             runs = [(min(float(be[k]), e) - max(float(ab[k]), s),
                      max(float(ab[k]), s)) for k in range(i0, i1)]
             peaks.append(max(runs)[1] if runs else s)
+        # The lit spans run on for the hold after each hit, which is how hits
+        # a second apart join up; the flashing itself stops at the last hit.
+        # Reported to the hold's end, flashing that stops where a section
+        # begins reads as a second of that section's own.
+        hits = tc[hit]
+        last = [max(float(hits[max(int(np.searchsorted(hits, m[1], side="right")), 1) - 1]), m[0])
+                for m in merged]
         starts = self._to_native(np.array([m[0] for m in merged]))
-        ends = self._to_native(np.array([m[1] for m in merged]))
+        ends = self._to_native(np.array(last))
         pk = self._to_native(np.array(peaks))
         return [Violation(float(a), float(b), "extended", m[2],
                           onset=float(a), peak=float(p))

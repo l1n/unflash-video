@@ -127,6 +127,11 @@ Files it reads:
    numbered *section* goes around each problem.
 2. **Open a section.** It prepares itself (its frames, plus a run-up and
    run-out, are decoded into memory at analysis resolution) and is checked.
+   Under the verdict, whatever still fails is listed with its frames and
+   times; flashing that goes on from before the section, or past its end,
+   says so and names the section it is in. Flashing from before the
+   section that reaches it only as its first picture comes up is the
+   section before's to fix, and is listed as such, outside this verdict.
 3. **Edit it.** Mark frames: **R** removes a frame and shows the previous
    one in its place, **F** the next one, **E** holds a frame for a second,
    **B** blends it with the frames either side of it (the flash is toned

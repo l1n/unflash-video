@@ -1266,7 +1266,7 @@ export async function checkSection(env, project, sec, edits, { extS = 1.0, onPro
   }
   await feeder.drain();
   const result = feeder.finish(true);
-  const cls = JSON.parse(wasm.classify(JSON.stringify(result), endDisp, ctx.nextAt === null ? undefined : ctx.nextAt + lastHold));
+  const cls = JSON.parse(wasm.classify(env.config, JSON.stringify(result), endDisp, ctx.nextAt === null ? undefined : ctx.nextAt + lastHold));
   const violations = [...cls.inside, ...cls.after];
   const wcagSafe = !violations.some((v) => v.kind === 'flash' || v.kind === 'red');
   const extendedBad = result.flag_extended && violations.some((v) => v.kind === 'extended');
@@ -1304,6 +1304,7 @@ export async function checkSection(env, project, sec, edits, { extS = 1.0, onPro
     inside: cls.inside,
     after: cls.after,
     elsewhere: cls.elsewhere,
+    before: cls.before,
     flagged,
     spills,
     stats,

@@ -2059,6 +2059,8 @@ function wireWorkspace() {
     selectFrames(sec, sec.check.flagged || [], 'everything still failing');
   });
   $('wsFindings').addEventListener('click', (e) => {
+    const go = e.target.closest('button[data-open-section]');
+    if (go) return openSection(+go.dataset.openSection);
     const b = e.target.closest('button[data-finding]');
     const sec = currentSection();
     if (!b || !sec || !sec.check) return;
@@ -2283,6 +2285,39 @@ function findings(sec) {
   return out;
 }
 
+/**
+ * The other sections over a stretch of the video's time `a`–`b` (seconds
+ * from the start of `sec`), nearest `sec` first.
+ */
+function sectionsNear(sec, a, b) {
+  const lo = sec.start + a;
+  const hi = sec.start + b;
+  return state.project
+    .sectionsSorted()
+    .filter((o) => o.id !== sec.id && o.end > lo + 1e-6 && o.start < hi - 1e-6)
+    .sort((x, y) => Math.abs(x.start - sec.start) - Math.abs(y.start - sec.start));
+}
+
+/**
+ * Where a violation's flashing lies outside `sec`, in words ("it starts
+ * 3.0 s before this section, in section #2"), and the section to open for
+ * it (null if none).
+ */
+function outsideOf(sec, v) {
+  const c = sec.check;
+  const parts = [];
+  let open = null;
+  const where = (list, video) => {
+    if (!list.length) return `, in ${video}, which no section covers`;
+    if (!open) open = list[0];
+    return `, in section${list.length > 1 ? 's' : ''} ${list.map((o) => '#' + o.id).join(' and ')}`;
+  };
+  if (v.start < -0.05) parts.push(`it starts ${(-v.start).toFixed(1)} s before this section${where(sectionsNear(sec, v.start, 0), 'the video before it')}`);
+  const end = c.endDisp || 0;
+  if (v.end > end + 0.05) parts.push(`it runs on ${(v.end - end).toFixed(1)} s past its end${where(sectionsNear(sec, sec.end - sec.start, sec.end - sec.start + v.end - end), 'the video after it')}`);
+  return { text: parts.join('; '), open };
+}
+
 /** Select `frames`, bring the first into view and say what was selected. */
 function selectFrames(sec, frames, what) {
   if (!frames.length) return toast('Nothing to select: the last check found nothing failing in this section.');
@@ -2295,15 +2330,28 @@ function selectFrames(sec, frames, what) {
   drawChart();
 }
 
+/**
+ * Flashing just before the section that runs up to its first picture and is
+ * the run-up's to fix (the check leaves it out of this section's verdict).
+ */
+function runUpFlashing(sec) {
+  const c = sec.check;
+  if (!c || c.stale || !c.before) return [];
+  return c.before.filter((v) => v.kind !== 'pattern' && c[`flag_${v.kind}`] !== false && v.end >= -1);
+}
+
 /** The list under the verdict: each remaining problem, where it is, and what fixes it. */
 function renderFindings(sec) {
   const box = $('wsFindings');
   const list = sec.prepared ? findings(sec) : [];
-  box.classList.toggle('hidden', !list.length);
-  if (!list.length) {
+  const runUp = sec.prepared ? runUpFlashing(sec) : [];
+  box.classList.toggle('hidden', !list.length && !runUp.length);
+  if (!list.length && !runUp.length) {
     box.innerHTML = '';
     return;
   }
+  const label = (kind) => (KIND_LABEL[kind] || kind).replace(/^./, (m) => m.toUpperCase());
+  const openButton = (o) => (o ? `<button class="small" data-open-section="${o.id}">open section #${o.id}</button>` : '');
   const dur = (f) => `${fmt(sec.check.seq.t[f.first])} – ${fmt(sec.check.seq.t[f.last])} into the section`;
   const how = {
     flash: 'Flashing faster than 3 times a second over enough of the screen: remove (R, F) or blend (B) frames, or let a Suggest button pick them.',
@@ -2311,9 +2359,19 @@ function renderFindings(sec) {
     extended: 'Flashing at the limit rate (3 a second) for 5 seconds or more. WCAG allows it; this profile flags it because long runs of it affect some viewers. It clears once the flashing is broken into stretches shorter than 5 seconds by pauses of more than a second (remove or hold frames), or once its contrast is low enough: select it, tick "selection only" and use a Suggest button.',
     pattern: 'A stationary stripe pattern over a quarter of the screen: tick "soften stripes" above.',
   };
-  box.innerHTML = list
-    .map((f, k) => `<div class="finding ${f.kind}"><b>${(KIND_LABEL[f.kind] || f.kind).replace(/^./, (m) => m.toUpperCase())}</b>, frames ${f.first}–${f.last} (${dur(f)}, ${(sec.check.seq.t[f.last] - sec.check.seq.t[f.first]).toFixed(1)} s)<button class="small" data-finding="${k}">select these frames</button><div class="how">${how[f.kind] || ''}</div></div>`)
-    .join('');
+  const own = list.map((f, k) => {
+    const out = outsideOf(sec, f.v);
+    const more = out.text ? `; ${out.text}` : '';
+    return `<div class="finding ${f.kind}"><b>${label(f.kind)}</b>, frames ${f.first}–${f.last} (${dur(f)}, ${(sec.check.seq.t[f.last] - sec.check.seq.t[f.first]).toFixed(1)} s)${more}<button class="small" data-finding="${k}">select these frames</button>${openButton(out.open)}<div class="how">${how[f.kind] || ''}</div></div>`;
+  });
+  const before = runUp.map((v) => {
+    const near = sectionsNear(sec, v.start, 0);
+    const where = near.length ? `in section #${near[0].id}` : 'in the video before it, which no section covers';
+    const what = v.end >= -0.05 ? 'up to its first picture' : `up to ${(-v.end).toFixed(1)} s before it`;
+    const fix = near.length ? `It is fixed there: nothing in this section's frames can clear it.` : `Nothing in this section's frames can clear it: widen this section back over it, or add a section there.`;
+    return `<div class="finding ${v.kind} run-up"><b>${label(v.kind)} before this section</b>, from ${(-v.start).toFixed(1)} s before it ${what}, ${where}${openButton(near[0])}<div class="how">${fix} This section's verdict leaves it out.</div></div>`;
+  });
+  box.innerHTML = own.join('') + before.join('');
 }
 
 function describeFailure(c) {
