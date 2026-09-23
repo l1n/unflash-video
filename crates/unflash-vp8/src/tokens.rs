@@ -98,7 +98,17 @@ fn read_block(bd: &mut BoolDecoder, probs: &[[[u8; 11]; 3]; 8], ctx: usize, firs
 /// updating the contexts above and to the left. `y2` says whether the luma
 /// DCs have their own block (every mode but `B_PRED` and `SPLITMV`).
 /// Returns whether any block has coefficients.
-pub fn read_mb(bd: &mut BoolDecoder, probs: &[[[[u8; 11]; 3]; 8]; 4], y2: bool, dq: &Dequant, above: &mut NonZero, left: &mut NonZero, out: &mut Coeffs) -> bool {
+pub fn read_mb(partition: &mut BoolDecoder, probs: &[[[[u8; 11]; 3]; 8]; 4], y2: bool, dq: &Dequant, above: &mut NonZero, left: &mut NonZero, out: &mut Coeffs) -> bool {
+    // a copy of the decoder the compiler can keep in registers, where the
+    // stores of the coefficients cannot touch it
+    let mut local = partition.clone();
+    let any = read_blocks(&mut local, probs, y2, dq, above, left, out);
+    *partition = local;
+    any
+}
+
+#[inline(always)]
+fn read_blocks(bd: &mut BoolDecoder, probs: &[[[[u8; 11]; 3]; 8]; 4], y2: bool, dq: &Dequant, above: &mut NonZero, left: &mut NonZero, out: &mut Coeffs) -> bool {
     let mut any = 0;
     let (first, luma) = if y2 {
         let ctx = (above[8] + left[8]) as usize;

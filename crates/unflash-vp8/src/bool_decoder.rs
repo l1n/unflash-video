@@ -4,6 +4,7 @@
 /// Reads the bools of one partition, MSB first. Past the end of the data it
 /// reads zeros as the reference decoder does, and keeps count so a frame
 /// that runs out of data can be recognised (see [`BoolDecoder::exhausted`]).
+#[derive(Clone)]
 pub struct BoolDecoder<'a> {
     data: &'a [u8],
     /// The next byte of `data` to load; it keeps counting past the end
