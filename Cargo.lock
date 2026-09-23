@@ -1134,6 +1134,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7c4ceeeca15c8384bbc3e011dbd8fccb7f068a440b752b7d9b32ceb0ca0e2e8"
 
 [[package]]
+name = "unflash-av1"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "md5",
+ "rav1d",
+ "unflash-mp4",
+]
+
+[[package]]
 name = "unflash-core"
 version = "0.1.0"
 dependencies = [
