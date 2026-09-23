@@ -415,9 +415,10 @@ macroblock's four neighbours are found once instead of at every lookup:
 the macroblock layer's hot code was just over a 32 KB instruction cache
 (over the first 16 frames, 16.4 M simulated misses at 32 KB but 3.7 M at
 48 KB; now 10.4 M and 1.7 M). Together with the
-deblocking kernels this took the decoder from 9.53 G to 8.19 G
-instructions, from 51.5 M to 39.6 M mispredicted branches and from
-60.4 M to 39.0 M instruction-cache misses on that clip.
+deblocking kernels (and the boundary strengths' coefficient test done on
+all of an edge's segments at once) this took the decoder from 9.53 G to
+8.17 G instructions, from 51.5 M to 38.5 M mispredicted branches and from
+60.4 M to 39.5 M instruction-cache misses on that clip.
 
 The **temporal stage** (`crates/unflash-core/src/temporal.rs`) is the rest
 of the reference `FlashDetector`, unchanged in logic: the window-mean
