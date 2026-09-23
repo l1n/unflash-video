@@ -39,9 +39,18 @@ function smallPicture(p) {
     displayHeight: p.height,
     timestamp: p.timestamp,
     data: p.data,
+    damaged: !!p.damaged,
     detail: `${p.from[0]}×${p.from[1]}, made ${p.width}×${p.height} by the built-in decoder`,
     close() {},
   };
+}
+
+/** A picture as a worker sent it: made small, or whole. */
+function workerPicture(p) {
+  if (p.kind === 'rgba') return smallPicture(p);
+  const pic = rawPicture(p.data, p.width, p.height, p.timestamp, p.colorSpace);
+  pic.damaged = !!p.damaged;
+  return pic;
 }
 
 export class SoftwarePool {
@@ -170,10 +179,12 @@ export class SoftwarePool {
    * what it has not handed out yet can still go elsewhere (a hybrid scan
    * gives it to another decoder). The pictures of consecutive stretches
    * reach `onFrame(frame, tSec)` in presentation order, with no pause for
-   * the workers at the seams. With `strict`, a damaged picture fails the
-   * pass instead of being handed on. Returns the number of frames delivered.
+   * the workers at the seams, and `onStretchDone(stretch)` hears when the
+   * last picture of a stretch has been handed on. With `strict`, a damaged
+   * picture fails the pass instead of being handed on (the pictures before
+   * it have been). Returns the number of frames delivered.
    */
-  async decodeStretches(next, onFrame, { cancel, onProgress, window, raw = false, fast = false, shrink = null, strict = false } = {}) {
+  async decodeStretches(next, onFrame, { cancel, onProgress, window, raw = false, fast = false, shrink = null, strict = false, onStretchDone = null } = {}) {
     if (this.busy) throw new Error('the decoder pool is busy');
     this.busy = true;
     // pictures made small (raw ones for the detector only) cost little to hold
@@ -192,11 +203,13 @@ export class SoftwarePool {
           break;
         }
         const gs = this.groups(s.startIdx, s.endIdx);
-        for (const g of gs) {
-          groups.push({ ...g, startSec: s.startSec, endSec: s.endSec });
+        // a stretch with nothing to decode still ends, in its turn
+        if (!gs.length) gs.push({ a: s.startIdx, ext: s.startIdx, minPts: 0, maxPts: 0 });
+        gs.forEach((g, k) => {
+          groups.push({ ...g, startSec: s.startSec, endSec: s.endSec, stretch: s, last: k === gs.length - 1 });
           out.push({ queue: [], done: false, damaged: 0, error: null, worker: null });
-        }
-        if (gs.length) return true;
+        });
+        return true;
       }
       return false;
     };
@@ -222,7 +235,7 @@ export class SoftwarePool {
     const handlers = this.workers.map((w) => {
       const h = (e) => {
         const m = e.data;
-        if (m.type === 'frame') out[m.id].queue.push(m.pic.kind === 'rgba' ? smallPicture(m.pic) : rawPicture(m.pic.data, m.pic.width, m.pic.height, m.pic.timestamp, m.pic.colorSpace));
+        if (m.type === 'frame') out[m.id].queue.push(workerPicture(m.pic));
         else if (m.type === 'done') {
           const o = out[m.id];
           o.done = true;
@@ -259,6 +272,7 @@ export class SoftwarePool {
             const pic = o.queue.shift();
             const t = pic.timestamp / 1e6;
             if (t >= g.startSec - 1e-6 && t < g.endSec - 1e-9) {
+              if (strict && pic.damaged) throw new Error(`the built-in ${this.codec.name} decoder damaged the picture at ${t.toFixed(3)} s`);
               await onFrame(raw ? pic : pic.toVideoFrame(), t);
               frames++;
             }
@@ -273,6 +287,7 @@ export class SoftwarePool {
         if (stopped) break;
         damaged += o.damaged;
         if (strict && o.damaged) throw new Error(o.error ? `the built-in decoder failed: ${o.error}` : `the built-in decoder damaged ${o.damaged} picture${o.damaged === 1 ? '' : 's'}`);
+        if (g.last && onStretchDone) await onStretchDone(g.stretch);
         if (onProgress) onProgress(k + 1, groups.length);
       }
     } finally {

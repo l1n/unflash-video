@@ -271,14 +271,18 @@ export class Movie {
  * `fast` it skips the deblocking filter (statistics only). Decoding starts
  * at the last keyframe at or before `startSec`, or at sample `fromIndex`
  * (decode order) when given. With `inline`, the built-in decoder decodes on
- * the page rather than in its workers.
+ * the page rather than in its workers. With `raw` and `shrink` ({aw, ah}:
+ * the detector's analysis size) the pictures may come made that small;
+ * with `workers` as well they always do, the browser's decoder running in
+ * a decode worker (pictures a scan holds on to: a VideoFrame held stops
+ * its decoder).
  */
-export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null, shrink = null, inline = false } = {}) {
+export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null, shrink = null, inline = false, workers = false } = {}) {
   if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, fromIndex, reader, shrink, inline });
   // pictures for the detector alone: decoded and copied in a worker where
   // the detector would copy them on the page anyway (and, with `shrink`
   // ({aw, ah}), made that small there)
-  if (raw && movie.decodeInWorkers && typeof Worker !== 'undefined') return decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onProgress, fromIndex, shrink });
+  if (raw && (movie.decodeInWorkers || workers) && typeof Worker !== 'undefined') return decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onProgress, fromIndex, shrink });
   const cfg = movie.decoderConfig();
   reader = reader || movie.reader || new ChunkReader(movie.file);
   const { pts, dts, offset, size, sync, dur } = movie.v;
@@ -548,6 +552,8 @@ function workerPicture(p, credit) {
     timestamp: p.timestamp,
     colorSpace: p.colorSpace,
     data: new Uint8Array(p.data, 0, p.bytes),
+    // the buffer goes back to the worker on close: copy what is to be kept
+    lent: true,
     layout: p.layout,
     detail: p.shrunk ? `${p.format} ${p.shrunk.from[0]}×${p.shrunk.from[1]}, made ${p.width}×${p.height} in a decode worker` : `${p.format}, copied in a decode worker`,
     close() {
@@ -609,6 +615,28 @@ export function rawPicture(data, width, height, timestampUs, colorSpace) {
   };
 }
 
+/** The analysis size pictures for the detector alone are made small to, or null. */
+function smallSize(raw, shrink) {
+  return raw && shrink && shrink.aw > 0 && shrink.ah > 0 ? { aw: shrink.aw, ah: shrink.ah } : null;
+}
+
+/** A picture the built-in decoder made the detector's size on the page (RGBA), shaped like a raw one for the Feeder. */
+function smallRawPicture(data, small, timestampUs, width, height) {
+  return {
+    raw: true,
+    kind: 'rgba',
+    format: 'RGBA',
+    codedWidth: small.aw,
+    codedHeight: small.ah,
+    displayWidth: small.aw,
+    displayHeight: small.ah,
+    timestamp: timestampUs,
+    data,
+    detail: `${width}×${height}, made ${small.aw}×${small.ah} by the built-in decoder`,
+    close() {},
+  };
+}
+
 /** The picture the built-in decoder just produced, copied out of WebAssembly memory. */
 export function softwarePicture(wasm, dec, timestampUs) {
   const w = dec.width();
@@ -630,14 +658,17 @@ export function softwarePicture(wasm, dec, timestampUs) {
  * fromIndex } (as decodeRange takes them) or null; the pictures reach
  * `onFrame` in order, made the detector's size (`shrink`) in the workers,
  * fully decoded (the deblocking filter too, so they are the pictures the
- * browser's decoder gives). A damaged picture fails the pass.
+ * browser's decoder gives). With `strict` (as it is unless said otherwise)
+ * a damaged picture fails the pass. `onStretchDone(stretch)` hears when a
+ * stretch (next()'s record, with anything else it carries) has handed on
+ * its last picture.
  */
-export function decodeStretchesBuiltIn(movie, pool, next, onFrame, { cancel, shrink = null } = {}) {
+export function decodeStretchesBuiltIn(movie, pool, next, onFrame, { cancel, shrink = null, strict = true, onStretchDone = null } = {}) {
   const stretch = () => {
     const s = next();
-    return s ? { ...sampleRange(movie, s.startSec, s.endSec, s.fromIndex), startSec: s.startSec, endSec: s.endSec } : null;
+    return s ? { ...s, ...sampleRange(movie, s.startSec, s.endSec, s.fromIndex) } : null;
   };
-  return pool.decodeStretches(stretch, onFrame, { cancel, raw: true, fast: false, shrink, strict: true });
+  return pool.decodeStretches(stretch, onFrame, { cancel, raw: true, fast: false, shrink, strict, onStretchDone });
 }
 
 /**
@@ -647,12 +678,15 @@ export function decodeStretchesBuiltIn(movie, pool, next, onFrame, { cancel, shr
  * on in presentation order (a decoder that gives them in decode order says
  * how far out of order they can be).
  */
-async function decodeRangeBuiltInInline(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null } = {}) {
+async function decodeRangeBuiltInInline(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null, shrink = null } = {}) {
   const mod = await loadDecoders();
   reader = reader || movie.reader || new ChunkReader(movie.file);
   const { pts, offset, size } = movie.v;
   const { startIdx, endIdx } = sampleRange(movie, startSec, endSec, fromIndex);
   const d = new mod.SoftDecoder(movie.builtIn.id, movie.dx.track_description(movie.video.index), fast);
+  // pictures for the detector alone made small here, as the workers make them
+  const small = smallSize(raw, shrink);
+  if (small) d.set_shrink(small.aw, small.ah);
   const reorder = d.reorder_depth();
   const held = [];
   let frames = 0;
@@ -660,6 +694,10 @@ async function decodeRangeBuiltInInline(movie, startSec, endSec, onFrame, { canc
   const collect = (n) => {
     for (let k = 0; k < n && d.next(); k++) {
       if (d.frame_damaged()) damaged++;
+      if (small) {
+        held.push(smallRawPicture(d.small(), small, pts[d.frame_pts()], d.width(), d.height()));
+        continue;
+      }
       const data = new Uint8Array(mod.wasm_memory().buffer, d.frame_ptr(), d.frame_len()).slice();
       let colorSpace = null;
       try {
@@ -726,8 +764,20 @@ async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, o
     // pictures for the detector are made small in the workers
     return pool.decodeRange(startIdx, endIdx, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, shrink: raw ? shrink : null });
   }
-  if (movie.builtIn && movie.builtIn.id !== 'h264') return decodeRangeBuiltInInline(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, fromIndex: startIdx, reader });
+  if (movie.builtIn && movie.builtIn.id !== 'h264') return decodeRangeBuiltInInline(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, fromIndex: startIdx, reader, shrink });
   const dec = new movie.wasm.H264Decoder(movie.dx.track_description(movie.video.index), fast);
+  // pictures for the detector alone made small here, as the workers make them
+  const small = smallSize(raw, shrink);
+  if (small) {
+    let colorSpace = null;
+    try {
+      colorSpace = JSON.parse(dec.color_json());
+    } catch (e) {
+      /* default colour space */
+    }
+    const words = yuvLayoutWords('I420', [{ offset: 0, stride: 0 }, { offset: 0, stride: 0 }, { offset: 0, stride: 0 }], colorSpace, dec.height());
+    dec.set_shrink(small.aw, small.ah, words[7] === 1, words[8] === 1);
+  }
   // presentation order of the samples this pass will decode
   const ptsSorted = [];
   for (let i = startIdx; i < n; i++) {
@@ -766,7 +816,7 @@ async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, o
       profile.add('sw.decode', performance.now() - td);
       if (got) {
         if (dec.frame_damaged()) damaged++;
-        ready.set(pts[i], softwarePicture(movie.wasm, dec, pts[i]));
+        ready.set(pts[i], small ? smallRawPicture(dec.small(), small, pts[i], dec.width(), dec.height()) : softwarePicture(movie.wasm, dec, pts[i]));
       } else {
         // no picture for this sample: do not wait for it
         const k = ptsSorted.indexOf(pts[i]);

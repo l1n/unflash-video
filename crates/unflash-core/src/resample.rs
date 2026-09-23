@@ -345,13 +345,11 @@ fn convert_row(yrow: &[u8], t: &[i32], cw: usize, ky: i32, yoff: i32, out: [&mut
     assert!(t.len() >= 3 * cw && cw >= w.div_ceil(2) && out.iter().all(|o| o.len() >= w));
     #[allow(unused_mut)]
     let mut out = out;
-    #[allow(unused_mut)]
-    let mut x0 = 0;
+    // SAFETY: the lengths were checked above; simd128 is enabled for the build
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    {
-        // SAFETY: the lengths were checked above; simd128 is enabled for the build
-        x0 = unsafe { convert_row_simd128(yrow, t, cw, ky, yoff, &mut out) };
-    }
+    let x0 = unsafe { convert_row_simd128(yrow, t, cw, ky, yoff, &mut out) };
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    let x0 = 0;
     let [r, g, b] = out;
     for x in x0..w {
         let yy = (yrow[x] as i32 - yoff) * ky;

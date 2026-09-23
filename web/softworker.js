@@ -57,6 +57,8 @@ async function run(job) {
   let damaged = 0;
   let decodeMs = 0;
   let decoded = 0;
+  // after a sample the decoder could not take, what refers to it is not to be trusted
+  let tainted = false;
   const post = async (pic) => {
     while (credits <= 0 && !cancelled) await wait();
     if (cancelled) return;
@@ -68,10 +70,14 @@ async function run(job) {
   // the sample it came from (exact, where a time might not round-trip)
   const collect = (n) => {
     for (let k = 0; k < n && d.next(); k++) {
-      if (d.frame_damaged()) damaged++;
+      // each picture says whether it is damaged, so that a scan can stop at it
+      const bad = d.frame_damaged() || tainted;
+      if (bad) damaged++;
       const at = pts[d.frame_pts()];
       if (at === undefined || at < minPts || at >= maxPts) continue;
-      held.push(picture(d, shrink, at));
+      const pic = picture(d, shrink, at);
+      if (bad) pic.damaged = true;
+      held.push(pic);
     }
     held.sort((a, b) => a.timestamp - b.timestamp);
   };
@@ -84,6 +90,7 @@ async function run(job) {
         n = d.decode(data, i);
       } catch (e) {
         damaged++;
+        tainted = true;
       }
       decodeMs += performance.now() - t0;
       decoded++;
@@ -95,6 +102,7 @@ async function run(job) {
         collect(d.flush());
       } catch (e) {
         damaged++;
+        tainted = true;
       }
       while (held.length && !cancelled) await post(held.shift());
     }

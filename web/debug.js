@@ -72,13 +72,16 @@ function block(label, lines) {
   return out.length ? out : [`${label.padEnd(LABEL)}none`];
 }
 
-/** What each decoder of a hybrid scan did. */
-function hybridLine(h) {
+/** How a chunked scan went: its chunks, the early looks, the pictures held and what each decoder did. */
+function chunkedLines(h) {
+  if (h.fallback) return [`chunked: ${h.chunks} chunks of about ${h.chunkS} s, but ${h.fallback}: scanned in one piece`];
   const lanes = h.lanes.map((l) => {
     const fps = l.frames / Math.max(0.001, l.ms / 1000);
-    return `${l.kind === 'built-in' ? `built-in decoder ×${l.workers}` : "browser's decoder"}: ${int(l.frames)} frames, ${fps.toFixed(0)} fps${l.runs > 1 ? `, ${l.runs} runs` : ''}${l.failed ? `, gave up: ${l.failed}` : ''}`;
+    const looks = l.looks ? `, ${l.looks} early look${l.looks === 1 ? '' : 's'}` : '';
+    return `${l.kind === 'built-in' ? `built-in decoder ×${l.workers}` : "browser's decoder"}: ${int(l.frames)} frames, ${fps.toFixed(0)} fps, ${l.chunks} chunk${l.chunks === 1 ? '' : 's'}${looks}${l.failed ? `, gave up: ${l.failed}` : ''}`;
   });
-  return [`hybrid: ${h.chunks} chunks of about ${h.chunkS} s, scanned in ${h.parts.length} run${h.parts.length === 1 ? '' : 's'}`, ...lanes];
+  const looks = h.order === 'triage' ? `, early looks at ${h.looks.length} of the ${h.hot.length} likeliest to flash` : '';
+  return [`chunked: ${h.chunks} chunks of about ${h.chunkS} s, detected in file order${looks}; at most ${bytes(h.peak)} of pictures held (${bytes(h.budget)} allowed)`, ...lanes];
 }
 
 /**
@@ -111,7 +114,8 @@ export function debugReport({ version, state, profile, gpu, segments, hybrid = n
     det.push(`${f.backend === 'webgpu' ? 'WebGPU' : 'CPU (WebAssembly)'} at ${f.aw}×${f.ah}${f.note ? ` (${f.note})` : ''}`);
     det.push(`pictures reach it as: ${f.route || 'nothing yet'}${f.routeDetail ? ` (${f.routeDetail})` : ''}${f.takesFrames === false && f.backend === 'webgpu' ? ' · this WebGPU takes no decoded frame' : ''}`);
     const m = state.movie;
-    const scans = hybrid ? `scans hybrid: ${hybrid.hw} lane${hybrid.hw === 1 ? '' : 's'} of the browser's decoder${hybrid.sw ? ` + the built-in decoder in ${hybrid.sw} worker${hybrid.sw === 1 ? '' : 's'}` : ''}` : `scans in ${segments > 1 ? `up to ${segments} segments` : 'one piece'}`;
+    const lanes = hybrid ? hybrid.hw : segments;
+    const scans = `long files scanned in chunks by ${lanes} lane${lanes === 1 ? '' : 's'} of the browser's decoder${hybrid && hybrid.sw ? ` + the built-in decoder in ${hybrid.sw} worker${hybrid.sw === 1 ? '' : 's'}` : ''}, one detector in order`;
     det.push(`decoding: ${state.decode && state.decode.software && m && m.builtIn ? `the built-in ${m.builtIn.name} decoder` : m && m.decodeInWorkers ? 'WebCodecs, in workers' : 'WebCodecs, on the page'} · ${scans}`);
     lines.push(...block('Detector', det));
   }
@@ -131,7 +135,7 @@ export function debugReport({ version, state, profile, gpu, segments, hybrid = n
   if (s) {
     const fps = s.frames / Math.max(0.001, s.elapsedMs / 1000);
     const head = `${int(s.frames)} frames in ${secs(s.elapsedMs)} = ${fps.toFixed(0)} fps${m && m.fps ? ` (${(fps / m.fps).toFixed(1)}× real time)` : ''}`;
-    lines.push(...block('Scan', s.hybrid ? [head, ...hybridLine(s.hybrid)] : [`${head} · ${s.segments || 1} segment${(s.segments || 1) === 1 ? '' : 's'}`]));
+    lines.push(...block('Scan', s.chunked ? [head, ...chunkedLines(s.chunked)] : [`${head} · ${s.segments || 1} segment${(s.segments || 1) === 1 ? '' : 's'}`]));
   }
   lines.push(...block('Jobs', jobs.map((j) => `${clock(j.at)} ${j.name}: ${secs(j.ms)} ${j.outcome}${j.hidden > 500 ? ` (${secs(j.hidden)} of it out of sight)` : ''}`)));
   const job = state.job;

@@ -71,6 +71,8 @@ async function run(job) {
   let damaged = 0;
   let decodeMs = 0;
   let decoded = 0;
+  // after a sample the decoder could not take, what refers to it is not to be trusted
+  let tainted = false;
   const release = async () => {
     while (next < order.length && pictures.has(order[next])) {
       const pic = pictures.get(order[next]);
@@ -92,12 +94,19 @@ async function run(job) {
         got = dec.decode(data, pts[i] / 1e6);
       } catch (e) {
         damaged++;
+        tainted = true;
       }
       decodeMs += performance.now() - t0;
       decoded++;
       if (got) {
-        if (dec.frame_damaged()) damaged++;
-        if (pts[i] >= minPts && pts[i] < maxPts) pictures.set(pts[i], shrink ? smallPicture(dec, shrink, pts[i]) : picture(dec, pts[i]));
+        // each picture says whether it is damaged, so that a scan can stop at it
+        const bad = dec.frame_damaged() || tainted;
+        if (bad) damaged++;
+        if (pts[i] >= minPts && pts[i] < maxPts) {
+          const pic = shrink ? smallPicture(dec, shrink, pts[i]) : picture(dec, pts[i]);
+          if (bad) pic.damaged = true;
+          pictures.set(pts[i], pic);
+        }
       } else {
         // no picture for this sample: do not wait for it
         const k = order.indexOf(pts[i]);

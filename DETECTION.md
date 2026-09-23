@@ -385,7 +385,10 @@ frames, with nothing you can edit to break the loop.
 A run is now re-anchored once it reaches `MAX_RUN_SECONDS`, which bounds the
 memory and makes the run-up length an honest promise. Nothing that slow was
 ever a flash anyway: a flash is a pair of opposing changes inside a second,
-so a swing that took longer than that can't be half of one.
+so a swing that took longer than that can't be half of one. It bounds how
+far back a swing reaches, not everything the detector carries: see *Scans
+in chunks are exact* below for what a run-up still cannot recover, and why
+a scan no longer relies on one.
 
 A related point about arithmetic rather than logic. Every per-pixel time the
 detector keeps is float64. A float32 holding 4259 s resolves to a quarter of
@@ -548,17 +551,29 @@ each frame's pattern pass by the same command buffer. A test feeds the same
 frames to a stage with batches of one and a stage with batches of sixteen
 and requires identical statistics, captures and final state.
 
-**Parallel segments are exact.** A long scan is split into segments run at
-once, each after the first started a run-up (the section check's run-up)
-early. Everything the per-pixel and per-window state remembers is bounded by
-that run-up (the 2 s run cap, the 1 s pairing and failure windows, the 5 s
-extended window and its 1 s hold), so at the seam a segment's state equals
-the sequential run's. The segments' per-frame statistics are concatenated
-with the run-ups dropped, the internal clock and the onset times shifted so
-the clock is continuous across the seams, and the violations are then
-derived from the joined statistics by the same functions a single run uses.
-A test splits a sequence with a flash straddling the seam and requires the
-merged result to equal the sequential one.
+**Scans in chunks are exact; run-ups are only close.** A long scan is
+decoded in chunks by several decoders at once, but one detector takes the
+pictures in file order, so its result is the result of a scan in one piece
+whichever decoder made which chunk's pictures. An earlier version ran
+segments at once, each after the first started with a run-up, on the
+reasoning that everything the per-pixel and per-window state remembers is
+bounded by that run-up (the 2 s run cap, the 1 s pairing and failure
+windows, the 5 s extended window and its 1 s hold). The windows are
+bounded; two things the state carries are not. Which opposite changes pair
+into flashes: a change pairs with the pending opposite one if that is
+under a second old, so a chain of changes each under a second apart decides
+the pairing from where the chain began, however long ago. And, for a pixel
+still since some change, the direction of its last run and the phase of
+the 2 s run cap, which a fresh detector starts at its own first frame. A
+fresh detector knows neither, so a segment starting in the middle of
+flashing could pair a strobe's changes the other way round: in the browser
+test the edge of a red violation moved by four frames, depending on where
+the seam fell. Checking a seam afterwards against the state the previous
+segment ended in does not rescue it: on a letterboxed film the bars'
+pixels differ in run-cap phase at every seam, forever. The segments remain
+behind `?chunked=0`, and section checks still start from a run-up: they
+are quick local checks, and the export's verification scans the whole
+file.
 
 **The pattern pass is one thread per sampling line.** Eight orientations
 times the lines that cover the picture, each walking its line with the

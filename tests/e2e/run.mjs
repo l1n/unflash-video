@@ -835,12 +835,15 @@ try {
   }
   assert(results.segScan.held === results.gpuWhole.held, `held frames ${results.segScan.held} vs ${results.gpuWhole.held}`);
 
-  // ======== a hybrid scan (the browser's decoder and the built-in one side
-  // by side, over chunks they share out and take over from each other) must
-  // give the scan of one decoder. The test browser has no H.264 in
-  // WebCodecs, so `sim` stands the built-in decoder, on the page, in for the
-  // browser's; `hybridfail` fails the built-in decoder's first run, which
-  // the browser's lanes must then scan again
+  // ======== a scan in chunks must give exactly what the scan in one piece
+  // gives: the decoders (the browser's and the built-in one side by side, in
+  // a hybrid scan) make the detector's pictures of chunk after chunk, early
+  // looks decode the chunks likeliest to flash first, and one detector takes
+  // the pictures in file order. The test browser has no H.264 in WebCodecs,
+  // so `sim` stands the built-in decoder, on the page, in for the browser's;
+  // `hybridfail` fails the built-in decoder at its tenth picture, and the
+  // browser's decoder must go on from there; `hold` makes the pictures held
+  // for the detector few, so that the decoders wait for it
   const hybridScan = async (query) => {
     await page.goto(`http://127.0.0.1:${port}/?auto=0&${query}`);
     await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
@@ -848,72 +851,91 @@ try {
     scan = await scanCurrent();
     return page.evaluate(() => {
       const s = window.__unflash.lastScan;
-      return { ms: Math.round(s.elapsedMs), frames: s.frames, held: s.result.held, violations: s.result.violations, hybrid: s.hybrid || null, report: window.__unflash.debugReport() };
+      return { ms: Math.round(s.elapsedMs), frames: s.frames, held: s.result.held, violations: s.result.violations, chunked: s.chunked || null, partials: window.__unflash.partials, report: window.__unflash.debugReport() };
     });
   };
+  const sameAsWhole = (name, r) => {
+    const w = results.h264Whole;
+    assert(r.frames === w.frames && r.held === w.held, `${name}: frames ${r.frames} (held ${r.held}) vs ${w.frames} (held ${w.held})`);
+    assert(r.violations.length > 0 && r.violations.length === w.violations.length, `${name}: the violations of the scan in one piece: ${JSON.stringify(r.violations)} vs ${JSON.stringify(w.violations)}`);
+    for (let i = 0; i < r.violations.length; i++) {
+      const a = r.violations[i];
+      const b = w.violations[i];
+      const same = a.kind === b.kind && ['start', 'end', 'onset', 'peak', 'count'].every((k) => Math.abs(a[k] - b[k]) < 1e-6);
+      assert(same, `${name}: violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
+    }
+  };
   results.h264Whole = await hybridScan('hybrid=0');
-  assert(!results.h264Whole.hybrid, '?hybrid=0 scans with one decoder');
+  assert(!results.h264Whole.chunked, 'a ten-second file is scanned in one piece: ' + JSON.stringify(results.h264Whole.chunked));
   results.hybrid = await hybridScan('hybrid=sim:2,2&chunk=1');
-  results.hybridFail = await hybridScan('hybrid=sim:2,2&chunk=1&hybridfail=1');
+  results.hybridFail = await hybridScan('hybrid=sim:2,2&chunk=1&order=file&hybridfail=1');
+  results.hybridTight = await hybridScan('hybrid=sim:2,0&chunk=1&order=file&hold=5');
+  results.triaged = await hybridScan('hybrid=0&chunk=1');
   for (const [name, r] of [
     ['hybrid', results.hybrid],
     ['hybrid, the built-in decoder failing', results.hybridFail],
+    ['hybrid, little held', results.hybridTight],
+    ['one lane, early looks', results.triaged],
   ]) {
-    const h = r.hybrid;
-    console.log(`${name} scan:`, r.ms, 'ms |', JSON.stringify({ frames: r.frames, held: r.held, violations: r.violations.map((v) => [v.kind, v.start, v.end]), parts: h && h.parts.map((p) => `${p.first}-${p.last} ${p.kind}`), lanes: h && h.lanes.map((l) => [l.kind, l.frames, l.runs, l.steals, l.failed]) }));
-    assert(h && h.chunks >= 8, `${name}: a hybrid scan in chunks: ` + JSON.stringify(h));
-    assert(r.frames === results.h264Whole.frames && r.held === results.h264Whole.held, `${name}: frames ${r.frames} (held ${r.held}) vs ${results.h264Whole.frames} (held ${results.h264Whole.held})`);
-    assert(r.violations.length > 0 && r.violations.length === results.h264Whole.violations.length, `${name}: the violations of the one-decoder scan: ${JSON.stringify(r.violations)} vs ${JSON.stringify(results.h264Whole.violations)}`);
-    for (let i = 0; i < r.violations.length; i++) {
-      const a = r.violations[i];
-      const b = results.h264Whole.violations[i];
-      // the lanes hand the detector their pictures by different routes (a
-      // frame's difference at the edges, as between routes)
-      assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.05 && Math.abs(a.end - b.end) < 0.05, `${name}: violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
-    }
-    // every chunk once, in order
-    let c = 0;
-    for (const p of h.parts) {
-      assert(p.first === c, `${name}: the runs cover each chunk once: ${JSON.stringify(h.parts)}`);
-      c = p.last + 1;
-    }
-    assert(c === h.chunks, `${name}: the runs reach the last chunk: ${JSON.stringify(h.parts)}`);
-    assert(/Scan\s+.*\n\s+hybrid: \d+ chunks/.test(r.report) && /built-in decoder ×2/.test(r.report), `${name}: the debug report shows the lanes:\n${r.report}`);
+    const h = r.chunked;
+    console.log(`${name} scan:`, r.ms, 'ms |', JSON.stringify({ frames: r.frames, violations: r.violations.map((v) => [v.kind, v.start, v.end]), taken: h && h.taken, looks: h && h.looks, lanes: h && h.lanes.map((l) => [l.kind, l.frames, l.chunks, l.looks, l.failed]), peak: h && h.peak, partials: r.partials.length }));
+    assert(h && h.chunks >= 8 && !h.fallback, `${name}: a scan in chunks: ` + JSON.stringify(h));
+    sameAsWhole(name, r);
+    // every picture decoded once: a chunk a decoder gave up on is gone on with from its last picture
+    assert(h.lanes.reduce((a, l) => a + l.frames, 0) === r.frames, `${name}: the lanes decoded each picture once: ${JSON.stringify(h.lanes)} for ${r.frames} frames`);
+    assert(/Scan\s+.*\n\s+chunked: \d+ chunks of about 1 s, detected in file order/.test(r.report), `${name}: the debug report shows the chunks:\n${r.report}`);
   }
-  assert(results.hybrid.hybrid.lanes.length === 3 && results.hybrid.hybrid.lanes.every((l) => l.frames > 0 && !l.failed), 'every lane scanned part of the file: ' + JSON.stringify(results.hybrid.hybrid.lanes));
-  const gaveUp = results.hybridFail.hybrid.lanes.find((l) => l.kind === 'built-in');
-  assert(gaveUp.failed && gaveUp.frames === 0 && results.hybridFail.hybrid.parts.every((p) => p.kind === 'browser'), 'the built-in lane gave up and the browser lanes scanned its chunks: ' + JSON.stringify(results.hybridFail.hybrid));
+  assert(results.hybrid.chunked.lanes.length === 3 && results.hybrid.chunked.lanes.every((l) => l.frames > 0 && !l.failed), 'every lane decoded part of the file: ' + JSON.stringify(results.hybrid.chunked.lanes));
+  assert(/built-in decoder ×2/.test(results.hybrid.report), 'the debug report shows the built-in decoder:\n' + results.hybrid.report);
+  const gaveUp = results.hybridFail.chunked.lanes.find((l) => l.kind === 'built-in');
+  assert(gaveUp.failed && gaveUp.frames === 10, 'the built-in lane gave up at its tenth picture and the browser lanes went on from there: ' + JSON.stringify(results.hybridFail.chunked));
   assert(/gave up: the built-in decoder failed/.test(results.hybridFail.report), 'the debug report says the built-in decoder gave up:\n' + results.hybridFail.report);
-  // how the lanes share the chunks out and take them over
-  results.shares = await page.evaluate(async () => {
-    const { shareChunks, stealChunks } = await import('./analysis.js');
+  {
+    // at most a chunk (the detector's own) more than the budget held
+    const h = results.hybridTight.chunked;
+    assert(h.budget === 5 * 1024 * 1024 && h.peak > 0 && h.peak <= h.budget + 50 * 144 * 256 * 4, 'the pictures held keep to the budget: ' + JSON.stringify({ budget: h.budget, peak: h.peak }));
+  }
+  {
+    // triage: a lone lane looks at the likeliest chunks first (the run-up
+    // before them decoded with them, all held for the detector), and what
+    // it finds there is known before the end
+    const h = results.triaged.chunked;
+    const look = h.looks[0];
+    assert(h.order === 'triage' && h.hot.length >= 2 && look && h.hot.includes(look.from) && h.taken[0] === look.first, 'the first chunks decoded are an early look at a hot chunk: ' + JSON.stringify(h));
+    assert(look.found > 0 && results.triaged.partials.some((p) => p.early && p.found > 0), 'the early look found the flashing: ' + JSON.stringify({ looks: h.looks, partials: results.triaged.partials }));
+    assert(/early looks at \d+ of the \d+ likeliest to flash/.test(results.triaged.report), 'the debug report tells of the early looks:\n' + results.triaged.report);
+    const looked = results.hybrid.chunked.looks;
+    assert(looked.length >= 1 && results.hybrid.chunked.lanes.some((l) => l.looks > 0), 'a hybrid scan looks early too: ' + JSON.stringify(results.hybrid.chunked));
+  }
+  // the picker: the detector's chunk, then the next ones while the budget
+  // has room; early looks at hot chunks with their run-up; chunks given back
+  results.picker = await page.evaluate(async () => {
+    const { ChunkPicker } = await import('./analysis.js');
     const n = new Array(10).fill(30);
-    const lanes = [{ weight: 1 }, { weight: 1 }, { weight: 0.5 }];
-    shareChunks(n, lanes);
-    const first = lanes.map((l) => [l.lo, l.hi]);
-    // lane 0 has started all its chunks, lane 1 two of its four, the slow lane none of its two
-    lanes[0].lo = lanes[0].hi;
-    lanes[1].lo += 2;
-    const speeds = new Map([
-      [lanes[0], 2],
-      [lanes[1], 1],
-      [lanes[2], 0.5],
-    ]);
-    const took = stealChunks(n, lanes, lanes[0], (l) => speeds.get(l));
-    const after = lanes.map((l) => [l.lo, l.hi]);
-    // as fast as each other: half of what is left
-    const even = [{ lo: 3, hi: 3 }, { lo: 4, hi: 10 }];
-    const half = stealChunks(n, even, even[0], () => 1);
-    // a slower lane takes nothing from another's last chunk
-    const slow = [{ lo: 5, hi: 5 }, { lo: 9, hi: 10 }];
-    const none = stealChunks(n, slow, slow[0], (l) => (l === slow[0] ? 1 : 2));
-    return { first, took, after, half, even: even.map((l) => [l.lo, l.hi]), none };
+    const t = Array.from({ length: 11 }, (_, i) => i);
+    const p = new ChunkPicker(n, t, { bytes: 1, budget: 90 });
+    const ahead = [p.ahead(), p.ahead(), p.ahead(), p.ahead(), p.ahead()];
+    p.advance(2);
+    const later = [p.ahead(), p.ahead()];
+    const q = new ChunkPicker(n, t, { bytes: 1, budget: 300, order: [6, 2, 7, 0, 1, 3, 4, 5, 8, 9], hot: 3, runup: 2, hotShare: 0.5 });
+    const look = q.hotRun(1);
+    const noRoom = q.hotRun(1);
+    const rest = [];
+    for (let k = 0; k < 7; k++) rest.push(q.ahead());
+    q.release(5);
+    const back = q.ahead();
+    const r = new ChunkPicker(n, t, { bytes: 1, order: [1, 6, 0, 2, 3, 4, 5, 7, 8, 9], hot: 2 });
+    const near = r.hotRun(3);
+    return { ahead, later, look, noRoom, rest, back, near };
   });
-  console.log('hybrid shares:', JSON.stringify(results.shares));
-  assert(JSON.stringify(results.shares.first) === '[[0,4],[4,8],[8,10]]', 'first shares in proportion to the weights: ' + JSON.stringify(results.shares));
-  assert(results.shares.took === 2 && JSON.stringify(results.shares.after) === '[[8,10],[6,8],[8,8]]', 'the fast lane takes the slow lane\'s chunks: ' + JSON.stringify(results.shares));
-  assert(results.shares.half === 3 && JSON.stringify(results.shares.even) === '[[7,10],[4,7]]', 'equal speeds split what is left: ' + JSON.stringify(results.shares));
-  assert(results.shares.none === 0, 'a slower lane leaves a last chunk alone: ' + JSON.stringify(results.shares));
+  console.log('chunk picker:', JSON.stringify(results.picker));
+  {
+    const k = results.picker;
+    assert(JSON.stringify(k.ahead) === '[0,1,2,3,-2]' && JSON.stringify(k.later) === '[4,-2]', 'chunks in file order, as many ahead as the budget holds: ' + JSON.stringify(k));
+    assert(JSON.stringify(k.look) === '{"first":4,"from":6,"last":7}' && k.noRoom === null, 'an early look takes its run-up and the hot chunks after it, within the share of the budget for looks: ' + JSON.stringify(k));
+    assert(JSON.stringify(k.rest) === '[0,1,2,3,8,9,-1]' && k.back === 5, 'then the rest in order, and a chunk given back goes again: ' + JSON.stringify(k));
+    assert(JSON.stringify(k.near) === '{"first":6,"from":6,"last":6}', 'no early look at a chunk the lanes get to soon anyway: ' + JSON.stringify(k));
+  }
 
   // ======== a BGRX picture (what Firefox on a Mac decodes to), copied as it
   // is and put back in order by the GPU, must be analysed exactly like the

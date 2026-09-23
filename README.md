@@ -376,27 +376,32 @@ own slice of the input planes as it arrives, and the passes that depend on
 the previous frame's state (the moved-pixel count, the pattern mask, the
 update, the row sums and the gather) run for the whole batch in one
 submission with one readback, so the submit-to-result latency is paid once
-per sixteen frames rather than once per frame. Up to **eight batches are in
+per sixteen frames rather than once per frame. Up to **32 batches are in
 flight** at a time, so that the GPU always has the next one: a scan's pace
 is at most the frames in flight divided by the round trip, and Firefox's
 GPU runs in another process, about 300 ms from submission to result, which
-two batches held each detector to about a hundred frames a second. The live monitor asks
+two batches held to about a hundred frames a second; 32 allow 1700, what
+a scan's one detector needs to keep up with all its decoders (a batch in
+flight costs only its readback buffer, about 50 KB). The live monitor asks
 for a batch of one, since it wants a result after every frame.
 
-A scan of a long file is also cut into up to four **segments scanned at the
-same time**, each with its own decoder and detector. Every segment after
-the first starts a run-up early, the same run-up a section check gets, so
-that its detector's state at the seam is the state a run from the start of
-the file would have reached; the per-frame statistics are then joined with
-the run-ups dropped and the internal clock made continuous, and the
-violations are derived from the joined statistics exactly as they are for
-one run. A test holds the merged result of a split run identical to the
-sequential run, frame statistics, events and violations alike. Segments are
-used with the browser's own decoder on the GPU detector (the built-in
-decoder already spreads over workers); `?segments=N` forces a count, and a
-file shorter than four run-ups per segment is scanned in one. Each segment
-reads the file through a window of its own (sharing one had them take
-turns re-reading it).
+A long file is scanned **in chunks** (see *Both decoders at once* below):
+several decoders at once, one detector taking their pictures in file
+order. It used to be cut into up to four **segments scanned at the same
+time**, each with its own decoder and detector, every segment after the
+first starting a run-up early (the same run-up a section check gets) so
+that its detector's state at the seam would be the state a run from the
+start of the file reaches, and the per-frame statistics joined with the
+run-ups dropped. That holds for most frames, not all: the detector's state
+remembers more than any run-up. A pixel's flashes pair opposite changes
+less than a second apart, so a chain of them decides which changes pair
+from where it began, however long ago, and a pixel still since some change
+long before keeps where that change left its monotonic run (the phase of
+the two-second run cap, and which way it last moved), which a fresh
+detector does not know. At a seam in the middle of flashing that moved a
+violation's edge by four frames in the browser test. The segments remain
+behind `?chunked=0` (with `?segments=N` to force a count); a file shorter
+than four run-ups per segment is scanned in one.
 
 Preparing a section works the same way without the run-ups: the range is
 cut at keyframes into as many spans as a scan would use, each decoded by
@@ -441,33 +446,65 @@ worker. The export and the players, which need real frames, decode on
 the page. `?decodeworkers=0` / `=1` overrides the choice, and `?shrink=0`
 hands the pictures over whole.
 
-### Both decoders at once
+### Both decoders at once, one detector in order
 
-The browser's decoder (usually hardware) has a speed of its own, and it
-leaves the processor's cores mostly idle. For H.264, where the app has a
-decoder of its own, a scan of a file of two minutes or more on a machine
-with six cores or more is a **hybrid scan**: two to four lanes decode with
-the browser's decoder and one with the built-in decoder, in a worker for
-each core left over (two stay for the page and the browser), each lane
-feeding a detector of its own. The file is cut into **chunks** of about 30
-seconds at keyframes. Each lane starts with consecutive chunks in
-proportion to how fast it is guessed to be; a lane that runs out takes over
-the far end of the chunks the lane with the most time left has still to
-start, in proportion to the speeds the two have shown, so the lanes finish
-together whichever decoder turns out faster. The built-in decoder is asked
-for its next chunk only when a worker is free for it, so its workers never
-wait at a seam and what it has not started can still go elsewhere. Every
-run of consecutive chunks a lane scans is a segment with its run-up, joined
-exactly as the segments are. The built-in decoder decodes fully here
-(deblocking filter and all), so its pictures are the browser's, and a run
-it cannot decode cleanly (a damaged picture) goes back to the browser's
-decoder. The debug report shows how many frames each decoder scanned and
-how fast. `?hybrid=0` turns it off, `?hybrid=1` on for any file,
-`?hybrid=H,S` sets H browser lanes and S built-in workers, and `?chunk=S`
-the chunks' length; the browser test, whose Chromium has no H.264, runs it
-with the built-in decoder standing in for the browser's (`?hybrid=sim:H,S`)
-and requires the scan of one decoder, also when the built-in decoder's
-first run fails (`?hybridfail=1`).
+A file of two chunks or more is scanned **in chunks**: cut at keyframes
+into chunks of about 10 seconds, decoded by several **lanes** at once, as
+many of the browser's decoder (each in a decode worker) as the segments
+would have used, and each picture made the detector's size where it is
+decoded. The browser's decoder (usually hardware) has a speed of its own
+and leaves the processor's cores mostly idle, so for H.264, where the app
+has a decoder of its own, a scan of a file of two minutes or more on a
+machine with six cores or more is also **hybrid**: two to four lanes of the
+browser's decoder and one of the built-in decoder, in a worker for each
+core left over (two stay for the page and the browser).
+
+However many lanes decode, **one detector takes the pictures in file
+order**, so a scan in chunks gives exactly what a scan in one piece gives,
+whichever lane decoded which chunk and in whatever order, and no chunk
+needs a run-up. Each chunk's pictures wait in a slot of their own until
+the detector gets to them (about 150 KB each at 256×144). A `ChunkPicker`
+decides what each lane decodes next: the chunk the detector is on if
+nobody has it, else the next chunk nobody has, as long as the pictures
+held stay within a budget (96 MB for each GB of memory the browser reports,
+384 MB to 1 GB; 512 MB where it reports none; `?hold=MB` sets it). A lane
+with no room waits for the detector to free some, and the detector's own
+chunk never waits, so the lanes cannot all stop. On a real GPU the
+detector is far faster than the decoders (a few tens of microseconds of
+GPU time a frame), so it keeps up with all of them. The built-in decoder is asked for its
+next chunk only when a worker is free for it, so its workers never wait at
+a seam. It decodes fully here (deblocking filter and all), so its pictures
+are the browser's, and each picture it sends says whether it is damaged:
+at the first damaged one it stops, and its chunk goes to the browser's
+decoder, which goes on from the last picture it gave.
+
+**Early looks.** Before any of it is decoded, `triage.js` scores each chunk
+from the file's index alone for how likely it is to flash (bytes per
+frame against the film's median, keyframes a second, frames that cost
+three times the chunk's upper quartile, and near-empty keyframes: a
+white, black or faded picture), and the likeliest quarter are hot. A lane
+not needed for the chunk the detector is on, or a lone lane at the start,
+takes an **early look** at the likeliest hot chunk still far enough ahead:
+it decodes the chunks before it as a run-up (6.5 s), the hot chunk and
+the hot chunks straight after it, and runs them through a detector of
+its own. What that finds is shown on the timeline, dashed, long before the
+scan gets there; the pictures wait for the scan's detector like any
+others, so nothing is decoded twice and the result is the same. Early
+looks use at most 60% of the budget. As the scan goes, the timeline
+shows what it has found so far, exactly up to where it has got and the
+early looks' findings after that.
+
+The debug report shows how many chunks and frames each decoder decoded,
+how fast, how many early looks it took and the most pictures held.
+`?hybrid=0` turns the built-in decoder off, `?hybrid=1` on for any file,
+`?hybrid=H,S` sets H browser lanes and S built-in workers, `?chunk=S` the
+chunks' length, `?order=file` leaves out the early looks and `?chunked=0`
+scans in segments as before. The browser test, whose Chromium has no
+H.264, runs hybrid scans with the built-in decoder standing in for the
+browser's (`?hybrid=sim:H,S`) and requires exactly the violations of the
+scan in one piece: with early looks, when the built-in decoder fails at
+its tenth picture (`?hybridfail=1`), with room for one chunk held
+(`?hold=5`), and on one lane with early looks.
 
 ### Spans re-encoded, the rest copied
 

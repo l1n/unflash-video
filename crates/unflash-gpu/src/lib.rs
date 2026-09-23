@@ -54,8 +54,10 @@ const PATTERN_WG: u32 = 64;
 /// throughput is at most slots × batch frames per submit-to-result
 /// latency, and that latency can be long (in Firefox every readback crosses
 /// to its GPU process: 300 ms was measured), so the page may run well
-/// ahead of the results. A slot costs only its small readback buffers.
-pub const DEFAULT_SLOTS: usize = 8;
+/// ahead of the results: 32 × 16 frames a round trip is 1700 frames a
+/// second even there, as a scan's one detector must keep up with all its
+/// decoders. A slot costs only its small readback buffers (about 50 KB).
+pub const DEFAULT_SLOTS: usize = 32;
 /// Frames per batch: one command buffer and one readback for this many
 /// frames, so the submit-to-result latency is paid once per batch.
 pub const DEFAULT_BATCH: usize = 16;

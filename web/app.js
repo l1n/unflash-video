@@ -6,7 +6,7 @@ import { builtInFor } from './codecs.js';
 import { Movie, tick } from './media.js';
 import { createDetector, gpuAdapter } from './detector.js';
 import { profile } from './profile.js';
-import { scanMovie, scanChunks, HYBRID_CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, BLEND_DEFAULT } from './analysis.js';
+import { scanMovie, scanChunks, CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, BLEND_DEFAULT } from './analysis.js';
 import { Project, projectKey, dropCaches, lastSavedAt } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
@@ -55,6 +55,8 @@ const state = {
   checkRunning: false,
   checkAgain: false,
   scanTrace: null,
+  // what a running scan has found so far (chunked scans), else null
+  provisional: null,
   traceNorm: null, // the scan trace as area fractions, for the timeline and the monitor
   auto: null, // the unattended scan -> fix -> export -> verify run (see autopilot)
   // what the player shows: 'video' (the whole file) or the open section, 'edited' or 'original';
@@ -714,7 +716,7 @@ function scanSegments() {
 
 /**
  * Whether a scan decodes with the browser's decoder and the built-in one at
- * the same time (a hybrid scan, analysis.js scanHybrid), and with how many
+ * the same time (a hybrid scan, analysis.js scanChunked), and with how many
  * of each: for a codec the browser decodes itself and the app has a
  * decoder for (H.264, HEVC, VP9, VP8, AV1), on the GPU detector, on a
  * machine with six cores or more, for a file of two minutes or more (a
@@ -722,8 +724,7 @@ function scanSegments() {
  * four lanes and the built-in decoder a worker for each core left over
  * (two stay for the page and the browser). `?hybrid=0` turns it off,
  * `?hybrid=1` on for any file, `?hybrid=H,S` makes H lanes for the
- * browser's decoder and S workers for the built-in one (0: none), and
- * `?chunk=S` sets the chunks' length in seconds.
+ * browser's decoder and S workers for the built-in one (0: none).
  */
 function hybridPlan(movie, feeder) {
   const q = new URLSearchParams(location.search);
@@ -749,21 +750,30 @@ function hybridPlan(movie, feeder) {
     hw = movie.decodeInWorkers ? Math.min(4, Math.max(2, Math.round(cores * 0.4))) : Math.min(3, Math.max(2, Math.floor(cores / 4)));
     sw = Math.max(1, Math.min(8, cores - hw - 2));
   }
-  const chunk = parseFloat(q.get('chunk') || '');
-  return { hw, sw, chunkS: chunk > 0 ? chunk : HYBRID_CHUNK_S, sim, failBuiltIn: q.get('hybridfail') === '1' };
+  return { hw, sw, sim, failBuiltIn: q.get('hybridfail') === '1' };
 }
 
 /**
- * scanMovie, as a hybrid scan when hybridPlan makes one: the built-in
- * decoder's workers start for the scan and stop after it (and when they
- * cannot start, the scan goes on without them). `opts` as scanMovie's.
+ * How a scan runs: a file long enough for two chunks or more is scanned in
+ * chunks (analysis.js scanChunked): decoded by as many lanes of the
+ * browser's decoder as a segmented scan would use, plus the built-in
+ * decoder's lane when hybridPlan makes one (its workers start for the scan
+ * and stop after it, and when they cannot start the scan goes on without
+ * them), taken by the detector in file order, with early looks at the
+ * chunks triage finds likeliest to flash (`?order=file`: none); a shorter
+ * file, or with `?chunked=0`, as before. `?chunk=S` sets the chunks' length
+ * and `?hold=MB` how much of the pictures decoded ahead may be held. `opts`
+ * as scanMovie's.
  */
 async function scanWithPlan(env, movie, opts) {
+  const q = new URLSearchParams(location.search);
+  const chunk = parseFloat(q.get('chunk') || '');
+  const chunkS = chunk > 0 ? chunk : CHUNK_S;
+  const hold = parseFloat(q.get('hold') || '');
+  if (q.get('chunked') === '0' || scanChunks(movie, chunkS).length < 2) return scanMovie(env, movie, opts);
   const plan = hybridPlan(movie, env.feeder);
-  // a file with keyframes too far apart to cut into chunks is scanned as before
-  if (!plan || scanChunks(movie, plan.chunkS).length < 2) return scanMovie(env, movie, opts);
   let pool = null;
-  if (plan.sw > 0) {
+  if (plan && plan.sw > 0) {
     try {
       pool = await SoftwarePool.create(movie, plan.sw);
     } catch (e) {
@@ -772,8 +782,9 @@ async function scanWithPlan(env, movie, opts) {
       noteError(`hybrid scan without the built-in decoder: ${why}`);
     }
   }
+  const order = q.get('order') === 'file' ? 'file' : 'triage';
   try {
-    return await scanMovie(env, movie, { ...opts, hybrid: { hw: plan.hw, pool, chunkS: plan.chunkS, sim: plan.sim, failBuiltIn: plan.failBuiltIn } });
+    return await scanMovie(env, movie, { ...opts, chunked: { hw: plan ? plan.hw : scanSegments(), pool, chunkS, order, budget: hold > 0 ? hold * 1024 * 1024 : null, sim: !!(plan && plan.sim), failBuiltIn: !!(plan && plan.failBuiltIn) } });
   } finally {
     if (pool) pool.close();
   }
@@ -856,15 +867,26 @@ async function scan() {
   if (!state.movie || !state.env) return;
   setLive(false);
   $('liveToggle').checked = false;
+  // what the scan has found so far, until the whole result is in
+  state.provisional = [];
+  const t0 = performance.now();
+  state.partials = [];
   const res = await runJob('Scanning for flashes', async (progress, cancelled) => {
     const r = await scanWithPlan(state.env, state.movie, {
       cancel: cancelled,
       segments: scanSegments(),
       forceSegments: segmentsForced(),
       moreFeeders: spareFeeders,
+      // exactly what the scan has found up to where it has got, and what its early looks found after that
+      onPartial: (part) => {
+        state.provisional = part.violations;
+        state.partials.push({ ms: performance.now() - t0, until: part.until, found: part.violations.length, early: !!part.early });
+        state.timelineDrawnAt = 0;
+      },
       onProgress: (p, trace, count, ms) => {
         state.scanTrace = trace;
-        progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`);
+        const found = state.provisional.length;
+        progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps${found ? ` · ${found} violation${found === 1 ? '' : 's'} found so far` : ''}`);
         // the timeline twice a second, not per so many frames
         const now = performance.now();
         if (!(now - (state.timelineDrawnAt || 0) < 500)) {
@@ -876,7 +898,11 @@ async function scan() {
     // a cancelled scan saw only part of the file: keep nothing of it
     return cancelled() ? null : r;
   });
-  if (!res) return null;
+  state.provisional = null;
+  if (!res) {
+    drawTimeline();
+    return null;
+  }
   state.lastScan = res;
   const project = state.project;
   const counted = res.result.violations.filter((v) => reported(res.result, v));
@@ -1520,6 +1546,19 @@ function drawTimeline(dragSpan = null) {
   // threshold line label
   g.fillStyle = '#5a6070';
   g.fillRect(0, H - 24, W, 1);
+  // what a running scan has found so far (dashed: its edges may still move)
+  if (state.provisional && state.provisional.length) {
+    g.save();
+    g.setLineDash([4, 3]);
+    g.lineWidth = 1.5;
+    for (const v of state.provisional) {
+      const x0 = x(v.start);
+      const x1 = Math.max(x0 + 4, x(v.end));
+      g.strokeStyle = v.kind === 'red' ? '#e04fb0' : v.kind === 'flash' ? '#e8a33c' : v.kind === 'extended' ? '#7f9bff' : PATTERN_COLOUR;
+      g.strokeRect(x0 + 0.5, 4.5, x1 - x0 - 1, H - 27);
+    }
+    g.restore();
+  }
   // sections
   for (const s of state.project.sectionsSorted()) {
     const x0 = x(s.start);
@@ -3207,6 +3246,10 @@ window.__unflash = {
     state.live.lastCheck = 0;
     drainLive();
     return $('liveVerdict').textContent;
+  },
+  /** What the last scan had found as it finished each chunk and each early look, and when (tests). */
+  get partials() {
+    return state.partials || [];
   },
   /** Change the finish-alert settings for this visit (tests). */
   setAlerts(s) {
