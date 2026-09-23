@@ -22,7 +22,30 @@ const MAX_W: usize = 16;
 /// before and three after in each direction (what the six taps reach).
 const WIN: usize = MAX_W + 5;
 
-/// Eight-lane row kernels (wasm simd128, SSE2 or NEON through `wide`) for
+/// The six-tap filter of a fraction: its taps, and with `simd` each tap
+/// across a vector, made once for a block rather than for every row.
+#[derive(Clone, Copy)]
+struct SixTap {
+    taps: [i32; 6],
+    #[cfg(feature = "simd")]
+    lanes: [wide::i16x8; 6],
+}
+
+impl SixTap {
+    #[inline(always)]
+    fn new(frac: usize) -> SixTap {
+        let taps = SIXTAP_FILTERS[frac];
+        #[cfg(feature = "simd")]
+        let lane = |k: usize| wide::i16x8::splat(taps[k] as i16);
+        SixTap {
+            taps,
+            #[cfg(feature = "simd")]
+            lanes: [lane(0), lane(1), lane(2), lane(3), lane(4), lane(5)],
+        }
+    }
+}
+
+/// Eight-lane kernels (wasm simd128, SSE2 or NEON through `wide`) for
 /// blocks at least eight samples wide, computing exactly what the scalar
 /// loops compute. A six-tap sum can exceed 16 bits (up to 160 x 255), but
 /// its negative taps are at most 32 x 255: adding those first and the
@@ -48,8 +71,8 @@ mod simd {
 
     /// The six-tap filter over six vectors of samples.
     #[inline(always)]
-    fn taps(s: [i16x8; 6], f: &[i32; 6]) -> i16x8 {
-        let t = |k: usize| s[k] * f[k] as i16;
+    fn taps(s: [i16x8; 6], f: &[i16x8; 6]) -> i16x8 {
+        let t = |k: usize| s[k] * f[k];
         let v = t(1) + t(4);
         let v = v.saturating_add(t(2)).saturating_add(t(3)).saturating_add(t(0)).saturating_add(t(5));
         v.saturating_add(i16x8::splat(64)) >> 7
@@ -58,20 +81,28 @@ mod simd {
     /// Horizontal six-tap of one row: `r` starts two samples before the
     /// block and holds W + 5 samples.
     #[inline(always)]
-    pub fn sixtap_h<const W: usize>(r: &[u8], f: &[i32; 6], o: &mut [u8]) {
+    pub fn sixtap_h<const W: usize>(r: &[u8], f: &[i16x8; 6], o: &mut [u8]) {
         for k in 0..W / 8 {
             let s: &[u8; 13] = r[8 * k..8 * k + 13].try_into().unwrap();
-            let v = taps(std::array::from_fn(|t| load8(&s[t..t + 8])), f);
+            let v = taps([load8(&s[0..]), load8(&s[1..]), load8(&s[2..]), load8(&s[3..]), load8(&s[4..]), load8(&s[5..])], f);
             store8(v, &mut o[8 * k..8 * k + 8]);
         }
     }
 
-    /// Vertical six-tap of one row from the six rows around it.
+    /// Vertical six-tap of a `W`x`h` block, eight columns at a time down
+    /// the block, each row of `src` (from two above the block, `ss` apart)
+    /// loaded once and kept while the six taps pass over it.
     #[inline(always)]
-    pub fn sixtap_v<const W: usize>(r: [&[u8]; 6], f: &[i32; 6], o: &mut [u8]) {
+    pub fn sixtap_v<const W: usize>(src: &[u8], ss: usize, f: &[i16x8; 6], dst: &mut [u8], ds: usize, h: usize) {
         for k in 0..W / 8 {
-            let v = taps(std::array::from_fn(|t| load8(&r[t][8 * k..8 * k + 8])), f);
-            store8(v, &mut o[8 * k..8 * k + 8]);
+            let x = 8 * k;
+            let row = |j: usize| load8(&src[j * ss + x..]);
+            let mut w = [row(0), row(1), row(2), row(3), row(4)];
+            for j in 0..h {
+                let next = row(j + 5);
+                store8(taps([w[0], w[1], w[2], w[3], w[4], next], f), &mut dst[j * ds + x..]);
+                w = [w[1], w[2], w[3], w[4], next];
+            }
         }
     }
 
@@ -100,28 +131,30 @@ fn bilinear(a: u8, b: u8, f: usize) -> u8 {
 /// Horizontal six-tap of one row of `W` samples (`r` starts two samples
 /// before the block).
 #[inline(always)]
-fn sixtap_h<const W: usize>(r: &[u8], f: &[i32; 6], o: &mut [u8]) {
+fn sixtap_h<const W: usize>(r: &[u8], f: &SixTap, o: &mut [u8]) {
     #[cfg(feature = "simd")]
     if W >= 8 {
-        simd::sixtap_h::<W>(r, f, o);
+        simd::sixtap_h::<W>(r, &f.lanes, o);
         return;
     }
     for (i, v) in o[..W].iter_mut().enumerate() {
-        *v = sixtap(r, i + 2, 1, f);
+        *v = sixtap(r, i + 2, 1, &f.taps);
     }
 }
 
-/// Vertical six-tap of one row of `W` samples from the six rows around it.
+/// Vertical six-tap of a `W`x`h` block: `src` starts two rows above it
+/// and holds `h + 5` rows, `ss` apart.
 #[inline(always)]
-fn sixtap_v<const W: usize>(r: [&[u8]; 6], f: &[i32; 6], o: &mut [u8]) {
+fn sixtap_v<const W: usize>(src: &[u8], ss: usize, f: &SixTap, dst: &mut [u8], ds: usize, h: usize) {
     #[cfg(feature = "simd")]
     if W >= 8 {
-        simd::sixtap_v::<W>(r, f, o);
+        simd::sixtap_v::<W>(src, ss, &f.lanes, dst, ds, h);
         return;
     }
-    for (i, v) in o[..W].iter_mut().enumerate() {
-        let s = (0..6).map(|t| f[t] * r[t][i] as i32).sum::<i32>();
-        *v = ((s + 64) >> 7).clamp(0, 255) as u8;
+    for j in 0..h {
+        for (i, v) in dst[j * ds..j * ds + W].iter_mut().enumerate() {
+            *v = sixtap(src, (j + 2) * ss + i, ss, &f.taps);
+        }
     }
 }
 
@@ -145,36 +178,36 @@ fn bilinear_row<const W: usize>(a: &[u8], b: &[u8], f: usize, o: &mut [u8]) {
 #[inline(always)]
 fn filter_block<const W: usize>(src: &[u8], origin: usize, ss: usize, fx: usize, fy: usize, h: usize, filter: Filter, dst: &mut [u8], ds: usize) {
     if fx == 0 && fy == 0 {
-        for j in 0..h {
-            dst[j * ds..j * ds + W].copy_from_slice(&src[origin + j * ss..origin + j * ss + W]);
+        // whole samples: the rows split off one at a time, the last one
+        // alone as the plane may end with it
+        let (mut s, mut d) = (&src[origin..], dst);
+        for _ in 1..h {
+            let (row, rest) = s.split_at(ss);
+            let (out, rest_out) = std::mem::take(&mut d).split_at_mut(ds);
+            out[..W].copy_from_slice(&row[..W]);
+            (s, d) = (rest, rest_out);
         }
+        d[..W].copy_from_slice(&s[..W]);
         return;
     }
     match filter {
         Filter::SixTap => {
-            let (hf, vf) = (&SIXTAP_FILTERS[fx], &SIXTAP_FILTERS[fy]);
+            let (hf, vf) = (SixTap::new(fx), SixTap::new(fy));
             if fy == 0 {
                 for j in 0..h {
                     let r = origin + j * ss - 2;
-                    sixtap_h::<W>(&src[r..r + W + 5], hf, &mut dst[j * ds..]);
+                    sixtap_h::<W>(&src[r..r + W + 5], &hf, &mut dst[j * ds..]);
                 }
             } else if fx == 0 {
-                for j in 0..h {
-                    let r = origin + j * ss;
-                    let rows = std::array::from_fn(|t| &src[r + t * ss - 2 * ss..r + t * ss - 2 * ss + W]);
-                    sixtap_v::<W>(rows, vf, &mut dst[j * ds..]);
-                }
+                sixtap_v::<W>(&src[origin - 2 * ss..], ss, &vf, dst, ds, h);
             } else {
                 // rows -2 ..= h + 2 through the horizontal filter, then down
                 let mut tmp = [0u8; WIN * MAX_W];
                 for j in 0..h + 5 {
                     let r = origin + j * ss - 2 * ss - 2;
-                    sixtap_h::<W>(&src[r..r + W + 5], hf, &mut tmp[j * W..]);
+                    sixtap_h::<W>(&src[r..r + W + 5], &hf, &mut tmp[j * W..]);
                 }
-                for j in 0..h {
-                    let rows = std::array::from_fn(|t| &tmp[(j + t) * W..(j + t + 1) * W]);
-                    sixtap_v::<W>(rows, vf, &mut dst[j * ds..]);
-                }
+                sixtap_v::<W>(&tmp, W, &vf, dst, ds, h);
             }
         }
         Filter::Bilinear => {
