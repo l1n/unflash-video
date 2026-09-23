@@ -61,7 +61,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [editing, files, gpu, routes, auto, formats]
+        part: [editing, files, gpu, routes, auto, formats, firefox]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -121,18 +121,20 @@ jobs:
         if: steps.clips.outputs.cache-hit != 'true'
         run: python3 tests/media/gen_e2e.py
       - name: Playwright's Chromium, from the cache
+        if: matrix.part != 'firefox'
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-1.56.1-chromium-${{ runner.os }}
       - name: Playwright
+        if: matrix.part != 'firefox'
         run: |
           npm install -g playwright@1.56.1
           npx playwright@1.56.1 install chromium
           # the runner image has Chrome's libraries; fetch them only if the browser won't start
           node --input-type=module -e "import { loadPlaywright } from './tests/e2e/playwright.mjs'; const { chromium } = await loadPlaywright(); await (await chromium.launch()).close();" || npx playwright@1.56.1 install-deps chromium
       - name: End-to-end, ${{ matrix.part }} (headless Chromium, WebGPU on SwiftShader)
-        if: matrix.part != 'formats'
+        if: matrix.part != 'formats' && matrix.part != 'firefox'
         run: node tests/e2e/run.mjs --part=${{ matrix.part }}
       - name: Smart-cut splice, MKV and WebM, the sound of held frames, project files, the guided tour, the page while a job runs, the built-in HEVC, VP9, VP8 and AV1 decoders (headless Chromium), the shrink in WebAssembly
         if: matrix.part == 'formats'
@@ -145,6 +147,30 @@ jobs:
           node tests/e2e/busy.mjs
           node tests/e2e/decoders.mjs
           node tests/e2e/shrink.mjs
+      # Firefox: a pinned release, as Mozilla ships it, kept in the cache;
+      # WebGPU on lavapipe; driven over WebDriver BiDi by puppeteer-core
+      - name: Firefox, from the cache
+        if: matrix.part == 'firefox'
+        id: firefox
+        uses: actions/cache@v4
+        with:
+          path: ~/firefox
+          key: firefox-156.0.1-${{ runner.os }}
+      - name: Firefox 156.0.1
+        if: matrix.part == 'firefox' && steps.firefox.outputs.cache-hit != 'true'
+        run: curl -fsSL https://download-installer.cdn.mozilla.net/pub/firefox/releases/156.0.1/linux-x86_64/en-US/firefox-156.0.1.tar.xz | tar xJ -C ~
+      - name: lavapipe (WebGPU for Firefox)
+        if: matrix.part == 'firefox'
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: mesa-vulkan-drivers
+          version: 1
+      - name: puppeteer-core
+        if: matrix.part == 'firefox'
+        run: npm install -g puppeteer-core@25.12.0
+      - name: End-to-end in Firefox (headless, WebGPU on lavapipe)
+        if: matrix.part == 'firefox'
+        run: FIREFOX=~/firefox/firefox node tests/e2e/firefox.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
