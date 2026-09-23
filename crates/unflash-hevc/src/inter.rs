@@ -210,12 +210,18 @@ fn interpolate<P: Sample, const TAPS: usize>(plane: &Plane<P>, xi: i32, yi: i32,
     let (src, base, ss): (&[P], usize, usize) = if x0 >= 0 && y0 >= 0 && x0 + ww as i32 <= pw && y0 + wh as i32 <= ph {
         (&plane.data, y0 as usize * plane.stride + x0 as usize, plane.stride)
     } else {
+        // the window columns left of, inside and right of the picture
+        let inside_from = (-x0).clamp(0, ww as i32) as usize;
+        let inside_to = (pw - x0).clamp(inside_from as i32, ww as i32) as usize;
         for (j, out) in win.chunks_exact_mut(ww).take(wh).enumerate() {
             let sy = (y0 + j as i32).clamp(0, ph - 1) as usize;
             let row = &plane.data[sy * plane.stride..][..plane.width];
-            for (i, o) in out.iter_mut().enumerate() {
-                *o = row[(x0 + i as i32).clamp(0, pw - 1) as usize];
+            out[..inside_from].fill(row[0]);
+            if inside_to > inside_from {
+                let first = (x0 + inside_from as i32) as usize;
+                out[inside_from..inside_to].copy_from_slice(&row[first..first + inside_to - inside_from]);
             }
+            out[inside_to..].fill(row[plane.width - 1]);
         }
         (&win[..], 0, ww)
     };
@@ -381,7 +387,7 @@ mod tests {
         let plane = Plane { data: noise(40 * 30, &mut seed), stride: 40, width: 40, height: 30 };
         let mut dst = vec![0i16; 16 * 16];
         let mut scratch = Scratch::new();
-        for &(x, y) in &[(8, 8), (0, 0), (-5, 3), (36, 26), (20, -9)] {
+        for &(x, y) in &[(8, 8), (0, 0), (-5, 3), (36, 26), (20, -9), (-100, 5), (140, -60), (38, 29)] {
             for mvx in -9..10 {
                 for mvy in -9..10 {
                     luma(&plane, x, y, [mvx, mvy], 8, 4, 8, &mut dst, &mut scratch);
