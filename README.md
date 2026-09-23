@@ -418,7 +418,15 @@ pixels) straight into the WebAssembly module's memory and makes it the
 detector's size there (`resample::Shrink`: the boxes of the GPU's ingest
 pass, summed exactly in integers, rows first so the sums vectorise, YUV
 converted a row at a time with the GPU's arithmetic), and the page gets
-128 KB a frame instead of the whole picture. That upload was most of a
+128 KB a frame instead of the whole picture. The YUV conversion is written
+for the vector unit: each chroma sample's terms are worked out once for
+the two rows that share them, each row goes to three planes (R, G, B)
+sixteen samples at a time in WebAssembly SIMD (a shuffle spreads each
+chroma term over its two samples, and the saturating narrowing from 32 to
+8 bits is the clamp), and each average is divided by a multiply and a
+shift instead of a division (`Divider`). A 1920×960 picture takes 3.7 ms
+in WebAssembly, 10 before; `tests/e2e/shrink.mjs` holds the WebAssembly
+build to a plain JavaScript statement of the arithmetic, value for value. That upload was most of a
 scan in Firefox, where it also crosses to a separate GPU process: an hour
 of 1920×960 took 172 s of a 269 s scan uploading 7 MB pictures. The
 browser test prepares a section both ways and requires the same cached

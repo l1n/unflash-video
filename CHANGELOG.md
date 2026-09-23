@@ -12,6 +12,7 @@ internals. -->
 
 ## 2026-09-23
 
+- <!-- 03:40 --> **Faster where pictures are made small before the detector sees them**: in the built-in decoder's workers, and in Firefox where the video decodes to YUV (Windows, Linux). Converting a 1920×960 picture's colours and shrinking it took 10 ms and now takes under 4, the same result to the last value.
 - <!-- 02:55 --> **Scans with the built-in H.264 decoder give exactly the browser's pictures.** It used to leave out a filter (to be quicker) whose absence adds up over each run of frames between keyframes, enough to matter at the edge of a verdict; the filter costs about an eighth of the decoding time.
 - <!-- 02:35 --> **Scans of H.264 films use two decoders at once**: the browser's (usually the graphics chip's) and Unflash's own, on the processor cores the first leaves idle. The film is shared out in half-minute pieces, and whichever decoder turns out faster takes over more of them as they go, so both finish together. It starts by itself for films of two minutes or more on computers with six cores or more; the *debug info* report shows what each decoder did.
 - <!-- 02:35 --> **Faster scans in Firefox and with the built-in decoder.** The GPU is given eight batches of frames at a time instead of two (Firefox's GPU answers from another process, a third of a second away), and the built-in decoder makes each picture the detector's size in its own workers, which no longer wait for each other at every keyframe.

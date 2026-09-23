@@ -134,11 +134,12 @@ jobs:
       - name: End-to-end, ${{ matrix.part }} (headless Chromium, WebGPU on SwiftShader)
         if: matrix.part != 'formats'
         run: node tests/e2e/run.mjs --part=${{ matrix.part }}
-      - name: Smart-cut splice, MKV and WebM (headless Chromium)
+      - name: Smart-cut splice, MKV and WebM (headless Chromium), the shrink in WebAssembly
         if: matrix.part == 'formats'
         run: |
           node tests/e2e/splice.mjs
           node tests/e2e/mkv.mjs
+          node tests/e2e/shrink.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

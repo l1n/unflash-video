@@ -88,6 +88,12 @@ impl Axis {
 /// by one there; here the exact average is rounded half to even, as WGSL
 /// rounds. Rows are summed first (a straight run over each row, which the
 /// compiler vectorises), then columns, on one output row's sums at a time.
+///
+/// A 4:2:0 picture is converted a row at a time into three planes (R, G, B)
+/// with each chroma sample's terms worked out once per chroma row, so that
+/// the conversion is one straight loop over the row that the compiler
+/// vectorises, and summed plane by plane. Averages are divided by a
+/// multiply and a shift ([`Divider`]) rather than a division per value.
 #[derive(Clone, Debug)]
 pub struct Shrink {
     sw: usize,
@@ -98,13 +104,16 @@ pub struct Shrink {
     rows: Axis,
     acc: Vec<u32>,
     acc16: Vec<u16>,
-    rgba: Vec<u8>,
+    /// R, G and B of the row converted last, one plane after another.
+    planes: Vec<u8>,
+    /// The chroma terms (R, G, B) of the chroma row used last, one per luma column.
+    terms: Vec<i32>,
 }
 
 impl Shrink {
     pub fn new(sw: u32, sh: u32, aw: u32, ah: u32) -> Shrink {
         let (sw, sh, aw, ah) = (sw as usize, sh as usize, aw.max(1) as usize, ah.max(1) as usize);
-        Shrink { sw, sh, aw, ah, cols: Axis::new(sw, aw), rows: Axis::new(sh, ah), acc: Vec::new(), acc16: Vec::new(), rgba: Vec::new() }
+        Shrink { sw, sh, aw, ah, cols: Axis::new(sw, aw), rows: Axis::new(sh, ah), acc: Vec::new(), acc16: Vec::new(), planes: Vec::new(), terms: Vec::new() }
     }
 
     /// The size of the pictures it takes.
@@ -145,11 +154,89 @@ impl Shrink {
         self.shrink_planes(Planes { y, y_stride, u, u_stride, v, v_stride, nv12: false }, coef, out);
     }
 
-    fn shrink_planes(&mut self, planes: Planes, coef: [i32; 6], out: &mut Vec<u8>) {
-        let buf = std::mem::take(&mut self.rgba);
-        let mut rows = YuvRows { p: planes, coef, width: self.sw, buf, last: usize::MAX };
-        self.shrink_rows(&mut rows, false, out);
-        self.rgba = rows.buf;
+    fn shrink_planes(&mut self, p: Planes, coef: [i32; 6], out: &mut Vec<u8>) {
+        let (sw, aw, ah) = (self.sw, self.aw, self.ah);
+        out.clear();
+        out.resize(aw * ah * 4, 255);
+        let [ky, kr, kgu, kgv, kb, yoff] = coef;
+        let cw = sw.div_ceil(2);
+        let mut rgb = std::mem::take(&mut self.planes);
+        rgb.resize(3 * sw, 0);
+        let mut terms = std::mem::take(&mut self.terms);
+        terms.resize(3 * cw, 0);
+        let (mut last_row, mut last_crow) = (usize::MAX, usize::MAX);
+        // row `y` as R, G, B planes, exactly as `crate::yuv::to_rgba` converts each pixel
+        let mut convert = |y: usize, rgb: &mut [u8], terms: &mut [i32]| {
+            if y == last_row {
+                return;
+            }
+            last_row = y;
+            let cy = y / 2;
+            if cy != last_crow {
+                // the chroma terms, once per chroma sample for the two rows that share them
+                last_crow = cy;
+                let (tr, rest) = terms.split_at_mut(cw);
+                let (tg, tb) = rest.split_at_mut(cw);
+                if p.nv12 {
+                    let crow = &p.u[cy * p.u_stride..][..2 * cw];
+                    for (cx, uv) in crow.chunks_exact(2).enumerate() {
+                        let (u, v) = (uv[0] as i32 - 128, uv[1] as i32 - 128);
+                        tr[cx] = kr * v + 32768;
+                        tg[cx] = -kgu * u - kgv * v + 32768;
+                        tb[cx] = kb * u + 32768;
+                    }
+                } else {
+                    let (urow, vrow) = (&p.u[cy * p.u_stride..][..cw], &p.v[cy * p.v_stride..][..cw]);
+                    for cx in 0..cw {
+                        let (u, v) = (urow[cx] as i32 - 128, vrow[cx] as i32 - 128);
+                        tr[cx] = kr * v + 32768;
+                        tg[cx] = -kgu * u - kgv * v + 32768;
+                        tb[cx] = kb * u + 32768;
+                    }
+                }
+            }
+            let (r, rest) = rgb.split_at_mut(sw);
+            let (g, b) = rest.split_at_mut(sw);
+            convert_row(&p.y[y * p.y_stride..][..sw], terms, cw, ky, yoff, [r, g, b]);
+        };
+        let total = self.cols.total as u64 * self.rows.total as u64;
+        let div = Divider::new(total, 255 * total);
+        let narrow = self.rows.total as usize * 255 <= u16::MAX as usize;
+        macro_rules! shrink_with {
+            ($acc:expr, $t:ty) => {{
+                let acc = &mut $acc[..3 * sw];
+                for (y, (first, wy)) in self.rows.boxes.iter().enumerate() {
+                    acc.fill(0);
+                    for (k, &w) in wy.iter().enumerate() {
+                        convert(first + k, &mut rgb, &mut terms);
+                        let w = w as $t;
+                        for (a, &v) in acc.iter_mut().zip(rgb.iter()) {
+                            *a += w * v as $t;
+                        }
+                    }
+                    let orow = &mut out[y * aw * 4..(y + 1) * aw * 4];
+                    for (c, plane) in acc.chunks_exact(sw).enumerate() {
+                        for (x, (first, wx)) in self.cols.boxes.iter().enumerate() {
+                            let sum: u64 = wx.iter().zip(&plane[*first..]).map(|(&w, &a)| w as u64 * a as u64).sum();
+                            orow[x * 4 + c] = div.round(sum);
+                        }
+                    }
+                }
+            }};
+        }
+        if narrow {
+            let mut acc = std::mem::take(&mut self.acc16);
+            acc.resize(3 * sw, 0);
+            shrink_with!(acc, u16);
+            self.acc16 = acc;
+        } else {
+            let mut acc = std::mem::take(&mut self.acc);
+            acc.resize(3 * sw, 0);
+            shrink_with!(acc, u32);
+            self.acc = acc;
+        }
+        self.planes = rgb;
+        self.terms = terms;
     }
 
     fn shrink_rows<R: Rows>(&mut self, rows: &mut R, bgr: bool, out: &mut Vec<u8>) {
@@ -157,6 +244,7 @@ impl Shrink {
         out.clear();
         out.resize(aw * ah * 4, 255);
         let total = self.cols.total as u64 * self.rows.total as u64;
+        let div = Divider::new(total, 255 * total);
         let (ri, bi) = if bgr { (2, 0) } else { (0, 2) };
         // a row box's sums in 16 bits when they fit (twice the lanes)
         let narrow = self.rows.total as usize * 255 <= u16::MAX as usize;
@@ -185,9 +273,9 @@ impl Shrink {
                                 sum[1] += w as u64 * p[1] as u64;
                                 sum[2] += w as u64 * p[2] as u64;
                             }
-                            o[0] = round_div(sum[ri], total);
-                            o[1] = round_div(sum[1], total);
-                            o[2] = round_div(sum[bi], total);
+                            o[0] = div.round(sum[ri]);
+                            o[1] = div.round(sum[1]);
+                            o[2] = div.round(sum[bi]);
                         } else {
                             let mut sum = [0u32; 3];
                             for (k, &w) in wx.iter().enumerate() {
@@ -196,9 +284,9 @@ impl Shrink {
                                 sum[1] += w * p[1] as u32;
                                 sum[2] += w * p[2] as u32;
                             }
-                            o[0] = round_div(sum[ri] as u64, total);
-                            o[1] = round_div(sum[1] as u64, total);
-                            o[2] = round_div(sum[bi] as u64, total);
+                            o[0] = div.round(sum[ri] as u64);
+                            o[1] = div.round(sum[1] as u64);
+                            o[2] = div.round(sum[bi] as u64);
                         }
                     }
                 }
@@ -248,53 +336,60 @@ struct Planes<'a> {
     nv12: bool,
 }
 
-/// A 4:2:0 picture's rows converted to RGBX one at a time (a row two boxes
-/// share is converted once).
-struct YuvRows<'a> {
-    p: Planes<'a>,
-    coef: [i32; 6],
-    width: usize,
-    buf: Vec<u8>,
-    last: usize,
+/// A row of luma samples and its chroma terms (`t`: R, G and B, `cw`
+/// apart, one per chroma sample) converted to R, G and B planes, each
+/// sample as `crate::yuv::to_rgba` converts it: `(yy + term) >> 16`,
+/// clamped to 0..=255.
+fn convert_row(yrow: &[u8], t: &[i32], cw: usize, ky: i32, yoff: i32, out: [&mut [u8]; 3]) {
+    let w = yrow.len();
+    assert!(t.len() >= 3 * cw && cw >= w.div_ceil(2) && out.iter().all(|o| o.len() >= w));
+    #[allow(unused_mut)]
+    let mut out = out;
+    #[allow(unused_mut)]
+    let mut x0 = 0;
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        // SAFETY: the lengths were checked above; simd128 is enabled for the build
+        x0 = unsafe { convert_row_simd128(yrow, t, cw, ky, yoff, &mut out) };
+    }
+    let [r, g, b] = out;
+    for x in x0..w {
+        let yy = (yrow[x] as i32 - yoff) * ky;
+        let c = x >> 1;
+        r[x] = ((yy + t[c]) >> 16).clamp(0, 255) as u8;
+        g[x] = ((yy + t[cw + c]) >> 16).clamp(0, 255) as u8;
+        b[x] = ((yy + t[2 * cw + c]) >> 16).clamp(0, 255) as u8;
+    }
 }
 
-impl Rows for YuvRows<'_> {
-    fn row(&mut self, y: usize) -> &[u8] {
-        if self.last != y {
-            self.last = y;
-            let (p, w) = (&self.p, self.width);
-            self.buf.resize(w * 4, 255);
-            let [ky, kr, kgu, kgv, kb, yoff] = self.coef;
-            let yrow = &p.y[y * p.y_stride..][..w];
-            let cy = y / 2;
-            let cw = w.div_ceil(2);
-            let out = &mut self.buf[..w * 4];
-            // the chroma terms once for the two pixels that share them
-            let mut pair = |cx: usize, u: i32, v: i32| {
-                let (cr, cg, cb) = (kr * v + 32768, -kgu * u - kgv * v + 32768, kb * u + 32768);
-                for x in 2 * cx..(2 * cx + 2).min(w) {
-                    let yy = (yrow[x] as i32 - yoff) * ky;
-                    let o = &mut out[x * 4..x * 4 + 3];
-                    o[0] = ((yy + cr) >> 16).clamp(0, 255) as u8;
-                    o[1] = ((yy + cg) >> 16).clamp(0, 255) as u8;
-                    o[2] = ((yy + cb) >> 16).clamp(0, 255) as u8;
-                }
-            };
-            if p.nv12 {
-                let crow = &p.u[cy * p.u_stride..][..2 * cw];
-                for cx in 0..cw {
-                    pair(cx, crow[2 * cx] as i32 - 128, crow[2 * cx + 1] as i32 - 128);
-                }
-            } else {
-                let urow = &p.u[cy * p.u_stride..][..cw];
-                let vrow = &p.v[cy * p.v_stride..][..cw];
-                for cx in 0..cw {
-                    pair(cx, urow[cx] as i32 - 128, vrow[cx] as i32 - 128);
-                }
-            }
+/// `convert_row` sixteen samples at a time: each chroma term is loaded once
+/// and spread over its two samples by a shuffle, and the clamp is the
+/// saturation of the two narrowing steps (i32 to i16 to u8), which gives
+/// exactly 0..=255. Returns how many samples it converted (a multiple of 16).
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[target_feature(enable = "simd128")]
+unsafe fn convert_row_simd128(yrow: &[u8], t: &[i32], cw: usize, ky: i32, yoff: i32, out: &mut [&mut [u8]; 3]) -> usize {
+    use core::arch::wasm32::*;
+    let n = yrow.len() / 16 * 16;
+    let (kyv, yoffv) = (i32x4_splat(ky), i32x4_splat(yoff));
+    let mut x = 0;
+    while x < n {
+        let yv = v128_load(yrow.as_ptr().add(x) as *const v128);
+        let (lo, hi) = (u16x8_extend_low_u8x16(yv), u16x8_extend_high_u8x16(yv));
+        let yy = [u32x4_extend_low_u16x8(lo), u32x4_extend_high_u16x8(lo), u32x4_extend_low_u16x8(hi), u32x4_extend_high_u16x8(hi)].map(|v| i32x4_mul(i32x4_sub(v, yoffv), kyv));
+        // chroma samples x / 2 .. x / 2 + 8 (within the first cw: x + 16 <= n <= w)
+        let c = x / 2;
+        for (k, plane) in out.iter_mut().enumerate() {
+            let tp = t.as_ptr().add(k * cw + c);
+            let (t0, t1) = (v128_load(tp as *const v128), v128_load(tp.add(4) as *const v128));
+            let v = [i32x4_shuffle::<0, 0, 1, 1>(t0, t0), i32x4_shuffle::<2, 2, 3, 3>(t0, t0), i32x4_shuffle::<0, 0, 1, 1>(t1, t1), i32x4_shuffle::<2, 2, 3, 3>(t1, t1)];
+            let s = [0, 1, 2, 3].map(|i| i32x4_shr(i32x4_add(yy[i], v[i]), 16));
+            let px = u8x16_narrow_i16x8(i16x8_narrow_i32x4(s[0], s[1]), i16x8_narrow_i32x4(s[2], s[3]));
+            v128_store(plane.as_mut_ptr().add(x) as *mut v128, px);
         }
-        &self.buf
+        x += 16;
     }
+    n
 }
 
 /// `n / d` rounded to the nearest integer, halves to even, capped at 255.
@@ -302,6 +397,44 @@ fn round_div(n: u64, d: u64) -> u8 {
     let (q, r) = (n / d, n % d);
     let q = if 2 * r > d || (2 * r == d && q % 2 == 1) { q + 1 } else { q };
     q.min(255) as u8
+}
+
+/// Division by a fixed `d` of numerators up to `max`, by a multiply and a
+/// shift (Granlund and Montgomery): with `s` = ⌈log₂ d⌉ and numerators
+/// below 2^`bits`, `m` = ⌊2^(bits+s) / d⌋ + 1 gives ⌊n / d⌋ = (n·m) >>
+/// (bits+s) exactly. A division costs tens of cycles, and a shrink divides
+/// each of its 100 000 or so output values; where the product would not
+/// fit in 64 bits it divides after all.
+#[derive(Clone, Copy, Debug)]
+struct Divider {
+    d: u64,
+    m: u64,
+    shift: u32,
+    exact: bool,
+}
+
+impl Divider {
+    fn new(d: u64, max: u64) -> Divider {
+        let d = d.max(1);
+        let bits = 64 - max.max(1).leading_zeros();
+        let s = 64 - (d - 1).leading_zeros();
+        let m = ((1u128 << (bits + s)) / d as u128 + 1) as u64;
+        // n·m must fit: bits + bits(m) <= 64
+        let exact = bits + s <= 63 && bits + (64 - m.leading_zeros()) <= 64;
+        Divider { d, m, shift: bits + s, exact }
+    }
+
+    /// `n / d`, rounded as [`round_div`] rounds.
+    #[inline(always)]
+    fn round(&self, n: u64) -> u8 {
+        if !self.exact {
+            return round_div(n, self.d);
+        }
+        let q = (n * self.m) >> self.shift;
+        let r = n - q * self.d;
+        let q = if 2 * r > self.d || (2 * r == self.d && q % 2 == 1) { q + 1 } else { q };
+        q.min(255) as u8
+    }
 }
 
 #[cfg(test)]
@@ -429,6 +562,21 @@ mod tests {
         s.packed(&rgba, 0, w * 4, false, &mut want);
         s.yuv420(&data, &l, &mut got);
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn divider_matches_division() {
+        for d in [1u64, 2, 3, 7, 15, 225, 255, 1000, 4096, 50625, 65793, 1 << 20] {
+            let max = 255 * d;
+            let div = Divider::new(d, max);
+            let step = (max / 200_000).max(1);
+            let mut n = 0;
+            while n <= max {
+                assert_eq!(div.round(n), round_div(n, d), "{n} / {d}");
+                n += if n < 4 * d { 1 } else { step };
+            }
+            assert_eq!(div.round(max), round_div(max, d));
+        }
     }
 
     #[test]
