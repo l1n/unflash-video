@@ -197,6 +197,10 @@ pub struct SliceDecoder<'a> {
     y_stride: usize,
     c_base: usize,
     c_stride: usize,
+    /// Not MBAFF: the macroblocks A (left), B (above), C (above right) and
+    /// D (above left) of the current one when available (`mb_avail`, which
+    /// they would otherwise cost at every neighbour lookup), else usize::MAX
+    nb_mbs: [usize; 4],
     /// the coefficient scans of the current macroblock
     scan4: &'static [u8; 16],
     scan8: &'static [u8; 64],
@@ -304,6 +308,7 @@ impl<'a> SliceDecoder<'a> {
             y_stride: 0,
             c_base: 0,
             c_stride: 0,
+            nb_mbs: [usize::MAX; 4],
             scan4: &ZIGZAG4X4,
             scan8: &ZIGZAG8X8,
             cur: MbInfo::default(),
@@ -477,6 +482,7 @@ impl<'a> SliceDecoder<'a> {
             self.mb_addr = self.my * self.width_mbs + self.mx;
             self.mb_field = self.field_pic;
             self.mb_bottom = false;
+            self.nb_mbs = [(-1, 0), (0, -1), (1, -1), (-1, -1)].map(|(dx, dy)| self.mb_avail(dx, dy).unwrap_or(usize::MAX));
         }
         self.cur = MbInfo { slice: self.slice_id, ..Default::default() };
         self.done = 0;
@@ -641,10 +647,18 @@ impl<'a> SliceDecoder<'a> {
         }
         let xw = ((xn + maxw) % maxw) as usize;
         if !self.mbaff {
-            let dx = if xn < 0 { -1 } else if xn >= maxw { 1 } else { 0 };
-            let dy = if yn < 0 { -1 } else { 0 };
-            let addr = self.mb_avail(dx, dy)?;
-            return Some((addr, xw, ((yn + maxh) % maxh) as usize));
+            // A when to the left, else above: B, C to the right, D to the left
+            let k = if yn >= 0 {
+                0
+            } else if xn < 0 {
+                3
+            } else if xn >= maxw {
+                2
+            } else {
+                1
+            };
+            let addr = self.nb_mbs[k];
+            return (addr != usize::MAX).then(|| (addr, xw, ((yn + maxh) % maxh) as usize));
         }
         self.neighbour_mbaff(xn, yn, maxw, maxh, xw)
     }
