@@ -213,7 +213,7 @@ results. Its changes to each section can be undone like any other.
 The **Guide** button opens the guide beside your work and closes it again
 (so does Esc).
 
-**🔔** (in the header) sets the finish alert: a beep when a job that ran
+**Alerts** (in the header) sets the finish alert: a beep when a job that ran
 for over a minute ends (the time is yours to change), and if you allow it
 a system notification while the tab is in the background. Jobs that
 follow one another, such as opening a file and its scan, or every stage of
@@ -255,7 +255,7 @@ Pages build regenerates them; for a local copy run
 
 ### Diagnostics
 
-**🐞 debug info**, at the bottom right, puts together what someone helping
+**Debug info**, at the bottom right, puts together what someone helping
 with a slow or failing run needs, as text to paste into a message: the
 browser, the WebGPU adapter, the detector and how pictures reach it, the
 open video (container, codec, size, frame rate, length), each job of the

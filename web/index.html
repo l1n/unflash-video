@@ -4,12 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Unflash</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230d0d0d'/%3E%3Cpath d='M9.5 1.5 4 9h3.5L6.5 14.5 12 7H8.5z' fill='%23e4e4e4'/%3E%3Cpath d='M2 14 14 2' stroke='%230d0d0d' stroke-width='3'/%3E%3Cpath d='M2 14 14 2' stroke='%23e4e4e4' stroke-width='1.2'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header>
-  <div class="brand" title="Unflash — WebGPU / WebAssembly">⚡̶ Unflash</div>
+  <div class="brand" title="Unflash: WebGPU and WebAssembly">Unflash</div>
   <button id="btnHome" title="Show or hide the guide (it opens beside your work, and Esc closes it)">Guide</button>
   <button id="btnChanges" title="What has changed in Unflash, newest first">What's new<span id="changesDot" class="new-dot hidden"></span></button>
   <label class="filebtn primary"><input type="file" id="fileInput" accept="video/*,.mp4,.m4v,.mov,.mkv,.webm,.3gp">Open video…</label>
@@ -36,7 +36,7 @@
     </div>
   </span>
   <span class="alerts-wrap">
-    <button id="btnAlerts" title="A beep, and if you like a system notification, when a long job (opening, scanning, preparing, exporting, verifying) finishes">🔔</button>
+    <button id="btnAlerts" title="A beep, and if you like a system notification, when a long job (opening, scanning, preparing, exporting, verifying) finishes">Alerts</button>
     <div id="alertsMenu" class="menu alerts-menu hidden">
       <label class="toggle"><input type="checkbox" id="alertBeep"> beep when a job that ran for over</label>
       <div class="fps-row"><input type="number" id="alertAfter" min="0" max="7200" step="5"><span>seconds finishes</span></div>
@@ -125,7 +125,7 @@
             <option value="0.5">½×</option>
             <option value="0.25">¼×</option>
           </select>
-          <button id="btnPreviewSound" class="small sound-toggle" aria-pressed="false" title="Play the section's sound too (off to start with). Held frames are silent while they wait, as in the export.">🔇 sound off</button>
+          <button id="btnPreviewSound" class="small sound-toggle" aria-pressed="false" title="Play the section's sound too (off to start with). Held frames are silent while they wait, as in the export.">sound off</button>
           <span id="previewInfo" class="preview-info"></span>
         </div>
       </div>
@@ -209,7 +209,7 @@
         </div>
         <div class="grid-head">
           <h3>Frames <span id="frameCount"></span></h3>
-          <span class="size-switch thumb-size" title="Thumbnail size (they are the detector's small copies: 🔍 view frame shows one at full size)">
+          <span class="size-switch thumb-size" title="Thumbnail size (they are the detector's small copies: view frame shows one at full size)">
             <button data-thumb="s" class="small">S</button><button data-thumb="m" class="small">M</button><button data-thumb="l" class="small">L</button><button data-thumb="xl" class="small">XL</button>
           </span>
           <div class="legend">
@@ -231,7 +231,7 @@
             <button id="btnMarkKeep" class="small" title="Keep the selected frames: the suggestions leave them alone">K: keep</button>
             <button id="btnMarkBlend" class="small" title="Lower the contrast of the selected frames: blend them with the frames either side of them (by the blend strength above), which takes a flash down without taking a frame out">B: blend</button>
             <button id="btnUnmark" class="small">U: unmark</button>
-            <button id="btnViewFrame" class="small" title="The selected frame at full size, decoded from the file, to read a subtitle or look closer (also Z, or double-click a frame). ← → step through the frames.">🔍 view frame (Z)</button>
+            <button id="btnViewFrame" class="small" title="The selected frame at full size, decoded from the file, to read a subtitle or look closer (also Z, or double-click a frame). ← → step through the frames.">view frame (Z)</button>
             <button id="btnSelectUnsafe" class="small danger hidden" title="Select the frames inside whatever is still failing">select unsafe frames</button>
           </div>
         </div>
@@ -325,7 +325,7 @@
   </div>
 </div>
 
-<footer class="status"><div id="status" class="status-parts"></div><button id="btnDebug" class="small" title="What this browser, its GPU and the open video are, and how long each job took (the last scan step by step), as text to paste into a message to whoever is helping. No file names.">🐞 debug info</button></footer>
+<footer class="status"><div id="status" class="status-parts"></div><button id="btnDebug" class="small" title="What this browser, its GPU and the open video are, and how long each job took (the last scan step by step), as text to paste into a message to whoever is helping. No file names.">debug info</button></footer>
 <div id="toast" class="toast hidden"></div>
 
 <script type="module" src="app.js"></script>

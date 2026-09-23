@@ -12,6 +12,7 @@ internals. -->
 
 ## 2026-09-23
 
+- <!-- 19:50 --> **A plainer look**, after the edit controllers video editing grew up on: fixed-width type, square keys that light up when they are on, a neutral grey that tints nothing around the picture, and colour kept for what it means (the kinds of flash, pass and fail, the selection). A failing section's verdict is lit red, a passing one green. The emoji are words now: *Alerts*, *sound off*, *view frame*, *debug info*.
 - <!-- 19:30 --> **Clicking Scan during a scan no longer ends it.** The scan under way used to fail ("Scanning for flashes failed: … is null"); now it carries on, and the page says a scan is under way. Opening another video, preparing a section or exporting while a job runs is turned away the same way, with nothing changed.
 - <!-- 19:30 --> **The page stays responsive while it scans**: Firefox no longer says the page is slowing it down. A scan decodes ahead of its detector, and with several decoders at work (as in Firefox) or a slow computer, the detector then took hundreds of pictures in one go and held the page for seconds. Now it lets the page draw and answer between them, and the scan is no slower.
 - <!-- 18:20 --> **Long films no longer run the tab out of memory in Firefox** (or in a browser without WebGPU). Since an update earlier today, every frame decoded there for a scan or a section left a small copy of itself in memory until the tab was closed, about 150 KB a frame: gigabytes for a long film. The memory now stays the same however long the film.

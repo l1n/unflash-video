@@ -293,7 +293,26 @@ function reported(result, v) {
 }
 
 const KIND_LABEL = { flash: 'flash', red: 'red flash', extended: 'extended flash', pattern: 'stripes' };
-const PATTERN_COLOUR = '#3fc1c9';
+
+// The page's colours and type, for the canvases: style.css keeps them
+// (:root), so the timeline and the charts draw in the same palette as the
+// rest of the page.
+const ink = (() => {
+  const cs = getComputedStyle(document.documentElement);
+  const v = (k) => cs.getPropertyValue(`--${k}`).trim();
+  const out = {};
+  for (const k of ['bg', 'line2', 'fg', 'fg2', 'flash', 'red', 'pat', 'ext', 'held', 'blend', 'sel', 'ok', 'bad']) out[k] = v(k);
+  const mono = v('mono');
+  out.font = (px) => `${px}px ${mono}`;
+  return out;
+})();
+/** Colour `hex` (#rrggbb) at opacity `a`. */
+function tint(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+}
+/** A violation's or a section's colour, by its kind. */
+const kindInk = (kind) => ({ flash: ink.flash, red: ink.red, extended: ink.ext, pattern: ink.pat })[kind] || ink.fg2;
 
 /** `?cpu=1` forces the WebAssembly detector (for comparison and tests). */
 function preferGpuSetting() {
@@ -1340,7 +1359,7 @@ function renderSoundButton() {
   const on = soundSetting();
   const slow = (parseFloat($('previewSpeed').value) || 1) !== 1;
   b.setAttribute('aria-pressed', on ? 'true' : 'false');
-  b.textContent = on ? '🔊 sound on' : '🔇 sound off';
+  b.textContent = on ? 'sound on' : 'sound off';
   b.title = sectionSound.failed
     ? `No sound: ${sectionSound.failed}.`
     : on
@@ -1669,16 +1688,16 @@ function drawTimeline(dragSpan = null) {
       const gcount = sum.general[i];
       const rcount = sum.red[i];
       if (gcount) {
-        g.fillStyle = `rgba(232,163,60,${Math.min(1, 0.25 + gcount / 6)})`;
+        g.fillStyle = tint(ink.flash, Math.min(1, 0.25 + gcount / 6));
         g.fillRect(x(sum.t0 + i * sum.bin), 6, bw + 0.5, H - 30);
       }
       if (rcount) {
-        g.fillStyle = `rgba(224,79,176,${Math.min(1, 0.25 + rcount / 6)})`;
+        g.fillStyle = tint(ink.red, Math.min(1, 0.25 + rcount / 6));
         g.fillRect(x(sum.t0 + i * sum.bin), 6, bw + 0.5, (H - 30) / 2);
       }
       const pcount = sum.pattern ? sum.pattern[i] : 0;
       if (pcount) {
-        g.fillStyle = `rgba(63,193,201,${Math.min(1, 0.3 + pcount / 4)})`;
+        g.fillStyle = tint(ink.pat, Math.min(1, 0.3 + pcount / 4));
         g.fillRect(x(sum.t0 + i * sum.bin), 6 + (H - 30) / 2, bw + 0.5, (H - 30) / 2);
       }
     }
@@ -1700,8 +1719,8 @@ function drawTimeline(dragSpan = null) {
       if (trace.r[i] > rmax[c]) rmax[c] = trace.r[i];
     }
     for (const [col, vals] of [
-      ['rgba(232,163,60,.9)', hmax],
-      ['rgba(224,79,176,.9)', rmax],
+      [tint(ink.flash, 0.9), hmax],
+      [tint(ink.red, 0.9), rmax],
     ]) {
       g.strokeStyle = col;
       g.beginPath();
@@ -1715,7 +1734,7 @@ function drawTimeline(dragSpan = null) {
     }
   }
   // threshold line label
-  g.fillStyle = '#5a6070';
+  g.fillStyle = ink.line2;
   g.fillRect(0, H - 24, W, 1);
   // what a running scan has found so far (dashed: its edges may still move)
   const provisional = state.scanning ? state.scanning.violations : null;
@@ -1726,7 +1745,7 @@ function drawTimeline(dragSpan = null) {
     for (const v of provisional) {
       const x0 = x(v.start);
       const x1 = Math.max(x0 + 4, x(v.end));
-      g.strokeStyle = v.kind === 'red' ? '#e04fb0' : v.kind === 'flash' ? '#e8a33c' : v.kind === 'extended' ? '#7f9bff' : PATTERN_COLOUR;
+      g.strokeStyle = kindInk(v.kind);
       g.strokeRect(x0 + 0.5, 4.5, x1 - x0 - 1, H - 27);
     }
     g.restore();
@@ -1736,23 +1755,23 @@ function drawTimeline(dragSpan = null) {
     const x0 = x(s.start);
     const x1 = Math.max(x0 + 3, x(s.end));
     const isCur = state.current === s.id;
-    const kind = (s.kinds || []).includes('red') ? '#e04fb0' : (s.kinds || []).includes('flash') ? '#e8a33c' : (s.kinds || []).includes('extended') ? '#7f9bff' : (s.kinds || []).includes('pattern') ? PATTERN_COLOUR : '#9aa0ad';
-    g.fillStyle = isCur ? 'rgba(79,140,255,.35)' : 'rgba(255,255,255,.08)';
+    const kind = kindInk(['red', 'flash', 'extended', 'pattern'].find((k) => (s.kinds || []).includes(k)));
+    g.fillStyle = isCur ? tint(ink.fg, 0.2) : tint(ink.fg, 0.07);
     g.fillRect(x0, 4, x1 - x0, H - 26);
-    g.strokeStyle = s.check && !s.check.stale ? (s.check.safe ? '#3dbb6a' : '#e0503f') : kind;
+    g.strokeStyle = s.check && !s.check.stale ? (s.check.safe ? ink.ok : ink.bad) : kind;
     g.lineWidth = isCur ? 2 : 1;
     g.strokeRect(x0 + 0.5, 4.5, x1 - x0 - 1, H - 27);
-    g.fillStyle = '#fff';
-    g.font = '11px system-ui';
+    g.fillStyle = ink.fg;
+    g.font = ink.font(11);
     g.fillText(`#${s.id}`, x0 + 3, 16);
   }
   if (dragSpan) {
-    g.fillStyle = 'rgba(79,140,255,.3)';
+    g.fillStyle = tint(ink.fg, 0.25);
     g.fillRect(x(dragSpan[0]), 4, x(dragSpan[1]) - x(dragSpan[0]), H - 26);
   }
   // time ticks
-  g.fillStyle = '#7d8494';
-  g.font = '10px system-ui';
+  g.fillStyle = ink.fg2;
+  g.font = ink.font(10);
   const step = niceStep(span / Math.max(2, W / 90));
   for (let t = Math.ceil(lo / step) * step; t <= hi; t += step) {
     g.fillRect(x(t), H - 22, 1, 4);
@@ -1761,7 +1780,7 @@ function drawTimeline(dragSpan = null) {
   // playhead: the section player's, while it shows a section
   const ct = state.player.mode !== 'video' && sectionPlayer && sectionPlayer.run && sectionPlayer.run.t != null ? sectionPlayer.run.t : $('player').currentTime;
   if (ct >= lo && ct <= hi) {
-    g.fillStyle = '#fff';
+    g.fillStyle = ink.fg;
     g.fillRect(x(ct), 0, 1.5, H);
   }
 }
@@ -2881,7 +2900,6 @@ function lowerBound(ts, t) {
   return lo;
 }
 
-const KIND_COLOUR = { flash: '#e8a33c', red: '#e04fb0', extended: '#7f9bff' };
 
 /** The scan's verdict on the whole video, for the section list and the chart. */
 function scanStatus() {
@@ -2932,18 +2950,18 @@ function drawChart() {
   for (let i = 0; i < n; i++) {
     const e = (sec.edits || {})[i] || {};
     if (blendSet.has(i) && !e.removed) {
-      g.fillStyle = 'rgba(167,130,255,.22)';
+      g.fillStyle = tint(ink.blend, 0.22);
       g.fillRect(i * bw, 0, bw + 0.5, H);
     }
     if (e.removed) {
-      g.fillStyle = 'rgba(224,80,63,.22)';
+      g.fillStyle = tint(ink.bad, 0.22);
       g.fillRect(i * bw, 0, bw + 0.5, H);
     } else if (e.extended) {
-      g.fillStyle = 'rgba(79,140,255,.22)';
+      g.fillStyle = tint(ink.held, 0.22);
       g.fillRect(i * bw, 0, bw + 0.5, H);
     }
     if (sec.check.flagged && sec.check.flagged.includes(i)) {
-      g.fillStyle = extOnly.has(i) ? 'rgba(127,155,255,.14)' : 'rgba(232,163,60,.12)';
+      g.fillStyle = extOnly.has(i) ? tint(ink.ext, 0.14) : tint(ink.flash, 0.12);
       g.fillRect(i * bw, 0, bw + 0.5, H);
     }
   }
@@ -2952,23 +2970,23 @@ function drawChart() {
     const x = i * bw;
     const up = st.up[i] * scale;
     const dn = st.down[i] * scale;
-    g.fillStyle = st.hazard[i] >= thresh ? '#e8a33c' : 'rgba(232,163,60,.5)';
+    g.fillStyle = st.hazard[i] >= thresh ? ink.flash : tint(ink.flash, 0.5);
     g.fillRect(x, mid - up, Math.max(1, bw - 0.5), up);
     g.fillRect(x, mid, Math.max(1, bw - 0.5), dn);
     const red = st.red[i] * scale;
     if (red > 0) {
-      g.fillStyle = st.hazardRed[i] >= thresh ? '#e04fb0' : 'rgba(224,79,176,.6)';
+      g.fillStyle = st.hazardRed[i] >= thresh ? ink.red : tint(ink.red, 0.6);
       g.fillRect(x, mid - red, Math.max(1, bw - 0.5), red);
     }
   }
-  g.strokeStyle = 'rgba(255,255,255,.35)';
+  g.strokeStyle = tint(ink.fg, 0.35);
   g.beginPath();
   g.moveTo(0, mid - thresh * scale);
   g.lineTo(W, mid - thresh * scale);
   g.moveTo(0, mid + thresh * scale);
   g.lineTo(W, mid + thresh * scale);
   g.stroke();
-  g.strokeStyle = '#e6e8ee';
+  g.strokeStyle = ink.fg;
   g.lineWidth = 1.2;
   g.beginPath();
   for (let i = 0; i < n; i++) {
@@ -2978,7 +2996,7 @@ function drawChart() {
   }
   g.stroke();
   if (st.ext && st.ext.length === n) {
-    g.strokeStyle = '#7f9bff';
+    g.strokeStyle = ink.ext;
     g.lineWidth = 1.2;
     g.beginPath();
     for (let i = 0; i < n; i++) {
@@ -2990,7 +3008,7 @@ function drawChart() {
   }
   if (st.pattern && st.pattern.length === n && sec.check.pattern_thresh) {
     const pt = sec.check.pattern_thresh;
-    g.strokeStyle = PATTERN_COLOUR;
+    g.strokeStyle = ink.pat;
     g.lineWidth = 1.2;
     g.beginPath();
     for (let i = 0; i < n; i++) {
@@ -3001,7 +3019,7 @@ function drawChart() {
     g.stroke();
   }
   for (const i of state.selection) {
-    g.fillStyle = 'rgba(255,216,79,.35)';
+    g.fillStyle = tint(ink.sel, 0.35);
     g.fillRect(i * bw, 0, bw + 0.5, H);
   }
 }
@@ -3069,21 +3087,21 @@ function drawVideoChart(g, W, H) {
   const MAXL = Math.min(8, Math.max(1.5, peak * 1.1));
   const y = (lev) => bottom - (Math.min(MAXL, Math.max(0, lev)) / MAXL) * plotH;
   // the sections
-  g.font = '10px system-ui';
+  g.font = ink.font(10);
   for (const s of state.project.sectionsSorted()) {
     if (s.end < t0 || s.start > t1) continue;
     const x0 = Math.max(0, x(s.start));
     const x1 = Math.min(W, Math.max(x0 + 2, x(s.end)));
-    g.fillStyle = state.current === s.id ? 'rgba(79,140,255,.2)' : 'rgba(255,255,255,.07)';
+    g.fillStyle = state.current === s.id ? tint(ink.fg, 0.16) : tint(ink.fg, 0.06);
     g.fillRect(x0, top, x1 - x0, plotH);
-    g.fillStyle = '#9aa0ad';
+    g.fillStyle = ink.fg2;
     g.fillText(`#${s.id}`, x0 + 3, top + 10);
   }
   // what the scan found, along the top
   const found = state.scanning ? state.scanning.violations : scan ? scan.violations.filter((v) => scanReports(scan, v)) : [];
   for (const v of found) {
     if (v.end < t0 || v.start > t1) continue;
-    g.fillStyle = KIND_COLOUR[v.kind] || PATTERN_COLOUR;
+    g.fillStyle = kindInk(v.kind);
     const x0 = Math.max(0, x(v.start));
     g.fillRect(x0, 2, Math.max(2, Math.min(W, x(v.end)) - x0), 7);
   }
@@ -3091,11 +3109,11 @@ function drawVideoChart(g, W, H) {
     // bars: flashing faster than the limit, general then red
     for (let c = 0; c < cols; c++) {
       if (hmax[c] > 0) {
-        g.fillStyle = hmax[c] >= 1 ? '#e8a33c' : 'rgba(232,163,60,.55)';
+        g.fillStyle = hmax[c] >= 1 ? ink.flash : tint(ink.flash, 0.55);
         g.fillRect(c, y(hmax[c]), 1, bottom - y(hmax[c]));
       }
       if (rmax[c] > 0) {
-        g.fillStyle = rmax[c] >= 1 ? '#e04fb0' : 'rgba(224,79,176,.6)';
+        g.fillStyle = rmax[c] >= 1 ? ink.red : tint(ink.red, 0.6);
         g.fillRect(c, y(rmax[c]), 1, bottom - y(rmax[c]));
       }
     }
@@ -3121,23 +3139,24 @@ function drawVideoChart(g, W, H) {
       }
       g.stroke();
     };
-    line(lsum, 'rgba(200,205,215,.45)', (v, c) => bottom - (v / lcnt[c]) * plotH * 0.9, lcnt);
-    line(emax, '#7f9bff', (v) => y(v), lcnt);
-    if (scan && scan.flag_patterns) line(pmax, PATTERN_COLOUR, (v) => y(v), lcnt);
+    line(lsum, tint(ink.fg, 0.45), (v, c) => bottom - (v / lcnt[c]) * plotH * 0.9, lcnt);
+    line(emax, ink.ext, (v) => y(v), lcnt);
+    if (scan && scan.flag_patterns) line(pmax, ink.pat, (v) => y(v), lcnt);
   }
   // the limit
   g.save();
   g.setLineDash([4, 3]);
-  g.strokeStyle = 'rgba(255,255,255,.45)';
+  g.strokeStyle = tint(ink.fg, 0.45);
   g.beginPath();
   g.moveTo(0, y(1) + 0.5);
   g.lineTo(W, y(1) + 0.5);
   g.stroke();
   g.restore();
-  g.fillStyle = 'rgba(255,255,255,.6)';
-  g.fillText(MAXL > 1.6 ? `limit (top: ${Math.round(MAXL * 10) / 10}×)` : 'limit', W - (MAXL > 1.6 ? 92 : 26), y(1) - 3);
+  g.fillStyle = tint(ink.fg, 0.6);
+  const limitLabel = MAXL > 1.6 ? `limit (top: ${Math.round(MAXL * 10) / 10}×)` : 'limit';
+  g.fillText(limitLabel, W - g.measureText(limitLabel).width - 4, y(1) - 3);
   // time ticks and the playhead
-  g.fillStyle = '#7d8494';
+  g.fillStyle = ink.fg2;
   const step = niceStep(span / Math.max(2, W / 90));
   for (let t = Math.ceil(t0 / step) * step; t <= t1; t += step) {
     g.fillRect(x(t), bottom, 1, 3);
@@ -3145,7 +3164,7 @@ function drawVideoChart(g, W, H) {
   }
   const ct = $('player').currentTime;
   if (ct >= t0 && ct <= t1) {
-    g.fillStyle = '#fff';
+    g.fillStyle = ink.fg;
     g.fillRect(x(ct), 0, 1.5, H);
   }
   // the words under it
