@@ -1,20 +1,23 @@
 //! Decode the JCT-VC HEVC conformance streams (Annex B byte streams, as
 //! mirrored by ffmpeg's FATE suite) and compare every picture with
-//! ffmpeg's per-frame MD5s, `<stream>.framemd5`, made with
+//! ffmpeg's per-frame MD5s, `<stream>.framemd5`. Missing ones are made
+//! with ffmpeg (which must then be on the path) as
 //!
 //!     ffmpeg -flags unaligned -i <stream> -pix_fmt <format> -f framemd5 <stream>.framemd5
 //!
-//! where the format is the decoder's native one (yuv420p, yuv420p10le, ...;
-//! `-flags unaligned` makes ffmpeg apply a left crop exactly). Output order
-//! is not compared, only the multiset of pictures. The decoder also checks
-//! every picture against the stream's decoded picture hash SEI messages
-//! (most conformance streams carry them), which covers pictures that are
-//! never output and streams ffmpeg cannot decode.
+//! where the format is the decoder's native one at the stream's bit depth
+//! (yuv420p, yuv420p10le, ...; `-flags unaligned` makes ffmpeg apply a
+//! left crop exactly). Output order is not compared, only the multiset of
+//! pictures. The decoder also checks every picture against the stream's
+//! decoded picture hash SEI messages (most conformance streams carry
+//! them), which covers pictures that are never output and streams ffmpeg
+//! cannot decode.
 //!
 //!     cargo run --release -p unflash-hevc --example conformance -- <dir> [name-filter]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use unflash_hevc::{Decoder, Error, Frame};
 
@@ -44,8 +47,17 @@ fn streams(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-fn expected(path: &Path) -> Option<Vec<String>> {
-    let text = std::fs::read_to_string(format!("{}.framemd5", path.display())).ok()?;
+/// ffmpeg's per-frame MD5s of a stream, made first if there are none yet.
+fn expected(path: &Path, bit_depth: u8) -> Option<Vec<String>> {
+    let file = format!("{}.framemd5", path.display());
+    if !Path::new(&file).exists() {
+        let format = if bit_depth > 8 { format!("yuv420p{bit_depth}le") } else { "yuv420p".to_string() };
+        let made = Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-flags", "unaligned", "-i"]).arg(path).args(["-pix_fmt", &format, "-f", "framemd5", &file]).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return None;
+        }
+    }
+    let text = std::fs::read_to_string(&file).ok()?;
     let md5s: Vec<String> = text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).map(|l| l.rsplit(',').next().unwrap_or("").trim().to_string()).collect();
     (!md5s.is_empty()).then_some(md5s)
 }
@@ -75,14 +87,16 @@ fn picture_hashes(data: &[u8]) -> usize {
 }
 
 /// Decode a whole stream; the MD5 of every output picture, in output
-/// order, and how many were damaged (or differ from their hash).
-fn decode(data: &[u8]) -> Result<(Vec<String>, usize), Error> {
+/// order, how many were damaged (or differ from their hash), and the bit
+/// depth.
+fn decode(data: &[u8]) -> Result<(Vec<String>, usize, u8), Error> {
     let mut dec = Decoder::new(&[])?;
     dec.set_check_hashes(true);
     let mut frames = dec.decode_annexb(data, 0.0)?;
     frames.extend(dec.flush()?);
     let damaged = frames.iter().filter(|f| f.damaged).count();
-    Ok((frames.iter().map(md5).collect(), damaged))
+    let bit_depth = frames.first().map_or(8, |f| f.bit_depth);
+    Ok((frames.iter().map(md5).collect(), damaged, bit_depth))
 }
 
 /// How many of `want` are in `got`, as multisets.
@@ -124,7 +138,7 @@ fn main() {
         let result = decode(&data);
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         total_time += ms;
-        let (got, damaged) = match result {
+        let (got, damaged, bit_depth) = match result {
             Ok(r) => r,
             Err(Error::Unsupported(s)) => {
                 unsupported += 1;
@@ -137,7 +151,7 @@ fn main() {
                 continue;
             }
         };
-        let Some(want) = expected(&path) else {
+        let Some(want) = expected(&path, bit_depth) else {
             if damaged == 0 && hashes >= got.len() {
                 ok += 1;
                 println!("ok   {} pictures, no ffmpeg reference but all match the stream's hashes ({ms:.0} ms)", got.len());
