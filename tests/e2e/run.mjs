@@ -506,6 +506,11 @@ try {
   results.verify = await page.textContent('#exportResult');
   console.log('verify:', results.verifyMs, 'ms;', results.verify);
   assert(results.verify.includes('Passes WCAG'), 'the exported file must pass WCAG');
+  // the debug report tells how the check went, as it does for the scan, and how far apart the keyframes are
+  {
+    const report = await page.evaluate(() => window.__unflash.debugReport());
+    assert(/\nVerify\s+[\d,]+ frames in [\d.]+ s = \d+ fps/.test(report) && /keyframes every [\d.]+ s/.test(report), 'the debug report has the check of the export:\n' + report);
+  }
   await page.screenshot({ path: path.join(OUT, '4-export.png') });
   await page.click('#btnCloseExport');
 

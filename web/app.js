@@ -673,6 +673,7 @@ async function openFile(file) {
     forgetExport();
     if (state.project) for (const s of state.project.sections) dropCaches(s);
     state.lastScan = null;
+    state.lastVerify = null;
     state.scanTrace = null;
     state.traceNorm = null;
     state.movie = movie;
@@ -845,7 +846,10 @@ function scanSegments() {
  * machine with six cores or more, for a file of two minutes or more (a
  * shorter one scans in seconds anyway). The browser's decoder gets two to
  * four lanes and the built-in decoder a worker for each core left over
- * (two stay for the page and the browser). `?hybrid=0` turns it off,
+ * (two stay for the page and the browser); where the browser's pictures
+ * are copied out of it (Firefox), H.264 gets one lane of the browser's
+ * decoder and the built-in decoder the rest, less a few cores for the
+ * other tabs. `?hybrid=0` turns it off,
  * `?hybrid=1` on for any file, `?hybrid=H,S` makes H lanes for the
  * browser's decoder and S workers for the built-in one (0: none).
  */
@@ -870,9 +874,20 @@ function hybridPlan(movie, feeder) {
     sw = Math.min(16, +counts[2]);
   } else {
     if (!(h === '1' || h === 'on') && (cores < 6 || movie.duration < 120)) return null;
-    // decoding in workers, each lane also copies and shrinks its pictures on a core of its own
-    hw = movie.decodeInWorkers ? Math.min(4, Math.max(2, Math.round(cores * 0.4))) : Math.min(3, Math.max(2, Math.floor(cores / 4)));
-    sw = Math.max(1, Math.min(8, cores - hw - 2));
+    if (movie.decodeInWorkers && builtInFor(movie.video.codec).id === 'h264') {
+      // Where every picture of the browser's decoder is copied out whole
+      // (Firefox), a lane of it costs a core and a readback through the GPU
+      // process that draws every tab, for some 17 fps of 1080p; a built-in
+      // worker decodes some 40 on a core of its own. So one lane, and the
+      // built-in decoder on the cores left once the page, the browser and
+      // the rest of the computer have theirs (32 MB a worker at 1080p).
+      hw = 1;
+      sw = Math.max(1, Math.min(movie.width * movie.height <= 1920 * 1088 ? 12 : 8, cores - hw - 3 - Math.floor(cores / 8)));
+    } else {
+      // decoding in workers, each lane also copies and shrinks its pictures on a core of its own
+      hw = movie.decodeInWorkers ? Math.min(4, Math.max(2, Math.round(cores * 0.4))) : Math.min(3, Math.max(2, Math.floor(cores / 4)));
+      sw = Math.max(1, Math.min(8, cores - hw - 2));
+    }
   }
   return { hw, sw, sim, failBuiltIn: q.get('hybridfail') === '1' };
 }
@@ -912,7 +927,8 @@ async function scanWithPlan(env, movie, opts) {
   try {
     return await scanMovie(env, movie, {
       ...opts,
-      chunked: { hw: plan ? plan.hw : scanSegments(), pool, chunkS, order, budget: hold > 0 ? hold * 1024 * 1024 : null, sim: !!(plan && plan.sim), failBuiltIn: !!(plan && plan.failBuiltIn), slow: parseFloat(q.get('slowlanes') || '') || 0, steal: q.get('steal') !== '0' },
+      // (a plan that leans on the built-in decoder, without it, goes back to the browser's lanes)
+      chunked: { hw: plan && (pool || !plan.sw || plan.sim) ? plan.hw : scanSegments(), pool, chunkS, order, budget: hold > 0 ? hold * 1024 * 1024 : null, sim: !!(plan && plan.sim), failBuiltIn: !!(plan && plan.failBuiltIn), slow: parseFloat(q.get('slowlanes') || '') || 0, steal: q.get('steal') !== '0' },
     });
   } finally {
     if (pool) pool.close();
@@ -3608,6 +3624,7 @@ async function verifyBlob(blob) {
     }
   });
   if (!res) return null;
+  state.lastVerify = res;
   const v = res.result.violations;
   const wcagBad = v.filter((x) => x.kind === 'flash' || x.kind === 'red');
   const ext = v.filter((x) => x.kind === 'extended');

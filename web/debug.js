@@ -85,6 +85,28 @@ function chunkedLines(h) {
   return [`chunked: ${h.chunks} chunks of about ${h.chunkS} s, detected in file order${looks}; at most ${bytes(h.peak)} of pictures held (${bytes(h.budget)} allowed)`, ...lanes];
 }
 
+/** The usual time between keyframes (the median, s), or null: how far apart a decoder can start. */
+function keyframeSpacing(m) {
+  const v = m.v;
+  if (!v || !v.sync || !v.pts) return null;
+  const keys = [];
+  for (let i = 0; i < v.sync.length; i++) if (v.sync[i]) keys.push(v.pts[i]);
+  if (keys.length < 2) return null;
+  keys.sort((a, b) => a - b);
+  const gaps = keys
+    .slice(1)
+    .map((t, i) => t - keys[i])
+    .sort((a, b) => a - b);
+  return gaps[gaps.length >> 1] / 1e6;
+}
+
+/** A scan's lines: frames, time, pace, and how its chunks were decoded. */
+function scanLines(s, fps0) {
+  const fps = s.frames / Math.max(0.001, s.elapsedMs / 1000);
+  const head = `${int(s.frames)} frames in ${secs(s.elapsedMs)} = ${fps.toFixed(0)} fps${fps0 ? ` (${(fps / fps0).toFixed(1)}× real time)` : ''}`;
+  return s.chunked ? [head, ...chunkedLines(s.chunked)] : [`${head} · ${s.segments || 1} segment${(s.segments || 1) === 1 ? '' : 's'}`];
+}
+
 /**
  * The report, from the page's `state` and `profile`, the app's `version`,
  * the WebGPU adapter's description of itself (`gpu`), the number of
@@ -126,18 +148,16 @@ export function debugReport({ version, state, profile, gpu, segments, hybrid = n
     const a = m.audio;
     lines.push(
       ...block('Video', [
-        [`${String(m.format || '?').toUpperCase()}${m.info && m.info.fragmented ? ' (fragmented)' : ''}`, v.codec, `${m.width}×${m.height}`, `${(m.fps || 0).toFixed(3)} fps`, duration(m.duration || 0), `${int(m.frameCount || 0)} frames`, m.file ? bytes(m.file.size) : null].filter(Boolean).join(' · '),
+        [`${String(m.format || '?').toUpperCase()}${m.info && m.info.fragmented ? ' (fragmented)' : ''}`, v.codec, `${m.width}×${m.height}`, `${(m.fps || 0).toFixed(3)} fps`, duration(m.duration || 0), `${int(m.frameCount || 0)} frames`, m.file ? bytes(m.file.size) : null, keyframeSpacing(m) ? `keyframes every ${keyframeSpacing(m).toFixed(1)} s` : null].filter(Boolean).join(' · '),
         a ? `audio ${a.codec}${a.copyable === false ? ' (re-encoded on export)' : ''}` : 'no audio',
         state.decode && !state.decode.supported && state.decode.reason ? `cannot decode: ${state.decode.reason}` : null,
       ])
     );
   } else lines.push(...block('Video', ['none open']));
   const s = state.lastScan;
-  if (s) {
-    const fps = s.frames / Math.max(0.001, s.elapsedMs / 1000);
-    const head = `${int(s.frames)} frames in ${secs(s.elapsedMs)} = ${fps.toFixed(0)} fps${m && m.fps ? ` (${(fps / m.fps).toFixed(1)}× real time)` : ''}`;
-    lines.push(...block('Scan', s.chunked ? [head, ...chunkedLines(s.chunked)] : [`${head} · ${s.segments || 1} segment${(s.segments || 1) === 1 ? '' : 's'}`]));
-  }
+  if (s) lines.push(...block('Scan', scanLines(s, m && m.fps)));
+  // (the check of an export is a scan of its own, of the exported file)
+  if (state.lastVerify) lines.push(...block('Verify', scanLines(state.lastVerify, m && m.fps)));
   lines.push(...block('Jobs', jobs.map((j) => `${clock(j.at)} ${j.name}: ${secs(j.ms)} ${j.outcome}${j.hidden > 500 ? ` (${secs(j.hidden)} of it out of sight)` : ''}`)));
   const job = state.job;
   if (job) lines.push(...block('Running', [`${job.name}: ${secs(performance.now() - (job.t0 || performance.now()))} so far, ${job.pct || 0}% done (the report of it comes when it ends)`]));

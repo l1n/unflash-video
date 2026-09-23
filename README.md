@@ -580,7 +580,16 @@ and leaves the processor's cores mostly idle, so for H.264, where the app
 has a decoder of its own, a scan of a file of two minutes or more on a
 machine with six cores or more is also **hybrid**: two to four lanes of the
 browser's decoder and one of the built-in decoder, in a worker for each
-core left over (two stay for the page and the browser).
+core left over (two stay for the page and the browser). Where the
+browser's pictures have to be copied out of its decoder (Firefox), the
+balance tips the other way: each picture comes out whole (8 MB at 1080p,
+some 25 ms), through the process that draws every tab, so a lane of the
+browser's decoder makes some 17 fps of 1080p on a core and slows the
+other tabs, where a built-in worker makes some 40. There H.264 gets one
+lane of the browser's decoder, and the built-in decoder a worker for each
+core left over, less three to seven (by the number of cores) for the
+page, the browser and the rest of the computer: up to twelve workers at
+1080p, some 32 MB each, and eight above it.
 
 However many lanes decode, **one detector takes the pictures in file
 order**, so a scan in chunks gives exactly what a scan in one piece gives,
@@ -618,7 +627,9 @@ shows what it has found so far, exactly up to where it has got and the
 early looks' findings after that.
 
 The debug report shows how many chunks and frames each decoder decoded,
-how fast, how many early looks it took and the most pictures held.
+how fast, how many early looks it took and the most pictures held, for
+the last scan and for the last check of an export (a scan of the exported
+file), and how far apart the video's keyframes are.
 `?hybrid=0` turns the built-in decoder off, `?hybrid=1` on for any file,
 `?hybrid=H,S` sets H browser lanes and S built-in workers, `?chunk=S` the
 chunks' length, `?order=file` leaves out the early looks and `?chunked=0`
