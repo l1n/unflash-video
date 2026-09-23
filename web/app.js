@@ -57,8 +57,9 @@ const state = {
   checkRunning: false,
   checkAgain: false,
   scanTrace: null,
-  // what a running scan has found so far (chunked scans), else null
-  provisional: null,
+  // a running scan's own: { violations: what it has found so far (chunked
+  // scans), partials: when }, else null
+  scanning: null,
   traceNorm: null, // the scan trace as area fractions, for the timeline and the monitor
   auto: null, // the unattended scan -> fix -> export -> verify run (see autopilot)
   // what the player shows: 'video' (the whole file) or the open section, 'edited' or 'original';
@@ -114,6 +115,17 @@ function withFeeder(fn) {
     () => {}
   );
   return run;
+}
+
+/**
+ * Whether a job is under way, telling the visitor so (`then`: what they
+ * wanted, to do once it is over). Asked before anything is changed: a start
+ * that runJob turns away must leave the running job's state alone.
+ */
+function busy(then) {
+  if (!state.job) return false;
+  toast(`${state.job.name} is under way: ${then} once it has finished (or cancel it).`, 6000);
+  return true;
 }
 
 async function runJob(name, fn) {
@@ -622,9 +634,11 @@ async function boot() {
 // ---- opening a file -------------------------------------------------------------
 
 async function openFile(file) {
+  // an unattended run gives way to the new file; a job started by hand is waited for
+  await stopAuto();
+  if (busy('open the video')) return;
   noteFileName(file.name);
   $('banner').classList.add('hidden');
-  await stopAuto();
   if (sectionPlayer) await sectionPlayer.stop();
   closeViewer();
   const opened = await runJob('Opening video', async (progress) => {
@@ -715,6 +729,8 @@ function setGuide(open) {
 
 /** Open one of the test clips published next to the app. */
 async function openClip(name) {
+  // (an unattended run gives way to a new video: openFile stops it)
+  if (!(state.auto && state.auto.running) && busy('open the clip')) return;
   toast(`Fetching ${name}…`, 10000);
   try {
     const r = await fetch(`clips/${name}`);
@@ -958,42 +974,48 @@ async function spareFeeders(n) {
 }
 
 async function scan() {
-  if (!state.movie || !state.env) return;
-  setLive(false);
-  $('liveToggle').checked = false;
-  // what the scan has found so far, until the whole result is in
-  state.provisional = [];
+  if (!state.movie || !state.env || busy('scan')) return null;
   const t0 = performance.now();
-  state.partials = [];
+  // what this scan has found so far, until the whole result is in: its own,
+  // made and dropped inside its job, so nothing outside it can clear it
+  // under a running scan
+  const found = { violations: [], partials: [] };
   const res = await runJob('Scanning for flashes', async (progress, cancelled) => {
-    const r = await scanWithPlan(state.env, state.movie, {
-      cancel: cancelled,
-      segments: scanSegments(),
-      forceSegments: segmentsForced(),
-      moreFeeders: spareFeeders,
-      // exactly what the scan has found up to where it has got, and what its early looks found after that
-      onPartial: (part) => {
-        state.provisional = part.violations;
-        state.partials.push({ ms: performance.now() - t0, until: part.until, found: part.violations.length, early: !!part.early });
-        state.timelineDrawnAt = 0;
-      },
-      onProgress: (p, trace, count, ms) => {
-        state.scanTrace = trace;
-        const found = state.provisional.length;
-        progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps${found ? ` · ${found} violation${found === 1 ? '' : 's'} found so far` : ''}`);
-        // the timeline twice a second, not per so many frames
-        const now = performance.now();
-        if (!(now - (state.timelineDrawnAt || 0) < 500)) {
-          state.timelineDrawnAt = now;
-          drawTimeline();
-          if (chartMode() === 'video') drawChart();
-        }
-      },
-    });
-    // a cancelled scan saw only part of the file: keep nothing of it
-    return cancelled() ? null : r;
+    setLive(false);
+    $('liveToggle').checked = false;
+    state.scanning = found;
+    state.partials = found.partials;
+    try {
+      const r = await scanWithPlan(state.env, state.movie, {
+        cancel: cancelled,
+        segments: scanSegments(),
+        forceSegments: segmentsForced(),
+        moreFeeders: spareFeeders,
+        // exactly what the scan has found up to where it has got, and what its early looks found after that
+        onPartial: (part) => {
+          found.violations = part.violations;
+          found.partials.push({ ms: performance.now() - t0, until: part.until, found: part.violations.length, early: !!part.early });
+          state.timelineDrawnAt = 0;
+        },
+        onProgress: (p, trace, count, ms) => {
+          state.scanTrace = trace;
+          const n = found.violations.length;
+          progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps${n ? ` · ${n} violation${n === 1 ? '' : 's'} found so far` : ''}`);
+          // the timeline twice a second, not per so many frames
+          const now = performance.now();
+          if (!(now - (state.timelineDrawnAt || 0) < 500)) {
+            state.timelineDrawnAt = now;
+            drawTimeline();
+            if (chartMode() === 'video') drawChart();
+          }
+        },
+      });
+      // a cancelled scan saw only part of the file: keep nothing of it
+      return cancelled() ? null : r;
+    } finally {
+      if (state.scanning === found) state.scanning = null;
+    }
   });
-  state.provisional = null;
   if (!res) {
     drawTimeline();
     return null;
@@ -1696,11 +1718,12 @@ function drawTimeline(dragSpan = null) {
   g.fillStyle = '#5a6070';
   g.fillRect(0, H - 24, W, 1);
   // what a running scan has found so far (dashed: its edges may still move)
-  if (state.provisional && state.provisional.length) {
+  const provisional = state.scanning ? state.scanning.violations : null;
+  if (provisional && provisional.length) {
     g.save();
     g.setLineDash([4, 3]);
     g.lineWidth = 1.5;
-    for (const v of state.provisional) {
+    for (const v of provisional) {
       const x0 = x(v.start);
       const x1 = Math.max(x0 + 4, x(v.end));
       g.strokeStyle = v.kind === 'red' ? '#e04fb0' : v.kind === 'flash' ? '#e8a33c' : v.kind === 'extended' ? '#7f9bff' : PATTERN_COLOUR;
@@ -2695,6 +2718,8 @@ async function runCheck(announce) {
 async function doPrepare(sec) {
   if (!sec) return;
   if (!state.decode.supported) return banner(`Preparing needs WebCodecs to decode ${state.movie.video.codec}: ${state.decode.reason}`);
+  // (before the eviction: a running job may be reading another section's frames)
+  if (busy('prepare the section')) return false;
   state.project.evictCaches(sec, cacheBudget());
   const ok = await runJob(`Preparing section #${sec.id}`, async (progress, cancelled) => {
     await prepareSection(state.env, state.movie, sec, {
@@ -3055,7 +3080,7 @@ function drawVideoChart(g, W, H) {
     g.fillText(`#${s.id}`, x0 + 3, top + 10);
   }
   // what the scan found, along the top
-  const found = state.provisional || (scan ? scan.violations.filter((v) => scanReports(scan, v)) : []);
+  const found = state.scanning ? state.scanning.violations : scan ? scan.violations.filter((v) => scanReports(scan, v)) : [];
   for (const v of found) {
     if (v.end < t0 || v.start > t1) continue;
     g.fillStyle = KIND_COLOUR[v.kind] || PATTERN_COLOUR;
@@ -3230,6 +3255,7 @@ async function renderExportChoice() {
 }
 
 async function doExport() {
+  if (busy('export')) return;
   const movie = state.movie;
   const quality = +$('exportQuality').value;
   // a file of the user's choosing where the browser has the dialog, private

@@ -134,7 +134,7 @@ jobs:
       - name: End-to-end, ${{ matrix.part }} (headless Chromium, WebGPU on SwiftShader)
         if: matrix.part != 'formats'
         run: node tests/e2e/run.mjs --part=${{ matrix.part }}
-      - name: Smart-cut splice, MKV and WebM, the sound of held frames, project files, the guided tour, the built-in HEVC, VP9, VP8 and AV1 decoders (headless Chromium), the shrink in WebAssembly
+      - name: Smart-cut splice, MKV and WebM, the sound of held frames, project files, the guided tour, the page while a job runs, the built-in HEVC, VP9, VP8 and AV1 decoders (headless Chromium), the shrink in WebAssembly
         if: matrix.part == 'formats'
         run: |
           node tests/e2e/splice.mjs
@@ -142,6 +142,7 @@ jobs:
           node tests/e2e/sound.mjs
           node tests/e2e/project.mjs
           node tests/e2e/tour.mjs
+          node tests/e2e/busy.mjs
           node tests/e2e/decoders.mjs
           node tests/e2e/shrink.mjs
       - uses: actions/upload-artifact@v4

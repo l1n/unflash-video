@@ -163,9 +163,12 @@ try {
   await p2.keyboard.press('Escape');
   // "show me" in What's new: a section's tour, with no video open, waits for its place
   await p2.waitForFunction(() => !document.querySelector('.tour'));
-  const showMe = await p2.$$eval('#newsList .show-me', (b) => b.map((x) => x.dataset.tour));
-  assert(showMe.length >= 2, 'What\'s new offers "show me": ' + showMe);
-  await p2.click('#newsList .show-me[data-tour="section-sound"]');
+  // (the card on the start page lists the newest few; everything that changed, the rest)
+  assert((await p2.$$eval('#newsList .show-me', (b) => b.length)) >= 1, 'the card of what is new offers "show me"');
+  await p2.click('#btnNewsAll');
+  const showMe = await p2.$$eval('#changesList .show-me', (b) => b.map((x) => x.dataset.tour));
+  assert(['tours', 'section-sound', 'whole-video', 'findings', 'project-files'].every((id) => showMe.includes(id)), 'What\'s new offers "show me" beside each: ' + showMe);
+  await p2.click('#changesList .show-me[data-tour="section-sound"]');
   await p2.waitForFunction(() => /Open a section/.test(document.querySelector('#toast').textContent), null, { timeout: 5000 });
   await openClip(p2, 'flash.webm');
   await p2.click('#btnScan');

@@ -18,6 +18,34 @@ export const yieldTask = () =>
       })
     : tick();
 
+// The page's turns. A loop that feeds pictures to the detector one after
+// another awaits promises that are already settled, which never lets the
+// page draw, take a click or hear from its workers: with pictures waiting
+// (a scan holds hundreds, decoded ahead) it can keep the thread for seconds,
+// and Firefox then offers to stop the page. Such a loop calls breathe()
+// after each picture, which gives the page a turn once the loop has had the
+// thread TURN_MS on end. A ping through the yield channel says when the page
+// last had a turn, whoever gave it, so a loop that waits anyway (for a
+// decoder, the GPU) is not held up further. 30 ms: no task grows long (the
+// browsers' mark is 50) and a scan is as fast as without the turns; at 12 a
+// scan lost a tenth of its speed to the page drawing its progress.
+const TURN_MS = 30;
+let turnAt = 0;
+let pinging = false;
+const pinged = () => {
+  pinging = false;
+  turnAt = performance.now();
+};
+export async function breathe() {
+  if (!yieldChannel) return;
+  if (!pinging) {
+    pinging = true;
+    yieldQueue.push(pinged);
+    yieldChannel.port2.postMessage(0);
+  }
+  if (performance.now() - turnAt >= TURN_MS) await yieldTask();
+}
+
 /**
  * Settles when `promise` does or after `ms`, whichever is first: a safety
  * net for waits on events that should come but might not (a lost device).
@@ -331,6 +359,7 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
       }
       await onFrame(f, t);
       frames++;
+      await breathe();
     }
   };
   let i = startIdx;
@@ -499,6 +528,7 @@ async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onP
         }
         frames++;
         if (onProgress && frames % 30 === 0) onProgress(frames / Math.max(1, endIdx - startIdx));
+        await breathe();
         continue;
       }
       if (failed) throw failed;

@@ -2,7 +2,7 @@
 // same flow as the Python reference (analysis.py / editing.py), driving the
 // WASM detector over WebCodecs frames or cached section frames.
 
-import { decodeRange, decodeStretchesBuiltIn, tick } from './media.js';
+import { breathe, decodeRange, decodeStretchesBuiltIn, tick } from './media.js';
 import { profile } from './profile.js';
 import { dropCaches } from './project.js';
 import { triageChunks } from './triage.js';
@@ -626,6 +626,8 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
             collect();
             report();
           }
+          // (the lanes decode ahead: hundreds of pictures can be waiting here)
+          await breathe();
           continue;
         }
         if (slot.done) break;
@@ -1144,6 +1146,9 @@ export function sectionContext(env, project, sec, extS) {
 /** The instant safety check for a section's (or the given) edits. */
 export async function checkSection(env, project, sec, edits, { extS = 1.0, onProgress } = {}) {
   const { wasm, feeder } = env;
+  // a turn for the page between checks (a suggestion runs dozens), never
+  // during one: what a check reads stays put while it runs
+  await breathe();
   if (!sec.prepared || !sec.cache) throw new Error('Section not prepared');
   const useEdits = edits || sec.edits || {};
   const ctx = sectionContext(env, project, sec, extS);

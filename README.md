@@ -739,6 +739,7 @@ cargo run --release -p unflash-av1 --example compare -- file.mkv   # decode an A
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
 node tests/e2e/tour.mjs                   # the guided tour, on a first visit and after an update
+node tests/e2e/busy.mjs                   # the page while a job runs: a second start turned away, never a long freeze
 node tests/e2e/screenshots.mjs            # the screenshots above, made again from the test clips (not a test)
 ```
 
@@ -762,6 +763,11 @@ requires every frame of the exported file to decode as its source did.
 back after an update: every step lights something on screen with its card
 in view beside it, each part waits until its place is on screen and
 nothing is running, comes once, and holds back the page's own keys.
+`tests/e2e/busy.mjs` clicks Scan and opens another video while a scan
+runs (both turned away, the scan finishes whole), and watches the page's
+long tasks during a chunked scan whose detector is slowed down, so that
+three decode lanes get ahead of it: none may reach 250 ms (the old
+detector loop kept the page for over a second).
 
 To compare the two detectors on a real file rather than on synthetic
 frames, run both over it and line up the violations:
