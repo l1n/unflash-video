@@ -249,7 +249,9 @@ impl Decoder {
                             // every reference)
                             predict_inter(pic, r, &mb, mb_x, mb_y, filter, full_pixel);
                         }
-                        add_residual(pic, &mb, mb_x, mb_y, &mut self.coeffs);
+                        if coded {
+                            add_residual(pic, &mb, mb_x, mb_y, &mut self.coeffs);
+                        }
                         self.mbs[i] = mb;
                     }
                 }
