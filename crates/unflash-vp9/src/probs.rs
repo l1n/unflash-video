@@ -8,7 +8,7 @@ use crate::tables::*;
 /// inter), band and context.
 pub type PerCoefContext<T> = [[[[[T; 6]; 6]; 2]; 2]; 4];
 
-/// Coefficient probabilities: [tx size][plane > 0][inter][band][context][node].
+/// Coefficient probabilities: `[tx size][plane > 0][inter][band][context][node]`.
 pub type CoefProbs = PerCoefContext<[u8; 3]>;
 
 /// The probabilities a frame decodes with; four of these are kept between

@@ -915,7 +915,7 @@ pub const SIZE_GROUP: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3];
 pub const MAX_TX_SIZE: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3];
 pub const TX_MODE_TO_BIGGEST_TX_SIZE: [u8; 5] = [0, 1, 2, 3, 3];
 
-/// The size of a block's chroma in 4:2:0 (ss_size_lookup[..][1][1]).
+/// The size of a block's chroma in 4:2:0 (`ss_size_lookup[..][1][1]`).
 pub const UV_BLOCK_SIZE: [u8; 13] = [BLOCK_INVALID, BLOCK_INVALID, BLOCK_INVALID, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 /// The sub-blocks of a partition: [partition][block size].

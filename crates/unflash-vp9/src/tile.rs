@@ -176,7 +176,7 @@ pub struct TileDecoder<'a, 'd, T: Pixel> {
     pub mi_col_start: usize,
     pub mi_col_end: usize,
     pub scratch: &'a mut Scratch<T>,
-    /// Dequantisation factors: [segment][plane > 0][dc, ac].
+    /// Dequantisation factors: `[segment][plane > 0][dc, ac]`.
     pub dequant: [[[i32; 2]; 2]; 8],
     pub bit_depth: u32,
     /// Some block was decoded from invalid data (the frame is damaged).
