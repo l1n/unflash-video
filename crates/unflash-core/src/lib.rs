@@ -26,6 +26,7 @@
 //! (see `DETECTION.md`); differences are documented where they exist.
 
 pub mod config;
+pub mod blend;
 pub mod detector;
 pub mod editing;
 pub mod grid;

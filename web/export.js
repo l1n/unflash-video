@@ -9,7 +9,7 @@
 
 import { decodeRange, ChunkReader, orTimeout } from './media.js';
 import { profile } from './profile.js';
-import { shownPts, softenPlan } from './analysis.js';
+import { shownPts, softenPlan, blendMarks, blendStrength, blendSources, blendWeights } from './analysis.js';
 
 function avcLevel(w, h, fps) {
   const mbs = Math.ceil(w / 16) * Math.ceil(h / 16);
@@ -236,10 +236,27 @@ export function sectionRenderPlan(env, movie, s, extS, { edited = true } = {}) {
   const tl = JSON.parse(wasm.section_timeline(Float64Array.from(s.pts), s.start, s.end));
   const shown = shownPts(wasm, s);
   const seq = JSON.parse(wasm.edited_sequence(Float64Array.from(shown), JSON.stringify(edited ? s.edits || {} : {}), extS));
-  const hasEdits = edited && Object.values(s.edits || {}).some((e) => e.removed || e.extended);
+  const hasEdits = edited && (Object.values(s.edits || {}).some((e) => e.removed || e.extended) || blendMarks(s).length > 0);
   const needCount = new Map();
-  for (const src of seq.src) needCount.set(src, (needCount.get(src) || 0) + 1);
+  const need = (i) => needCount.set(i, (needCount.get(i) || 0) + 1);
+  for (const src of seq.src) need(src);
   const extra = seq.t.length ? seq.t[seq.t.length - 1] - shown[shown.length - 1] : 0;
+  // "lower contrast": marked frames mixed with the unmarked frames either
+  // side of them, which must be at hand when they show
+  let blend = null;
+  const marks = edited ? blendMarks(s) : [];
+  if (marks.length) {
+    const marked = new Array(shown.length).fill(false);
+    for (const i of marks) if (i < marked.length) marked[i] = true;
+    const sources = blendSources(marked);
+    blend = { sources, strength: blendStrength(s) };
+    for (const src of seq.src) {
+      const b = sources[src];
+      if (!b) continue;
+      if (b.prev !== null) need(b.prev);
+      if (b.next !== null) need(b.next);
+    }
+  }
   // "soften stripes": blur the patterned frames at source resolution with
   // the σ the section's check used, scaled up from analysis pixels
   let soft = null;
@@ -247,7 +264,7 @@ export function sectionRenderPlan(env, movie, s, extS, { edited = true } = {}) {
     const plan = softenPlan(s);
     if (plan) soft = { frames: plan.frames, sigma: plan.sigma * (movie.width / env.feeder.aw) };
   }
-  return { sec: s, base: tl.base, seq, nOut: tl.n_out, hasEdits, needCount, extra, soft };
+  return { sec: s, base: tl.base, seq, nOut: tl.n_out, hasEdits, needCount, extra, soft, blend };
 }
 
 function sectionPlans(env, movie, project, extS, warnings) {
@@ -255,7 +272,7 @@ function sectionPlans(env, movie, project, extS, warnings) {
     .sectionsSorted()
     .filter((s) => s.pts && s.pts.length)
     .map((s) => sectionRenderPlan(env, movie, s, extS));
-  const unprepared = project.sections.filter((s) => !(s.pts && s.pts.length) && Object.values(s.edits || {}).some((e) => e.removed || e.extended));
+  const unprepared = project.sections.filter((s) => !(s.pts && s.pts.length) && (Object.values(s.edits || {}).some((e) => e.removed || e.extended) || (s.blend || []).length));
   if (unprepared.length) warnings.push(`Sections ${unprepared.map((s) => '#' + s.id).join(', ')} have marks but were never prepared; their marks were not applied. Prepare them and export again.`);
   if (sections.some((p) => p.extra > 0) && movie.audio) warnings.push('Some frames are held for a second (E marks). The audio is copied unchanged, so it runs ahead of the picture after each hold.');
   return sections;
@@ -440,41 +457,60 @@ export async function exportPlan(env, movie, project, { extS = 1.0, codec = null
  * Decode a piece of the source (`startSec`..`endSec`, from sample `from` when
  * given) and hand its edited timeline to `emit(frame, tSec, info)` in order:
  * inside a section the slots of its edited sequence (removed frames showing
- * their stand-in, held frames held, softened frames blurred), outside the
- * frames as they are, every time shifted by the holds before it. `emit` must
- * not keep the frame past its return (clone it if needed). `info` is
- * `{ sec, slot, src, softened }` (sec null and slot -1 outside a section).
- * Returns `{ softened, warnings }`. The export encodes what it is handed;
+ * their stand-in, held frames held, blended frames mixed with the frames
+ * around them, softened frames blurred), outside the frames as they are,
+ * every time shifted by the holds before it. `emit` must not keep the frame
+ * past its return (clone it if needed). `info` is `{ sec, slot, src,
+ * softened, blended }` (sec null and slot -1 outside a section). Returns
+ * `{ softened, blended, warnings }`. The export encodes what it is handed;
  * the section player paces it onto a canvas.
  */
 export async function walkEdited(movie, piece, emit, { cancel, reader = null } = {}) {
   let softened = 0;
+  let blended = 0;
   const warnings = [];
   let offset = piece.offset || 0; // cumulative extension seconds
   const sections = piece.sections;
   let si = 0;
   let cur = null;
   const enterSection = (p) => ({ p, ordinal: 0, next: 0, frames: new Map(), need: new Map(p.needCount) });
+  const release = (st, i) => {
+    const left = st.need.get(i) - 1;
+    st.need.set(i, left);
+    if (left <= 0) {
+      st.frames.get(i).close();
+      st.frames.delete(i);
+    }
+  };
   const flushSection = async (st) => {
     const { p } = st;
-    while (st.next < p.seq.t.length && st.frames.has(p.seq.src[st.next])) {
+    while (st.next < p.seq.t.length) {
       const src = p.seq.src[st.next];
+      const mix = p.blend ? p.blend.sources[src] : null;
+      // a blended frame waits for the frame after it
+      if (!st.frames.has(src) || (mix && ((mix.prev !== null && !st.frames.has(mix.prev)) || (mix.next !== null && !st.frames.has(mix.next))))) break;
       const t = p.sec.start + p.base + p.seq.t[st.next] + offset;
-      if (p.soft && p.soft.frames.has(src)) {
-        const b = blurFrame(st.frames.get(src), p.soft.sigma);
-        try {
-          await emit(b, t, { sec: p.sec, slot: st.next, src, softened: true });
-        } finally {
-          b.close();
+      let frame = st.frames.get(src);
+      const made = [];
+      try {
+        if (mix) {
+          frame = blendFrame(frame, mix.prev !== null ? st.frames.get(mix.prev) : null, mix.next !== null ? st.frames.get(mix.next) : null, blendWeights(mix, p.blend.strength));
+          made.push(frame);
+          blended++;
         }
-        softened++;
-      } else await emit(st.frames.get(src), t, { sec: p.sec, slot: st.next, src, softened: false });
-      const left = st.need.get(src) - 1;
-      st.need.set(src, left);
-      if (left <= 0) {
-        st.frames.get(src).close();
-        st.frames.delete(src);
+        const soft = !!(p.soft && p.soft.frames.has(src));
+        if (soft) {
+          frame = blurFrame(frame, p.soft.sigma);
+          made.push(frame);
+          softened++;
+        }
+        await emit(frame, t, { sec: p.sec, slot: st.next, src, softened: soft, blended: !!mix });
+      } finally {
+        for (const f of made) f.close();
       }
+      release(st, src);
+      if (mix && mix.prev !== null) release(st, mix.prev);
+      if (mix && mix.next !== null) release(st, mix.next);
       st.next++;
     }
   };
@@ -511,7 +547,7 @@ export async function walkEdited(movie, piece, emit, { cancel, reader = null } =
           return;
         }
         try {
-          await emit(frame, t + offset, { sec: null, slot: -1, src: -1, softened: false });
+          await emit(frame, t + offset, { sec: null, slot: -1, src: -1, softened: false, blended: false });
         } finally {
           frame.close();
         }
@@ -523,7 +559,7 @@ export async function walkEdited(movie, piece, emit, { cancel, reader = null } =
     // an error or a cancel mid-section: its held frames go too
     if (cur) for (const f of cur.frames.values()) f.close();
   }
-  return { softened, warnings };
+  return { softened, blended, warnings };
 }
 
 // ---- H.264 in Annex B ----------------------------------------------------------------
@@ -588,6 +624,7 @@ class PieceEncoder {
     this.chunks = []; // { pts, sync, bytes, desc, codec }
     this.frames = 0;
     this.softened = 0;
+    this.blended = 0;
     this.warnings = [];
     this.error = null;
     this.description = null; // the encoder's current decoderConfig description
@@ -667,6 +704,7 @@ class PieceEncoder {
       // a reader of its own: pieces decode at the same time as the writer copies
       const walked = await walkEdited(movie, piece, emit, { cancel: ctx.cancel, reader: movie.reader ? movie.reader.fork() : null });
       this.softened += walked.softened;
+      this.blended += walked.blended;
       this.warnings.push(...walked.warnings);
       if (pending) {
         await encodeOne(pending.frame, pending.tUs, ctx.medianUs);
@@ -798,6 +836,7 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
   let description = null;
   let codecString = chosen.config.codec;
   let softened = 0;
+  let blended = 0;
   const rewriterFor = (desc) => {
     if (!/^avc1/.test(codecString)) return null;
     // H.264 with no record: its samples cannot be told apart from the source's
@@ -866,6 +905,7 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
       } else {
         const pe = await piece.done;
         softened += pe.softened;
+        blended += pe.blended;
         warnings.push(...pe.warnings);
         if (pe.codec) codecString = pe.codec;
         for (const c of pe.chunks) {
@@ -936,7 +976,7 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
   mx.free();
   const elapsedMs = performance.now() - started;
   profile.report(`export (${chosen.label}, ${plan.mode})`, encodedFrames, elapsedMs);
-  return { blob, warnings, frames: encodedFrames, copied: copiedFrames, spans: encodePieces.length, mode: plan.mode, parallel: K, softened, elapsedMs, codec: codecString, encoderLabel: chosen.label };
+  return { blob, warnings, frames: encodedFrames, copied: copiedFrames, spans: encodePieces.length, mode: plan.mode, parallel: K, softened, blended, elapsedMs, codec: codecString, encoderLabel: chosen.label };
 }
 
 /**
@@ -1084,6 +1124,31 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel } = {}) {
 }
 
 let blurCanvas = null;
+let blendCanvas = null;
+
+/**
+ * A frame mixed with the frames either side of it, by weights `w` (the
+ * frame's own, `prev`'s, `next`'s; they add to one): the canvas lays each
+ * over what is there at the share that makes the running mix come out
+ * right. Mixed in 8-bit sRGB values, as the check mixes its small copies.
+ */
+function blendFrame(frame, prev, next, w) {
+  const width = frame.displayWidth || frame.codedWidth;
+  const height = frame.displayHeight || frame.codedHeight;
+  if (!blendCanvas || blendCanvas.width !== width || blendCanvas.height !== height) blendCanvas = new OffscreenCanvas(width, height);
+  const ctx = blendCanvas.getContext('2d');
+  ctx.globalAlpha = 1;
+  ctx.drawImage(frame, 0, 0, width, height);
+  let sum = w[0];
+  for (const [f, wk] of [[prev, w[1]], [next, w[2]]]) {
+    if (!f || !(wk > 0)) continue;
+    sum += wk;
+    ctx.globalAlpha = Math.min(1, wk / sum);
+    ctx.drawImage(f, 0, 0, width, height);
+  }
+  ctx.globalAlpha = 1;
+  return new VideoFrame(blendCanvas, { timestamp: frame.timestamp || 0 });
+}
 /**
  * A Gaussian-blurred copy of a frame (σ in source pixels). The sharp frame
  * is drawn first so the blur's transparent fringe at the picture edge shows

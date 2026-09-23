@@ -1,11 +1,11 @@
 // The section player: one section of the source played on a canvas, either
 // with its marks applied exactly as the export renders them (removed frames
-// showing their stand-in, held frames held, softened frames blurred) or as
-// it is, paced to the frames' own times. It decodes the section afresh for
-// every pass, so it plays at the file's full resolution and needs nothing
-// prepared beyond the section's frame times; the marks are read when a
-// pass starts, so an edit shows from the next pass (or at once, when the
-// caller restarts it).
+// showing their stand-in, held frames held, blended frames blended,
+// softened frames blurred) or as it is, paced to the frames' own times. It
+// decodes the section afresh for every pass, so it plays at the file's full
+// resolution and needs nothing prepared beyond the section's frame times;
+// the marks are read when a pass starts, so an edit shows from the next
+// pass (or at once, when the caller restarts it).
 
 import { walkEdited, sectionRenderPlan } from './export.js';
 

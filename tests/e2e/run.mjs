@@ -358,15 +358,72 @@ try {
   assert(results.keep.keep.includes(bright) && !(results.keep.mark && results.keep.mark.removed) && results.keep.tile, 'keep dark leaves the kept (bright) frame alone: ' + JSON.stringify(results.keep));
   assert(results.keepVerdict.startsWith('passes'), 'and still makes the section pass: ' + results.keepVerdict);
 
+  // --- lower contrast: the flashing frames blended, none removed ---------------
+  await page.click('#btnClearEdits'); // R, F, E and B marks go; the K mark stays
+  await verdictReady(page);
+  assert((await page.textContent('#wsVerdict')).startsWith('fails'), 'clearing the marks brings the flashing back');
+  toastNow = await page.textContent('#toast');
+  await page.click('#btnSuggestBlend');
+  await toastChange(toastNow);
+  await verdictReady(page);
+  const blendState = () =>
+    page.evaluate(() => {
+      const s = window.__unflash.currentSection();
+      const tiles = [...document.querySelectorAll('#frameGrid .frame.blended')];
+      return {
+        marks: (s.blend || []).length,
+        strength: s.blendStrength,
+        removed: Object.values(s.edits).filter((e) => e.removed).length,
+        keep: s.keep,
+        blend: s.blend,
+        tiles: tiles.length,
+        stale: tiles.filter((t) => t.dataset.drawn && t.dataset.drawnKey !== t.dataset.want).length,
+        control: !document.querySelector('#blendWrap').classList.contains('hidden') && document.querySelector('#blendStrength').value,
+      };
+    });
+  results.blend = await blendState();
+  results.blendVerdict = await page.textContent('#wsVerdict');
+  results.blendToast = await page.textContent('#toast');
+  console.log('lower contrast:', JSON.stringify({ ...results.blend, blend: undefined }), results.blendVerdict, '|', results.blendToast);
+  assert(results.blendVerdict.startsWith('passes'), 'lower contrast makes the section pass: ' + results.blendVerdict);
+  assert(results.blend.marks > 0 && results.blend.removed === 0 && results.blend.tiles === results.blend.marks && results.blend.stale === 0, 'it blends frames and removes none: ' + JSON.stringify(results.blend));
+  assert(results.blend.strength > 0 && results.blend.strength <= 1 && results.blend.control === String(Math.round(results.blend.strength * 100)), 'its strength shows in the control: ' + JSON.stringify(results.blend));
+  assert(!results.blend.blend.includes(bright) && results.blend.keep.includes(bright), 'the kept frame is not blended');
+  await page.screenshot({ path: path.join(OUT, '3-blended.png'), fullPage: true });
+  // turned down to 5% the flashing is back; undo puts the strength back
+  await page.$eval('#blendStrength', (el) => {
+    el.value = '5';
+    el.dispatchEvent(new Event('input'));
+    el.dispatchEvent(new Event('change'));
+  });
+  await verdictReady(page);
+  results.blendWeak = await page.textContent('#wsVerdict');
+  assert(results.blendWeak.startsWith('fails'), 'blended at 5% it fails: ' + results.blendWeak);
+  await page.click('#wsTitle');
+  await page.keyboard.press('Control+z');
+  await verdictReady(page);
+  assert((await page.evaluate(() => window.__unflash.currentSection().blendStrength)) === results.blend.strength && (await page.textContent('#wsVerdict')).startsWith('passes'), 'undo puts the strength back, and it passes');
+  // B takes a frame's blend off and puts it back
+  const b0 = results.blend.blend[0];
+  await page.click(`#frameGrid .frame:nth-child(${b0 + 1})`);
+  await page.keyboard.press('b');
+  assert(!(await page.evaluate((i) => window.__unflash.currentSection().blend.includes(i), b0)), 'B on a blended frame takes it off');
+  await page.keyboard.press('b');
+  assert(await page.evaluate((i) => window.__unflash.currentSection().blend.includes(i), b0), 'B again puts it back');
+  await page.keyboard.press('Escape');
+  await verdictReady(page);
+
   // --- the section player plays the section with the marks applied -------------
   assert((await page.$eval('#playerSource', (s) => s.value)) === 'edited', 'with a section open the player shows it, edited');
   results.playerWarning = await page.textContent('#playerWarning');
   assert(/Section #\d+ with your marks: passes the check/.test(results.playerWarning), 'the player says what it shows: ' + results.playerWarning);
   await page.evaluate(() => {
     window.__slots = [];
+    window.__blendedSlots = 0;
     const orig = window.__unflash.sectionPlayer.onFrame;
     window.__unflash.sectionPlayer.onFrame = (info, t, plan) => {
       window.__slots.push(info.slot);
+      if (info.blended) window.__blendedSlots++;
       window.__playingTiles = Math.max(window.__playingTiles || 0, document.querySelectorAll('#frameGrid .frame.playing').length);
       orig(info, t, plan);
     };
@@ -375,9 +432,10 @@ try {
   await page.click('#btnPreviewPlay');
   await page.waitForFunction(() => window.__unflash.sectionPlayer.active, null, { timeout: 10000 });
   await page.waitForFunction(() => !window.__unflash.sectionPlayer.active, null, { timeout: 120000 });
-  results.play = await page.evaluate(() => ({ n: window.__slots.length, first: window.__slots[0], last: window.__slots[window.__slots.length - 1], inOrder: window.__slots.every((s, i, a) => i === 0 || s === a[i - 1] + 1), tiles: document.querySelectorAll('#frameGrid .frame').length, playing: document.querySelectorAll('#frameGrid .frame.playing').length }));
+  results.play = await page.evaluate(() => ({ n: window.__slots.length, first: window.__slots[0], last: window.__slots[window.__slots.length - 1], inOrder: window.__slots.every((s, i, a) => i === 0 || s === a[i - 1] + 1), tiles: document.querySelectorAll('#frameGrid .frame').length, playing: document.querySelectorAll('#frameGrid .frame.playing').length, blended: window.__blendedSlots }));
   console.log('section player:', JSON.stringify(results.play));
   assert(results.play.first === 0 && results.play.last === results.play.tiles - 1 && results.play.inOrder, 'the section plays every frame of the section in order: ' + JSON.stringify(results.play));
+  assert(results.play.blended === results.blend.marks, `the player shows the ${results.blend.marks} blended frames blended: ${results.play.blended}`);
   await page.evaluate(() => (window.__unflash.sectionPlayer.onFrame = null));
 
   // --- the guide opens beside the work and closes again -------------------------
@@ -412,6 +470,7 @@ try {
   // VP9 into VP9: the GOPs the sections leave alone are copied, not re-encoded
   assert(/(\d+) copied from the source/.test(results.exportResult) && +results.exportResult.match(/(\d+) copied from the source/)[1] > 0, 'the export copies the untouched GOPs: ' + results.exportResult);
   assert(/(\d+) re-encoded/.test(results.exportResult) && +results.exportResult.match(/(\d+) re-encoded/)[1] > 0, 'and re-encodes the sections: ' + results.exportResult);
+  assert(new RegExp(`; ${results.blend.marks} blended`).test(results.exportResult), `the export blends the ${results.blend.marks} frames marked B: ` + results.exportResult);
   const exported = await page.evaluate(async () => {
     const a = document.querySelector('#exportDownload');
     const blob = await (await fetch(a.href)).blob();

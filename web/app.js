@@ -5,7 +5,7 @@ import { defaultWorkerCount } from './h264pool.js';
 import { Movie, tick } from './media.js';
 import { createDetector } from './detector.js';
 import { profile } from './profile.js';
-import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, rateLadder, keepJson, shownPts, softenPlan } from './analysis.js';
+import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, BLEND_DEFAULT } from './analysis.js';
 import { Project, projectKey, dropCaches } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
@@ -576,7 +576,7 @@ function parallelSetting() {
 }
 
 /** The export dialog's line about what an export does with this plan. */
-function describePlan(plan, movie, softened) {
+function describePlan(plan, movie, softened, blended = []) {
   const secs = (t) => `${t.toFixed(1)} s`;
   let text;
   if (plan.mode === 'smart') {
@@ -589,6 +589,7 @@ function describePlan(plan, movie, softened) {
   }
   text += !movie.audio ? '.' : movie.audio.copyable ? '; audio is copied without re-encoding.' : `; the audio (${movie.audio.codec}) can't go into an MP4 as it is, so it is re-encoded (AAC, or Opus) where this browser can.`;
   if (softened.length) text += ` Section${softened.length === 1 ? '' : 's'} ${softened.map((s) => '#' + s.id).join(', ')} ${softened.length === 1 ? 'is' : 'are'} softened (blurred) where stripes were found.`;
+  if (blended.length) text += ` In section${blended.length === 1 ? '' : 's'} ${blended.map((s) => '#' + s.id).join(', ')} the frames marked B are blended with the frames around them.`;
   return text;
 }
 
@@ -1075,7 +1076,7 @@ function onPreviewFrame(info, t, plan) {
   let what = '';
   if (k >= 0) {
     const e = state.player.mode === 'edited' ? (sec.edits || {})[k] || {} : {};
-    what = `frame ${k}${info.src !== k ? `, showing ${info.src}` : ''}${e.removed ? ' (removed)' : e.extended ? ' (held 1 s)' : ''}${info.softened ? ', softened' : ''}`;
+    what = `frame ${k}${info.src !== k ? `, showing ${info.src}` : ''}${e.removed ? ' (removed)' : e.extended ? ' (held 1 s)' : ''}${info.blended ? `, blended ${Math.round(blendStrength(sec) * 100)}%` : ''}${info.softened ? ', softened' : ''}`;
   }
   $('previewInfo').textContent = `${fmt(Math.max(0, rel))} / ${fmt(total)} · ${what}`;
   if (state.live.on) previewMeter(sec, k, t);
@@ -1126,6 +1127,11 @@ function previewMeter(sec, k, t) {
   }
 }
 
+/** Whether a section has marks that change what it shows. */
+function hasMarks(sec) {
+  return !!sec.soften || blendMarks(sec).length > 0 || Object.values(sec.edits || {}).some((e) => e.removed || e.extended);
+}
+
 /** The line above the player: what it shows, whether that passes, whether it is dimmed. */
 function renderPlayerWarning() {
   const w = $('playerWarning');
@@ -1140,7 +1146,7 @@ function renderPlayerWarning() {
   else if (!sec) text = '';
   else if (mode === 'original') text = `⚠ Section #${sec.id} as it is: it may flash.${dim}`;
   else {
-    const marked = sec.soften || Object.values(sec.edits || {}).some((e) => e.removed || e.extended);
+    const marked = hasMarks(sec);
     const c = sec.check;
     if (!sectionPlayable(sec)) text = `Section #${sec.id} plays here once it is prepared.`;
     else if (!marked) text = `⚠ Section #${sec.id} has no marks yet, so this is how it is: it may flash.${dim}`;
@@ -1430,9 +1436,12 @@ function wireWorkspace() {
     sec.end = Math.min(hi, e);
     sec.prepared = false;
     sec.cache = null;
+    sec.blendCache = null;
+    sec.blendKey = null;
     sec.ctx = null;
     sec.check = null;
     sec.edits = {};
+    sec.blend = [];
     sec.pts = null;
     state.project.save();
     renderAll();
@@ -1450,6 +1459,17 @@ function wireWorkspace() {
     if (!sec) return;
     pushHistory(sec);
     sec.edits = {};
+    sec.blend = [];
+    afterEdit(sec);
+  });
+  $('blendStrength').addEventListener('input', () => {
+    $('blendValue').textContent = `${$('blendStrength').value}%`;
+  });
+  $('blendStrength').addEventListener('change', () => {
+    const sec = currentSection();
+    if (!sec) return;
+    pushHistory(sec);
+    sec.blendStrength = +$('blendStrength').value / 100;
     afterEdit(sec);
   });
   $('btnUndo').addEventListener('click', undo);
@@ -1457,6 +1477,7 @@ function wireWorkspace() {
   $('btnSuggestLight').addEventListener('click', () => doSuggest('light'));
   $('btnSuggestDark').addEventListener('click', () => doSuggest('dark'));
   $('btnSuggestFewest').addEventListener('click', () => doSuggest('fewest'));
+  $('btnSuggestBlend').addEventListener('click', () => doSuggestBlend());
   $('btnSuggestFps').addEventListener('click', () => doSuggestFps());
   $('btnFpsMenu').addEventListener('click', (e) => {
     e.stopPropagation();
@@ -1483,6 +1504,7 @@ function wireWorkspace() {
   $('btnMarkRemovedNext').addEventListener('click', () => markSelection('F'));
   $('btnMarkExtended').addEventListener('click', () => markSelection('E'));
   $('btnMarkKeep').addEventListener('click', () => markSelection('K'));
+  $('btnMarkBlend').addEventListener('click', () => markSelection('B'));
   $('btnUnmark').addEventListener('click', () => markSelection('U'));
   $('btnSelectUnsafe').addEventListener('click', () => {
     const sec = currentSection();
@@ -1546,7 +1568,7 @@ function onKey(e) {
     return;
   }
   if (e.altKey) return;
-  if (['r', 'f', 'e', 'k', 'u'].includes(k)) {
+  if (['r', 'f', 'e', 'k', 'b', 'u'].includes(k)) {
     e.preventDefault();
     markSelection(k.toUpperCase());
     renderViewerInfo();
@@ -1611,6 +1633,7 @@ function renderWorkspace() {
   if (!$('fpsInput').value) $('fpsInput').value = wasm.safe_picture_rate(state.config).toString();
   updateFpsNote();
   renderSoften(sec);
+  renderBlend(sec);
   renderUndo();
   if (sec.prepared) {
     $('frameCount').textContent = `(${sec.nFrames})`;
@@ -1618,6 +1641,16 @@ function renderWorkspace() {
   }
   drawChart();
   renderPlayerWarning();
+}
+
+/** The blend strength: shown when the section has frames marked B. */
+function renderBlend(sec) {
+  const marks = (sec.blend || []).length;
+  $('blendWrap').classList.toggle('hidden', !marks);
+  const pct = Math.round(blendStrength(sec) * 100);
+  $('blendStrength').value = String(pct);
+  $('blendValue').textContent = `${pct}%`;
+  $('blendNote').textContent = marks ? `${marks} frame${marks === 1 ? '' : 's'}` : '';
 }
 
 /** The "soften stripes" switch: shown when the section has a pattern. */
@@ -1750,7 +1783,32 @@ function renderViewerInfo() {
   if (e.removed) marks.push(`removed: frame ${e.fill === 'next' ? 'after' : 'before'} it shows instead`);
   if (e.extended) marks.push('held for 1 s');
   if ((sec.keep || []).includes(i)) marks.push('keep');
+  if ((sec.blend || []).includes(i)) marks.push(`blended ${Math.round(blendStrength(sec) * 100)}% with the frames around it in the export (shown here as it is)`);
   $('viewerInfo').textContent = `Section #${sec.id}, frame ${i} of ${sec.nFrames} · ${fmt(sec.start + sec.pts[i])} (${sec.pts[i].toFixed(3)} s in)${marks.length ? ' · ' + marks.join(' · ') : ''} · ${state.movie.width}×${state.movie.height}`;
+}
+
+/**
+ * A tile's thumbnail from the section's small copies: blended, for a frame
+ * marked B, as the check sees it (`tile.dataset.want` names that version;
+ * the blur of softened frames is a CSS filter on top).
+ */
+function drawTile(sec, tile) {
+  const i = +tile.dataset.i;
+  const want = tile.dataset.want || '';
+  const canvas = tile.querySelector('canvas');
+  try {
+    const cache = want ? blendedFrames(sec) : sec.cache;
+    const aw = cache.width();
+    const ah = cache.height();
+    if (!scratch || scratch.width !== aw || scratch.height !== ah) scratch = new OffscreenCanvas(aw, ah);
+    const rgba = cache.frame(i);
+    const img = new ImageData(new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength), aw, ah);
+    scratch.getContext('2d').putImageData(img, 0, 0);
+    canvas.getContext('2d').drawImage(scratch, 0, 0, canvas.width, canvas.height);
+    tile.dataset.drawnKey = want;
+  } catch (e) {
+    /* cache gone */
+  }
 }
 
 function renderGrid(sec) {
@@ -1762,10 +1820,6 @@ function renderGrid(sec) {
   const ah = sec.cache.height();
   const tw = THUMB_W;
   const th = Math.max(1, Math.round((THUMB_W * ah) / aw));
-  if (!scratch || scratch.width !== aw || scratch.height !== ah) {
-    scratch = new OffscreenCanvas(aw, ah);
-  }
-  const sctx = scratch.getContext('2d');
   tileObserver = new IntersectionObserver(
     (entries) => {
       for (const en of entries) {
@@ -1773,16 +1827,7 @@ function renderGrid(sec) {
         const tile = en.target;
         if (tile.dataset.drawn) continue;
         tile.dataset.drawn = '1';
-        const i = +tile.dataset.i;
-        const canvas = tile.querySelector('canvas');
-        try {
-          const rgba = sec.cache.frame(i);
-          const img = new ImageData(new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength), aw, ah);
-          sctx.putImageData(img, 0, 0);
-          canvas.getContext('2d').drawImage(scratch, 0, 0, tw, th);
-        } catch (e) {
-          /* cache gone */
-        }
+        drawTile(sec, tile);
         tileObserver.unobserve(tile);
       }
     },
@@ -1867,6 +1912,10 @@ function renderGridMarks() {
   }
   const soft = new Set(sec.soften && sec.check && !sec.check.stale ? sec.check.soft_frames || [] : []);
   const kept = new Set(sec.keep || []);
+  const blendSet = new Set(blendMarks(sec));
+  // the blended thumbnails are redrawn when the marks or the strength change
+  const blendKey = blendSet.size && sec.cache && blendedFrames(sec) !== sec.cache ? sec.blendKey : '';
+  const blendPct = Math.round(blendStrength(sec) * 100);
   const softBlur = soft.size && sec.cache ? `blur(${((sec.check.soft_sigma || 1) * THUMB_W) / sec.cache.width()}px)` : '';
   for (let i = 0; i < grid.children.length; i++) {
     const tile = grid.children[i];
@@ -1879,24 +1928,32 @@ function renderGridMarks() {
     tile.classList.toggle('flagged-pat', patFlag.has(i) && !redFlag.has(i));
     tile.classList.toggle('soft', soft.has(i));
     tile.classList.toggle('kept', kept.has(i));
+    const blended = blendSet.has(i) && !e.removed;
+    tile.classList.toggle('blended', blended);
+    tile.dataset.want = blended ? blendKey : '';
+    if (tile.dataset.drawn && (tile.dataset.drawnKey || '') !== tile.dataset.want) drawTile(sec, tile);
     tile.querySelector('canvas').style.filter = soft.has(i) ? softBlur : '';
     const fb = tile.querySelector('.fb');
     if (e.removed) {
       fb.textContent = `shows ${rep[i]}`;
       fb.classList.remove('hidden');
     } else if (e.extended) {
-      fb.textContent = 'held 1 s';
+      fb.textContent = blended ? `held 1 s · blend ${blendPct}%` : 'held 1 s';
+      fb.classList.remove('hidden');
+    } else if (blended) {
+      fb.textContent = `blend ${blendPct}%`;
       fb.classList.remove('hidden');
     } else fb.classList.add('hidden');
   }
 }
 
 /**
- * R, F, E and K toggle their own mark on the selected frames, as in the
+ * R, F, E, K and B toggle their own mark on the selected frames, as in the
  * original tool: pressed on frames that already carry it (judged by the
  * first frame selected) they take it off, otherwise they put it on. R and F
  * each toggle their own direction, so one pressed on a removal marked the
- * other way flips it. U takes every mark off.
+ * other way flips it; a removal and a blend (B) exclude each other. U takes
+ * every mark off.
  */
 function markSelection(key) {
   const sec = currentSection();
@@ -1905,6 +1962,7 @@ function markSelection(key) {
   pushHistory(sec);
   sec.edits = sec.edits || {};
   const keep = new Set(sec.keep || []);
+  const blend = new Set(sec.blend || []);
   const items = [...state.selection];
   const first = sec.edits[items[0]] || null;
   const removedAs = (fill) => !!(first && first.removed && ((first.fill || 'prev') === 'next') === (fill === 'next'));
@@ -1918,7 +1976,10 @@ function markSelection(key) {
     for (const i of items) {
       const e = sec.edits[i] || {};
       set(i, on, on ? false : !!e.extended, fill);
-      if (on) keep.delete(i);
+      if (on) {
+        keep.delete(i);
+        blend.delete(i);
+      }
     }
   } else if (key === 'E') {
     const on = !(first && first.extended && !first.removed);
@@ -1937,13 +1998,28 @@ function markSelection(key) {
         if (e && e.removed) delete sec.edits[i];
       }
     }
+  } else if (key === 'B') {
+    const on = !blend.has(items[0]);
+    for (const i of items) {
+      if (!on) blend.delete(i);
+      else {
+        blend.add(i);
+        // a blended frame stays on screen: a removal goes, a hold stays
+        const e = sec.edits[i];
+        if (e && e.removed) delete sec.edits[i];
+      }
+    }
+    if (on && sec.blendStrength == null) sec.blendStrength = BLEND_DEFAULT;
   } else {
     for (const i of items) {
       delete sec.edits[i];
       keep.delete(i);
+      blend.delete(i);
     }
   }
   sec.keep = [...keep].sort((a, b) => a - b);
+  sec.blend = [...blend].sort((a, b) => a - b);
+  renderBlend(sec);
   afterEdit(sec);
 }
 
@@ -1977,7 +2053,7 @@ function historyOf(sec) {
 }
 
 function markSnapshot(sec) {
-  return JSON.stringify({ edits: sec.edits || {}, keep: sec.keep || [], soften: !!sec.soften });
+  return JSON.stringify({ edits: sec.edits || {}, keep: sec.keep || [], soften: !!sec.soften, blend: sec.blend || [], blendStrength: sec.blendStrength == null ? null : sec.blendStrength });
 }
 
 /** Remember a section's marks before a change, for undo. */
@@ -1995,6 +2071,8 @@ function restoreMarks(sec, snap) {
   sec.edits = o.edits || {};
   sec.keep = o.keep || [];
   sec.soften = !!o.soften;
+  sec.blend = o.blend || [];
+  sec.blendStrength = o.blendStrength == null ? null : o.blendStrength;
 }
 
 function undo() {
@@ -2005,6 +2083,7 @@ function undo() {
   h.redo.push(markSnapshot(sec));
   restoreMarks(sec, h.undo.pop());
   renderSoften(sec);
+  renderBlend(sec);
   afterEdit(sec);
 }
 
@@ -2016,6 +2095,7 @@ function redo() {
   h.undo.push(markSnapshot(sec));
   restoreMarks(sec, h.redo.pop());
   renderSoften(sec);
+  renderBlend(sec);
   afterEdit(sec);
 }
 
@@ -2125,6 +2205,25 @@ async function doSuggest(prefer) {
   toast(res.note, 6000);
 }
 
+/** Lower contrast: blend the flashing frames with the frames around them, as little as passes. */
+async function doSuggestBlend() {
+  const sec = currentSection();
+  if (!sec || !sec.prepared) return;
+  const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
+  const res = await runJob('Suggesting (lower contrast)', async (progress) => suggestBlend(state.env, state.project, sec, only, { extS: EXT_S, onProgress: (r) => progress(Math.min(0.95, 0.05 + r * 0.09), `check ${r + 1}`) }));
+  if (!res) return;
+  pushHistory(sec);
+  sec.edits = res.edits;
+  sec.blend = res.blend;
+  sec.blendStrength = res.strength;
+  sec.check = res.verdict || null;
+  state.project.invalidateNeighbours(sec, wasm.context_seconds(state.config));
+  if (sec.id === state.current && state.player.mode === 'edited' && sectionPlayer && sectionPlayer.active && !sectionPlayer.paused) playSection(Math.max(0, sectionPlayer.slot));
+  await state.project.save();
+  renderAll();
+  toast(res.note, 8000);
+}
+
 /** Reduce FPS: from twice the guaranteed-safe rate down, a tenth at a time, to the first rate that passes. */
 async function doSuggestFps() {
   const sec = currentSection();
@@ -2182,9 +2281,14 @@ function drawChart() {
   const thresh = sec.check.area_thresh || 1;
   const mid = H * 0.62;
   const bw = W / n;
-  $('chartHint').textContent = 'Brightness (line) and how much of the window is changing (bars: brightening up, darkening down, magenta for red, orange when the flash rate is over the limit). The teal line is how much of the picture is a stripe pattern. Red shading is removed, blue is held. Click to jump to a frame.';
+  $('chartHint').textContent = 'Brightness (line) and how much of the window is changing (bars: brightening up, darkening down, magenta for red, orange when the flash rate is over the limit). The teal line is how much of the picture is a stripe pattern. Red shading is removed, blue is held, violet is blended. Click to jump to a frame.';
+  const blendSet = new Set(blendMarks(sec));
   for (let i = 0; i < n; i++) {
     const e = (sec.edits || {})[i] || {};
+    if (blendSet.has(i) && !e.removed) {
+      g.fillStyle = 'rgba(167,130,255,.22)';
+      g.fillRect(i * bw, 0, bw + 0.5, H);
+    }
     if (e.removed) {
       g.fillStyle = 'rgba(224,80,63,.22)';
       g.fillRect(i * bw, 0, bw + 0.5, H);
@@ -2251,7 +2355,7 @@ async function openExport() {
   const p = state.project;
   if (!p) return;
   const rows = p.sectionsSorted().map((s) => {
-    const marks = Object.values(s.edits || {}).filter((e) => e.removed || e.extended).length;
+    const marks = Object.values(s.edits || {}).filter((e) => e.removed || e.extended).length + (s.blend || []).length;
     const applies = marks || (s.soften && softenPlan(s));
     const status = !applies ? 'nothing to apply' : !(s.pts && s.pts.length) ? 'has marks but was never prepared: marks will NOT be applied' : s.check && !s.check.stale ? (s.check.safe ? 'passes' : 'still failing') : 'unchecked';
     return `<tr><td>#${s.id}</td><td>${fmt(s.start)} – ${fmt(s.end)}</td><td>${marks} marks</td><td>${status}</td></tr>`;
@@ -2284,10 +2388,11 @@ async function renderExportChoice() {
   const cands = state.exportCands || [];
   const chosen = cands.find((c) => c.label === $('exportCodec').value) || cands[0];
   const softened = state.project.sectionsSorted().filter((s) => s.soften && softenPlan(s));
+  const blended = state.project.sectionsSorted().filter((s) => s.pts && s.pts.length && blendMarks(s).length);
   const plan = chosen ? await exportPlan(state.env, state.movie, state.project, { extS: EXT_S, codec: chosen.config.codec, smartCut: smartCutSetting(), parallel: parallelSetting() }) : null;
   state.exportPlan = plan;
   $('exportFormatNote').textContent = chosen ? formatInfo(chosen, state.movie).note : '';
-  $('exportPlan').textContent = plan ? describePlan(plan, state.movie, softened) : 'This browser has no WebCodecs video encoder, so it cannot export.';
+  $('exportPlan').textContent = plan ? describePlan(plan, state.movie, softened, blended) : 'This browser has no WebCodecs video encoder, so it cannot export.';
   const need = estimateExportBytes(state.movie, +$('exportQuality').value, plan);
   $('exportSize').textContent = chosen ? `About ${fmtBytes(need)}. ${window.showSaveFilePicker ? 'You will be asked where to save it.' : privateStorageAvailable() ? "It is written to the browser's private storage on disk and offered for download." : `It is assembled in memory and offered for download${need > memoryExportLimit() ? ', which is more than this browser is likely to hold' : ''}.`}` : '';
 }
@@ -2335,7 +2440,7 @@ function exportSummary(res) {
   const total = res.frames + (res.copied || 0);
   const parts = [`${res.frames} re-encoded with ${res.encoderLabel} (${res.codec})${res.spans > 1 ? ` in ${res.spans} spans` : ''}`];
   if (res.copied) parts.push(`${res.copied} copied from the source as they are`);
-  return `Exported ${total} frames in ${(res.elapsedMs / 1000).toFixed(1)} s: ${parts.join(', ')}${res.softened ? `; ${res.softened} softened` : ''}.`;
+  return `Exported ${total} frames in ${(res.elapsedMs / 1000).toFixed(1)} s: ${parts.join(', ')}${res.blended ? `; ${res.blended} blended` : ''}${res.softened ? `; ${res.softened} softened` : ''}.`;
 }
 
 /**
@@ -2565,8 +2670,7 @@ async function autopilot({ rescan = false } = {}) {
       if (!res || halted()) return bail('scan', 'The scan did not finish.');
       autoStep(auto, 'scan', 'done', describeScan(project.scan));
     }
-    const marked = (s) => s.soften || Object.values(s.edits || {}).some((e) => e.removed || e.extended);
-    if (project.scan.safe && !project.sections.some(marked)) {
+    if (project.scan.safe && !project.sections.some(hasMarks)) {
       autoStep(auto, 'fix', 'skipped', 'nothing to fix');
       autoStep(auto, 'export', 'skipped', 'the file passes as it is');
       autoStep(auto, 'verify', 'skipped');
@@ -2684,7 +2788,7 @@ async function autoFixSection(sec, auto) {
   const env = state.env;
   const project = state.project;
   const ctxS = wasm.context_seconds(state.config);
-  const hadMarks = Object.values(sec.edits || {}).some((e) => e.removed || e.extended);
+  const hadMarks = blendMarks(sec).length > 0 || Object.values(sec.edits || {}).some((e) => e.removed || e.extended);
   if (!sec.prepared && !(await doPrepare(sec))) return null;
   const check = async () => {
     if (auto.stopped) return null;

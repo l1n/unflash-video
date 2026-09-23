@@ -48,6 +48,7 @@ export function projectKey(file) {
 export function dropCaches(sec) {
   if (sec.cache) sec.cache.free();
   if (sec.softCache) sec.softCache.free();
+  if (sec.blendCache) sec.blendCache.free();
   if (sec.ctx) {
     sec.ctx.lead.free();
     sec.ctx.tail.free();
@@ -55,6 +56,8 @@ export function dropCaches(sec) {
   sec.cache = null;
   sec.softCache = null;
   sec.softKey = null;
+  sec.blendCache = null;
+  sec.blendKey = null;
   sec.ctx = null;
   sec.prepared = false;
 }
@@ -84,10 +87,13 @@ export class Project {
           prepared: false,
           cache: null,
           softCache: null,
+          blendCache: null,
           ctx: null,
           check: s.check || null,
           edits: s.edits || {},
           keep: s.keep || [],
+          blend: s.blend || [],
+          blendStrength: s.blendStrength == null ? null : s.blendStrength,
           soften: !!s.soften,
           pattern: s.pattern || null,
         }));
@@ -106,6 +112,8 @@ export class Project {
       kinds: s.kinds || [],
       edits: s.edits || {},
       keep: s.keep || [],
+      blend: s.blend || [],
+      blendStrength: s.blendStrength == null ? null : s.blendStrength,
       check: s.check ? summarizeCheck(s.check) : null,
       nFrames: s.nFrames || 0,
       pts: s.pts || null,
@@ -141,9 +149,12 @@ export class Project {
       kinds,
       edits: {},
       keep: [],
+      blend: [],
+      blendStrength: null,
       prepared: false,
       cache: null,
       softCache: null,
+      blendCache: null,
       ctx: null,
       check: null,
       custom,
@@ -177,6 +188,7 @@ export class Project {
     for (const s of this.sections) {
       if (s.cache) b += s.cache.byte_length();
       if (s.softCache) b += s.softCache.byte_length();
+      if (s.blendCache) b += s.blendCache.byte_length();
       if (s.ctx) b += s.ctx.lead.byte_length() + s.ctx.tail.byte_length();
     }
     return b;

@@ -88,7 +88,9 @@ Files it reads:
 2. **Open a section.** It prepares itself (its frames, plus a run-up and
    run-out, are decoded into memory at analysis resolution) and is checked.
 3. **Edit it.** Mark frames: **R** removes a frame and shows the previous
-   one in its place, **F** the next one, **E** holds a frame for a second;
+   one in its place, **F** the next one, **E** holds a frame for a second,
+   **B** blends it with the frames either side of it (lower contrast: the
+   flash is toned down rather than taken out, see below);
    pressing the same key again takes the mark off, as in the original tool,
    and the keys work with the focus anywhere but a text field. **Ctrl+Z**
    undoes (and **Ctrl+Shift+Z** redoes) any change to the section's marks,
@@ -104,7 +106,9 @@ Files it reads:
    whichever of the light or dark frames are fewer and then puts back as
    many flashes as the rules allow (no more than three a second, fewer
    where the profile still objects, each try checked), so as little as
-   possible goes; *reduce FPS* thins the section the way
+   possible goes; *lower contrast* removes nothing: it blends those frames
+   with the frames around them instead, as little as passes; *reduce FPS*
+   thins the section the way
    an editor does it by hand, trying twice the rate that can never fail
    first and stepping down a tenth at a time until the check passes (the ▾
    menu thins to a rate you type). They choose by brightness alone, so
@@ -114,7 +118,8 @@ Files it reads:
 5. **Watch it.** With a section open, the player plays that section with
    your marks applied, rendered from the source file exactly as the export
    will render it (removed frames showing their stand-in, holds held,
-   softened frames blurred); switch it to *original* to compare, or to the
+   blended frames blended, softened frames blurred); switch it to
+   *original* to compare, or to the
    *whole video*. It plays from the selected frame, loops if asked, runs at
    ½× or ¼×, outlines the frame on screen in the grid, and with **live
    monitor** on shows the check's meter for that frame. It starts small
@@ -123,6 +128,28 @@ Files it reads:
 6. A stripe pattern can't be removed a frame at a time; tick **soften
    stripes** and the frames that carry it are blurred just enough to take
    it under the threshold, in the check, the player and the export alike.
+
+**Lower contrast** (Kel's "get rid of flashing by reducing contrast rather
+than removing frames"). A frame marked **B** is mixed with what the frames
+either side of it show: the nearest unmarked frame before it and the
+nearest after, weighted by where it sits between them. At 100% a run of
+blended frames becomes a crossfade between its neighbours, so the flash
+is gone but every frame and the timing stay; at less, some of the flash
+stays, and so does whatever it shows (a line of subtitles). One **blend**
+strength per section (shown once it has B marks; 80% for marks made by
+hand) sets how far. *Suggest: lower contrast* marks the frames on the
+flashing's minority side (the light frames among dark ones, or the other
+way round), adds the frames a check still flags if that is not enough at
+100%, finds the least strength that passes in 5% steps and sets a little
+more (what is left of the flash is at most 80% of what just passes);
+removals within its reach make way for it, and frames marked **K** are
+never blended. The mix is made on 8-bit sRGB values, the space in which
+the detector averages pixels down to its analysis size, so blending the
+small copies predicts what blending the full-size frames in the export
+shows; the section player and the export blend the decoded frames on a
+canvas the same way. Where something moves between the frames, a blended
+frame shows it twice, faintly (a ghost), which is the price of keeping the
+frame.
 7. **Export**: the spans around the sections are re-encoded in the browser
    with the edits applied, several at a time; every GOP no section touches
    is copied from the source as it is, and so is the audio. **Verify**
@@ -445,7 +472,7 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 
 | crate | what |
 |---|---|
-| `crates/unflash-core` | the detector: config and profiles, the per-pixel kernel (scalar and SIMD), grid reduction, temporal stage, violations, sections, editing helpers. No I/O. |
+| `crates/unflash-core` | the detector: config and profiles, the per-pixel kernel (scalar and SIMD), grid reduction, temporal stage, violations, sections, editing helpers, the blend of lower contrast. No I/O. |
 | `crates/unflash-gpu` | the WGSL pipeline on `wgpu` (native backends and the browser's WebGPU) |
 | `crates/unflash-mp4` | byte-range demuxers for WebCodecs, MP4 (fragmented files, edit lists) and Matroska / WebM (lacing, unknown sizes, header stripping), giving codec strings, decoder descriptions and sample tables; MP4 sample entries for Matroska audio; a muxer for the export |
 | `crates/unflash-h264` | the built-in H.264 decoder, for browsers whose WebCodecs has none |
@@ -486,7 +513,7 @@ decodes the x264 test streams and requires ffmpeg's MD5 of every frame.
 `crates/unflash-h264/tests/rewrite.rs` renumbers the parameter sets of
 every conformance stream and decodes it again, and splices GOPs of one
 encoding into another and checks the result in this decoder and in ffmpeg.
-`tests/e2e/run.mjs` scans, edits, softens, exports and verifies the
+`tests/e2e/run.mjs` scans, edits, blends, softens, exports and verifies the
 synthetic clips in headless Chromium, including the H.264 clip through the
 built-in decoder (the test browser has no H.264); the VP9 exports copy
 their untouched GOPs. `tests/e2e/splice.mjs` runs the H.264 smart cut with

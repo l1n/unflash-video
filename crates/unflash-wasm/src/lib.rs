@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use serde::Serialize;
+use unflash_core::blend;
 use unflash_core::config::{DetectorConfig, Profile};
 use unflash_core::detector::{CpuStage, Detector as CoreDetector, PixelStage};
 use unflash_core::editing::{self, Edits, FrameSource, Prefer, SuggestStep};
@@ -374,6 +375,28 @@ impl FrameCache {
     }
 
     /// A copy of this cache with the frames whose `mask` entry is non-zero
+    /// blended with their unmarked neighbours at `strength` (0 to 1; see
+    /// `unflash_core::blend`).
+    pub fn blended(&self, mask: &[u8], strength: f32) -> FrameCache {
+        let marked: Vec<bool> = (0..self.n).map(|i| mask.get(i).map(|&m| m != 0).unwrap_or(false)).collect();
+        let sources = blend::blend_sources(&marked);
+        let fs = (self.width * self.height * 3) as usize;
+        let frame = |i: usize| &self.data[i * fs..(i + 1) * fs];
+        let mut out = FrameCache { width: self.width, height: self.height, data: Vec::with_capacity(self.data.len()), n: self.n };
+        let mut tmp = Vec::new();
+        for (i, src) in sources.iter().enumerate() {
+            match src {
+                Some(src) => {
+                    blend::mix(&mut tmp, frame(i), src.prev.map(frame), src.next.map(frame), blend::blend_weights(src, strength));
+                    out.data.extend_from_slice(&tmp);
+                }
+                None => out.data.extend_from_slice(frame(i)),
+            }
+        }
+        out
+    }
+
+    /// A copy of this cache with the frames whose `mask` entry is non-zero
     /// blurred (three box passes of `radius`); the others are copied as
     /// they are. A short or empty mask blurs every frame.
     pub fn blurred(&self, radius: u32, mask: &[u8]) -> FrameCache {
@@ -416,6 +439,18 @@ impl FrameSource for FrameCache {
     fn height(&self) -> u32 {
         self.height
     }
+}
+
+/// The frames of a section to blend, from a check of it (`result_json`):
+/// `{"frames": [...], "side": "light" | "dark"}`, the frames on the
+/// flashing's minority side (`tight`: only the most extreme of them).
+#[wasm_bindgen]
+pub fn blend_candidates(rel_pts: &[f64], result_json: &str, frames: &FrameCache, only_json: Option<String>, keep_json: Option<String>, tight: bool) -> Result<String, JsValue> {
+    let result = parse_result(result_json)?;
+    let only = parse_only(only_json)?;
+    let keep = parse_keep(keep_json)?;
+    let (idx, side) = editing::flash_frames(rel_pts.to_vec(), frames, &result, only, keep, tight);
+    Ok(serde_json::json!({ "frames": idx, "side": side }).to_string())
 }
 
 // ---- suggester -------------------------------------------------------------

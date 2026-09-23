@@ -697,6 +697,20 @@ impl Suggester {
     }
 }
 
+/// The frames that make the flashing, on its minority side: the light
+/// frames among dark ones, or the other way round (the side the
+/// fewest-removals suggester would take out), with the side they are on.
+/// `tight`: only the most extreme of them. For blending rather than
+/// removing (see [`crate::blend`]).
+pub fn flash_frames(rel_pts: Vec<f64>, frames: &dyn FrameSource, result: &AnalysisResult, only: Option<BTreeSet<usize>>, keep: BTreeSet<usize>, tight: bool) -> (Vec<usize>, Prefer) {
+    let mut s = Suggester::new(rel_pts, &Edits::new(), Prefer::Fewest, only, keep);
+    s.prefer = s.pick_side(frames, result);
+    s.apply_percentile_pass(frames, result, tight);
+    // the side kept is the one not blended
+    let blended_side = if s.prefer == Prefer::Dark { Prefer::Light } else { Prefer::Dark };
+    (s.removed.into_iter().collect(), blended_side)
+}
+
 /// A "reduce FPS" proposal: removals that thin the section down to `fps`
 /// pictures a second, from timestamps alone.
 #[derive(Clone, Debug, PartialEq)]

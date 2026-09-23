@@ -375,17 +375,94 @@ export function softenPlan(sec) {
   return { frames, hot, period, sigma, radius };
 }
 
-/** The frames a check or suggestion should read: softened when asked. */
+/** How far a blend mark made by hand mixes a frame with the frames around it, to begin with. */
+export const BLEND_DEFAULT = 0.8;
+
+/** How far a section's blend marks mix their frames with the frames around them (0 to 1). */
+export function blendStrength(sec) {
+  return sec.blendStrength == null ? BLEND_DEFAULT : sec.blendStrength;
+}
+
+/** A section's blend marks that apply (on its frames, at some strength), in order. */
+export function blendMarks(sec) {
+  const n = sec.cache ? sec.cache.len() : sec.nFrames || 0;
+  if (!(blendStrength(sec) > 0)) return [];
+  return [...new Set(sec.blend || [])].filter((i) => i >= 0 && i < n).sort((a, b) => a - b);
+}
+
+/**
+ * What each of `marked.length` frames is blended with: null when it is not
+ * marked (or no frame around it is unmarked), else `{ prev, next, u }`, the
+ * nearest unmarked frames before and after it (null past the ends) and how
+ * far from `prev` to `next` it sits. The same rule as the check's
+ * (`unflash_core::blend`), so the export shows what was checked.
+ */
+export function blendSources(marked) {
+  const n = marked.length;
+  const out = new Array(n).fill(null);
+  let prev = null;
+  let i = 0;
+  while (i < n) {
+    if (!marked[i]) {
+      prev = i++;
+      continue;
+    }
+    let j = i;
+    while (j < n && marked[j]) j++;
+    const next = j < n ? j : null;
+    if (prev !== null || next !== null) {
+      for (let k = i; k < j; k++) {
+        const u = prev !== null && next !== null ? (k - prev) / (next - prev) : prev === null ? 1 : 0;
+        out[k] = { prev, next, u };
+      }
+    }
+    i = j;
+  }
+  return out;
+}
+
+/** The weights of (the frame itself, `prev`, `next`) at strength `s`. */
+export function blendWeights(src, s) {
+  s = Math.max(0, Math.min(1, s));
+  if (src.prev !== null && src.next !== null) return [1 - s, s * (1 - src.u), s * src.u];
+  if (src.prev !== null) return [1 - s, s, 0];
+  if (src.next !== null) return [1 - s, 0, s];
+  return [1, 0, 0];
+}
+
+/** A section's frames with its blend marks applied (its own cache when it has none). */
+export function blendedFrames(sec) {
+  if (!sec.cache) return sec.cache;
+  const marks = blendMarks(sec);
+  if (!marks.length) {
+    if (sec.blendCache) sec.blendCache.free();
+    sec.blendCache = null;
+    sec.blendKey = null;
+    return sec.cache;
+  }
+  const s = blendStrength(sec);
+  const key = `${sec.preparedAt}:${s}:${marks.join(',')}`;
+  if (sec.blendCache && sec.blendKey === key) return sec.blendCache;
+  if (sec.blendCache) sec.blendCache.free();
+  const mask = new Uint8Array(sec.cache.len());
+  for (const i of marks) mask[i] = 1;
+  sec.blendCache = sec.cache.blended(mask, s);
+  sec.blendKey = key;
+  return sec.blendCache;
+}
+
+/** The frames a check or suggestion should read: blended and softened as marked. */
 export function sectionFrames(sec) {
-  if (!sec.soften || !sec.cache) return sec.cache;
+  const frames = blendedFrames(sec);
+  if (!frames || !sec.soften) return frames;
   const plan = softenPlan(sec);
-  if (!plan) return sec.cache;
-  const key = `${plan.radius}:${sec.preparedAt}:${[...plan.frames].join(',')}`;
+  if (!plan) return frames;
+  const key = `${plan.radius}:${sec.blendKey || sec.preparedAt}:${[...plan.frames].join(',')}`;
   if (sec.softCache && sec.softKey === key) return sec.softCache;
   if (sec.softCache) sec.softCache.free();
   const mask = new Uint8Array(sec.cache.len());
   for (const i of plan.frames) if (i < mask.length) mask[i] = 1;
-  sec.softCache = sec.cache.blurred(plan.radius, mask);
+  sec.softCache = frames.blurred(plan.radius, mask);
   sec.softKey = key;
   sec.softPlan = plan;
   return sec.softCache;
@@ -526,7 +603,7 @@ export async function checkSection(env, project, sec, edits, { extS = 1.0, onPro
   const extendedBad = result.flag_extended && violations.some((v) => v.kind === 'extended');
   const patternBad = result.flag_patterns && violations.some((v) => v.kind === 'pattern');
   const safe = wcagSafe && !extendedBad && !patternBad;
-  const soft = sec.soften && frames !== sec.cache && sec.softPlan ? sec.softPlan : null;
+  const soft = sec.soften && sec.softCache && frames === sec.softCache ? sec.softPlan : null;
   const flagged = Array.from(wasm.flagged_frames(Float64Array.from(seq.t), JSON.stringify(cls.inside)));
   const spills = cls.inside.filter((v) => v.end > endDisp + 1e-6);
   // chart statistics for the section's own frames
@@ -656,6 +733,94 @@ export async function searchFrameRate(env, project, sec, only, { extS = 1.0, sou
   }
   const tried = failed.length ? ` Tried ${failed.map((r) => `${r}/s`).join(', ')} first; ${failed.length === 1 ? 'it fails' : 'they fail'}.` : '';
   return { ...res, note: res.note + tried, ladder, failed };
+}
+
+/** Blend strengths are searched in steps of this much. */
+const BLEND_STEP = 0.05;
+/** What a suggested blend leaves of a flash: this share of what just passes, for room to spare. */
+const BLEND_ROOM = 0.8;
+/** Rounds of adding the frames a check still flags, when blending all the way is not enough. */
+const BLEND_ROUNDS = 3;
+
+/**
+ * "Lower contrast": take the contrast out of the flashing rather than
+ * frames out of it. The frames on the flashing's minority side (the light
+ * ones among dark ones, or the other way round) are marked to blend with the
+ * frames around them; if that does not pass at full strength, the frames the
+ * check still flags join them (a few rounds at most). Then the least
+ * strength that passes is found (in 5% steps) and a little added, so the
+ * flash that stays is at most 80% of what just passes. Removals within
+ * reach (the selection, with "selection only") make way for it; holds and
+ * keep marks stay, and frames marked keep are never blended. Resolves to
+ * `{ edits, blend, strength, least, safe, note, verdict }`; the section's
+ * own marks are as they were.
+ */
+export async function suggestBlend(env, project, sec, only, { extS = 1.0, onProgress } = {}) {
+  const { wasm } = env;
+  const reach = only ? new Set(only) : null;
+  const inReach = (i) => !reach || reach.has(i);
+  const edits = {};
+  for (const [k, e] of Object.entries(sec.edits || {})) if (!(e.removed && inReach(+k))) edits[k] = e;
+  const outside = (sec.blend || []).filter((i) => !inReach(i));
+  const shown = Float64Array.from(shownPts(wasm, sec));
+  const saved = { blend: sec.blend, blendStrength: sec.blendStrength };
+  let checks = 0;
+  const check = (marks, s) => {
+    sec.blend = marks;
+    sec.blendStrength = s;
+    if (onProgress) onProgress(checks++);
+    return checkSection(env, project, sec, edits, { extS });
+  };
+  const candidates = (verdict) => JSON.parse(wasm.blend_candidates(shown, JSON.stringify(verdict.raw), sec.cache, only ? JSON.stringify(only) : undefined, keepJson(sec), false)).frames;
+  const pct = (s) => `${Math.round(s * 100)}%`;
+  const removed = Object.keys(sec.edits || {}).length - Object.keys(edits).length;
+  try {
+    const s0 = blendStrength(sec);
+    const base = await check(outside, s0);
+    if (base.safe) return { edits, blend: outside, strength: s0, least: 0, safe: true, verdict: base, note: removed ? 'It passes with the removals taken off and nothing blended.' : 'It passes as it is: nothing to blend.' };
+    // the frames to blend: at full strength until it passes
+    const marks = new Set(outside);
+    let verdict = base;
+    for (let round = 0; round < BLEND_ROUNDS; round++) {
+      const before = marks.size;
+      for (const i of candidates(verdict)) marks.add(i);
+      if (marks.size === before) break;
+      verdict = await check([...marks].sort((a, b) => a - b), 1);
+      if (verdict.safe) break;
+    }
+    const list = [...marks].sort((a, b) => a - b);
+    if (!list.length) return { edits, blend: outside, strength: 1, least: 1, safe: false, verdict: base, note: 'Found no flashing frames to blend here. Try a removal suggestion, or mark frames with B.' };
+    if (!verdict.safe) {
+      return { edits, blend: list, strength: 1, least: 1, safe: false, verdict, note: `Even blended all the way, ${list.length} frames do not take the flashing out here. They are left marked at 100% to go on from; a removal suggestion may do better.` };
+    }
+    // the least strength that passes, in steps: lo fails, hi passes
+    const steps = Math.round(1 / BLEND_STEP);
+    let lo = 0;
+    let hi = steps;
+    let found = verdict;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      const v = await check(list, mid / steps);
+      if (v.safe) {
+        hi = mid;
+        found = v;
+      } else lo = mid;
+    }
+    const least = hi / steps;
+    // room to spare: leave at most BLEND_ROOM of the flash that just passes
+    const chosen = Math.min(steps, Math.ceil((1 - BLEND_ROOM * (1 - least)) * steps - 1e-9));
+    let strength = chosen / steps;
+    if (chosen !== hi) {
+      const v = await check(list, strength);
+      if (v.safe) found = v;
+      else strength = least;
+    }
+    const note = `Blended ${list.length} frame${list.length === 1 ? '' : 's'} with the frames around ${list.length === 1 ? 'it' : 'them'} at ${pct(strength)} (${pct(least)} is the least that passes)${removed ? `, in place of ${removed} removal${removed === 1 ? '' : 's'}` : ''}: it passes, and no frame is taken out.`;
+    return { edits, blend: list, strength, least, safe: true, verdict: found, note };
+  } finally {
+    sec.blend = saved.blend;
+    sec.blendStrength = saved.blendStrength;
+  }
 }
 
 export { tick };

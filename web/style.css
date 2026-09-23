@@ -1,6 +1,6 @@
 :root {
   --bg: #15171c; --bg2: #1d2027; --bg3: #262a33; --fg: #e6e8ee; --fg2: #a5aab6; --line: #333844;
-  --accent: #4f8cff; --ok: #3dbb6a; --bad: #e0503f; --warn: #e8a33c; --red: #e04fb0; --sel: #ffd84f; --pat: #3fc1c9;
+  --accent: #4f8cff; --ok: #3dbb6a; --bad: #e0503f; --warn: #e8a33c; --red: #e04fb0; --sel: #ffd84f; --pat: #3fc1c9; --blend: #a782ff;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -138,6 +138,7 @@ aside#sections { width: 250px; border-right: 1px solid var(--line); background: 
 .chip.soft { border-color: var(--pat); color: #9fe8ec; border-style: dashed; }
 .chip.selected { border-color: var(--sel); color: var(--sel); }
 .chip.kept { border-color: var(--ok); color: #9fe8b8; }
+.chip.blended { border-color: var(--blend); color: #d6c8ff; }
 .grid-actions { display: flex; gap: 6px; margin-left: auto; }
 .grid-hint { color: var(--fg2); font-size: 12px; margin: 6px 0; }
 .frame-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--thumb-min, 146px), 1fr)); gap: 6px; outline: none; }
@@ -162,6 +163,9 @@ aside#sections { width: 250px; border-right: 1px solid var(--line); background: 
 .frame.removed { border-color: var(--bad); }
 .frame.removed canvas { opacity: .45; }
 .frame.extended { border-color: var(--accent); }
+.frame.blended { border-color: var(--blend); }
+.frame.blended .fb { background: var(--blend); color: #150d2b; }
+#blendStrength { width: 110px; accent-color: var(--blend); }
 .frame.selected { outline: 2px solid var(--sel); outline-offset: -1px; }
 .frame.kept .fno { background: var(--ok); color: #0c2415; }
 .frame.kept .fno::before { content: "K "; font-weight: 700; }
