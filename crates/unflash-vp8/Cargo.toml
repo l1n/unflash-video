@@ -6,6 +6,7 @@ description = "A small VP8 decoder (RFC 6386, all profiles) for browsers without
 license = "MIT"
 
 [dependencies]
+bytemuck = { workspace = true, optional = true }
 wide = { version = "0.7", optional = true }
 
 [dev-dependencies]
@@ -14,4 +15,4 @@ md5 = "0.7"
 
 [features]
 default = ["simd"]
-simd = ["dep:wide"]
+simd = ["dep:wide", "dep:bytemuck"]

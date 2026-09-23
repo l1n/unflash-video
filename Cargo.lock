@@ -1088,6 +1088,7 @@ dependencies = [
 name = "unflash-vp8"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "md5",
  "unflash-mp4",
  "wide",

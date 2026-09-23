@@ -42,7 +42,8 @@ impl MbFilter {
     }
 }
 
-/// The filter across one edge, with its limits.
+/// The filter across one edge, with its limits (the edge limit is at most
+/// 193, the interior limit 63).
 #[derive(Clone, Copy, Debug)]
 enum Kind {
     /// 15.3: the normal filter across a macroblock edge (up to three
@@ -121,184 +122,287 @@ fn filter_position(buf: &mut [u8], at: usize, step: usize, kind: Kind) {
     }
 }
 
-/// Eight positions of an edge at once, in 16-bit lanes (wasm simd128, SSE2
-/// or NEON through `wide`), computing exactly what `filter_position` does:
-/// every lane takes both branches and the masks pick.
+/// Sixteen positions of an edge at once in byte lanes (wasm simd128, SSE2
+/// or NEON through `wide`): sixteen of luma, or eight of U beside the same
+/// eight of V, whose limits are the same. It computes exactly what
+/// `filter_position` does, as libvpx's SIMD filters do: the differences
+/// across the edge on unsigned bytes with saturation, the adjustments on
+/// signed bytes (samples less 128), where saturating is clamping, and the
+/// adjustments of positions left alone masked to zero.
 #[cfg(feature = "simd")]
 mod simd {
     use super::Kind;
-    use wide::{i16x8, u8x16, CmpGt};
+    use bytemuck::cast;
+    use wide::{i16x8, i8x16, u16x8, u8x16};
 
     #[inline(always)]
-    fn splat(v: i32) -> i16x8 {
-        i16x8::splat(v as i16)
+    fn splat(v: i32) -> u8x16 {
+        u8x16::splat(v as u8)
+    }
+
+    /// |a - b| of unsigned bytes.
+    #[inline(always)]
+    fn absdiff(a: u8x16, b: u8x16) -> u8x16 {
+        a.saturating_sub(b) | b.saturating_sub(a)
+    }
+
+    /// Unsigned bytes shifted right by `N`: through 16-bit lanes, dropping
+    /// the bits that cross from one byte into the next.
+    #[inline(always)]
+    fn shr_u<const N: i32>(v: u8x16) -> u8x16 {
+        cast::<u16x8, u8x16>(cast::<u8x16, u16x8>(v) >> N) & splat(0xff >> N)
+    }
+
+    /// Signed bytes shifted right by `N`: the logical shift with its sign
+    /// bit (bit 7 - `N`) extended.
+    #[inline(always)]
+    fn shr_s<const N: i32>(v: i8x16) -> i8x16 {
+        let sign = 0x80 >> N;
+        cast::<u8x16, i8x16>(shr_u::<N>(cast(v)) ^ splat(sign)) - i8x16::splat(sign as i8)
+    }
+
+    /// Samples as signed bytes (less 128), and back.
+    #[inline(always)]
+    fn signed(v: u8x16) -> i8x16 {
+        cast(v ^ splat(0x80))
     }
 
     #[inline(always)]
-    fn clamp_s8(v: i16x8) -> i16x8 {
-        v.max(splat(-128)).min(splat(127))
+    fn unsigned(v: i8x16) -> u8x16 {
+        cast::<i8x16, u8x16>(v) ^ splat(0x80)
     }
 
+    /// (k w + 63) >> 7 for k = 27, 18 and 9, the macroblock filter's
+    /// 3/7, 2/7 and 1/7 of the step, through 16-bit lanes.
     #[inline(always)]
-    fn clamp_u8(v: i16x8) -> i16x8 {
-        v.max(splat(0)).min(splat(255))
+    fn weights(w: i8x16) -> [i8x16; 3] {
+        // a byte beside itself is 257 w, whose high byte is w
+        let w: u8x16 = cast(w);
+        let lo9 = (cast::<u8x16, i16x8>(u8x16::unpack_low(w, w)) >> 8) * 9i16;
+        let hi9 = (cast::<u8x16, i16x8>(u8x16::unpack_high(w, w)) >> 8) * 9i16;
+        let round = |lo: i16x8, hi: i16x8| i8x16::from_i16x16_saturate(cast([(lo + 63i16) >> 7, (hi + 63i16) >> 7]));
+        [round(lo9 * 3i16, hi9 * 3i16), round(lo9 + lo9, hi9 + hi9), round(lo9, hi9)]
     }
 
-    /// Lanes where `v` <= `limit`.
-    #[inline(always)]
-    fn at_most(v: i16x8, limit: i32) -> i16x8 {
-        splat(limit + 1).cmp_gt(v)
-    }
-
-    /// Eight samples as 16-bit lanes.
-    #[inline(always)]
-    fn load8(s: &[u8]) -> i16x8 {
-        let mut a = [0u8; 16];
-        a[..8].copy_from_slice(&s[..8]);
-        i16x8::from_u8x16_low(u8x16::from(a))
-    }
-
-    /// Eight lanes (already 0..=255) into `d[..8]`.
-    #[inline(always)]
-    fn store8(v: i16x8, d: &mut [u8]) {
-        d[..8].copy_from_slice(&u8x16::narrow_i16x8(v, v).as_array_ref()[..8]);
-    }
-
-    /// Filter eight positions: `t` holds p3, p2, p1, p0, q0, q1, q2, q3.
+    /// Filter sixteen positions: `t` holds p3, p2, p1, p0, q0, q1, q2, q3.
     /// Returns whether any position is filtered.
     #[inline(always)]
-    fn filter(t: &mut [i16x8; 8], kind: Kind) -> bool {
+    fn filter(t: &mut [u8x16; 8], kind: Kind) -> bool {
         let [p3, p2, p1, p0, q0, q1, q2, q3] = *t;
         let (edge_limit, interior, hev) = match kind {
-            Kind::Simple { edge_limit } => (edge_limit, 255, 255),
+            Kind::Simple { edge_limit } => (edge_limit, 0, 0),
             Kind::Inner { edge_limit, interior, hev } | Kind::Mb { edge_limit, interior, hev } => (edge_limit, interior, hev),
         };
-        let mut mask = at_most((p0 - q0).abs() * 2i16 + ((p1 - q1).abs() >> 1), edge_limit);
-        if !matches!(kind, Kind::Simple { .. }) {
-            let steps = (p3 - p2).abs().max((p2 - p1).abs()).max((p1 - p0).abs()).max((q1 - q0).abs()).max((q2 - q1).abs()).max((q3 - q2).abs());
-            mask &= at_most(steps, interior);
+        let simple = matches!(kind, Kind::Simple { .. });
+        // non-zero where the position is left alone: 2 |p0 - q0| +
+        // |p1 - q1| / 2 over the edge limit (saturating at 255, over every
+        // limit), or a step within either side over the interior limit
+        let d = absdiff(p0, q0);
+        let mut over = d.saturating_add(d).saturating_add(shr_u::<1>(absdiff(p1, q1))).saturating_sub(splat(edge_limit));
+        let (dp, dq) = (absdiff(p1, p0), absdiff(q1, q0));
+        if !simple {
+            let steps = absdiff(p3, p2).max(absdiff(p2, p1)).max(dp).max(dq).max(absdiff(q2, q1)).max(absdiff(q3, q2));
+            over |= steps.saturating_sub(splat(interior));
         }
+        let mask = over.cmp_eq(u8x16::ZERO);
         if mask.none() {
             return false;
         }
-        let high = if matches!(kind, Kind::Simple { .. }) { splat(-1) } else { (p1 - p0).abs().max((q1 - q0).abs()).cmp_gt(splat(hev)) };
-        let outer = clamp_s8(p1 - q1);
-        let step = (q0 - p0) * 3i16;
-        // the adjustment of p0 and q0 alone, with the outer taps where the
-        // variance is high (and always for the simple filter)
-        let a = clamp_s8((outer & high) + step);
-        let f1 = (a + 4i16).min(splat(127)) >> 3;
-        let f2 = (a + 3i16).min(splat(127)) >> 3;
-        let np0 = clamp_u8(p0 + f2);
-        let nq0 = clamp_u8(q0 - f1);
+        let mask: i8x16 = cast(mask);
+        // high edge variance, always for the simple filter
+        let high: i8x16 = if simple { i8x16::splat(-1) } else { cast(!dp.max(dq).saturating_sub(splat(hev)).cmp_eq(u8x16::ZERO)) };
+        let (ps1, ps0, qs0, qs1) = (signed(p1), signed(p0), signed(q0), signed(q1));
+        let step = qs0.saturating_sub(ps0);
+        // v + 3 (q0 - p0), clamped: saturating each addition clamps alike,
+        // as the three go the same way
+        let add_steps = |v: i8x16| v.saturating_add(step).saturating_add(step).saturating_add(step);
+        let outer = ps1.saturating_sub(qs1);
+        // how far q0 and p0 move: a / 8, the halves rounded apart
+        let moves = |a: i8x16| (shr_s::<3>(a.saturating_add(i8x16::splat(4))), shr_s::<3>(a.saturating_add(i8x16::splat(3))));
         match kind {
             Kind::Simple { .. } => {
-                t[3] = mask.blend(np0, p0);
-                t[4] = mask.blend(nq0, q0);
+                let (f1, f2) = moves(add_steps(outer) & mask);
+                t[3] = unsigned(ps0.saturating_add(f2));
+                t[4] = unsigned(qs0.saturating_sub(f1));
             }
             Kind::Inner { .. } => {
+                let (f1, f2) = moves(add_steps(outer & high) & mask);
+                t[3] = unsigned(ps0.saturating_add(f2));
+                t[4] = unsigned(qs0.saturating_sub(f1));
                 // without high variance p1 and q1 move half as far
-                let a = ((f1 + 1i16) >> 1) & !high;
-                t[2] = mask.blend(clamp_u8(p1 + a), p1);
-                t[3] = mask.blend(np0, p0);
-                t[4] = mask.blend(nq0, q0);
-                t[5] = mask.blend(clamp_u8(q1 - a), q1);
+                let a = shr_s::<1>(f1 + i8x16::splat(1)) & !high;
+                t[2] = unsigned(ps1.saturating_add(a));
+                t[5] = unsigned(qs1.saturating_sub(a));
             }
             Kind::Mb { .. } => {
-                // without high variance the macroblock filter proper; the
-                // masks pick: unfiltered, high variance, or this
-                let w = clamp_s8(outer + step);
-                let a0 = (w * 27i16 + 63i16) >> 7;
-                let a1 = (w * 18i16 + 63i16) >> 7;
-                let a2 = (w * 9i16 + 63i16) >> 7;
-                let low = mask & !high;
-                let high = mask & high;
-                t[1] = low.blend(clamp_u8(p2 + a2), p2);
-                t[2] = low.blend(clamp_u8(p1 + a1), p1);
-                t[3] = low.blend(clamp_u8(p0 + a0), high.blend(np0, p0));
-                t[4] = low.blend(clamp_u8(q0 - a0), high.blend(nq0, q0));
-                t[5] = low.blend(clamp_u8(q1 - a1), q1);
-                t[6] = low.blend(clamp_u8(q2 - a2), q2);
+                // with high variance p0 and q0 alone move, as above;
+                // without, the macroblock filter proper
+                let w = add_steps(outer) & mask;
+                let (f1, f2) = moves(w & high);
+                let [a0, a1, a2] = weights(w & !high);
+                t[1] = unsigned(signed(p2).saturating_add(a2));
+                t[2] = unsigned(ps1.saturating_add(a1));
+                t[3] = unsigned(ps0.saturating_add(f2).saturating_add(a0));
+                t[4] = unsigned(qs0.saturating_sub(f1).saturating_sub(a0));
+                t[5] = unsigned(qs1.saturating_sub(a1));
+                t[6] = unsigned(signed(q2).saturating_sub(a2));
             }
         }
         true
     }
 
-    /// Positions `at` .. `at + 16` of a horizontal edge, as two halves.
-    #[inline(always)]
-    pub fn horizontal16(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
-        let base = at - 4 * stride;
-        let rows = &mut buf[base..base + 7 * stride + 16];
-        let mut lo = [i16x8::ZERO; 8];
-        let mut hi = [i16x8::ZERO; 8];
-        for r in 0..8 {
-            let mut a = [0u8; 16];
-            a.copy_from_slice(&rows[r * stride..r * stride + 16]);
-            let v = u8x16::from(a);
-            lo[r] = i16x8::from_u8x16_low(v);
-            hi[r] = i16x8::from_u8x16_high(v);
+    /// The rows of p3 ..= q3 a filter can change.
+    fn changed(kind: Kind) -> std::ops::Range<usize> {
+        match kind {
+            Kind::Mb { .. } => 1..7,
+            Kind::Inner { .. } => 2..6,
+            Kind::Simple { .. } => 3..5,
         }
-        let changed = filter(&mut lo, kind) | filter(&mut hi, kind);
-        if changed {
-            for r in 1..7 {
-                rows[r * stride..r * stride + 16].copy_from_slice(u8x16::narrow_i16x8(lo[r], hi[r]).as_array_ref());
+    }
+
+    /// Eight samples of `a` then eight of `b`.
+    #[inline(always)]
+    fn load8x2(a: &[u8], b: &[u8]) -> u8x16 {
+        let mut v = [0u8; 16];
+        v[..8].copy_from_slice(&a[..8]);
+        v[8..].copy_from_slice(&b[..8]);
+        u8x16::from(v)
+    }
+
+    /// One round of byte interleaving: outputs 2j and 2j + 1 are the low
+    /// and the high halves of inputs j and j + 4 interleaved.
+    #[inline(always)]
+    fn interleave(v: [u8x16; 8]) -> [u8x16; 8] {
+        let [a0, a1, a2, a3, b0, b1, b2, b3] = v;
+        let (lo, hi) = (u8x16::unpack_low, u8x16::unpack_high);
+        [lo(a0, b0), hi(a0, b0), lo(a1, b1), hi(a1, b1), lo(a2, b2), hi(a2, b2), lo(a3, b3), hi(a3, b3)]
+    }
+
+    /// Filter across a vertical edge: sixteen rows of eight samples (four
+    /// each side, in their low halves) become eight columns of sixteen,
+    /// each round of interleaving moving one bit of the row number into the
+    /// lane number and one of the column number into the vector's, and
+    /// three rounds more take the columns back to rows, two to a vector
+    /// (none if nothing changed).
+    #[inline(always)]
+    fn vertical(rows: &[u8x16; 16], kind: Kind) -> Option<[u8x16; 8]> {
+        let mut t = [u8x16::ZERO; 8];
+        for (k, v) in t.iter_mut().enumerate() {
+            *v = u8x16::unpack_low(rows[k], rows[k + 8]);
+        }
+        let mut t = interleave(interleave(interleave(t)));
+        filter(&mut t, kind).then(|| interleave(interleave(interleave(t))))
+    }
+
+    /// A luma edge along a row: positions `at` .. `at + 16`.
+    #[inline(always)]
+    pub fn horizontal_luma(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
+        let base = at - 4 * stride;
+        let mut t = [u8x16::ZERO; 8];
+        for (r, v) in t.iter_mut().enumerate() {
+            *v = u8x16::from(<[u8; 16]>::try_from(&buf[base + r * stride..base + r * stride + 16]).unwrap());
+        }
+        if filter(&mut t, kind) {
+            for r in changed(kind) {
+                buf[base + r * stride..base + r * stride + 16].copy_from_slice(t[r].as_array_ref());
             }
         }
     }
 
-    /// Positions `at` .. `at + 8` of a horizontal edge.
+    /// Chroma edges along a row: positions `at` .. `at + 8` of each plane.
     #[inline(always)]
-    pub fn horizontal8(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
+    pub fn horizontal_chroma(u: &mut [u8], v: &mut [u8], at: usize, stride: usize, kind: Kind) {
         let base = at - 4 * stride;
-        let rows = &mut buf[base..base + 7 * stride + 8];
-        let mut t: [i16x8; 8] = std::array::from_fn(|r| load8(&rows[r * stride..]));
+        let mut t = [u8x16::ZERO; 8];
+        for (r, row) in t.iter_mut().enumerate() {
+            *row = load8x2(&u[base + r * stride..], &v[base + r * stride..]);
+        }
         if filter(&mut t, kind) {
-            for r in 1..7 {
-                store8(t[r], &mut rows[r * stride..]);
+            for r in changed(kind) {
+                let s = t[r].as_array_ref();
+                u[base + r * stride..base + r * stride + 8].copy_from_slice(&s[..8]);
+                v[base + r * stride..base + r * stride + 8].copy_from_slice(&s[8..]);
             }
         }
     }
 
-    /// Eight positions of a vertical edge (rows `at` down): the rows are
-    /// transposed so each lane is a row.
+    /// A luma edge down a column: positions `at` .. `at + 16 * stride`.
     #[inline(always)]
-    pub fn vertical8(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
-        let rows = &mut buf[at - 4..at + 7 * stride + 4];
-        let mut t = i16x8::transpose(std::array::from_fn(|r| load8(&rows[r * stride..])));
-        if filter(&mut t, kind) {
-            for (r, row) in i16x8::transpose(t).iter().enumerate() {
-                store8(*row, &mut rows[r * stride..]);
+    pub fn vertical_luma(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
+        let base = at - 4;
+        let mut rows = [u8x16::ZERO; 16];
+        for (k, row) in rows.iter_mut().enumerate() {
+            *row = load8x2(&buf[base + k * stride..], &[0; 8]);
+        }
+        if let Some(pairs) = vertical(&rows, kind) {
+            for (i, pair) in pairs.iter().enumerate() {
+                let s = pair.as_array_ref();
+                let r = base + 2 * i * stride;
+                buf[r..r + 8].copy_from_slice(&s[..8]);
+                buf[r + stride..r + stride + 8].copy_from_slice(&s[8..]);
+            }
+        }
+    }
+
+    /// Chroma edges down a column: positions `at` .. `at + 8 * stride` of
+    /// each plane.
+    #[inline(always)]
+    pub fn vertical_chroma(u: &mut [u8], v: &mut [u8], at: usize, stride: usize, kind: Kind) {
+        let base = at - 4;
+        let mut rows = [u8x16::ZERO; 16];
+        for k in 0..8 {
+            rows[k] = load8x2(&u[base + k * stride..], &[0; 8]);
+            rows[k + 8] = load8x2(&v[base + k * stride..], &[0; 8]);
+        }
+        if let Some(pairs) = vertical(&rows, kind) {
+            for (i, pair) in pairs.iter().enumerate() {
+                let s = pair.as_array_ref();
+                let plane = if i < 4 { &mut *u } else { &mut *v };
+                let r = base + 2 * (i % 4) * stride;
+                plane[r..r + 8].copy_from_slice(&s[..8]);
+                plane[r + stride..r + stride + 8].copy_from_slice(&s[8..]);
             }
         }
     }
 }
 
-/// Filter `count` (8 or 16) positions of an edge: `step` is the distance
+/// Filter the sixteen positions of a luma edge: `step` is the distance
 /// between samples across the edge (1 for a vertical edge, the stride for
 /// a horizontal one), `along` the distance between positions.
 #[inline]
-fn filter_edge(buf: &mut [u8], at: usize, step: usize, along: usize, count: usize, kind: Kind) {
+fn luma_edge(y: &mut [u8], at: usize, step: usize, along: usize, kind: Kind) {
     #[cfg(feature = "simd")]
-    {
-        if step == 1 {
-            simd::vertical8(buf, at, along, kind);
-            if count == 16 {
-                simd::vertical8(buf, at + 8 * along, along, kind);
-            }
-        } else if count == 16 {
-            simd::horizontal16(buf, at, step, kind);
-        } else {
-            simd::horizontal8(buf, at, step, kind);
-        }
+    if step == 1 {
+        simd::vertical_luma(y, at, along, kind);
+    } else {
+        simd::horizontal_luma(y, at, step, kind);
     }
     #[cfg(not(feature = "simd"))]
-    for i in 0..count {
-        filter_position(buf, at + i * along, step, kind);
+    for i in 0..16 {
+        filter_position(y, at + i * along, step, kind);
+    }
+}
+
+/// Filter the eight positions of an edge in each chroma plane.
+#[inline]
+fn chroma_edge(u: &mut [u8], v: &mut [u8], at: usize, step: usize, along: usize, kind: Kind) {
+    #[cfg(feature = "simd")]
+    if step == 1 {
+        simd::vertical_chroma(u, v, at, along, kind);
+    } else {
+        simd::horizontal_chroma(u, v, at, step, kind);
+    }
+    #[cfg(not(feature = "simd"))]
+    for plane in [u, v] {
+        for i in 0..8 {
+            filter_position(plane, at + i * along, step, kind);
+        }
     }
 }
 
 /// Filter macroblock row `mb_y` of `pic` with the normal (`simple` false)
-/// or simple filter; `row` holds the row's macroblock parameters.
+/// or simple filter; `row` holds the row's macroblock parameters. The
+/// simple filter leaves chroma alone.
 pub fn filter_row(pic: &mut Picture, mb_y: usize, row: &[MbFilter], simple: bool) {
     let stride = pic.width;
     let uv_stride = pic.width / 2;
@@ -318,34 +422,32 @@ pub fn filter_row(pic: &mut Picture, mb_y: usize, row: &[MbFilter], simple: bool
         } else {
             (Kind::Mb { edge_limit: mb_limit, interior, hev }, Kind::Inner { edge_limit: sub_limit, interior, hev })
         };
-        // the simple filter leaves chroma alone
-        let planes = if simple { 0 } else { 2 };
         if mb_x > 0 {
-            filter_edge(&mut pic.y, y0, 1, stride, 16, mb_kind);
-            for plane in [&mut pic.u, &mut pic.v].into_iter().take(planes) {
-                filter_edge(plane, c0, 1, uv_stride, 8, mb_kind);
+            luma_edge(&mut pic.y, y0, 1, stride, mb_kind);
+            if !simple {
+                chroma_edge(&mut pic.u, &mut pic.v, c0, 1, uv_stride, mb_kind);
             }
         }
         if f.inner {
             for x in [4, 8, 12] {
-                filter_edge(&mut pic.y, y0 + x, 1, stride, 16, inner_kind);
+                luma_edge(&mut pic.y, y0 + x, 1, stride, inner_kind);
             }
-            for plane in [&mut pic.u, &mut pic.v].into_iter().take(planes) {
-                filter_edge(plane, c0 + 4, 1, uv_stride, 8, inner_kind);
+            if !simple {
+                chroma_edge(&mut pic.u, &mut pic.v, c0 + 4, 1, uv_stride, inner_kind);
             }
         }
         if mb_y > 0 {
-            filter_edge(&mut pic.y, y0, stride, 1, 16, mb_kind);
-            for plane in [&mut pic.u, &mut pic.v].into_iter().take(planes) {
-                filter_edge(plane, c0, uv_stride, 1, 8, mb_kind);
+            luma_edge(&mut pic.y, y0, stride, 1, mb_kind);
+            if !simple {
+                chroma_edge(&mut pic.u, &mut pic.v, c0, uv_stride, 1, mb_kind);
             }
         }
         if f.inner {
             for y in [4, 8, 12] {
-                filter_edge(&mut pic.y, y0 + y * stride, stride, 1, 16, inner_kind);
+                luma_edge(&mut pic.y, y0 + y * stride, stride, 1, inner_kind);
             }
-            for plane in [&mut pic.u, &mut pic.v].into_iter().take(planes) {
-                filter_edge(plane, c0 + 4 * uv_stride, uv_stride, 1, 8, inner_kind);
+            if !simple {
+                chroma_edge(&mut pic.u, &mut pic.v, c0 + 4 * uv_stride, uv_stride, 1, inner_kind);
             }
         }
     }
@@ -378,7 +480,7 @@ mod tests {
             row[4..].fill(106);
         }
         let kind = Kind::Mb { edge_limit: 30, interior: 10, hev: 3 };
-        filter_edge(&mut buf, 4, 1, 8, 16, kind);
+        luma_edge(&mut buf, 4, 1, 8, kind);
         let row = &buf[..8];
         assert!(row.windows(2).all(|w| w[0] <= w[1]), "{row:?}");
         assert!(row[3] > 100 && row[4] < 106, "{row:?}");
@@ -388,12 +490,13 @@ mod tests {
             row[4..].fill(200);
         }
         let before = hard.clone();
-        filter_edge(&mut hard, 4, 1, 8, 16, kind);
+        luma_edge(&mut hard, 4, 1, 8, kind);
         assert_eq!(hard, before);
     }
 
     /// Every way of filtering an edge gives what `filter_position` gives,
-    /// on edges of every character (noise, gentle and sharp steps).
+    /// on edges of every character (noise, gentle and sharp steps, each
+    /// plane its own).
     #[test]
     fn edges_match_the_per_position_filter() {
         let mut seed = 9u32;
@@ -403,30 +506,39 @@ mod tests {
         };
         let stride = 24;
         for round in 0..3000 {
-            let spread = [4, 12, 40, 255][round % 4];
-            let base = rand() % 256;
-            let jump = rand() % 60;
-            let buf: Vec<u8> = (0..stride * 24)
-                .map(|i| {
-                    let side = if (round / 4) % 2 == 0 { (i % stride >= 12) as u32 } else { (i / stride >= 12) as u32 };
-                    (base + side * jump + rand() % spread).min(255) as u8
-                })
-                .collect();
+            let mut plane = || {
+                let spread = [4, 12, 40, 255][rand() as usize % 4];
+                let base = rand() % 256;
+                let jump = rand() % 60;
+                (0..stride * 24)
+                    .map(|i| {
+                        let side = if (round / 4) % 2 == 0 { (i % stride >= 12) as u32 } else { (i / stride >= 12) as u32 };
+                        (base + side * jump + rand() % spread).min(255) as u8
+                    })
+                    .collect::<Vec<u8>>()
+            };
+            let (y, u, v) = (plane(), plane(), plane());
             let level = (rand() % 64) as i32;
-            let interior = 1 + (rand() % 20) as i32;
+            let interior = 1 + (rand() % 63) as i32;
             let hev = (rand() % 4) as i32;
             let kinds = [Kind::Mb { edge_limit: (level + 2) * 2 + interior, interior, hev }, Kind::Inner { edge_limit: level * 2 + interior, interior, hev }, Kind::Simple { edge_limit: level * 2 + interior }];
             for kind in kinds {
                 for (step, along, at) in [(1, stride, 4 * stride + 12), (stride, 1, 12 * stride + 4)] {
-                    for count in [8, 16] {
-                        let mut a = buf.clone();
-                        let mut b = buf.clone();
-                        filter_edge(&mut a, at, step, along, count, kind);
-                        for i in 0..count {
-                            filter_position(&mut b, at + i * along, step, kind);
-                        }
-                        assert_eq!(a, b, "{kind:?} step {step} count {count}");
+                    let mut a = y.clone();
+                    let mut b = y.clone();
+                    luma_edge(&mut a, at, step, along, kind);
+                    for i in 0..16 {
+                        filter_position(&mut b, at + i * along, step, kind);
                     }
+                    assert_eq!(a, b, "luma {kind:?} step {step}");
+                    let (mut au, mut av) = (u.clone(), v.clone());
+                    let (mut bu, mut bv) = (u.clone(), v.clone());
+                    chroma_edge(&mut au, &mut av, at, step, along, kind);
+                    for i in 0..8 {
+                        filter_position(&mut bu, at + i * along, step, kind);
+                        filter_position(&mut bv, at + i * along, step, kind);
+                    }
+                    assert_eq!((au, av), (bu, bv), "chroma {kind:?} step {step}");
                 }
             }
         }
