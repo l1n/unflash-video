@@ -375,12 +375,16 @@ beside the browser's, exactly what the browser's decoder gives alone.
 The decoding runs in parallel Web Workers (`web/h264pool.js`, one group of
 pictures per worker, split at sync samples), with eight-lane SIMD row
 kernels (wasm simd128, SSE2 or NEON through `wide`) for the interpolation,
-averaging and weighting of blocks at least eight samples wide. A full
+averaging and weighting of blocks at least eight samples wide, and for the
+deblocking filter: eight lines of an edge at a time in 16-bit lanes, every
+decision a lane mask, a vertical edge's lines transposed into lanes and
+back (the line-at-a-time filter stays as the reference a randomised test
+checks it against). A full
 reconstruction is needed (H.264 predicts every macroblock from its
 neighbours and from earlier pictures, so there is no DC-only or
 low-resolution shortcut as for MPEG-2). The decoder has a **fast mode**
-that leaves out the in-loop deblocking filter (11–15 % of the decoding
-time), but nothing that gives a verdict uses it any more: the filter only
+that leaves out the in-loop deblocking filter (about a tenth of the
+decoding time), but nothing that gives a verdict uses it any more: the filter only
 touches block edges, yet later pictures are predicted from the unfiltered
 ones, so the difference grows through each GOP. On a 1080p clip at CRF 26
 with 10 s GOPs, the means of 8×8 luma blocks (about the detector's cells at
@@ -390,8 +394,30 @@ flash threshold of 10 %. Natively the
 decoder does about 65 fps at 1080p (80 fast); in WebAssembly about 50 fps
 single-threaded (60 fast) and 125 fps with four workers, and 400–550 fps
 at 640×360: well above real time for the analysis but slower than a
-hardware decoder. The player itself still cannot
-play such a file, so the live monitor is off for it.
+hardware decoder. (Those were measured before the work in the next
+paragraph, which made it about 15 % faster natively and 20 % in
+WebAssembly, the two builds timed side by side.) The player itself still
+cannot play such a file, so the live monitor is off for it.
+
+Where the rest of the time goes, measured with cachegrind (instruction,
+branch and cache simulation) on 48 frames of 1080p at CRF 20: about a
+fifth is CABAC's coefficient loop, one arithmetic-decoded bin after
+another. Its engine keeps codIRange, the offset and the bit count in
+machine registers through a block (through `&mut self`, each bin stored
+them and the next loaded them back), and a bin takes no branch on its own
+value; what remains are the significance map's branches on whether a
+coefficient is there, which are the data itself (ffmpeg's decoder has
+them too). The other syntax elements share one out-of-line bin decoder
+instead of a copy inlined at each of the ~55 places a bin is read, the
+luma interpolation filters are out-of-line primitives with one copy per
+block width (inlined into every case they made 41 KB of code), and a
+macroblock's four neighbours are found once instead of at every lookup:
+the macroblock layer's hot code was just over a 32 KB instruction cache
+(over the first 16 frames, 16.4 M simulated misses at 32 KB but 3.7 M at
+48 KB; now 10.4 M and 1.7 M). Together with the
+deblocking kernels this took the decoder from 9.53 G to 8.19 G
+instructions, from 51.5 M to 39.6 M mispredicted branches and from
+60.4 M to 39.0 M instruction-cache misses on that clip.
 
 The **temporal stage** (`crates/unflash-core/src/temporal.rs`) is the rest
 of the reference `FlashDetector`, unchanged in logic: the window-mean
