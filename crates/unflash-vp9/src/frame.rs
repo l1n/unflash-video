@@ -2,13 +2,21 @@
 //! samples, and the pixel type the prediction and filter code is generic
 //! over.
 
+use crate::loopfilter::{filter_run_lines, Run};
+
 /// A sample type: `u8` for 8-bit streams, `u16` for 10 and 12-bit ones.
+/// The hot kernels are methods, so the 8-bit ones can use SIMD.
 pub trait Pixel: Copy + Default + PartialEq + Send + Sync + 'static {
     fn get(self) -> i32;
     /// A value known to be in range.
     fn new(v: i32) -> Self;
     /// Clip1: clamp to 0..(1 << bd) - 1.
     fn clip(v: i32, bd: u32) -> Self;
+
+    /// Loop filter one run of up to 8 lines across an edge.
+    fn filter_run(d: &mut [Self], stride: usize, run: &Run, bd: u32) {
+        filter_run_lines(d, stride, run, bd);
+    }
 }
 
 impl Pixel for u8 {
@@ -23,6 +31,11 @@ impl Pixel for u8 {
     #[inline(always)]
     fn clip(v: i32, _bd: u32) -> Self {
         v.clamp(0, 255) as u8
+    }
+
+    #[cfg(feature = "simd")]
+    fn filter_run(d: &mut [u8], stride: usize, run: &Run, _bd: u32) {
+        crate::loopfilter::simd::filter_run(d, stride, run);
     }
 }
 

@@ -1,13 +1,16 @@
 //! The loop filter (8.8): superblocks in raster order, and in each the
 //! vertical edges of a plane (left to right) and then its horizontal edges
-//! (top to bottom), block and transform edges alike. The filter decisions
-//! are the same for 8 consecutive samples along an edge (one 8x8 block of
-//! the plane), so they are made once per such run.
+//! (top to bottom), block and transform edges alike.
+//!
+//! The filter decisions of 8.8.2 - 8.8.4 are the same for runs of 8
+//! consecutive samples along an edge (one 8x8 block of the plane), so they
+//! are made once per run, and the run is filtered by `Pixel::filter_run`:
+//! 8 lines at once in SIMD lanes for 8-bit frames, line by line otherwise.
 
-use crate::frame::{FrameBuf, Pixel};
+use crate::frame::{Pixel, FrameBuf};
 use crate::header::{FrameHeader, SEG_LVL_ALT_L};
 use crate::tables::{MAX_TX_SIZE, NUM_8X8_HIGH, NUM_8X8_WIDE, UV_BLOCK_SIZE};
-use crate::tile::{MiInfo, NEARESTMV, NEWMV};
+use crate::tile::{MiInfo, NEARESTMV, NEWMV, ZEROMV};
 
 const BLOCK_16X16: u8 = 6;
 
@@ -15,8 +18,15 @@ const BLOCK_16X16: u8 = 6;
 /// (LvlLookup, 8.8.1), and the thresholds of each strength (8.8.4).
 pub struct Levels {
     lvl: [[[u8; 2]; 4]; 8],
-    /// limit, blimit, thresh by level
-    limits: [(i32, i32, i32); 64],
+    limits: [Limits; 64],
+}
+
+/// The thresholds of one filter level, at 8-bit scale.
+#[derive(Clone, Copy, Default)]
+pub struct Limits {
+    pub limit: i32,
+    pub blimit: i32,
+    pub thresh: i32,
 }
 
 impl Levels {
@@ -33,12 +43,12 @@ impl Levels {
             }
             if !lf.delta_enabled {
                 *l = [[lvl_seg as u8; 2]; 4];
-            } else {
-                l[0][0] = (lvl_seg + lf.ref_deltas[0] as i32 * scale).clamp(0, 63) as u8;
-                for rf in 1..4 {
-                    for mode in 0..2 {
-                        l[rf][mode] = (lvl_seg + lf.ref_deltas[rf] as i32 * scale + lf.mode_deltas[mode] as i32 * scale).clamp(0, 63) as u8;
-                    }
+                continue;
+            }
+            l[0][0] = (lvl_seg + lf.ref_deltas[0] as i32 * scale).clamp(0, 63) as u8;
+            for (rf, modes) in l.iter_mut().enumerate().skip(1) {
+                for (mode, v) in modes.iter_mut().enumerate() {
+                    *v = (lvl_seg + lf.ref_deltas[rf] as i32 * scale + lf.mode_deltas[mode] as i32 * scale).clamp(0, 63) as u8;
                 }
             }
         }
@@ -50,18 +60,18 @@ impl Levels {
         } else {
             0
         };
-        let mut limits = [(0, 0, 0); 64];
+        let mut limits = [Limits::default(); 64];
         for (l, t) in limits.iter_mut().enumerate() {
             let l = l as i32;
             let limit = if sharp > 0 { (l >> shift).clamp(1, 9 - sharp) } else { (l >> shift).max(1) };
-            *t = (limit, 2 * (l + 2) + limit, l >> 4);
+            *t = Limits { limit, blimit: 2 * (l + 2) + limit, thresh: l >> 4 };
         }
         Levels { lvl, limits }
     }
 
     #[inline]
     fn level(&self, m: &MiInfo) -> usize {
-        let mode_type = (m.y_mode >= NEARESTMV && m.y_mode != crate::tile::ZEROMV && m.y_mode <= NEWMV) as usize;
+        let mode_type = (m.y_mode >= NEARESTMV && m.y_mode != ZEROMV && m.y_mode <= NEWMV) as usize;
         self.lvl[m.segment_id as usize & 7][m.ref_frame[0] as usize & 3][mode_type] as usize
     }
 }
@@ -79,6 +89,20 @@ pub fn filter_frame<T: Pixel>(frame: &mut FrameBuf<T>, mi: &[MiInfo], mi_rows: u
             }
         }
     }
+}
+
+/// One run of samples along an edge to filter.
+#[derive(Clone, Copy)]
+pub struct Run {
+    /// Index of the first line's q0 (the first sample past the edge).
+    pub start: usize,
+    /// The edge is vertical (lines are rows), or horizontal (lines are columns).
+    pub vertical: bool,
+    /// Lines to filter (up to 8; fewer where the run leaves the frame).
+    pub count: usize,
+    /// TX_4X4, TX_8X8 or TX_16X16: the widest filter allowed.
+    pub size: u8,
+    pub limits: Limits,
 }
 
 /// The superblock loop filter process (8.8.2) for one plane and direction.
@@ -118,81 +142,84 @@ fn filter_superblock<T: Pixel>(data: &mut [T], stride: usize, mi: &[MiInfo], mi_
             }
             // the filter size process (8.8.3)
             let base_size = if tx_size == 0 && is_32_edge { 1 } else { tx_size.min(2) };
-            let filter_size = if base_size == 2 && s == 1 && ((pass == 0 && x >> 3 == mi_cols - 1) || (pass == 1 && y >> 3 == mi_rows - 1)) { 1 } else { base_size };
+            let size = if base_size == 2 && s == 1 && ((pass == 0 && x >> 3 == mi_cols - 1) || (pass == 1 && y >> 3 == mi_rows - 1)) { 1 } else { base_size };
             let lvl = levels.level(m);
             if lvl == 0 {
                 continue;
             }
-            let (limit, blimit, thresh) = levels.limits[lvl];
-            let (px, py) = (x >> s, y >> s);
-            let (start, along, across) = if pass == 0 { (py * stride + px, stride, 1) } else { (py * stride + px, 1, stride) };
-            for k in 0..count {
-                filter_sample(data, start + k * along, across, filter_size, limit, blimit, thresh, bd);
+            let run = Run { start: (y >> s) * stride + (x >> s), vertical: pass == 0, count, size, limits: levels.limits[lvl] };
+            T::filter_run(data, stride, &run, bd);
+        }
+    }
+}
+
+/// Filter a run line by line (8.8.5): the portable version, for any depth.
+pub fn filter_run_lines<T: Pixel>(d: &mut [T], stride: usize, run: &Run, bd: u32) {
+    let (along, across) = if run.vertical { (stride, 1) } else { (1, stride) };
+    let n = if run.size == 2 { 8 } else { 4 };
+    for line in 0..run.count {
+        let q0 = run.start + line * along;
+        let mut s = [0i32; 16];
+        for (k, v) in s[8 - n..8 + n].iter_mut().enumerate() {
+            *v = d[q0 + k * across - n * across].get();
+        }
+        let old = s;
+        filter_line(&mut s, run.size, &run.limits, bd);
+        for k in 8 - n..8 + n {
+            if s[k] != old[k] {
+                d[q0 + k * across - 8 * across] = T::new(s[k]);
             }
         }
     }
 }
 
-/// The sample filtering process (8.8.5) across one edge: `pos` is q0 and
-/// `step` the distance to the next sample away from the edge.
-#[allow(clippy::too_many_arguments)]
+/// The filter mask process and the filters (8.8.5.1 - 8.8.5.3) on one
+/// line: `s` holds p7..p0 then q0..q7 (only p3..q3 below TX_16X16).
 #[inline]
-fn filter_sample<T: Pixel>(d: &mut [T], pos: usize, step: usize, filter_size: u8, limit: i32, blimit: i32, thresh: i32, bd: u32) {
+fn filter_line(s: &mut [i32; 16], size: u8, l: &Limits, bd: u32) {
     let sh = bd - 8;
-    let at = |d: &[T], k: isize| d[(pos as isize + k * step as isize) as usize].get();
-    let (q0, q1, q2, q3) = (at(d, 0), at(d, 1), at(d, 2), at(d, 3));
-    let (p0, p1, p2, p3) = (at(d, -1), at(d, -2), at(d, -3), at(d, -4));
-    // the filter mask process (8.8.5.1)
-    let limit = limit << sh;
-    let blimit = blimit << sh;
-    if (p3 - p2).abs() > limit || (p2 - p1).abs() > limit || (p1 - p0).abs() > limit || (q1 - q0).abs() > limit || (q2 - q1).abs() > limit || (q3 - q2).abs() > limit || (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 > blimit {
+    let (p3, p2, p1, p0, q0, q1, q2, q3) = (s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11]);
+    let limit = l.limit << sh;
+    if (p3 - p2).abs() > limit || (p2 - p1).abs() > limit || (p1 - p0).abs() > limit || (q1 - q0).abs() > limit || (q2 - q1).abs() > limit || (q3 - q2).abs() > limit || (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 > l.blimit << sh {
         return;
     }
-    let thresh = thresh << sh;
+    let thresh = l.thresh << sh;
     let hev = (p1 - p0).abs() > thresh || (q1 - q0).abs() > thresh;
     let one = 1 << sh;
-    let flat = filter_size >= 1 && (p1 - p0).abs() <= one && (q1 - q0).abs() <= one && (p2 - p0).abs() <= one && (q2 - q0).abs() <= one && (p3 - p0).abs() <= one && (q3 - q0).abs() <= one;
-    if !flat {
-        narrow(d, pos, step, hev, bd, [p1, p0, q0, q1]);
-        return;
+    let flat = |a: usize, b: usize| (a..b).all(|k| (s[7 - k] - p0).abs() <= one && (s[8 + k] - q0).abs() <= one);
+    if size == 0 || !flat(1, 4) {
+        narrow(s, hev, bd);
+    } else if size == 1 || !flat(4, 8) {
+        wide(s, 3);
+    } else {
+        wide(s, 4);
     }
-    if filter_size >= 2 {
-        let (q4, q5, q6, q7) = (at(d, 4), at(d, 5), at(d, 6), at(d, 7));
-        let (p4, p5, p6, p7) = (at(d, -5), at(d, -6), at(d, -7), at(d, -8));
-        let flat2 = (p7 - p0).abs() <= one && (q7 - q0).abs() <= one && (p6 - p0).abs() <= one && (q6 - q0).abs() <= one && (p5 - p0).abs() <= one && (q5 - q0).abs() <= one && (p4 - p0).abs() <= one && (q4 - q0).abs() <= one;
-        if flat2 {
-            wide(d, pos, step, 4, &[p7, p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5, q6, q7]);
-            return;
-        }
-    }
-    wide(d, pos, step, 3, &[p3, p3, p3, p3, p3, p2, p1, p0, q0, q1, q2, q3, q3, q3, q3, q3]);
 }
 
-/// The narrow filter (8.8.5.2): `s` is p1, p0, q0, q1.
+/// The narrow filter (8.8.5.2): p1, p0, q0 and q1 at most.
 #[inline]
-fn narrow<T: Pixel>(d: &mut [T], pos: usize, step: usize, hev: bool, bd: u32, s: [i32; 4]) {
+fn narrow(s: &mut [i32; 16], hev: bool, bd: u32) {
     let lo = -(1 << (bd - 1));
     let hi = (1 << (bd - 1)) - 1;
     let c = |v: i32| v.clamp(lo, hi);
     let off = 0x80 << (bd - 8);
-    let (ps1, ps0, qs0, qs1) = (s[0] - off, s[1] - off, s[2] - off, s[3] - off);
+    let (ps1, ps0, qs0, qs1) = (s[6] - off, s[7] - off, s[8] - off, s[9] - off);
     let mut filter = if hev { c(ps1 - qs1) } else { 0 };
     filter = c(filter + 3 * (qs0 - ps0));
     let filter1 = c(filter + 4) >> 3;
     let filter2 = c(filter + 3) >> 3;
-    d[pos] = T::new(c(qs0 - filter1) + off);
-    d[pos - step] = T::new(c(ps0 + filter2) + off);
+    s[8] = c(qs0 - filter1) + off;
+    s[7] = c(ps0 + filter2) + off;
     if !hev {
         let f = (filter1 + 1) >> 1;
-        d[pos + step] = T::new(c(qs1 - f) + off);
-        d[pos - 2 * step] = T::new(c(ps1 + f) + off);
+        s[9] = c(qs1 - f) + off;
+        s[6] = c(ps1 + f) + off;
     }
 }
 
-/// The wide filter (8.8.5.3) of 2^log2 taps: `s` holds p7..p0, q0..q7
-/// (only p3..q3 matter for log2 = 3).
+/// The wide filter (8.8.5.3) of 2^log2 taps.
 #[inline]
-fn wide<T: Pixel>(d: &mut [T], pos: usize, step: usize, log2: u32, s: &[i32; 16]) {
+fn wide(s: &mut [i32; 16], log2: u32) {
     let n = (1i32 << (log2 - 1)) - 1;
     let at = |k: i32| s[(8 + k) as usize];
     let mut out = [0i32; 16];
@@ -203,7 +230,180 @@ fn wide<T: Pixel>(d: &mut [T], pos: usize, step: usize, log2: u32, s: &[i32; 16]
         }
         out[(8 + i) as usize] = (t + (1 << (log2 - 1))) >> log2;
     }
-    for i in -n..n {
-        d[(pos as isize + i as isize * step as isize) as usize] = T::new(out[(8 + i) as usize]);
+    s[(8 - n) as usize..(8 + n) as usize].copy_from_slice(&out[(8 - n) as usize..(8 + n) as usize]);
+}
+
+/// The 8-bit filters on 8 lines at once, in 16-bit lanes (the largest
+/// intermediate, a 16-tap sum of samples, is 4080).
+#[cfg(feature = "simd")]
+pub mod simd {
+    use super::{Limits, Run};
+    use wide::{i16x8, u8x16, CmpGt, CmpLt};
+
+    #[inline(always)]
+    fn load8(s: &[u8]) -> i16x8 {
+        let mut a = [0u8; 16];
+        a[..8].copy_from_slice(&s[..8]);
+        i16x8::from_u8x16_low(u8x16::from(a))
+    }
+
+    #[inline(always)]
+    fn store8(v: i16x8, d: &mut [u8]) {
+        let p = u8x16::narrow_i16x8(v, v);
+        d[..8].copy_from_slice(&p.as_array_ref()[..8]);
+    }
+
+    /// Filter a run of 8-bit samples: gather p7..q7 of each line into lanes
+    /// (loads of rows for horizontal edges, a transpose for vertical ones),
+    /// filter, scatter back.
+    pub fn filter_run(d: &mut [u8], stride: usize, run: &Run) {
+        let n = if run.size == 2 { 8 } else { 4 };
+        let mut v = [i16x8::ZERO; 16];
+        if run.vertical {
+            let mut lo = [i16x8::ZERO; 8];
+            let mut hi = [i16x8::ZERO; 8];
+            for i in 0..8 {
+                let row = &d[run.start + i * stride - n..];
+                lo[i] = load8(row);
+                if n == 8 {
+                    hi[i] = load8(&row[8..]);
+                }
+            }
+            let lo = i16x8::transpose(lo);
+            v[8 - n..8 - n + 8].copy_from_slice(&lo);
+            if n == 8 {
+                v[8..16].copy_from_slice(&i16x8::transpose(hi));
+            }
+        } else {
+            for (k, vk) in v.iter_mut().enumerate().take(8 + n).skip(8 - n) {
+                *vk = load8(&d[run.start + k * stride - 8 * stride..]);
+            }
+        }
+        let active = i16x8::new([0, 1, 2, 3, 4, 5, 6, 7]).cmp_lt(i16x8::splat(run.count as i16));
+        let old = v;
+        filter_lanes(&mut v, run.size, &run.limits, active);
+        if run.vertical {
+            let lo = i16x8::transpose(v[8 - n..8 - n + 8].try_into().unwrap());
+            let hi = if n == 8 { i16x8::transpose(v[8..16].try_into().unwrap()) } else { lo };
+            for i in 0..run.count {
+                let row = &mut d[run.start + i * stride - n..];
+                store8(lo[i], row);
+                if n == 8 {
+                    store8(hi[i], &mut row[8..]);
+                }
+            }
+        } else {
+            for k in 8 - n..8 + n {
+                if v[k] != old[k] {
+                    store8(v[k], &mut d[run.start + k * stride - 8 * stride..]);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn absd(a: i16x8, b: i16x8) -> i16x8 {
+        (a - b).abs()
+    }
+
+    /// 8.8.5 on eight lines: `v` holds p7..q7 per lane.
+    #[inline(always)]
+    fn filter_lanes(v: &mut [i16x8; 16], size: u8, l: &Limits, active: i16x8) {
+        let (p3, p2, p1, p0, q0, q1, q2, q3) = (v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
+        let limit = i16x8::splat(l.limit as i16);
+        let over = absd(p3, p2).max(absd(p2, p1)).max(absd(p1, p0)).max(absd(q1, q0)).max(absd(q2, q1)).max(absd(q3, q2)).cmp_gt(limit);
+        let edge = (absd(p0, q0) * 2i16 + (absd(p1, q1) >> 1_i32)).cmp_gt(i16x8::splat(l.blimit as i16));
+        let mask = active & !(over | edge);
+        if mask.none() {
+            return;
+        }
+        let thresh = i16x8::splat(l.thresh as i16);
+        let hev = absd(p1, p0).cmp_gt(thresh) | absd(q1, q0).cmp_gt(thresh);
+        let one = i16x8::splat(1);
+        let flat = if size > 0 { mask & !(absd(p1, p0).max(absd(q1, q0)).max(absd(p2, p0)).max(absd(q2, q0)).max(absd(p3, p0)).max(absd(q3, q0)).cmp_gt(one)) } else { i16x8::ZERO };
+        let flat2 = if size == 2 && flat.any() { flat & !(absd(v[0], p0).max(absd(v[15], q0)).max(absd(v[1], p0)).max(absd(v[14], q0)).max(absd(v[2], p0)).max(absd(v[13], q0)).max(absd(v[3], p0)).max(absd(v[12], q0)).cmp_gt(one)) } else { i16x8::ZERO };
+        let src = *v;
+        // the narrow filter where the lines are not flat
+        let narrow = mask & !flat;
+        if narrow.any() {
+            let c = |x: i16x8| x.max(i16x8::splat(-128)).min(i16x8::splat(127));
+            let off = i16x8::splat(128);
+            let (ps1, ps0, qs0, qs1) = (p1 - off, p0 - off, q0 - off, q1 - off);
+            let f = c(ps1 - qs1) & hev;
+            let f = c(f + (qs0 - ps0) * 3i16);
+            let f1 = c(f + i16x8::splat(4)) >> 3_i32;
+            let f2 = c(f + i16x8::splat(3)) >> 3_i32;
+            v[8] = narrow.blend(c(qs0 - f1) + off, v[8]);
+            v[7] = narrow.blend(c(ps0 + f2) + off, v[7]);
+            let f = (f1 + one) >> 1_i32;
+            let outer = narrow & !hev;
+            v[9] = outer.blend(c(qs1 - f) + off, v[9]);
+            v[6] = outer.blend(c(ps1 + f) + off, v[6]);
+        }
+        // the 8-tap filter where only the inner lines are flat
+        let f8 = flat & !flat2;
+        if f8.any() {
+            wide(&src, v, 3, f8);
+        }
+        if flat2.any() {
+            wide(&src, v, 4, flat2);
+        }
+    }
+
+    /// The wide filter (8.8.5.3) as a running sum, into the lanes of `m`.
+    #[inline(always)]
+    fn wide(s: &[i16x8; 16], v: &mut [i16x8; 16], log2: i32, m: i16x8) {
+        let n = (1i32 << (log2 - 1)) - 1;
+        let at = |k: i32| s[(8 + k.clamp(-(n + 1), n)) as usize];
+        let mut t = at(-n);
+        for j in -n..=n {
+            t = t + at(-n + j);
+        }
+        let round = i16x8::splat(1 << (log2 - 1));
+        for i in -n..n {
+            if i > -n {
+                t = t - at(i - 1) + at(i) - at(i - 1 - n) + at(i + n);
+            }
+            let k = (8 + i) as usize;
+            v[k] = m.blend((t + round) >> log2, v[k]);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "simd"))]
+mod tests {
+    use super::*;
+
+    /// The SIMD filters agree with the line-by-line ones.
+    #[test]
+    fn simd_matches_scalar() {
+        let mut seed = 0x1234_5678_u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let stride = 48;
+        for trial in 0..20_000 {
+            // smooth data with steps, so that every filter gets chosen
+            let base = (rnd() % 200) as i32;
+            let step = (rnd() % 24) as i32 - 12;
+            let noise = 1 + (rnd() % [2, 3, 8, 40][trial % 4]) as i32;
+            let mut d = vec![0u8; stride * 32];
+            for (i, s) in d.iter_mut().enumerate() {
+                let (x, y) = (i % stride, i / stride);
+                let edge = if (trial % 2 == 0 && x >= 16) || (trial % 2 == 1 && y >= 16) { step } else { 0 };
+                *s = (base + edge + (rnd() % noise as u64) as i32).clamp(0, 255) as u8;
+            }
+            let level = (rnd() % 64) as i32;
+            let sharp = (rnd() % 8) as i32;
+            let limit = (level >> (sharp > 0) as i32 + (sharp > 4) as i32).clamp(1, if sharp > 0 { 9 - sharp } else { 63 });
+            let run = Run { start: 16 * stride + 16, vertical: trial % 2 == 0, count: 1 + (rnd() % 8) as usize, size: (rnd() % 3) as u8, limits: Limits { limit, blimit: 2 * (level + 2) + limit, thresh: level >> 4 } };
+            let mut a = d.clone();
+            filter_run_lines(&mut a, stride, &run, 8);
+            simd::filter_run(&mut d, stride, &run);
+            assert_eq!(a, d, "trial {trial}");
+        }
     }
 }
