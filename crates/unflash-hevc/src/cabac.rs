@@ -163,6 +163,8 @@ pub fn init_contexts(init_type: usize, slice_qp: i32) -> Contexts {
     c
 }
 
+/// The arithmetic decoding engine (9.3.4.3) over a slice segment's data,
+/// with its context variables.
 pub struct Cabac<'a> {
     data: &'a [u8],
     /// the next byte to fetch

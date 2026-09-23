@@ -13,6 +13,7 @@ use crate::ps::Sps;
 use crate::slice::SliceHeader;
 use crate::{Error, Result};
 
+/// A reference picture in the buffer.
 pub struct DpbEntry<P> {
     pub pic: Rc<Picture<P>>,
     pub long_term: bool,

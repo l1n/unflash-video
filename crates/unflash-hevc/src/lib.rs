@@ -65,4 +65,5 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The result of decoding.
 pub type Result<T> = std::result::Result<T, Error>;

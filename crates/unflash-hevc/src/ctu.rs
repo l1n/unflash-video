@@ -36,6 +36,7 @@ pub struct Carry {
     pub last_qp: i32,
 }
 
+/// PartMode (Table 7-10): how a coding unit splits into prediction blocks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PartMode {
     P2Nx2N,
@@ -69,6 +70,8 @@ fn init_type(hdr: &SliceHeader) -> usize {
     }
 }
 
+/// Decodes the coding tree units of one slice segment into the picture,
+/// recording what the loop filters and later pictures need in `meta`.
 pub struct SliceDecoder<'a, P: Sample> {
     pub sps: &'a Sps,
     pub pps: &'a Pps,

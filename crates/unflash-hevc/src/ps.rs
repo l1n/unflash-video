@@ -279,6 +279,7 @@ pub struct Vui {
     pub matrix_coeffs: u8,
 }
 
+/// A sequence parameter set (7.3.2.2), as far as decoding needs it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sps {
     pub id: u32,
@@ -656,6 +657,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     })
 }
 
+/// A picture parameter set (7.3.2.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pps {
     pub id: u32,

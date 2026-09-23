@@ -46,6 +46,7 @@ pub mod nal {
     }
 }
 
+/// slice_type (Table 7-7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SliceType {
     B,
@@ -76,6 +77,8 @@ pub struct PredWeights {
     pub w: [[[(i32, i32); 3]; 16]; 2],
 }
 
+/// A slice segment header (7.3.6.1), with what a dependent segment takes
+/// from the independent one before it.
 #[derive(Clone, Debug)]
 pub struct SliceHeader {
     pub nal_type: u8,

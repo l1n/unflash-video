@@ -73,6 +73,8 @@ pub struct SaoParams {
 /// Marks a coding tree block no slice has covered.
 pub const NO_SLICE: u16 = u16::MAX;
 
+/// The per-picture records: per 4x4 block, per coding tree block and per
+/// slice segment.
 pub struct Meta {
     /// 4x4 blocks per row and column.
     pub w4: usize,

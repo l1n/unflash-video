@@ -346,6 +346,10 @@ macro_rules! with_core {
     };
 }
 
+/// An HEVC decoder: parameter sets, the reference pictures and the
+/// picture in progress. Pictures come out in decoding order as soon as
+/// they are complete (the caller orders them by timestamp), so the
+/// decoder keeps only the pictures later ones may predict from.
 pub struct Decoder {
     nal_length_size: usize,
     spss: Vec<Option<Rc<Sps>>>,
