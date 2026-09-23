@@ -48,7 +48,7 @@ impl Lanes for u8 {
     fn taps(s: [i16x8; 8], f: &[i16x8; 8], _bd: u32) -> i16x8 {
         let mut acc = i16x8::splat(108 * 128 + 64);
         for t in 0..8 {
-            acc = acc + s[t] * f[t];
+            acc += s[t] * f[t];
         }
         ((acc >> 7_i32) & i16x8::splat(511)) - i16x8::splat(108)
     }
@@ -80,8 +80,8 @@ impl Lanes for u16 {
         let mut a = i16x8::ZERO;
         let mut b = i16x8::splat(64);
         for t in 0..8 {
-            a = a + (s[t] >> k) * f[t];
-            b = b + (s[t] & low) * f[t];
+            a += (s[t] >> k) * f[t];
+            b += (s[t] & low) * f[t];
         }
         (a + (b >> k)) >> (7 - k)
     }

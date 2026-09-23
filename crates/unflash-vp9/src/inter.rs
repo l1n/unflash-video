@@ -238,8 +238,8 @@ fn predict_scaled<T: Pixel>(refp: &Plane<T>, cur: &mut Plane<T>, x: usize, y: us
             let f = &filter[(p & 15) as usize];
             let px = (p >> 4) - 3;
             let mut sum = 0;
-            for t in 0..8 {
-                sum += f[t] as i32 * refp.data[row + (px + t as i64).clamp(0, last_x) as usize].get();
+            for (t, &f) in f.iter().enumerate() {
+                sum += f as i32 * refp.data[row + (px + t as i64).clamp(0, last_x) as usize].get();
             }
             tmp[r * w + c] = T::clip((sum + 64) >> 7, bd).get();
         }

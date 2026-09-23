@@ -76,23 +76,21 @@ impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
         match mode {
             V_PRED => {
                 for i in 0..size {
-                    for j in 0..size {
-                        put(i, j, above[j]);
+                    for (j, &a) in above[..size].iter().enumerate() {
+                        put(i, j, a);
                     }
                 }
             }
             H_PRED => {
-                for i in 0..size {
+                for (i, &l) in left[..size].iter().enumerate() {
                     for j in 0..size {
-                        put(i, j, left[i]);
+                        put(i, j, l);
                     }
                 }
             }
             D207_PRED => {
                 let mut pred = [[0i32; 32]; 32];
-                for j in 0..size {
-                    pred[size - 1][j] = left[size - 1];
-                }
+                pred[size - 1][..size].fill(left[size - 1]);
                 for i in 0..size - 1 {
                     pred[i][0] = avg2(left[i], left[i + 1]);
                 }

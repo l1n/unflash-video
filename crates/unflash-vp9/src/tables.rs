@@ -3,6 +3,8 @@
 //! fixed probabilities. The large ones are copied from the specification's
 //! tables; the rest are written out where they are used.
 
+use crate::probs::CoefProbs;
+
 /// Maps a decoded probability delta to its recentred value (6.3.5).
 pub const INV_MAP_TABLE: [u8; 255] = [
     7, 20, 33, 46, 59, 72, 85, 98, 111, 124, 137, 150, 163, 176, 189, 202, 215, 228, 241, 254,
@@ -740,7 +742,7 @@ pub const DEFAULT_MV_HP_PROB: [u8; 2] = [128, 128];
 /// Default coefficient probabilities by transform size, plane type (luma,
 /// chroma), reference (intra, inter), band and context. Band 0 has three
 /// contexts; its last three rows are unused.
-pub const DEFAULT_COEF_PROBS: [[[[[[u8; 3]; 6]; 6]; 2]; 2]; 4] = [
+pub const DEFAULT_COEF_PROBS: CoefProbs = [
     [
         [
             [

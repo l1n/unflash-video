@@ -344,7 +344,7 @@ pub mod simd {
         let at = |k: i32| s[(8 + k.clamp(-(n + 1), n)) as usize];
         let mut t = at(-n);
         for j in -n..=n {
-            t = t + at(-n + j);
+            t += at(-n + j);
         }
         let round = i16x8::splat(1 << (log2 - 1));
         let low = i16x8::splat(((1 << (16 - log2)) - 1) as i16);
@@ -380,7 +380,7 @@ mod tests {
             }
             let level = (rnd() % 64) as i32;
             let sharp = (rnd() % 8) as i32;
-            let limit = (level >> (sharp > 0) as i32 + (sharp > 4) as i32).clamp(1, if sharp > 0 { 9 - sharp } else { 63 });
+            let limit = (level >> ((sharp > 0) as i32 + (sharp > 4) as i32)).clamp(1, if sharp > 0 { 9 - sharp } else { 63 });
             let run = Run { start: 16 * stride + 16, vertical: trial % 2 == 0, count: 1 + (rnd() % 8) as usize, size: (rnd() % 3) as u8, limits: Limits { limit, blimit: 2 * (level + 2) + limit, thresh: level >> 4 } };
             let mut a = d.clone();
             filter_run_lines(&mut a, stride, &run, bd);

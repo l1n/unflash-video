@@ -4,8 +4,12 @@
 
 use crate::tables::*;
 
+/// One `T` per transform size, plane type (luma, chroma), reference (intra,
+/// inter), band and context.
+pub type PerCoefContext<T> = [[[[[T; 6]; 6]; 2]; 2]; 4];
+
 /// Coefficient probabilities: [tx size][plane > 0][inter][band][context][node].
-pub type CoefProbs = [[[[[[u8; 3]; 6]; 6]; 2]; 2]; 4];
+pub type CoefProbs = PerCoefContext<[u8; 3]>;
 
 /// The probabilities a frame decodes with; four of these are kept between
 /// frames and a frame picks one with `frame_context_idx`.
@@ -94,8 +98,8 @@ pub struct Counts {
     pub mv_fr: [[u32; 4]; 2],
     pub mv_class0_hp: [[u32; 2]; 2],
     pub mv_hp: [[u32; 2]; 2],
-    pub coef: [[[[[[u32; 4]; 6]; 6]; 2]; 2]; 4],
-    pub eob_branch: [[[[[u32; 6]; 6]; 2]; 2]; 4],
+    pub coef: PerCoefContext<[u32; 4]>,
+    pub eob_branch: PerCoefContext<u32>,
 }
 
 impl Counts {

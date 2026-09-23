@@ -232,7 +232,8 @@ impl Decoder {
             self.prev_segment_ids.clear();
             self.prev_segment_ids.resize(n_mi, 0);
         }
-        self.mi.clear();
+        // every block writes all the cells it covers before any are read, so
+        // the array is not cleared between frames
         self.mi.resize(n_mi, MiInfo::default());
 
         let mut fc = self.state.contexts[fh.frame_context_idx].clone();
