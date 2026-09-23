@@ -5,6 +5,7 @@ members = [
     "crates/unflash-core",
     "crates/unflash-gpu",
     "crates/unflash-h264",
+    "crates/unflash-hevc",
     "crates/unflash-mp4",
     "crates/unflash-vp8",
     "crates/unflash-vp9",
