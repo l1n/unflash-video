@@ -143,7 +143,7 @@ pub fn parse_st_rps(r: &mut BitReader, idx: usize, sets: &[StRps], in_slice_head
 }
 
 /// Scaling lists as signalled (7.3.4) or defaulted (Table 7-5 / 7-6):
-/// ScalingList[sizeId][matrixId] in diagonal scan order, and the DC values
+/// `ScalingList[sizeId][matrixId]` in diagonal scan order, and the DC values
 /// of the 16x16 and 32x32 lists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScalingList {
@@ -155,9 +155,9 @@ impl Default for ScalingList {
     /// The default lists (`scaling_list_enabled_flag` without data).
     fn default() -> Self {
         let mut lists = [[[16u8; 64]; 6]; 4];
-        for size in 1..4 {
-            for m in 0..6 {
-                lists[size][m] = if m < 3 { DEFAULT_INTRA_8X8 } else { DEFAULT_INTER_8X8 };
+        for size in lists.iter_mut().skip(1) {
+            for (m, list) in size.iter_mut().enumerate() {
+                *list = if m < 3 { DEFAULT_INTRA_8X8 } else { DEFAULT_INTER_8X8 };
             }
         }
         ScalingList { lists, dc: [[16; 6]; 2] }

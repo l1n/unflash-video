@@ -37,6 +37,14 @@ pub struct Frame {
     pub full_range: bool,
 }
 
+/// A finished picture to hand out, with what its frame needs.
+struct Finished<P> {
+    pic: Rc<Picture<P>>,
+    sps: Rc<Sps>,
+    pts: f64,
+    damaged: bool,
+}
+
 /// The picture being decoded.
 struct Current<P> {
     pic: Picture<P>,
@@ -172,11 +180,11 @@ impl<P: Sample> Core<P> {
     /// Finish the current picture: conceal what no slice covered, run the
     /// in-loop filters, check it against its hash when asked to, keep it
     /// as a reference, and return it for output.
-    fn finish_picture(&mut self, fast: bool, check_hash: bool) -> Option<(Rc<Picture<P>>, Rc<Sps>, f64, bool)> {
+    fn finish_picture(&mut self, fast: bool, check_hash: bool) -> Option<Finished<P>> {
         let mut cur = self.cur.take()?;
         let layout = cur.layout.clone();
         let sps = cur.sps.clone();
-        if self.meta.ctb_slice.iter().any(|&s| s == NO_SLICE) {
+        if self.meta.ctb_slice.contains(&NO_SLICE) {
             cur.damaged = true;
             self.conceal(&mut cur);
         }
@@ -194,7 +202,7 @@ impl<P: Sample> Core<P> {
         self.compress_motion(&mut cur.pic, sps.log2_ctb as usize, layout.width_ctbs as usize);
         let pic = Rc::new(cur.pic);
         self.dpb.push(DpbEntry { pic: pic.clone(), long_term: false });
-        cur.output.then_some((pic, sps, cur.pts, cur.damaged))
+        cur.output.then_some(Finished { pic, sps, pts: cur.pts, damaged: cur.damaged })
     }
 
     /// Fill the coding tree blocks no slice decoded with the co-located
@@ -245,9 +253,8 @@ impl<P: Sample> Core<P> {
                 let m = meta.motion[i];
                 let mut c = ColMv::default();
                 if slice != NO_SLICE && meta.flags[i] & INTRA == 0 {
-                    let refs = &meta.slices[slice as usize].refs;
-                    for l in 0..2 {
-                        if let Some(k) = m.uses(l).then(|| refs[l].get(m.ref_idx[l] as usize)).flatten() {
+                    for (l, refs) in meta.slices[slice as usize].refs.iter().enumerate() {
+                        if let Some(k) = m.uses(l).then(|| refs.get(m.ref_idx[l] as usize)).flatten() {
                             c.mv[l] = m.mv[l];
                             c.poc[l] = k.poc;
                             c.flags |= if l == 0 { COL_L0 } else { COL_L1 };
@@ -502,7 +509,7 @@ impl Decoder {
 
     fn finish_picture(&mut self) {
         let (fast, check) = (self.fast, self.check_hashes);
-        let frame = with_core!(&mut self.core, c => c.finish_picture(fast, check).map(|(pic, sps, pts, damaged)| to_frame(&pic, &sps, pts, damaged)), None);
+        let frame = with_core!(&mut self.core, c => c.finish_picture(fast, check).map(|f| to_frame(&f.pic, &f.sps, f.pts, f.damaged)), None);
         self.out.extend(frame);
     }
 
@@ -580,8 +587,7 @@ impl Decoder {
         if !hdr.dependent {
             self.prev_hdr = Some(hdr.clone());
         }
-        let result = with_core!(&mut self.core, c => c.decode_slice(&hdr, rbsp), Err(Error::Bitstream("slice without a picture")));
-        result
+        with_core!(&mut self.core, c => c.decode_slice(&hdr, rbsp), Err(Error::Bitstream("slice without a picture")))
     }
 
     fn mark_damaged(&mut self) {
@@ -594,7 +600,7 @@ impl Decoder {
         let sps = self.spss[pps.sps_id as usize].clone().ok_or(Error::Bitstream("PPS refers to a missing SPS"))?;
         let irap = nal::is_irap(nal_type);
         // a new sequence parameter set starts a new coded video sequence
-        let sps_changed = self.active_sps.as_ref().map_or(true, |a| !Rc::ptr_eq(a, &sps) && **a != *sps);
+        let sps_changed = self.active_sps.as_ref().is_none_or(|a| !Rc::ptr_eq(a, &sps) && **a != *sps);
         if sps_changed {
             self.max_ra = i32::MAX;
             self.new_sequence = true;

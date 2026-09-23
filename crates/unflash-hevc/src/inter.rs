@@ -322,6 +322,7 @@ pub fn put_bi<P: Sample>(a: &[i16], b: &[i16], w: usize, h: usize, bit_depth: u3
 }
 
 /// 8.5.3.3.4.3: explicit weighting of a single list `l`.
+#[allow(clippy::too_many_arguments)]
 pub fn put_weighted_uni<P: Sample>(src: &[i16], w: usize, h: usize, bit_depth: u32, wt: &Weights, l: usize, dst: &mut [P], ds: usize) {
     let max = (1 << bit_depth) - 1;
     let (w0, o0, sh) = (wt.w[l], wt.o[l], wt.log2wd);
@@ -334,6 +335,7 @@ pub fn put_weighted_uni<P: Sample>(src: &[i16], w: usize, h: usize, bit_depth: u
 }
 
 /// 8.5.3.3.4.3: explicit weighted bi-prediction.
+#[allow(clippy::too_many_arguments)]
 pub fn put_weighted_bi<P: Sample>(a: &[i16], b: &[i16], w: usize, h: usize, bit_depth: u32, wt: &Weights, dst: &mut [P], ds: usize) {
     let max = (1 << bit_depth) - 1;
     let sh = wt.log2wd;

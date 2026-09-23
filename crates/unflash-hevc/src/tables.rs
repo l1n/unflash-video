@@ -55,7 +55,7 @@ pub const HOR4: Scan<16> = horizontal::<16>(4);
 pub const VER2: Scan<4> = vertical::<4>(2);
 pub const VER4: Scan<16> = vertical::<16>(4);
 
-/// ScanOrder[2][scanIdx]: positions inside a 4x4 sub-block, per scanIdx
+/// `ScanOrder[2][scanIdx]`: positions inside a 4x4 sub-block, per scanIdx
 /// (0 up-right diagonal, 1 horizontal, 2 vertical).
 pub const SCAN4X4: [Scan<16>; 3] = [DIAG4, HOR4, VER4];
 
@@ -97,8 +97,7 @@ mod tests {
         assert_eq!(HOR4[5], (1, 1));
         assert_eq!(VER4[4], (1, 0));
         for s in 0..3 {
-            for n in 0..16 {
-                let (x, y) = SCAN4X4[s][n];
+            for (n, &(x, y)) in SCAN4X4[s].iter().enumerate() {
                 assert_eq!(SCAN4X4_POS[s][y as usize * 4 + x as usize] as usize, n);
             }
         }

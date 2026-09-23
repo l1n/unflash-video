@@ -42,7 +42,7 @@ pub mod nal {
     }
     /// A sub-layer non-reference picture (the even types below 16).
     pub fn is_sub_layer_non_ref(t: u8) -> bool {
-        t <= RSV_VCL_N14 && t % 2 == 0
+        t <= RSV_VCL_N14 && t.is_multiple_of(2)
     }
 }
 
@@ -72,7 +72,7 @@ pub struct LongTermEntry {
 pub struct PredWeights {
     pub luma_log2_denom: u32,
     pub chroma_log2_denom: u32,
-    /// [list][ref_idx][component] -> (weight, offset)
+    /// `[list][ref_idx][component]` -> (weight, offset)
     pub w: [[[(i32, i32); 3]; 16]; 2],
 }
 
@@ -152,8 +152,7 @@ fn parse_pred_weights(r: &mut BitReader, sps: &Sps, slice_type: SliceType, num_r
     let lists = if slice_type == SliceType::B { 2 } else { 1 };
     let luma_shift = sps.bit_depth - 8;
     let chroma_shift = sps.bit_depth_chroma - 8;
-    for l in 0..lists {
-        let n = num_ref_idx[l];
+    for (l, &n) in num_ref_idx.iter().enumerate().take(lists) {
         let mut luma_flags = [false; 16];
         let mut chroma_flags = [false; 16];
         for f in luma_flags.iter_mut().take(n) {
@@ -371,10 +370,10 @@ fn parse_independent(r: &mut BitReader, nal_type: u8, sps: &Sps, pps: &Pps) -> R
         if pps.lists_modification_present && total > 1 {
             let bits = ceil_log2(total);
             let lists = if slice_type == SliceType::B { 2 } else { 1 };
-            for l in 0..lists {
+            for (l, &count) in n.iter().enumerate().take(lists) {
                 if r.flag()? {
                     let mut entries = [0u8; 16];
-                    for e in entries.iter_mut().take(n[l]) {
+                    for e in entries.iter_mut().take(count) {
                         let v = r.u(bits)? as usize;
                         if v >= total {
                             return Err(Error::Bitstream("list_entry outside the reference picture set"));

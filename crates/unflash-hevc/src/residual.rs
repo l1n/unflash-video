@@ -12,6 +12,23 @@ use crate::{Error, Result};
 /// ctxIdxMap (Table 9-50) for sig_coeff_flag in 4x4 blocks.
 const CTX_IDX_MAP: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
 
+/// The sig_coeff_flag context increment of a position (y * 4 + x) in a
+/// sub-block of a larger block by prevCsbf (9.3.4.2.5): 2, 1 or 0 by how
+/// close the position is to the coded neighbouring sub-blocks.
+const SIG_PATTERN: [[u8; 16]; 4] = {
+    let mut t = [[0u8; 16]; 4];
+    let mut i = 0;
+    while i < 16 {
+        let (x, y) = (i % 4, i / 4);
+        t[0][i] = if x + y == 0 { 2 } else if x + y <= 2 { 1 } else { 0 };
+        t[1][i] = if y == 0 { 2 } else if y == 1 { 1 } else { 0 };
+        t[2][i] = if x == 0 { 2 } else if x == 1 { 1 } else { 0 };
+        t[3][i] = 2;
+        i += 1;
+    }
+    t
+};
+
 /// What residual coding found in a block.
 pub struct Coded {
     pub transform_skip: bool,
@@ -116,53 +133,26 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
             } else {
                 15
             };
-            let prev_csbf = right as usize | (below as usize) << 1;
+            let pattern = &SIG_PATTERN[right as usize | (below as usize) << 1];
+            // the sub-block's offset into the sig_coeff_flag contexts
+            let sig_offset = match (c, log2, scan_idx) {
+                (0, 3, 0) => 9,
+                (0, 3, _) => 15,
+                (0, _, _) => 21,
+                (_, 3, _) => 9,
+                _ => 12,
+            } + if c == 0 && xs + ys > 0 { 3 } else { 0 };
             let mut pos = first;
             while pos >= 0 {
                 let np = pos as usize;
                 let (xp, yp) = (pos_scan[np].0 as usize, pos_scan[np].1 as usize);
                 if np > 0 || !infer_dc {
-                    let (xc, yc) = ((xs << 2) + xp, (ys << 2) + yp);
                     let sig_ctx = if log2 == 2 {
-                        CTX_IDX_MAP[(yc << 2) + xc] as usize
-                    } else if xc + yc == 0 {
+                        CTX_IDX_MAP[(yp << 2) + xp] as usize
+                    } else if xs + ys + xp + yp == 0 {
                         0
                     } else {
-                        let mut s = match prev_csbf {
-                            0 => match xp + yp {
-                                0 => 2,
-                                1 | 2 => 1,
-                                _ => 0,
-                            },
-                            1 => match yp {
-                                0 => 2,
-                                1 => 1,
-                                _ => 0,
-                            },
-                            2 => match xp {
-                                0 => 2,
-                                1 => 1,
-                                _ => 0,
-                            },
-                            _ => 2,
-                        };
-                        if c == 0 {
-                            if xs + ys > 0 {
-                                s += 3;
-                            }
-                            s += if log2 == 3 {
-                                if scan_idx == 0 {
-                                    9
-                                } else {
-                                    15
-                                }
-                            } else {
-                                21
-                            };
-                        } else {
-                            s += if log2 == 3 { 9 } else { 12 };
-                        }
-                        s
+                        pattern[(yp << 2) + xp] as usize + sig_offset
                     };
                     if self.cabac.decision(ctx::SIG_COEFF + chroma_off + sig_ctx) != 0 {
                         sig[nsig] = np as u8;
@@ -188,9 +178,9 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
             let mut gt1 = [false; 16];
             let mut first_gt1 = 16;
             let g1_base = ctx::GREATER1 + if c > 0 { 16 } else { 0 };
-            for k in 0..nsig.min(8) {
+            for (k, g) in gt1.iter_mut().enumerate().take(nsig.min(8)) {
                 let f = self.cabac.decision(g1_base + ctx_set * 4 + greater1_ctx.min(3) as usize) != 0;
-                gt1[k] = f;
+                *g = f;
                 if greater1_ctx > 0 {
                     greater1_ctx = if f { 0 } else { greater1_ctx + 1 };
                 }

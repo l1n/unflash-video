@@ -98,7 +98,7 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
             let (xb2, yb2) = (xp - 1, yp - 1);
             if avail(xb2, yb2) {
                 let b2 = self.motion_at(xb2, yb2);
-                if !(av_a1 && a1 == b2) && !(av_b1 && b1 == b2) {
+                if !(av_a1 && a1 == b2 || av_b1 && b1 == b2) {
                     cands[count] = b2;
                     count += 1;
                 }

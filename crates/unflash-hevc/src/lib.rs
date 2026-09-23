@@ -18,7 +18,11 @@
 //! The decoder is written to the standard (ITU-T H.265 / ISO/IEC 23008-2)
 //! and tested bit-exact against ffmpeg's decoder on x265 streams that
 //! exercise these tools (`tests/`) and on the JCT-VC conformance streams
-//! (`examples/conformance.rs`).
+//! (`examples/conformance.rs`), which it can also check against their
+//! decoded picture hash messages (`Decoder::set_check_hashes`). It runs
+//! on one thread; the `simd` feature (on by default) runs the
+//! interpolation and loop filter rows eight samples at a time through
+//! `wide` (wasm simd128, SSE2 or NEON), with the same output.
 
 pub mod bitreader;
 pub mod cabac;

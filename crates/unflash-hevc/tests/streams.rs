@@ -200,7 +200,7 @@ fn damaged_streams_do_not_panic() {
                     _ => {}
                 }
                 let _ = dec.decode(&b, *pts);
-                if rng.next() % 16 == 0 {
+                if rng.next().is_multiple_of(16) {
                     let _ = dec.decode(&b, *pts);
                 }
             }

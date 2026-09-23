@@ -2,10 +2,10 @@
 //! filtering, and the planar, DC and angular modes.
 //!
 //! The 4N + 1 reference samples of an N×N block are kept in one line in
-//! the order the substitution process searches them: p[−1][2N−1] up the
-//! left column to the corner p[−1][−1], then along the top row to
-//! p[2N−1][−1]. Substitution and the [1 2 1] filter are then plain passes
-//! over the line.
+//! the order the substitution process searches them: `p[−1][2N−1]` up the
+//! left column to the corner `p[−1][−1]`, then along the top row to
+//! `p[2N−1][−1]`. Substitution and the \[1 2 1\] filter are then plain
+//! passes over the line.
 
 use crate::picture::Sample;
 

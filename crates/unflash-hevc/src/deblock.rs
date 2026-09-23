@@ -84,6 +84,10 @@ impl<'a> Ctx<'a> {
         if e & tu != 0 && (fp | fq) & CODED != 0 {
             return 1;
         }
+        if e & pu == 0 {
+            // inside one prediction block: the same motion either side
+            return 0;
+        }
         motion_strength(&self.meta.motion[p], &sp.refs, &self.meta.motion[q], &sq.refs)
     }
 }
@@ -293,7 +297,7 @@ pub fn deblock<P: Sample>(pic: &mut Picture<P>, meta: &Meta, sps: &Sps, pps: &Pp
         // chroma: the edges of strength 2 on the 8x8 chroma grid (every
         // other luma edge); a 4-line chroma segment spans two luma blocks
         // and takes the first one's strength
-        let on_chroma_grid = |x4: usize, y4: usize| if vertical { x4 % 4 == 0 && y4 % 2 == 0 } else { y4 % 4 == 0 && x4 % 2 == 0 };
+        let on_chroma_grid = |x4: usize, y4: usize| if vertical { x4.is_multiple_of(4) && y4.is_multiple_of(2) } else { y4.is_multiple_of(4) && x4.is_multiple_of(2) };
         let max = (1 << bdc) - 1;
         for c in 1..3 {
             let offset = if c == 1 { pps.cb_qp_offset } else { pps.cr_qp_offset };

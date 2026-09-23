@@ -61,6 +61,16 @@ struct Cu {
 /// QpC as a function of qPi for 4:2:0 (Table 8-10), for qPi 30..=43.
 const QPC: [i32; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
 
+/// initType (9.3.2.2): which set of initialisation values the slice's
+/// contexts start from.
+fn init_type(hdr: &SliceHeader) -> usize {
+    match hdr.slice_type {
+        SliceType::I => 0,
+        SliceType::P => 1 + hdr.cabac_init as usize,
+        SliceType::B => 2 - hdr.cabac_init as usize,
+    }
+}
+
 pub struct SliceDecoder<'a, P: Sample> {
     pub sps: &'a Sps,
     pub pps: &'a Pps,
@@ -86,8 +96,6 @@ pub struct SliceDecoder<'a, P: Sample> {
     pub(crate) chroma: bool,
     log2_qg: usize,
     log2_chroma_qg: usize,
-    ctb_rs: usize,
-    ctb_ts: usize,
     // quantisation state
     qp_y: i32,
     qp_pred: i32,
@@ -120,12 +128,7 @@ fn morton(x: usize, y: usize) -> usize {
 impl<'a, P: Sample> SliceDecoder<'a, P> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(sps: &'a Sps, pps: &'a Pps, layout: &'a Layout, hdr: &'a SliceHeader, slice_idx: u16, rbsp: &'a [u8], pic: &'a mut Picture<P>, meta: &'a mut Meta, refs: &'a [Vec<RefPic<P>>; 2], carry: &'a mut Carry, poc: i32) -> Result<SliceDecoder<'a, P>> {
-        let init_type = match hdr.slice_type {
-            SliceType::I => 0,
-            SliceType::P => 1 + hdr.cabac_init as usize,
-            SliceType::B => 2 - hdr.cabac_init as usize,
-        };
-        let cabac = Cabac::new(rbsp, hdr.data_offset, init_contexts(init_type, hdr.qp))?;
+        let cabac = Cabac::new(rbsp, hdr.data_offset, init_contexts(init_type(hdr), hdr.qp))?;
         let col = if hdr.temporal_mvp && !hdr.is_intra() {
             let l = if hdr.slice_type == SliceType::B && !hdr.collocated_from_l0 { 1 } else { 0 };
             refs[l].get(hdr.collocated_ref_idx).map(|r| &*r.pic).filter(|p| !p.generated)
@@ -170,8 +173,6 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
             chroma: sps.chroma_format_idc != 0,
             log2_qg,
             log2_chroma_qg,
-            ctb_rs: 0,
-            ctb_ts: 0,
             qp_y: hdr.qp,
             qp_pred: hdr.qp,
             qg_pending: None,
@@ -197,14 +198,6 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
         self.cu.bypass
     }
 
-    fn init_type(&self) -> usize {
-        match self.hdr.slice_type {
-            SliceType::I => 0,
-            SliceType::P => 1 + self.hdr.cabac_init as usize,
-            SliceType::B => 2 - self.hdr.cabac_init as usize,
-        }
-    }
-
     fn tile_of(&self, rs: usize) -> u16 {
         self.layout.tile_id[rs]
     }
@@ -217,13 +210,13 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
     /// The first CTB of a CTB row within a tile.
     fn row_start(&self, rs: usize) -> bool {
         let w = self.layout.width_ctbs as usize;
-        rs % w == 0 || self.tile_of(rs) != self.tile_of(rs - 1)
+        rs.is_multiple_of(w) || self.tile_of(rs) != self.tile_of(rs - 1)
     }
 
     /// 9.3.2.1: the context variables at the start of the CTU at `ts`
     /// (the first of the slice segment, or of a tile or wavefront row).
     fn start_contexts(&mut self, ts: usize, rs: usize, segment_start: bool) {
-        let fresh = || init_contexts(self.init_type(), self.hdr.qp);
+        let fresh = || init_contexts(init_type(self.hdr), self.hdr.qp);
         let ctx = if self.tile_start(ts) {
             fresh()
         } else if self.pps.entropy_coding_sync && self.row_start(rs) {
@@ -246,8 +239,8 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
         ((rs % w) << self.sps.log2_ctb, (rs / w) << self.sps.log2_ctb)
     }
 
-    /// Decode the slice segment; returns the number of CTUs decoded.
-    pub fn decode(&mut self) -> Result<usize> {
+    /// Decode the slice segment.
+    pub fn decode(&mut self) -> Result<()> {
         let total = self.layout.ts_to_rs.len();
         let mut ts = self.layout.rs_to_ts[self.hdr.segment_address as usize] as usize;
         let mut rs = self.hdr.segment_address as usize;
@@ -258,12 +251,8 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
         if self.tile_start(ts) || (self.pps.entropy_coding_sync && self.row_start(rs)) {
             self.carry.last_qp = self.hdr.qp;
         }
-        let mut count = 0;
         loop {
-            self.ctb_rs = rs;
-            self.ctb_ts = ts;
             self.decode_ctu(rs)?;
-            count += 1;
             if self.cabac.overrun() {
                 return Err(Error::Bitstream("slice data ends early"));
             }
@@ -279,7 +268,7 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
                 if self.pps.dependent_slice_segments_enabled {
                     self.carry.segment_end = Some(self.cabac.ctx);
                 }
-                return Ok(count);
+                return Ok(());
             }
             if ts >= total {
                 return Err(Error::Bitstream("slice runs past the end of the picture"));
@@ -402,8 +391,8 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
                     _ => p.class[1],
                 };
             }
-            for i in 0..4 {
-                p.offsets[c][i] = (abs[i] << scale) as i16;
+            for (o, a) in p.offsets[c].iter_mut().zip(abs) {
+                *o = (a << scale) as i16;
             }
         }
         self.meta.sao[rs] = p;
@@ -539,7 +528,7 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
                 self.finish_cu(x0, y0, n);
                 return Ok(());
             }
-            self.intra_modes(x0, y0, log2, part == PartMode::PNxN)?;
+            self.intra_modes(x0, y0, log2, part == PartMode::PNxN);
             let split = (part == PartMode::PNxN) as usize;
             self.cu.max_trafo_depth = self.sps.max_transform_hierarchy_depth_intra as usize + split;
             self.transform_tree(x0, y0, x0, y0, log2, 0, 0, [true, true])?;
@@ -656,7 +645,7 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
 
     /// 7.3.8.5 / 8.4.2 / 8.4.3: the luma intra prediction modes of the
     /// prediction blocks and the chroma mode.
-    fn intra_modes(&mut self, x0: usize, y0: usize, log2: usize, split: bool) -> Result<()> {
+    fn intra_modes(&mut self, x0: usize, y0: usize, log2: usize, split: bool) {
         let parts = if split { 4 } else { 1 };
         let pb = if split { 1usize << (log2 - 1) } else { 1 << log2 };
         let mut prev_flag = [false; 4];
@@ -701,7 +690,6 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
                 }
             };
         }
-        Ok(())
     }
 
     /// 8.4.2: candModeList of the prediction block at (`xp`, `yp`).
@@ -894,7 +882,12 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
         let (xl, yl) = ((xt << sub) as i32, (yt << sub) as i32);
         let unit = 4 >> sub;
         let cip = self.pps.constrained_intra_pred;
-        let usable = |s: &Self, xn: i32, yn: i32| -> bool { s.z_available(xl, yl, xn, yn) && (!cip || s.meta.flags[s.meta.at(xn as usize, yn as usize)] & INTRA != 0) };
+        // The neighbours directly left of and above the block make up the
+        // aligned blocks of its size there, which precede it in z-scan
+        // order: one availability check covers each of the two runs.
+        let near_left = self.z_available(xl, yl, xl - 1, yl);
+        let near_top = self.z_available(xl, yl, xl, yl - 1);
+        let usable = |s: &Self, near: Option<bool>, xn: i32, yn: i32| -> bool { near.unwrap_or_else(|| s.z_available(xl, yl, xn, yn)) && (!cip || s.meta.flags[s.meta.at(xn as usize, yn as usize)] & INTRA != 0) };
         let mut line = [0i32; MAX_LINE];
         let mut avail = [false; MAX_LINE];
         let len = 4 * n + 1;
@@ -907,7 +900,7 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
             let mut k = 0;
             while k < 2 * n {
                 let yn = yt + k;
-                if yn < ph && usable(self, xl - 1, (yn << sub) as i32) {
+                if yn < ph && usable(self, (k < n).then_some(near_left), xl - 1, (yn << sub) as i32) {
                     for j in k..(k + unit).min(2 * n) {
                         if yt + j < ph {
                             line[corner - 1 - j] = plane.data[(yt + j) * stride + xt - 1].get();
@@ -918,7 +911,7 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
                 k += unit;
             }
         }
-        if xt > 0 && yt > 0 && usable(self, xl - 1, yl - 1) {
+        if xt > 0 && yt > 0 && usable(self, None, xl - 1, yl - 1) {
             line[corner] = plane.data[(yt - 1) * stride + xt - 1].get();
             avail[corner] = true;
         }
@@ -927,7 +920,7 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
             let mut k = 0;
             while k < 2 * n {
                 let xn = xt + k;
-                if xn < pw && usable(self, (xn << sub) as i32, yl - 1) {
+                if xn < pw && usable(self, (k < n).then_some(near_top), (xn << sub) as i32, yl - 1) {
                     for i in k..(k + unit).min(2 * n) {
                         if xt + i < pw {
                             line[corner + 1 + i] = plane.data[(yt - 1) * stride + xt + i].get();

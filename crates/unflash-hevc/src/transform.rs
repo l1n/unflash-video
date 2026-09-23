@@ -77,7 +77,7 @@ fn idct(x: &[i32], n: usize, count: usize, out: &mut [i32]) {
 }
 
 /// 8.6.4: the inverse transform of the `n`×`n` scaled coefficients in `c`
-/// (row-major: `c[y * n + x]` is d[x][y]), whose non-zero values all lie in
+/// (row-major: `c[y * n + x]` is `d[x][y]`), whose non-zero values all lie in
 /// columns 0..=`max_x` and rows 0..=`max_y`, into residuals (row-major,
 /// after the final `bd_shift`, 8-299) in `res`. `c` is used as scratch.
 pub fn inverse_transform(c: &mut [i32], n: usize, dst: bool, bd_shift: u32, max_x: usize, max_y: usize, res: &mut [i32]) {
