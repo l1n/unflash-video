@@ -240,11 +240,10 @@ pub mod simd {
     use super::{Limits, Run};
     use wide::{i16x8, u8x16, CmpGt, CmpLt};
 
+    /// 16 samples (from a slice of at least 16: see `PAD`).
     #[inline(always)]
-    fn load8(s: &[u8]) -> i16x8 {
-        let mut a = [0u8; 16];
-        a[..8].copy_from_slice(&s[..8]);
-        i16x8::from_u8x16_low(u8x16::from(a))
+    fn load16(s: &[u8]) -> u8x16 {
+        u8x16::from(<[u8; 16]>::try_from(&s[..16]).unwrap())
     }
 
     #[inline(always)]
@@ -260,23 +259,14 @@ pub mod simd {
         let n = if run.size == 2 { 8 } else { 4 };
         let mut v = [i16x8::ZERO; 16];
         if run.vertical {
-            let mut lo = [i16x8::ZERO; 8];
-            let mut hi = [i16x8::ZERO; 8];
-            for i in 0..8 {
-                let row = &d[run.start + i * stride - n..];
-                lo[i] = load8(row);
-                if n == 8 {
-                    hi[i] = load8(&row[8..]);
-                }
-            }
-            let lo = i16x8::transpose(lo);
-            v[8 - n..8 - n + 8].copy_from_slice(&lo);
+            let rows: [u8x16; 8] = std::array::from_fn(|i| load16(&d[run.start + i * stride - n..]));
+            v[8 - n..8 - n + 8].copy_from_slice(&i16x8::transpose(rows.map(i16x8::from_u8x16_low)));
             if n == 8 {
-                v[8..16].copy_from_slice(&i16x8::transpose(hi));
+                v[8..16].copy_from_slice(&i16x8::transpose(rows.map(i16x8::from_u8x16_high)));
             }
         } else {
             for (k, vk) in v.iter_mut().enumerate().take(8 + n).skip(8 - n) {
-                *vk = load8(&d[run.start + k * stride - 8 * stride..]);
+                *vk = i16x8::from_u8x16_low(load16(&d[run.start + k * stride - 8 * stride..]));
             }
         }
         let active = i16x8::new([0, 1, 2, 3, 4, 5, 6, 7]).cmp_lt(i16x8::splat(run.count as i16));

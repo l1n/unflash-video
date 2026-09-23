@@ -5,7 +5,7 @@
 //! prediction in `mvpred.rs`.
 
 use crate::booldec::BoolDecoder;
-use crate::frame::{FrameBuf, Pixel};
+use crate::frame::{FrameBuf, Pixel, PAD};
 use crate::header::*;
 use crate::probs::*;
 use crate::tables::*;
@@ -150,7 +150,7 @@ pub struct Scratch<T> {
 
 impl<T: Pixel> Default for Scratch<T> {
     fn default() -> Self {
-        Scratch { coef: vec![0; 32 * 32], token_cache: vec![0; 32 * 32], mc_tmp: vec![0; 64 * (2 * 64 + 8)], edge: vec![T::default(); (64 + 7) * (64 + 7)] }
+        Scratch { coef: vec![0; 32 * 32], token_cache: vec![0; 32 * 32], mc_tmp: vec![0; 64 * (2 * 64 + 8)], edge: vec![T::default(); (64 + 7) * (64 + 7) + PAD] }
     }
 }
 

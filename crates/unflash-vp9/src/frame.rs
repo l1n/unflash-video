@@ -111,13 +111,19 @@ pub struct FrameBuf<T> {
     pub damaged: bool,
 }
 
+/// Samples after each plane (and the inter prediction's edge buffer), so
+/// that the SIMD kernels can load a whole 16-byte vector at any sample:
+/// one instruction everywhere, where assembling a vector from 8 bytes takes
+/// many in WebAssembly.
+pub const PAD: usize = 16;
+
 impl<T: Pixel> FrameBuf<T> {
     pub fn new(width: u32, height: u32, bit_depth: u8) -> Self {
         let (w, h) = (width as usize, height as usize);
         let aw = (w + 63) & !63;
         let ah = (h + 63) & !63;
-        let luma = Plane { data: vec![T::default(); aw * ah], stride: aw, width: w, height: h };
-        let chroma = || Plane { data: vec![T::default(); (aw / 2) * (ah / 2)], stride: aw / 2, width: w.div_ceil(2), height: h.div_ceil(2) };
+        let luma = Plane { data: vec![T::default(); aw * ah + PAD], stride: aw, width: w, height: h };
+        let chroma = || Plane { data: vec![T::default(); (aw / 2) * (ah / 2) + PAD], stride: aw / 2, width: w.div_ceil(2), height: h.div_ceil(2) };
         FrameBuf { planes: [luma, chroma(), chroma()], width, height, bit_depth, color_space: 0, color_range: false, damaged: false }
     }
 
