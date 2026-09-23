@@ -49,7 +49,8 @@ const { srv, port } = await serve(WEB);
 const browser = await chromium.launch({
   headless: !process.argv.includes('--headed'),
   channel: 'chromium',
-  args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--autoplay-policy=no-user-gesture-required'],
+  // (ForceEagerMeasureMemory: performance.measureUserAgentSpecificMemory() answers at once)
+  args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--autoplay-policy=no-user-gesture-required', '--enable-blink-features=ForceEagerMeasureMemory'],
 });
 const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
 const errors = [];
@@ -1059,6 +1060,15 @@ try {
     assert(cmp.frames[0] > 100 && cmp.frames[0] === cmp.frames[1], 'both prepares cache every frame: ' + JSON.stringify(cmp.frames));
     assert(/copied in a decode worker/.test(cmp.routes[0]) && /made \d+×\d+ in a decode worker/.test(cmp.routes[1]), 'one prepare hands over whole pictures, the other small ones: ' + JSON.stringify(cmp.routes));
     assert(cmp.max <= 1 && cmp.differ <= cmp.n / 100, `the workers' small pictures are the detector's, to a code: ${cmp.differ} of ${cmp.n} values differ, by at most ${cmp.max}`);
+    // what the decode workers keep after the scan and both prepares: their
+    // code and a few buffers to fill again, not the pictures they handed
+    // over (147 KB each, made small: a long film's worth would fill the memory)
+    const held = await page.evaluate(async () => {
+      const m = await performance.measureUserAgentSpecificMemory();
+      return m.breakdown.filter((b) => b.attribution.some((a) => a.scope === 'DedicatedWorkerGlobalScope')).map((b) => b.bytes);
+    });
+    console.log('the decode workers hold (MB):', held.map((b) => (b / 1e6).toFixed(1)).join(', '));
+    assert(held.length && Math.max(...held) < 16e6, 'a decode worker keeps none of the pictures it handed over: ' + held);
   }
   // the profiling summary is on the console at debug level
   const profileText = await page.evaluate(() => window.__unflash.profile.summary(1));

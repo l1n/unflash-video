@@ -86,7 +86,8 @@ try {
   await page.click('#btnDeleteAll');
   await page.waitForFunction(() => window.__unflash.state.project.sections.length === 0);
   await page.setInputFiles('#projectInput', { name: 'flash.unflash.json', mimeType: 'application/json', buffer: Buffer.from(text) });
-  await page.waitForFunction(() => window.__unflash.state.project.sections.length > 0, null, { timeout: 30000 });
+  // (the toast comes last, once the project is kept in the browser too)
+  await page.waitForFunction(() => /^Loaded /.test(document.querySelector('#toast').textContent), null, { timeout: 30000 });
   results.loaded = await sectionsNow();
   results.loadToast = await page.textContent('#toast');
   console.log('loaded:', results.loadToast);

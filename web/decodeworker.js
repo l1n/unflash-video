@@ -37,7 +37,11 @@ let shrinkFailed = false;
 let credits = 0;
 let cancelled = false;
 let waiter = null;
-const spare = []; // buffers the page gave back
+// buffers the page gave back, to be filled again: a few at most (a job
+// has at most `window` whole pictures out; a picture made small comes in a
+// buffer of its own, so those would otherwise pile up here, one a frame)
+const spare = [];
+const SPARE = 8;
 const wake = () => {
   if (waiter) {
     const w = waiter;
@@ -58,7 +62,7 @@ self.onmessage = (e) => {
     run(m).catch((err) => self.postMessage({ type: 'error', id: m.id, message: err && err.message ? err.message : String(err) }));
   } else if (m.type === 'credit') {
     credits += m.n;
-    if (m.buffer) spare.push(m.buffer);
+    if (m.buffer && spare.length < SPARE) spare.push(m.buffer);
     wake();
   } else if (m.type === 'cancel') {
     cancelled = true;
@@ -70,7 +74,8 @@ function bufferOf(size) {
   for (let i = 0; i < spare.length; i++) {
     if (spare[i].byteLength >= size) return spare.splice(i, 1)[0];
   }
-  if (spare.length > 8) spare.length = 0;
+  // none fits: they were for pictures of another size
+  spare.length = 0;
   return new ArrayBuffer(size);
 }
 
