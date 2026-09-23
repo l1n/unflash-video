@@ -12,6 +12,7 @@ internals. -->
 
 ## 2026-09-23
 
+- <!-- 05:20 --> **HEVC films open in any browser**, and VP9, VP8 and AV1 films in browsers that cannot decode them: Unflash now decodes these itself, as it already did H.264, on several processor cores at once, for the scan, the sections and the export (the player still needs the browser to play the file). Where the browser can decode them too, scans of long films use both decoders side by side.
 - <!-- 04:55 --> **A scan cut into pieces gives exactly what a scan in one go gives.** Long films are still decoded in several places at once (the browser's decoder and Unflash's own), but a single detector now takes the pictures in the film's order, so where the film was cut can no longer change a verdict (it could move the edge of a violation by a few frames), and nothing is decoded twice to warm up.
 - <!-- 04:55 --> **The likeliest flashing is looked at first.** Before decoding anything, the scan guesses from the file's index where flashing is likeliest (pictures that cost many bytes, bursts of keyframes, near-empty white or black frames), decodes those places first and marks what it finds on the timeline, dashed, long before it gets there. As the scan goes on, the timeline shows everything it has found so far.
 - <!-- 03:40 --> **Faster where pictures are made small before the detector sees them**: in the built-in decoder's workers, and in Firefox where the video decodes to YUV (Windows, Linux). Converting a 1920×960 picture's colours and shrinking it took 10 ms and now takes under 4, the same result to the last value.

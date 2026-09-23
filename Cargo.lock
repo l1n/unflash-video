@@ -1154,6 +1154,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "unflash-decoders"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "serde_json",
+ "unflash-av1",
+ "unflash-core",
+ "unflash-hevc",
+ "unflash-vp8",
+ "unflash-vp9",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "unflash-gpu"
 version = "0.1.0"
 dependencies = [

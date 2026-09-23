@@ -55,11 +55,12 @@ Browser support:
 | Chrome, Edge, Opera 113+ | WebCodecs (H.264, HEVC*, VP9, AV1) | any file the `<video>` element plays | WebGPU |
 | Safari 26+ | WebCodecs | yes | WebGPU |
 | Firefox 141+ (Windows), 142+ (macOS), other Firefox | WebCodecs where available | yes | WebGPU where enabled (its WebGPU takes no `VideoFrame` or `<video>` as a copy source, so pictures reach it through a canvas), otherwise the SIMD CPU kernel |
-| any of these without an H.264 decoder (Chromium builds without proprietary codecs, some Linux browsers) | the **built-in H.264 decoder** (Constrained Baseline, Main and High, progressive or interlaced) | no: the player cannot play the file | as above |
+| any of these without a decoder for the file's codec (H.264 in Chromium builds without proprietary codecs and some Linux browsers, HEVC in most browsers, VP9, VP8 or AV1 in some) | the **built-in decoders**: H.264 (Constrained Baseline, Main and High, progressive or interlaced), HEVC (Main, Main 10), VP9 (profiles 0 and 2), VP8, AV1 (8 and 10-bit) | no: the player cannot play the file | as above |
 
-\* platform dependent. A file whose codec the browser cannot decode can
-still be watched with the live monitor; an H.264 file is decoded by
-Unflash itself when the browser cannot.
+\* platform dependent. A file in any of those five codecs is decoded by
+Unflash itself when the browser cannot decode it; a file whose codec
+neither can decode can still be watched with the live monitor where the
+player plays it.
 
 Files it reads:
 
@@ -329,6 +330,48 @@ prepares take the pictures as I420 planes straight into the detector (no
 `VideoFrame` in between); the export, which re-encodes them, gets real
 `VideoFrame`s.
 
+### The built-in HEVC, VP9, VP8 and AV1 decoders
+
+HEVC is the codec browsers most often lack (Firefox has none, Chrome only
+where the operating system lends one), and VP9, VP8 and AV1 are missing
+here and there too. So the app has a decoder of its own for each, in a
+WebAssembly module of their own (`crates/unflash-decoders`, built into
+`web/pkg-dec`, about 2 MB) that is loaded only when a file needs one; H.264's
+stays in the main module. Each runs in the decode workers the way H.264's
+does (`web/softworker.js`, a group of pictures per worker, pictures made
+the detector's size there), so everything above holds for them: the
+fallback when the browser cannot decode a file, hybrid scans next to the
+browser's own decoder, the export. `?builtin=1` makes the app use the
+built-in decoder even where the browser has one.
+
+- **HEVC** (`crates/unflash-hevc`): Main, Main 10 and Main Still Picture,
+  4:2:0 and 4:0:0 at 8 to 12 bits, every tool of those profiles (tiles and
+  wavefronts decoded serially, dependent slices, AMP, TMVP, weighted
+  prediction, scaling lists, lossless and PCM, SAO). Bit-exact with ffmpeg
+  on the 177 JCT-VC conformance streams within those profiles and on the
+  x265 streams in `tests/media/hevc`; about 53 frames a second at 1080p on
+  one core, natively. Pictures come out in decoding order; the workers put
+  them in presentation order with the reordering the sequence declares.
+- **VP9** (`crates/unflash-vp9`): profiles 0 and 2 (8, 10 and 12-bit
+  4:2:0), every tool including superframes, `show_existing_frame` and
+  frame size changes from scaled references. Bit-exact on all 306 libvpx
+  test vectors of those profiles, natively and in WebAssembly; 1080p at
+  about 90 frames a second in WebAssembly.
+- **VP8** (`crates/unflash-vp8`): all of RFC 6386. Bit-exact on the 62
+  libvpx test vectors; about 90% of ffmpeg's single-thread speed.
+- **AV1** (`crates/unflash-av1`): rav1d, the Rust port of dav1d, vendored
+  in `third_party/rav1d` without its assembly and patched to build for
+  WebAssembly, behind a small wrapper: 8 and 10-bit 4:2:0 (film grain
+  applied, as the browsers apply it), bit-exact with ffmpeg's libdav1d.
+
+Deeper pictures are rounded to 8 bits, which is what the detector reads.
+Every decoder conceals what it cannot decode and marks the picture
+damaged; none panics on the damaged, truncated and shuffled streams the
+fuzzing fed them. `tests/e2e/decoders.mjs` scans the flash clip in each
+codec with its built-in decoder and requires what the browser's own
+decoder finds, and a hybrid scan of the VP9 clip, the built-in decoder
+beside the browser's, exactly what the browser's decoder gives alone.
+
 The decoding runs in parallel Web Workers (`web/h264pool.js`, one group of
 pictures per worker, split at sync samples), with eight-lane SIMD row
 kernels (wasm simd128, SSE2 or NEON through `wide`) for the interpolation,
@@ -590,6 +633,10 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 | `crates/unflash-gpu` | the WGSL pipeline on `wgpu` (native backends and the browser's WebGPU) |
 | `crates/unflash-mp4` | byte-range demuxers for WebCodecs, MP4 (fragmented files, edit lists) and Matroska / WebM (lacing, unknown sizes, header stripping), giving codec strings, decoder descriptions and sample tables; MP4 sample entries for Matroska audio; a muxer for the export |
 | `crates/unflash-h264` | the built-in H.264 decoder, for browsers whose WebCodecs has none |
+| `crates/unflash-hevc` | the built-in HEVC decoder (Main, Main 10; 4:2:0, 4:0:0) |
+| `crates/unflash-vp9` | the built-in VP9 decoder (profiles 0 and 2) |
+| `crates/unflash-vp8` | the built-in VP8 decoder |
+| `crates/unflash-decoders` | the `wasm-bindgen` API of the built-in HEVC, VP9, VP8 and AV1 decoders: a module of its own, loaded when a file needs one |
 | `crates/unflash-av1` | AV1 decoding (8- and 10-bit, film grain applied) into 8-bit 4:2:0 pictures: a small wrapper over rav1d, bit-exact with ffmpeg's libdav1d |
 | `third_party/rav1d` | rav1d 1.1.0, the Rust port of dav1d (BSD-2-Clause), without its assembly and patched to build for wasm32 (see its `UNFLASH.md`) |
 | `crates/unflash-wasm` | the `wasm-bindgen` API |
@@ -615,6 +662,12 @@ bash tests/media/gen.sh                   # demuxer/muxer test files (needs ffmp
 bash tests/media/h264/gen.sh              # H.264 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libx264)
 cargo run --release -p unflash-h264 --example compare -- file.mp4   # decode any MP4 and diff every frame against ffmpeg
 cargo run --release -p unflash-h264 --example conformance -- dir [filter]   # the JVT conformance streams (Annex B) against ffmpeg's framemd5 (dir/NAME.framemd5)
+bash tests/media/hevc/gen.sh              # HEVC decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libx265)
+cargo run --release -p unflash-hevc --example conformance -- dir   # the JCT-VC conformance streams against ffmpeg's framemd5
+bash tests/media/vp9/gen.sh               # VP9 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libvpx)
+cargo run --release -p unflash-vp9 --example conformance -- dir    # the libvpx VP9 test vectors (with their .md5 files)
+bash tests/media/vp8/gen.sh               # VP8 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libvpx)
+cargo run --release -p unflash-vp8 --example conformance -- dir    # the libvpx VP8 test vectors
 bash tests/media/av1/gen.sh               # AV1 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libaom, libsvtav1, librav1e, libdav1d)
 cargo run --release -p unflash-av1 --example compare -- file.mkv   # decode an AV1 track, diff every picture against ffmpeg's libdav1d, time it
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
@@ -688,8 +741,10 @@ player's position rather than detecting again, so it never misses a frame.
   the frames that carry the pattern; the result is verified by the same
   detector, and it is still a blur.
 - The built-in H.264 decoder does not do 4:2:2/4:4:4, 10-bit, slice groups
-  or SP/SI slices; such files need a browser with its own H.264 decoder.
-  HEVC has no built-in decoder at all.
+  or SP/SI slices; the built-in HEVC decoder does not do 4:2:2/4:4:4 or the
+  range extensions, VP9 profiles 1 and 3 (4:2:2, 4:4:4) and AV1 4:2:2,
+  4:4:4 and 12-bit are not decoded either. Such files need a browser with
+  its own decoder for them.
 - The export copies the audio (or re-encodes it, from an MKV whose audio an
   MP4 can't carry); after an **E** hold the audio runs ahead of the picture
   by the length of the hold. Removals (R/F) do not change timing and need

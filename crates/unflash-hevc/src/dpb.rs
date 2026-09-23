@@ -217,6 +217,7 @@ mod tests {
             temporal_mvp_enabled: false,
             strong_intra_smoothing: false,
             vui: None,
+            max_num_reorder_pics: 0,
         }
     }
 

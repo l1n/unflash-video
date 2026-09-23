@@ -433,6 +433,16 @@ impl Decoder {
         Ok(())
     }
 
+    /// How many pictures may come out before one that is shown earlier:
+    /// sps_max_num_reorder_pics of the stream's sequence parameter sets
+    /// (the most any of them allows), or the most the standard allows
+    /// before one has been seen. A caller putting the pictures in
+    /// presentation order holds this many back.
+    pub fn reorder_depth(&self) -> u32 {
+        let seen = self.spss.iter().flatten().map(|s| s.max_num_reorder_pics).max();
+        seen.unwrap_or(15)
+    }
+
     /// Leave out in-loop filtering (deblocking and SAO) for pictures used
     /// only for statistics. With fast = false (the default) output is
     /// bit-exact.

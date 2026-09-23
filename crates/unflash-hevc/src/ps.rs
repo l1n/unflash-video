@@ -317,6 +317,9 @@ pub struct Sps {
     pub temporal_mvp_enabled: bool,
     pub strong_intra_smoothing: bool,
     pub vui: Option<Vui>,
+    /// sps_max_num_reorder_pics of the highest sub-layer: how many pictures
+    /// may come before one in decoding order and after it in output order.
+    pub max_num_reorder_pics: u32,
 }
 
 impl Sps {
@@ -535,10 +538,13 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     let log2_max_poc_lsb = r.ue_max(12, "log2_max_pic_order_cnt_lsb_minus4")? + 4;
     let ordering_info_present = r.flag()?;
     let first = if ordering_info_present { 0 } else { max_sub_layers_minus1 };
+    // the buffer size and latency (pictures are output as decoded); the
+    // reordering of the highest sub-layer is what a caller putting them in
+    // presentation order has to allow for
+    let mut max_num_reorder_pics = 0;
     for _ in first..=max_sub_layers_minus1 {
-        // the buffer size, reordering and latency (pictures are output as decoded)
         r.ue_max(15, "sps_max_dec_pic_buffering_minus1")?;
-        r.ue_max(15, "sps_max_num_reorder_pics")?;
+        max_num_reorder_pics = r.ue_max(15, "sps_max_num_reorder_pics")?;
         r.ue()?;
     }
     let log2_min_cb = r.ue_max(3, "log2_min_luma_coding_block_size_minus3")? + 3;
@@ -654,6 +660,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         temporal_mvp_enabled,
         strong_intra_smoothing,
         vui,
+        max_num_reorder_pics,
     })
 }
 

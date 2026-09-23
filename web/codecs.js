@@ -6,7 +6,7 @@
  * Whether this build has the decoders module (web/pkg-dec). Until it does,
  * only H.264 has a built-in decoder and everything else is left to WebCodecs.
  */
-export const DECODERS_MODULE = false;
+export const DECODERS_MODULE = true;
 
 export const BUILT_IN = [
   { id: 'h264', name: 'H.264', test: /^avc[13]/, module: 'main' },
