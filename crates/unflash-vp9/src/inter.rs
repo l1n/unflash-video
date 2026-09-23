@@ -132,36 +132,45 @@ pub struct Mc<'a> {
 /// filters need, in place or as an edge-replicated copy, and interpolate.
 #[allow(clippy::too_many_arguments)]
 fn predict_unscaled<T: Pixel>(refp: &Plane<T>, cur: &mut Plane<T>, x: usize, y: usize, w: usize, h: usize, start_x: i64, start_y: i64, filter: &[[i16; 8]; 16], bd: u32, average: bool, tmp: &mut [i32], edge: &mut [T]) {
-    // the footprint of the filters: 3 samples before, 4 after
-    let (x0, y0) = ((start_x >> 4) - 3, (start_y >> 4) - 3);
-    let (fw, fh) = (w + 7, h + 7);
-    let last_x = refp.width as i64 - 1;
-    let last_y = refp.height as i64 - 1;
-    let (src, sstride): (&[T], usize) = if x0 >= 0 && y0 >= 0 && x0 + fw as i64 - 1 <= last_x && y0 + fh as i64 - 1 <= last_y {
+    let mc = Mc { w, h, fx: (start_x & 15) as usize, fy: (start_y & 15) as usize, filter, bd, average };
+    // the footprint: 3 samples before and 4 after the block in each
+    // direction that is filtered
+    let (hx, hy) = (mc.fx != 0, mc.fy != 0);
+    let (x0, y0) = ((start_x >> 4) - 3 * hx as i64, (start_y >> 4) - 3 * hy as i64);
+    let (fw, fh) = (w + 7 * hx as usize, h + 7 * hy as usize);
+    let (width, height) = (refp.width as i64, refp.height as i64);
+    let (src, sstride): (&[T], usize) = if x0 >= 0 && y0 >= 0 && x0 + fw as i64 <= width && y0 + fh as i64 <= height {
         (&refp.data[y0 as usize * refp.stride + x0 as usize..], refp.stride)
     } else {
+        // replicate the edges: each row is the samples left of the plane,
+        // those inside it, and those right of it
+        let left = (-x0).clamp(0, fw as i64) as usize;
+        let right = (x0 + fw as i64 - width).clamp(0, fw as i64) as usize;
+        let inside = fw - left - right;
         for (r, row) in edge.chunks_exact_mut(fw).take(fh).enumerate() {
-            let yy = (y0 + r as i64).clamp(0, last_y) as usize * refp.stride;
-            for (c, e) in row.iter_mut().enumerate() {
-                *e = refp.data[yy + (x0 + c as i64).clamp(0, last_x) as usize];
+            let line = &refp.data[(y0 + r as i64).clamp(0, height - 1) as usize * refp.stride..][..refp.width];
+            row[..left].fill(line[0]);
+            if inside > 0 {
+                row[left..left + inside].copy_from_slice(&line[(x0 + left as i64) as usize..][..inside]);
             }
+            row[left + inside..].fill(line[refp.width - 1]);
         }
         (&*edge, fw)
     };
     let cs = cur.stride;
-    let mc = Mc { w, h, fx: (start_x & 15) as usize, fy: (start_y & 15) as usize, filter, bd, average };
     T::predict(src, sstride, &mut cur.data[y * cs + x..], cs, &mc, tmp);
 }
 
 /// Interpolate a block from `src`, the top left of its filter footprint
-/// (3 rows and columns before the block): a copy, one 8-tap pass or two,
-/// depending on which of the position's components have a fraction.
+/// (which starts 3 columns left of the block if it is filtered
+/// horizontally, 3 rows above if vertically): a copy, one 8-tap pass or
+/// two, depending on which of the position's components have a fraction.
 pub fn predict_block<T: Pixel>(src: &[T], ss: usize, dst: &mut [T], ds: usize, mc: &Mc, tmp: &mut [i32]) {
     let (w, h, bd, average) = (mc.w, mc.h, mc.bd, mc.average);
     match (mc.fx != 0, mc.fy != 0) {
         (false, false) => {
             for r in 0..h {
-                let s = &src[(3 + r) * ss + 3..];
+                let s = &src[r * ss..];
                 for c in 0..w {
                     store(&mut dst[r * ds + c], s[c].get(), average);
                 }
@@ -170,7 +179,7 @@ pub fn predict_block<T: Pixel>(src: &[T], ss: usize, dst: &mut [T], ds: usize, m
         (true, false) => {
             let f = &mc.filter[mc.fx];
             for r in 0..h {
-                let s = &src[(3 + r) * ss..];
+                let s = &src[r * ss..];
                 for c in 0..w {
                     let v = T::clip((tap8(&s[c..c + 8], f) + 64) >> 7, bd).get();
                     store(&mut dst[r * ds + c], v, average);
@@ -183,7 +192,7 @@ pub fn predict_block<T: Pixel>(src: &[T], ss: usize, dst: &mut [T], ds: usize, m
                 for c in 0..w {
                     let mut sum = 0;
                     for t in 0..8 {
-                        sum += f[t] as i32 * src[(r + t) * ss + 3 + c].get();
+                        sum += f[t] as i32 * src[(r + t) * ss + c].get();
                     }
                     let v = T::clip((sum + 64) >> 7, bd).get();
                     store(&mut dst[r * ds + c], v, average);
@@ -292,8 +301,9 @@ pub mod simd {
     /// Store `N` samples, clipped, or their average with those there.
     #[inline(always)]
     fn put<const N: usize>(v: i16x8, d: &mut [u8], average: bool) {
+        let d = &mut d[..N];
         let v = if average { (clip(v) + load::<N>(d) + i16x8::splat(1)) >> 1_i32 } else { v };
-        d[..N].copy_from_slice(&u8x16::narrow_i16x8(v, v).as_array_ref()[..N]);
+        d.copy_from_slice(&u8x16::narrow_i16x8(v, v).as_array_ref()[..N]);
     }
 
     pub fn predict(src: &[u8], ss: usize, dst: &mut [u8], ds: usize, mc: &Mc) {
@@ -320,16 +330,16 @@ pub mod simd {
         let fy = mc.filter[mc.fy].map(i16x8::splat);
         // row r of the footprint, horizontally filtered or as it is
         let row = |r: usize| {
-            let s = &src[r * ss..];
             if H {
+                let s = &src[r * ss..][..N + 7];
                 clip(taps(std::array::from_fn(|t| load::<N>(&s[t..])), &fx))
             } else {
-                load::<N>(&s[3..])
+                load::<N>(&src[r * ss..])
             }
         };
         if mc.fy == 0 {
             for r in 0..mc.h {
-                put::<N>(row(3 + r), &mut dst[r * ds..], mc.average);
+                put::<N>(row(r), &mut dst[r * ds..], mc.average);
             }
         } else {
             // a window of the 8 rows the vertical filter reads
