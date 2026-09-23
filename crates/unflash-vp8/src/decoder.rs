@@ -153,6 +153,12 @@ impl Decoder {
         Ok(Vec::new())
     }
 
+    /// The macroblock records of the last frame decoded, in raster order
+    /// (for looking at which coding tools a stream uses).
+    pub fn macroblocks(&self) -> &[MbInfo] {
+        &self.mbs
+    }
+
     /// A key frame of a new size: start afresh with buffers of that size.
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         self.pics.clear();
