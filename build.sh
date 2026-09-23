@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the WebAssembly module and its JS glue into web/pkg.
+# Build the WebAssembly module and its JS glue into web/pkg, and put the
+# changelog next to the page.
 set -euo pipefail
 cd "$(dirname "$0")"
 PROFILE="${1:-release}"
@@ -15,4 +16,6 @@ wasm-bindgen --target web --out-dir web/pkg --out-name unflash "$WASM"
 if command -v wasm-opt >/dev/null 2>&1 && [ "$PROFILE" = "release" ]; then
   wasm-opt -O3 --enable-simd -o web/pkg/unflash_bg.wasm web/pkg/unflash_bg.wasm
 fi
+# the app's "What's new" reads the changelog from beside the page
+cp CHANGELOG.md web/CHANGELOG.md
 ls -la web/pkg

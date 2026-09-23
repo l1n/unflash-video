@@ -3,14 +3,16 @@
 import init, * as wasm from './pkg/unflash.js';
 import { defaultWorkerCount } from './h264pool.js';
 import { Movie, tick } from './media.js';
-import { createDetector } from './detector.js';
+import { createDetector, gpuAdapter } from './detector.js';
 import { profile } from './profile.js';
 import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, BLEND_DEFAULT } from './analysis.js';
-import { Project, projectKey, dropCaches } from './project.js';
+import { Project, projectKey, dropCaches, lastSavedAt } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
 import { FrameViewer } from './viewer.js';
 import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notifyState, systemNotify, titleProgress, titleMark } from './alerts.js';
+import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay } from './changes.js';
+import { watchPage, noteError, noteJob, noteFileName, debugReport } from './debug.js';
 
 const $ = (id) => document.getElementById(id);
 const EXT_S = 1.0;
@@ -58,9 +60,14 @@ const state = {
   // gen counts requests to it, so a poster that was overtaken never draws
   player: { mode: 'video', lastDraw: 0, gen: 0, playingTile: null, restartTimer: null },
   history: new Map(), // section id -> { undo: [], redo: [] } of mark snapshots
+  changes: null, // what's new: { log, newest, seen } (see initChanges)
 };
 
 let sectionPlayer = null;
+
+// read before this visit writes settings of its own: were they here already?
+const EARLIER_SETTINGS = hadEarlierSettings();
+watchPage();
 
 // ---- small helpers -----------------------------------------------------------
 
@@ -108,6 +115,7 @@ async function runJob(name, fn) {
   }
   const job = { name, cancelled: false };
   state.job = job;
+  const ended = noteJob(name);
   chainStart(name);
   $('jobName').textContent = name;
   $('jobBar').style.width = '0%';
@@ -143,12 +151,14 @@ async function runJob(name, fn) {
     console.error(e);
     outcome = 'failed';
     message = `${name} failed: ${e && e.message ? e.message : e}`;
+    noteError(message);
     banner(message);
     return null;
   } finally {
     state.job = null;
     $('jobbar').classList.add('hidden');
     titleProgress('');
+    ended(job.cancelled ? 'cancelled' : outcome);
     chainEnd(job.cancelled ? 'cancelled' : outcome, message);
   }
 }
@@ -284,6 +294,132 @@ function routeSetting() {
   return new URLSearchParams(location.search).get('route');
 }
 
+// ---- what's new ----------------------------------------------------------------
+//
+// The changes since this browser was last here, from CHANGELOG.md: a card on
+// the start page and a dot on the header's button until they are seen, the
+// whole list behind the button.
+
+/** Changes the start page's card lists; the rest are behind "everything that changed". */
+const NEWS_SHOWN = 6;
+
+/**
+ * Load the changelog and work out what this browser has not seen. One that
+ * has never been shown it is taken to have been here when it last saved a
+ * project, or, with only earlier settings to show for a visit, to have
+ * missed it all; a first visit is shown nothing and starts from here.
+ */
+async function initChanges() {
+  let log;
+  try {
+    log = await loadChangelog();
+  } catch (e) {
+    console.warn('no changelog', e);
+    return;
+  }
+  const newest = newestChange(log);
+  if (!newest) return;
+  let seen = changesSeen();
+  if (seen === null) {
+    let last = 0;
+    try {
+      last = await lastSavedAt();
+    } catch (e) {
+      /* no storage */
+    }
+    if (last) seen = last;
+    else if (EARLIER_SETTINGS) seen = 0;
+    else {
+      seen = newest;
+      markChangesSeen(newest);
+    }
+  }
+  state.changes = { log, newest, seen };
+  renderChanges();
+}
+
+function renderChanges() {
+  const c = state.changes;
+  if (!c) return;
+  const fresh = changesSince(c.log, c.seen);
+  const count = fresh.reduce((a, d) => a + d.items.length, 0);
+  $('changesDot').classList.toggle('hidden', !count);
+  $('btnChanges').title = count ? `What has changed in Unflash: ${count} change${count === 1 ? '' : 's'} since you were last here` : 'What has changed in Unflash, newest first';
+  $('newsCard').classList.toggle('hidden', !count);
+  if (!count) return;
+  const days = [];
+  let left = NEWS_SHOWN;
+  for (const d of fresh) {
+    if (left <= 0) break;
+    days.push({ ...d, items: d.items.slice(0, left) });
+    left -= d.items.length;
+  }
+  const more = count - Math.min(count, NEWS_SHOWN);
+  $('newsList').innerHTML = days.map((d) => renderDay(d)).join('') + (more ? `<p class="news-more">…and ${more} more.</p>` : '');
+}
+
+/** The changes so far count as seen: the card and the dot go until there are new ones. */
+function changesAcknowledged() {
+  const c = state.changes;
+  if (!c) return;
+  c.seen = c.newest;
+  markChangesSeen(c.newest);
+  renderChanges();
+}
+
+function openChanges() {
+  const c = state.changes;
+  if (!c) return toast('The list of changes could not be loaded');
+  const seen = c.seen;
+  $('changesList').innerHTML = c.log.days.map((d) => renderDay(d, (it) => it.at > seen)).join('');
+  $('changesModal').classList.remove('hidden');
+  $('changesList').scrollTop = 0;
+  changesAcknowledged();
+}
+
+function closeChanges() {
+  $('changesModal').classList.add('hidden');
+}
+
+// ---- debug info --------------------------------------------------------------------
+
+function makeDebugReport() {
+  return debugReport({ version: wasm.version(), state, profile, gpu: gpuAdapter, segments: scanSegments() });
+}
+
+/** The report in a dialog, copied to the clipboard at once where the browser lets it. */
+function openDebug() {
+  const text = makeDebugReport();
+  $('debugText').value = text;
+  const save = $('btnDebugSave');
+  if (save.href.startsWith('blob:')) URL.revokeObjectURL(save.href);
+  save.href = URL.createObjectURL(new Blob([text + '\n'], { type: 'text/plain' }));
+  $('debugNote').textContent = 'What this browser, its GPU and the open video are, and how long each job took. Paste it into a message to whoever is helping you; it names no files.';
+  $('debugModal').classList.remove('hidden');
+  copyDebug(text);
+}
+
+function copyDebug(text) {
+  const note = $('debugNote');
+  const manual = () => {
+    const t = $('debugText');
+    t.focus();
+    t.select();
+    note.textContent = `Select the text below and copy it (${/Mac/.test(navigator.platform) ? '⌘' : 'Ctrl'}+C), or save it as a file, and paste it into a message to whoever is helping you. It names no files.`;
+  };
+  if (!navigator.clipboard || !navigator.clipboard.writeText) return manual();
+  navigator.clipboard.writeText(text).then(
+    () => {
+      note.textContent = 'Copied: paste it into a message to whoever is helping you. It names no files.';
+    },
+    () => manual()
+  );
+}
+
+function closeDebug() {
+  $('debugModal').classList.add('hidden');
+}
+
 // ---- boot ---------------------------------------------------------------------
 
 async function boot() {
@@ -312,10 +448,24 @@ async function boot() {
   // the guide: the start page until a file is open, then a drawer beside the
   // work that the same button, its close button or Esc put away again
   $('btnHome').addEventListener('click', () => {
-    if (!state.movie) return window.scrollTo(0, 0);
+    if (!state.movie) return $('welcome').scrollTo(0, 0);
     setGuide(!document.body.classList.contains('guide-open'));
   });
   $('btnCloseGuide').addEventListener('click', () => setGuide(false));
+  $('btnChanges').addEventListener('click', openChanges);
+  $('btnNewsAll').addEventListener('click', openChanges);
+  $('btnNewsSeen').addEventListener('click', changesAcknowledged);
+  $('btnCloseChanges').addEventListener('click', closeChanges);
+  $('changesModal').addEventListener('click', (e) => {
+    if (e.target === $('changesModal')) closeChanges();
+  });
+  $('btnDebug').addEventListener('click', openDebug);
+  $('btnDebugCopy').addEventListener('click', () => copyDebug($('debugText').value));
+  $('btnCloseDebug').addEventListener('click', closeDebug);
+  $('debugModal').addEventListener('click', (e) => {
+    if (e.target === $('debugModal')) closeDebug();
+  });
+  initChanges();
   $('btnCloseBanner').addEventListener('click', () => $('banner').classList.add('hidden'));
   $('btnCancelJob').addEventListener('click', () => {
     if (state.job) state.job.cancelled = true;
@@ -389,6 +539,7 @@ async function boot() {
 // ---- opening a file -------------------------------------------------------------
 
 async function openFile(file) {
+  noteFileName(file.name);
   $('banner').classList.add('hidden');
   await stopAuto();
   if (sectionPlayer) await sectionPlayer.stop();
@@ -1541,6 +1692,9 @@ function wireWorkspace() {
 }
 
 function onKey(e) {
+  // the text dialogs close with Esc wherever the focus is (the debug text, say)
+  if (e.key === 'Escape' && !$('changesModal').classList.contains('hidden')) return closeChanges();
+  if (e.key === 'Escape' && !$('debugModal').classList.contains('hidden')) return closeDebug();
   const tag = e.target && e.target.tagName;
   if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
   if (e.key === 'Escape') {
@@ -1552,7 +1706,7 @@ function onKey(e) {
     renderGridMarks();
     return;
   }
-  if (!$('exportModal').classList.contains('hidden')) return;
+  if ([...document.querySelectorAll('.modal')].some((m) => !m.classList.contains('hidden'))) return;
   const sec = currentSection();
   if (!sec || !sec.prepared) return;
   const k = e.key.toLowerCase();
@@ -2860,6 +3014,10 @@ window.__unflash = {
   get sectionPlayer() {
     return sectionPlayer;
   },
+  get changes() {
+    return state.changes;
+  },
+  debugReport: makeDebugReport,
   setPlayerSource,
   playSection,
   undo,

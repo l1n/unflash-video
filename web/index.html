@@ -11,6 +11,7 @@
 <header>
   <div class="brand" title="Unflash — WebGPU / WebAssembly">⚡̶ Unflash</div>
   <button id="btnHome" title="Show or hide the guide (it opens beside your work, and Esc closes it)">Guide</button>
+  <button id="btnChanges" title="What has changed in Unflash, newest first">What's new<span id="changesDot" class="new-dot hidden"></span></button>
   <label class="filebtn primary"><input type="file" id="fileInput" accept="video/*,.mp4,.m4v,.mov,.mkv,.webm,.3gp">Open video…</label>
   <div id="videoInfo" class="video-info"></div>
   <div class="spacer"></div>
@@ -220,6 +221,11 @@
 
   <section id="welcome">
     <button id="btnCloseGuide" class="small guide-close" title="Close the guide (Esc)">close guide ✕</button>
+    <div id="newsCard" class="news-card hidden">
+      <h2>What's new since you were last here</h2>
+      <div id="newsList" class="changes-list"></div>
+      <div class="news-actions"><button id="btnNewsSeen" class="small primary">Got it</button><button id="btnNewsAll" class="small">everything that changed</button></div>
+    </div>
     <h1>Unflash</h1>
     <p>Find the flashing and the stripe patterns in a video that can trigger photosensitive seizures, and take them out without wrecking the footage. Everything runs in your browser, on your GPU; nothing is uploaded anywhere.</p>
     <ol>
@@ -278,7 +284,25 @@
   </div>
 </div>
 
-<footer id="status" class="status"></footer>
+<div id="changesModal" class="modal hidden">
+  <div class="modal-box changes-box">
+    <h2>What's new in Unflash</h2>
+    <p class="hint">Newest first. The ones marked new came after your last visit.</p>
+    <div id="changesList" class="changes-list scrollbox"></div>
+    <div class="modal-actions"><span class="spacer"></span><button id="btnCloseChanges">Close</button></div>
+  </div>
+</div>
+
+<div id="debugModal" class="modal hidden">
+  <div class="modal-box">
+    <h2>Debug info</h2>
+    <p id="debugNote" class="hint"></p>
+    <textarea id="debugText" class="debug-text" readonly spellcheck="false"></textarea>
+    <div class="modal-actions"><button id="btnDebugCopy" class="primary">Copy</button><a id="btnDebugSave" class="button" download="unflash-debug.txt" href="#">Save as a file</a><span class="spacer"></span><button id="btnCloseDebug">Close</button></div>
+  </div>
+</div>
+
+<footer class="status"><div id="status" class="status-parts"></div><button id="btnDebug" class="small" title="What this browser, its GPU and the open video are, and how long each job took (the last scan step by step), as text to paste into a message to whoever is helping. No file names.">🐞 debug info</button></footer>
 <div id="toast" class="toast hidden"></div>
 
 <script type="module" src="app.js"></script>

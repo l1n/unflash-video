@@ -35,6 +35,24 @@ async function idbPut(key, value) {
   });
 }
 
+/** When a project was last saved in this browser (ms), 0 when none was: roughly when it was last used. */
+export async function lastSavedAt() {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly');
+    let last = 0;
+    const req = tx.objectStore(STORE).openCursor();
+    req.onsuccess = () => {
+      const cur = req.result;
+      if (!cur) return resolve(last);
+      const at = cur.value && cur.value.savedAt;
+      if (at > last) last = at;
+      cur.continue();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
 export function projectKey(file) {
   return `${file.name}:${file.size}:${file.lastModified}`;
 }

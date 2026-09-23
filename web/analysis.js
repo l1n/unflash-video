@@ -109,6 +109,9 @@ export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, 
   const count = counts.reduce((a, b) => a + b, 0);
   const elapsed = performance.now() - started;
   profile.report(`scan of ${(movie.file && movie.file.name) || 'the file'} (${movie.width}×${movie.height}, ${feeder.backend}${nseg > 1 ? `, ${nseg} segments` : ''})`, count, elapsed);
+  // kept for the debug report (the next job starts the profile afresh)
+  const profileText = profile.text(`scan (${movie.width}×${movie.height}, ${feeder.backend}${nseg > 1 ? `, ${nseg} segments` : ''})`, count, elapsed);
+  const profileOps = profile.summary();
   let result;
   if (nseg === 1) {
     result = parts[0].result;
@@ -123,7 +126,7 @@ export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, 
   // flashing exactly instead of growing to the nearest keyframes
   const sections = JSON.parse(wasm.violations_to_sections(vjson, config, movie.tsMin, movie.tsMax, new Float64Array()));
   const summary = JSON.parse(wasm.timeline_summary(JSON.stringify(result), movie.tsMin, movie.tsMax, 1.0));
-  return { result, sections, summary, trace, frames: count, elapsedMs: elapsed, segments: nseg, patternThresh: feeder.det.pattern_thresh() };
+  return { result, sections, summary, trace, frames: count, elapsedMs: elapsed, segments: nseg, patternThresh: feeder.det.pattern_thresh(), profileText, profileOps };
 }
 
 /**

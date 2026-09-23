@@ -666,6 +666,107 @@ try {
   console.log('h264 section verdict:', results.h264Verdict);
   assert(results.h264Verdict.startsWith('fails'), 'the H.264 section fails before editing: ' + results.h264Verdict);
 
+  // --- debug info: a report to paste into a message, naming no files -----------
+  await page.click('#btnDebug');
+  await page.waitForSelector('#debugModal', { state: 'visible' });
+  const report = await page.inputValue('#debugText');
+  console.log('debug report (the start):\n' + report.split('\n').slice(0, 12).join('\n'));
+  for (const [what, re] of [
+    ['a heading', /^Unflash debug info · \d{4}-\d\d-\d\d/],
+    ['the browser', /\nBrowser +Mozilla\/5\.0/],
+    ['the detector', /\nDetector +CPU \(WebAssembly\) at 256×144/],
+    ['the video', /\nVideo +MP4 · avc1\.[0-9A-Fa-f]{6} · 640×360 · 30\.000 fps/],
+    ['the scan', /\nScan +\d+ frames in [\d.]+ s = \d+ fps/],
+    ['the jobs', /Scanning for flashes: [\d.]+ s ok/],
+    ["the scan's operations", /Last scan, time per operation:\nscan \(640×360, cpu\)/],
+  ]) assert(re.test(report), `the debug report gives ${what}:\n${report}`);
+  assert(!report.includes('flash_h264') && !report.includes('.mp4'), 'the debug report names no files:\n' + report);
+  assert((await page.getAttribute('#btnDebugSave', 'href')).startsWith('blob:') && (await page.textContent('#debugNote')).length > 20, 'it can be copied or saved as a file');
+  await page.click('#debugText');
+  await page.keyboard.press('Escape');
+  assert(await page.$eval('#debugModal', (m) => m.classList.contains('hidden')), 'Esc closes the debug report, from its text too');
+
+  // --- what's new: someone coming back sees what changed since they were here ---
+  {
+    const ctx = await browser.newContext({ viewport: { width: 1200, height: 900 } });
+    const p = await ctx.newPage();
+    p.on('pageerror', (e) => errors.push("pageerror (what's new): " + e.message));
+    const visit = async () => {
+      await p.goto(`http://127.0.0.1:${port}/?auto=0`);
+      await p.waitForFunction(() => window.__unflash && window.__unflash.changes, null, { timeout: 60000 });
+    };
+    const shown = () =>
+      p.evaluate(() => {
+        const c = window.__unflash.changes;
+        return {
+          card: !document.querySelector('#newsCard').classList.contains('hidden'),
+          items: document.querySelectorAll('#newsList li').length,
+          more: (document.querySelector('#newsList .news-more') || {}).textContent || '',
+          dot: !document.querySelector('#changesDot').classList.contains('hidden'),
+          mark: Number(localStorage.getItem('unflash:changesSeen')),
+          newest: c.newest,
+          days: c.log.days.length,
+          times: c.log.days.flatMap((d) => d.items.map((it) => it.at)),
+          untimed: c.log.days.flatMap((d) => d.items.filter((it) => !it.timed)).length,
+        };
+      });
+    // a first visit is shown nothing: it starts from the newest change
+    await visit();
+    let s = await shown();
+    assert(!s.card && !s.dot && s.mark === s.newest, 'a first visit is shown no changes: ' + JSON.stringify({ ...s, times: s.times.length }));
+    assert(s.times.length >= 20 && s.untimed === 0, `every change in CHANGELOG.md says when it went live (${s.untimed} do not)`);
+    const sorted = [...s.times].sort((a, b) => b - a);
+    const newer = (t) => sorted.filter((x) => x > t).length;
+    // back after a visit: the changes since, until "Got it"
+    await p.evaluate((t) => localStorage.setItem('unflash:changesSeen', String(t)), sorted[2]);
+    await visit();
+    s = await shown();
+    assert(s.card && s.dot && s.items === newer(sorted[2]) && !s.more, `back after a visit, the ${newer(sorted[2])} changes since: ` + JSON.stringify({ card: s.card, dot: s.dot, items: s.items }));
+    await p.screenshot({ path: path.join(OUT, '8-whats-new.png') });
+    await p.click('#btnNewsSeen');
+    s = await shown();
+    assert(!s.card && !s.dot && s.mark === s.newest, '"Got it" puts them away');
+    await visit();
+    assert(!(await shown()).card, 'and they stay away');
+    // from before there was a notice: the last project saved says when they were here
+    const lastSave = sorted[9] + 1;
+    await p.evaluate(async (at) => {
+      localStorage.removeItem('unflash:changesSeen');
+      await new Promise((resolve, reject) => {
+        const r = indexedDB.open('unflash', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('projects');
+        r.onerror = () => reject(r.error);
+        r.onsuccess = () => {
+          const tx = r.result.transaction('projects', 'readwrite');
+          tx.objectStore('projects').put({ savedAt: at, sections: [] }, 'an earlier video');
+          tx.oncomplete = () => {
+            r.result.close();
+            resolve();
+          };
+          tx.onerror = () => reject(tx.error);
+        };
+      });
+    }, lastSave);
+    await visit();
+    s = await shown();
+    const since = newer(lastSave);
+    console.log(`what's new: ${s.times.length} changes over ${s.days} days; back after the last save, ${since} new, the card lists ${s.items} ${s.more}`);
+    assert(s.card && s.items === Math.min(6, since) && (since > 6) === s.more.includes(`${since - 6} more`), 'back from before the notice, the changes since the last save: ' + JSON.stringify({ card: s.card, items: s.items, more: s.more, since }));
+    // everything, the new ones marked
+    await p.click('#btnChanges');
+    const list = await p.evaluate(() => ({
+      open: !document.querySelector('#changesModal').classList.contains('hidden'),
+      days: document.querySelectorAll('#changesList h3').length,
+      items: document.querySelectorAll('#changesList li').length,
+      fresh: document.querySelectorAll('#changesList li.new').length,
+    }));
+    assert(list.open && list.days === s.days && list.items === s.times.length && list.fresh === since, 'the whole list, the new ones marked: ' + JSON.stringify(list));
+    await p.keyboard.press('Escape');
+    s = await shown();
+    assert(!(await p.$eval('#changesModal', (m) => !m.classList.contains('hidden'))) && !s.card && s.mark === s.newest, 'Esc closes it, and they count as seen');
+    await ctx.close();
+  }
+
   }
 
   // ======== the same scans on the GPU must agree ==============================

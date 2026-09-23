@@ -65,11 +65,16 @@ class Profile {
     return lines.join('\n');
   }
 
-  /** One console.debug message: the label, the throughput, the notes and the operations. */
-  report(label, frames, elapsedMs) {
+  /** The label, the throughput, the notes and the operations, as text. */
+  text(label, frames, elapsedMs) {
     const head = frames > 0 && elapsedMs > 0 ? `${label}: ${frames} frames in ${(elapsedMs / 1000).toFixed(2)} s = ${(frames / (elapsedMs / 1000)).toFixed(1)} fps` : label;
     const notes = [...this.notes.entries()].map(([k, v]) => `${k}: ${v}`).join(' · ');
-    console.debug(`[unflash] ${head}${notes ? '\n  ' + notes : ''}\n${this.summary(frames)}`);
+    return `${head}${notes ? '\n  ' + notes : ''}\n${this.summary(frames)}`;
+  }
+
+  /** One console.debug message: text() with the [unflash] tag. */
+  report(label, frames, elapsedMs) {
+    console.debug(`[unflash] ${this.text(label, frames, elapsedMs)}`);
     this.lastReport = performance.now();
   }
 

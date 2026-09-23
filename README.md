@@ -32,6 +32,12 @@ port is tested against, bit for bit where the arithmetic allows.
 `main` by the [Pages workflow](.github/workflows/pages.yml). It is a static
 site: the video never leaves your machine.
 
+**What's new:** [CHANGELOG.md](CHANGELOG.md), in plain words, newest first.
+`build.sh` puts a copy beside the page, and the app shows someone coming
+back the changes made since their last visit (on the start page, and
+behind *What's new* in the header). Each line starts with the time it goes
+live, in a comment; add one with every change people will notice.
+
 **Locally:** open `web/` from any static web server over `http://localhost`
 or `https://` (WebGPU and WebCodecs need a secure context):
 
@@ -207,6 +213,15 @@ Pages build regenerates them; for a local copy run
 `web/bench.html` measures both on your machine.
 
 ### Diagnostics
+
+**🐞 debug info**, at the bottom right, puts together what someone helping
+with a slow or failing run needs, as text to paste into a message: the
+browser, the WebGPU adapter, the detector and how pictures reach it, the
+open video (container, codec, size, frame rate, length), each job of the
+visit with how long it took (and how much of that the tab spent out of
+sight), the last scan's time per operation and any errors. It copies it to
+the clipboard where the browser allows, and saves it as a file. It names
+no files.
 
 The console reports, at **debug level** (enable "Debug" / "Verbose" messages
 in the devtools console), how long each operation takes: decoder waits, file

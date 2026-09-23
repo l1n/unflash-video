@@ -9,6 +9,7 @@ Cargo.lock.bak
 
 # web build output (rebuilt by build.sh)
 /web/pkg/
+/web/CHANGELOG.md
 /web/node_modules/
 /node_modules/
 /tests/e2e/out/

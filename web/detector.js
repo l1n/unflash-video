@@ -58,6 +58,19 @@ export async function createDetector(wasm, configJson, width, height, { preferGp
  * whole WASM instance. So every kind of source is tried once on a throwaway
  * device before it is allowed through to WASM.
  */
+/** What the WebGPU adapter says about itself (for the debug report). */
+export const gpuAdapter = { info: null, fallback: false };
+
+function describeAdapter(adapter) {
+  try {
+    const i = adapter.info;
+    if (i) gpuAdapter.info = { vendor: i.vendor, architecture: i.architecture, device: i.device, description: i.description };
+    gpuAdapter.fallback = adapter.isFallbackAdapter === true || !!(i && i.isFallbackAdapter);
+  } catch (e) {
+    /* an older WebGPU: no description */
+  }
+}
+
 export class SourceProbe {
   /** `allowed`: an optional list of kinds to treat as accepted without asking (tests: `?extsrc=canvas`). */
   static async create(allowed = null) {
@@ -69,6 +82,7 @@ export class SourceProbe {
     try {
       const adapter = await navigator.gpu.requestAdapter();
       if (!adapter) throw new Error('no adapter');
+      describeAdapter(adapter);
       p.device = await adapter.requestDevice();
       p.texture = p.device.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
       p.device.lost.then(() => p.release());
