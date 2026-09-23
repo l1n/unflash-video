@@ -22,6 +22,22 @@ jobs:
         with:
           packages: mesa-vulkan-drivers vulkan-tools ffmpeg python3-numpy
           version: 1
+      # the cache restores the packages' files, not what their install scripts
+      # make: the BLAS and LAPACK links (behind alternatives) that ffmpeg and
+      # numpy load. Made here; if anything still fails, installed the slow way.
+      - name: System packages work
+        run: |
+          dir=/usr/lib/x86_64-linux-gnu
+          for lib in blas lapack; do
+            if [ ! -e "$dir/lib$lib.so.3" ] && [ -e "$dir/$lib/lib$lib.so.3" ]; then sudo ln -s "$dir/$lib/lib$lib.so.3" "$dir/lib$lib.so.3"; fi
+          done
+          sudo ldconfig
+          if ! { ffmpeg -version && ffprobe -version && python3 -c 'import numpy' && vulkaninfo --summary; } > /dev/null; then
+            echo "::warning::the cached packages do not work as restored; installing them"
+            sudo apt-get update -q
+            sudo apt-get install -y -q mesa-vulkan-drivers vulkan-tools ffmpeg python3-numpy
+          fi
+          ffmpeg -version | head -1
       - name: Test media
         run: bash tests/media/gen.sh
       - name: Reference fixtures are up to date
