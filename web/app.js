@@ -2298,6 +2298,11 @@ function sectionsNear(sec, a, b) {
     .sort((x, y) => Math.abs(x.start - sec.start) - Math.abs(y.start - sec.start));
 }
 
+/** "at least " where a violation starts as far back as the check's run-up reaches (it may start further back). */
+function atLeast(c, v) {
+  return c.context_lead && v.start <= -c.context_lead + 0.05 ? 'at least ' : '';
+}
+
 /**
  * Where a violation's flashing lies outside `sec`, in words ("it starts
  * 3.0 s before this section, in section #2"), and the section to open for
@@ -2312,9 +2317,11 @@ function outsideOf(sec, v) {
     if (!open) open = list[0];
     return `, in section${list.length > 1 ? 's' : ''} ${list.map((o) => '#' + o.id).join(' and ')}`;
   };
-  if (v.start < -0.05) parts.push(`it starts ${(-v.start).toFixed(1)} s before this section${where(sectionsNear(sec, v.start, 0), 'the video before it')}`);
+  if (v.start < -0.05) parts.push(`it starts ${atLeast(c, v)}${(-v.start).toFixed(1)} s before this section${where(sectionsNear(sec, v.start, 0), 'the video before it')}`);
   const end = c.endDisp || 0;
-  if (v.end > end + 0.05) parts.push(`it runs on ${(v.end - end).toFixed(1)} s past its end${where(sectionsNear(sec, sec.end - sec.start, sec.end - sec.start + v.end - end), 'the video after it')}`);
+  // (the check sees the run-out's few seconds: flashing that goes on to their end may go on further)
+  const beyond = c.context_tail && v.end >= end + c.context_tail - 0.05 ? 'at least ' : '';
+  if (v.end > end + 0.05) parts.push(`it runs on ${beyond}${(v.end - end).toFixed(1)} s past its end${where(sectionsNear(sec, sec.end - sec.start, sec.end - sec.start + v.end - end), 'the video after it')}`);
   return { text: parts.join('; '), open };
 }
 
@@ -2369,7 +2376,7 @@ function renderFindings(sec) {
     const where = near.length ? `in section #${near[0].id}` : 'in the video before it, which no section covers';
     const what = v.end >= -0.05 ? 'up to its first picture' : `up to ${(-v.end).toFixed(1)} s before it`;
     const fix = near.length ? `It is fixed there: nothing in this section's frames can clear it.` : `Nothing in this section's frames can clear it: widen this section back over it, or add a section there.`;
-    return `<div class="finding ${v.kind} run-up"><b>${label(v.kind)} before this section</b>, from ${(-v.start).toFixed(1)} s before it ${what}, ${where}${openButton(near[0])}<div class="how">${fix} This section's verdict leaves it out.</div></div>`;
+    return `<div class="finding ${v.kind} run-up"><b>${label(v.kind)} before this section</b>, from ${atLeast(sec.check, v)}${(-v.start).toFixed(1)} s before it ${what}, ${where}${openButton(near[0])}<div class="how">${fix} This section's verdict leaves it out.</div></div>`;
   });
   box.innerHTML = own.join('') + before.join('');
 }
