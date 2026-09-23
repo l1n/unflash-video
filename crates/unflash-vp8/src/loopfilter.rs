@@ -269,6 +269,37 @@ mod simd {
         u8x16::from(v)
     }
 
+    /// Eight samples, in the low half.
+    #[inline(always)]
+    fn load8(a: &[u8]) -> u8x16 {
+        load8x2(a, &[0; 8])
+    }
+
+    /// The first `n` samples of `rows`, which lose them: the rows of a
+    /// plane taken one after another, each checked against the plane once.
+    #[inline(always)]
+    fn take<'a>(rows: &mut &'a [u8], n: usize) -> &'a [u8] {
+        let (first, rest) = rows.split_at(n);
+        *rows = rest;
+        first
+    }
+
+    #[inline(always)]
+    fn take_mut<'a>(rows: &mut &'a mut [u8], n: usize) -> &'a mut [u8] {
+        let (first, rest) = std::mem::take(rows).split_at_mut(n);
+        *rows = rest;
+        first
+    }
+
+    /// Two rows of eight samples from a vector, into the two rows of the
+    /// plane `lines` begins with, at column `x`.
+    #[inline(always)]
+    fn store_pair(pair: u8x16, lines: &mut [u8], stride: usize, x: usize) {
+        let s = pair.as_array_ref();
+        lines[x..x + 8].copy_from_slice(&s[..8]);
+        lines[stride + x..stride + x + 8].copy_from_slice(&s[8..]);
+    }
+
     /// One round of byte interleaving: outputs 2j and 2j + 1 are the low
     /// and the high halves of inputs j and j + 4 interleaved.
     #[inline(always)]
@@ -294,108 +325,122 @@ mod simd {
         filter(&mut t, kind).then(|| interleave(interleave(interleave(t))))
     }
 
-    /// A luma edge along a row: positions `at` .. `at + 16`.
+    /// A luma edge along a row: the eight `rows` hold p3 ..= q3, the
+    /// positions are columns `x` .. `x + 16`.
     #[inline(always)]
-    pub fn horizontal_luma(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
-        let base = at - 4 * stride;
+    pub fn horizontal_luma(rows: &mut [u8], stride: usize, x: usize, kind: Kind) {
         let mut t = [u8x16::ZERO; 8];
-        for (r, v) in t.iter_mut().enumerate() {
-            *v = u8x16::from(<[u8; 16]>::try_from(&buf[base + r * stride..base + r * stride + 16]).unwrap());
+        let mut lines: &[u8] = rows;
+        for t in t.iter_mut() {
+            *t = u8x16::from(<[u8; 16]>::try_from(&take(&mut lines, stride)[x..x + 16]).unwrap());
         }
         if filter(&mut t, kind) {
-            for r in changed(kind) {
-                buf[base + r * stride..base + r * stride + 16].copy_from_slice(t[r].as_array_ref());
+            let changed = changed(kind);
+            let mut lines = &mut rows[changed.start * stride..];
+            for t in &t[changed] {
+                take_mut(&mut lines, stride)[x..x + 16].copy_from_slice(t.as_array_ref());
             }
         }
     }
 
-    /// Chroma edges along a row: positions `at` .. `at + 8` of each plane.
+    /// Chroma edges along a row: columns `x` .. `x + 8` of the eight rows
+    /// of each plane.
     #[inline(always)]
-    pub fn horizontal_chroma(u: &mut [u8], v: &mut [u8], at: usize, stride: usize, kind: Kind) {
-        let base = at - 4 * stride;
+    pub fn horizontal_chroma(u: &mut [u8], v: &mut [u8], stride: usize, x: usize, kind: Kind) {
         let mut t = [u8x16::ZERO; 8];
-        for (r, row) in t.iter_mut().enumerate() {
-            *row = load8x2(&u[base + r * stride..], &v[base + r * stride..]);
+        let (mut lu, mut lv): (&[u8], &[u8]) = (u, v);
+        for t in t.iter_mut() {
+            *t = load8x2(&take(&mut lu, stride)[x..], &take(&mut lv, stride)[x..]);
         }
         if filter(&mut t, kind) {
-            for r in changed(kind) {
-                let s = t[r].as_array_ref();
-                u[base + r * stride..base + r * stride + 8].copy_from_slice(&s[..8]);
-                v[base + r * stride..base + r * stride + 8].copy_from_slice(&s[8..]);
+            let changed = changed(kind);
+            let (mut lu, mut lv) = (&mut u[changed.start * stride..], &mut v[changed.start * stride..]);
+            for t in &t[changed] {
+                let s = t.as_array_ref();
+                take_mut(&mut lu, stride)[x..x + 8].copy_from_slice(&s[..8]);
+                take_mut(&mut lv, stride)[x..x + 8].copy_from_slice(&s[8..]);
             }
         }
     }
 
-    /// A luma edge down a column: positions `at` .. `at + 16 * stride`.
+    /// A luma edge down the sixteen `rows`, before column `x`.
     #[inline(always)]
-    pub fn vertical_luma(buf: &mut [u8], at: usize, stride: usize, kind: Kind) {
-        let base = at - 4;
-        let mut rows = [u8x16::ZERO; 16];
-        for (k, row) in rows.iter_mut().enumerate() {
-            *row = load8x2(&buf[base + k * stride..], &[0; 8]);
+    pub fn vertical_luma(rows: &mut [u8], stride: usize, x: usize, kind: Kind) {
+        let mut t = [u8x16::ZERO; 16];
+        let mut lines: &[u8] = rows;
+        for t in t.iter_mut() {
+            *t = load8(&take(&mut lines, stride)[x - 4..]);
         }
-        if let Some(pairs) = vertical(&rows, kind) {
-            for (i, pair) in pairs.iter().enumerate() {
-                let s = pair.as_array_ref();
-                let r = base + 2 * i * stride;
-                buf[r..r + 8].copy_from_slice(&s[..8]);
-                buf[r + stride..r + stride + 8].copy_from_slice(&s[8..]);
+        if let Some(pairs) = vertical(&t, kind) {
+            let mut lines = rows;
+            for pair in pairs {
+                store_pair(pair, take_mut(&mut lines, 2 * stride), stride, x - 4);
             }
         }
     }
 
-    /// Chroma edges down a column: positions `at` .. `at + 8 * stride` of
-    /// each plane.
+    /// Chroma edges down the eight rows of each plane, before column `x`.
     #[inline(always)]
-    pub fn vertical_chroma(u: &mut [u8], v: &mut [u8], at: usize, stride: usize, kind: Kind) {
-        let base = at - 4;
-        let mut rows = [u8x16::ZERO; 16];
-        for k in 0..8 {
-            rows[k] = load8x2(&u[base + k * stride..], &[0; 8]);
-            rows[k + 8] = load8x2(&v[base + k * stride..], &[0; 8]);
+    pub fn vertical_chroma(u: &mut [u8], v: &mut [u8], stride: usize, x: usize, kind: Kind) {
+        let mut t = [u8x16::ZERO; 16];
+        let (tu, tv) = t.split_at_mut(8);
+        let (mut lu, mut lv): (&[u8], &[u8]) = (u, v);
+        for (tu, tv) in tu.iter_mut().zip(tv) {
+            *tu = load8(&take(&mut lu, stride)[x - 4..]);
+            *tv = load8(&take(&mut lv, stride)[x - 4..]);
         }
-        if let Some(pairs) = vertical(&rows, kind) {
-            for (i, pair) in pairs.iter().enumerate() {
-                let s = pair.as_array_ref();
-                let plane = if i < 4 { &mut *u } else { &mut *v };
-                let r = base + 2 * (i % 4) * stride;
-                plane[r..r + 8].copy_from_slice(&s[..8]);
-                plane[r + stride..r + stride + 8].copy_from_slice(&s[8..]);
+        if let Some(pairs) = vertical(&t, kind) {
+            let (pu, pv) = pairs.split_at(4);
+            for (pairs, mut lines) in [(pu, u), (pv, v)] {
+                for &pair in pairs {
+                    store_pair(pair, take_mut(&mut lines, 2 * stride), stride, x - 4);
+                }
             }
         }
     }
 }
 
-/// Filter the sixteen positions of a luma edge: `step` is the distance
-/// between samples across the edge (1 for a vertical edge, the stride for
-/// a horizontal one), `along` the distance between positions.
+/// Filter the sixteen positions of a luma edge: down the sixteen `rows`
+/// (whole rows of the plane) before column `x` when `vertical`, otherwise
+/// between the fourth and fifth of the eight `rows` at columns `x` ..
+/// `x + 16`.
 #[inline]
-fn luma_edge(y: &mut [u8], at: usize, step: usize, along: usize, kind: Kind) {
+fn luma_edge(rows: &mut [u8], stride: usize, x: usize, vertical: bool, kind: Kind) {
     #[cfg(feature = "simd")]
-    if step == 1 {
-        simd::vertical_luma(y, at, along, kind);
+    if vertical {
+        simd::vertical_luma(rows, stride, x, kind);
     } else {
-        simd::horizontal_luma(y, at, step, kind);
+        simd::horizontal_luma(rows, stride, x, kind);
     }
     #[cfg(not(feature = "simd"))]
     for i in 0..16 {
-        filter_position(y, at + i * along, step, kind);
+        if vertical {
+            filter_position(rows, i * stride + x, 1, kind);
+        } else {
+            filter_position(rows, 4 * stride + x + i, stride, kind);
+        }
     }
 }
 
-/// Filter the eight positions of an edge in each chroma plane.
+/// Filter the eight positions of an edge in each chroma plane: down the
+/// eight rows before column `x`, or between the fourth and fifth of eight
+/// rows at columns `x` .. `x + 8`.
 #[inline]
-fn chroma_edge(u: &mut [u8], v: &mut [u8], at: usize, step: usize, along: usize, kind: Kind) {
+fn chroma_edge(u: &mut [u8], v: &mut [u8], stride: usize, x: usize, vertical: bool, kind: Kind) {
     #[cfg(feature = "simd")]
-    if step == 1 {
-        simd::vertical_chroma(u, v, at, along, kind);
+    if vertical {
+        simd::vertical_chroma(u, v, stride, x, kind);
     } else {
-        simd::horizontal_chroma(u, v, at, step, kind);
+        simd::horizontal_chroma(u, v, stride, x, kind);
     }
     #[cfg(not(feature = "simd"))]
     for plane in [u, v] {
         for i in 0..8 {
-            filter_position(plane, at + i * along, step, kind);
+            if vertical {
+                filter_position(plane, i * stride + x, 1, kind);
+            } else {
+                filter_position(plane, 4 * stride + x + i, stride, kind);
+            }
         }
     }
 }
@@ -406,6 +451,14 @@ fn chroma_edge(u: &mut [u8], v: &mut [u8], at: usize, step: usize, along: usize,
 pub fn filter_row(pic: &mut Picture, mb_y: usize, row: &[MbFilter], simple: bool) {
     let stride = pic.width;
     let uv_stride = pic.width / 2;
+    // the rows the edges touch: those of the macroblock row for vertical
+    // edges, and for a horizontal edge `dy` rows down it the four either
+    // side (reaching into the row above for the macroblock edge)
+    let (top, uv_top) = (16 * mb_y, 8 * mb_y);
+    let luma_rows = top * stride..(top + 16) * stride;
+    let chroma_rows = uv_top * uv_stride..(uv_top + 8) * uv_stride;
+    let luma_around = |dy: usize| (top + dy - 4) * stride..(top + dy + 4) * stride;
+    let chroma_around = |dy: usize| (uv_top + dy - 4) * uv_stride..(uv_top + dy + 4) * uv_stride;
     for (mb_x, f) in row.iter().enumerate() {
         if f.level == 0 {
             continue;
@@ -415,39 +468,38 @@ pub fn filter_row(pic: &mut Picture, mb_y: usize, row: &[MbFilter], simple: bool
         let hev = f.hev_threshold as i32;
         let mb_limit = (level + 2) * 2 + interior;
         let sub_limit = level * 2 + interior;
-        let y0 = mb_y * 16 * stride + mb_x * 16;
-        let c0 = mb_y * 8 * uv_stride + mb_x * 8;
+        let (x, uv_x) = (16 * mb_x, 8 * mb_x);
         let (mb_kind, inner_kind) = if simple {
             (Kind::Simple { edge_limit: mb_limit }, Kind::Simple { edge_limit: sub_limit })
         } else {
             (Kind::Mb { edge_limit: mb_limit, interior, hev }, Kind::Inner { edge_limit: sub_limit, interior, hev })
         };
         if mb_x > 0 {
-            luma_edge(&mut pic.y, y0, 1, stride, mb_kind);
+            luma_edge(&mut pic.y[luma_rows.clone()], stride, x, true, mb_kind);
             if !simple {
-                chroma_edge(&mut pic.u, &mut pic.v, c0, 1, uv_stride, mb_kind);
+                chroma_edge(&mut pic.u[chroma_rows.clone()], &mut pic.v[chroma_rows.clone()], uv_stride, uv_x, true, mb_kind);
             }
         }
         if f.inner {
-            for x in [4, 8, 12] {
-                luma_edge(&mut pic.y, y0 + x, 1, stride, inner_kind);
+            for dx in [4, 8, 12] {
+                luma_edge(&mut pic.y[luma_rows.clone()], stride, x + dx, true, inner_kind);
             }
             if !simple {
-                chroma_edge(&mut pic.u, &mut pic.v, c0 + 4, 1, uv_stride, inner_kind);
+                chroma_edge(&mut pic.u[chroma_rows.clone()], &mut pic.v[chroma_rows.clone()], uv_stride, uv_x + 4, true, inner_kind);
             }
         }
         if mb_y > 0 {
-            luma_edge(&mut pic.y, y0, stride, 1, mb_kind);
+            luma_edge(&mut pic.y[luma_around(0)], stride, x, false, mb_kind);
             if !simple {
-                chroma_edge(&mut pic.u, &mut pic.v, c0, uv_stride, 1, mb_kind);
+                chroma_edge(&mut pic.u[chroma_around(0)], &mut pic.v[chroma_around(0)], uv_stride, uv_x, false, mb_kind);
             }
         }
         if f.inner {
-            for y in [4, 8, 12] {
-                luma_edge(&mut pic.y, y0 + y * stride, stride, 1, inner_kind);
+            for dy in [4, 8, 12] {
+                luma_edge(&mut pic.y[luma_around(dy)], stride, x, false, inner_kind);
             }
             if !simple {
-                chroma_edge(&mut pic.u, &mut pic.v, c0 + 4 * uv_stride, uv_stride, 1, inner_kind);
+                chroma_edge(&mut pic.u[chroma_around(4)], &mut pic.v[chroma_around(4)], uv_stride, uv_x, false, inner_kind);
             }
         }
     }
@@ -480,7 +532,7 @@ mod tests {
             row[4..].fill(106);
         }
         let kind = Kind::Mb { edge_limit: 30, interior: 10, hev: 3 };
-        luma_edge(&mut buf, 4, 1, 8, kind);
+        luma_edge(&mut buf, 8, 4, true, kind);
         let row = &buf[..8];
         assert!(row.windows(2).all(|w| w[0] <= w[1]), "{row:?}");
         assert!(row[3] > 100 && row[4] < 106, "{row:?}");
@@ -490,7 +542,7 @@ mod tests {
             row[4..].fill(200);
         }
         let before = hard.clone();
-        luma_edge(&mut hard, 4, 1, 8, kind);
+        luma_edge(&mut hard, 8, 4, true, kind);
         assert_eq!(hard, before);
     }
 
@@ -523,22 +575,28 @@ mod tests {
             let hev = (rand() % 4) as i32;
             let kinds = [Kind::Mb { edge_limit: (level + 2) * 2 + interior, interior, hev }, Kind::Inner { edge_limit: level * 2 + interior, interior, hev }, Kind::Simple { edge_limit: level * 2 + interior }];
             for kind in kinds {
-                for (step, along, at) in [(1, stride, 4 * stride + 12), (stride, 1, 12 * stride + 4)] {
+                // a vertical edge before column 12 down rows 4 .. 20 (8 ..
+                // 16 in chroma), a horizontal one before row 12 along
+                // columns 4 .. 20 (8 .. 16)
+                for vertical in [true, false] {
+                    let (rows, x, step, along) = if vertical { (4..20, 12, 1, stride) } else { (8..16, 4, stride, 1) };
+                    let at = |rows: std::ops::Range<usize>, x: usize| if vertical { rows.start * stride + x } else { 12 * stride + x };
                     let mut a = y.clone();
                     let mut b = y.clone();
-                    luma_edge(&mut a, at, step, along, kind);
+                    luma_edge(&mut a[rows.start * stride..rows.end * stride], stride, x, vertical, kind);
                     for i in 0..16 {
-                        filter_position(&mut b, at + i * along, step, kind);
+                        filter_position(&mut b, at(rows.clone(), x) + i * along, step, kind);
                     }
-                    assert_eq!(a, b, "luma {kind:?} step {step}");
+                    assert_eq!(a, b, "luma {kind:?} vertical {vertical}");
+                    let (rows, x) = (8..16, if vertical { 12 } else { 8 });
                     let (mut au, mut av) = (u.clone(), v.clone());
                     let (mut bu, mut bv) = (u.clone(), v.clone());
-                    chroma_edge(&mut au, &mut av, at, step, along, kind);
+                    chroma_edge(&mut au[rows.start * stride..rows.end * stride], &mut av[rows.start * stride..rows.end * stride], stride, x, vertical, kind);
                     for i in 0..8 {
-                        filter_position(&mut bu, at + i * along, step, kind);
-                        filter_position(&mut bv, at + i * along, step, kind);
+                        filter_position(&mut bu, at(rows.clone(), x) + i * along, step, kind);
+                        filter_position(&mut bv, at(rows.clone(), x) + i * along, step, kind);
                     }
-                    assert_eq!((au, av), (bu, bv), "chroma {kind:?} step {step}");
+                    assert_eq!((au, av), (bu, bv), "chroma {kind:?} vertical {vertical}");
                 }
             }
         }
