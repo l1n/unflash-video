@@ -12,7 +12,7 @@
   <div class="brand" title="Unflash: WebGPU and WebAssembly">Unflash</div>
   <button id="btnHome" title="Show or hide the guide (it opens beside your work, and Esc closes it)">Guide</button>
   <button id="btnChanges" title="What has changed in Unflash, newest first">What's new<span id="changesDot" class="new-dot hidden"></span></button>
-  <label class="filebtn primary"><input type="file" id="fileInput" accept="video/*,.mp4,.m4v,.mov,.mkv,.webm,.3gp">Open video…</label>
+  <label class="filebtn primary"><input type="file" id="fileInput" autocomplete="off" accept="video/*,.mp4,.m4v,.mov,.mkv,.webm,.3gp">Open video…</label>
   <div id="videoInfo" class="video-info"></div>
   <div class="spacer"></div>
   <label class="profile-label">Profile
@@ -31,7 +31,7 @@
     <div id="projectMenu" class="menu project-menu hidden">
       <p class="fps-note">Sections, marks and the scan are kept in this browser as you work, and come back when you open the same video here again. A project file keeps them anywhere: another browser or computer, or after this site's data is cleared.</p>
       <button id="btnProjectSave" class="small" title="Download the project as a file (JSON) you can load later">save a project file…</button>
-      <label class="filebtn small" title="Load a project file saved for the open video: its sections and marks replace the ones here">load a project file…<input type="file" id="projectInput" accept=".json,application/json"></label>
+      <label class="filebtn small" title="Load a project file saved for the open video: its sections and marks replace the ones here">load a project file…<input type="file" id="projectInput" autocomplete="off" accept=".json,application/json"></label>
       <p id="projectNote" class="fps-note"></p>
     </div>
   </span>
@@ -309,6 +309,7 @@
       <button id="btnDoExport" class="primary">Export</button>
       <button id="btnVerifyExport" disabled>Verify exported file</button>
       <a id="exportDownload" class="button hidden" download>Download</a>
+      <label class="button small filebtn" title="Check a file you saved earlier, an export of this video say: every frame of it is scanned with the current profile">verify a saved file…<input type="file" id="verifyFileInput" autocomplete="off" accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.mkv,.webm" hidden></label>
       <button id="btnCloseExport" class="small">close</button>
     </div>
     <div id="exportResult" class="scrollbox"></div>

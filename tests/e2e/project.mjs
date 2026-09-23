@@ -101,6 +101,38 @@ try {
   assert(await page.evaluate(() => window.__unflash.currentSection().prepared), 'the loaded section prepares when opened');
   await page.evaluate(() => window.__unflash.state.project.save());
 
+  // an export, kept on disk: after a reload the same video (a new copy of it)
+  // finds it again, to download or verify, as does a file saved elsewhere
+  await page.click('#btnExport');
+  await page.waitForFunction(() => !document.querySelector('#exportModal').classList.contains('hidden') && !document.querySelector('#btnDoExport').disabled, null, { timeout: 30000 });
+  results.beforeExport = await page.textContent('#exportResult');
+  assert(/An export stays here/.test(results.beforeExport) && (await page.$eval('#btnVerifyExport', (b) => b.disabled)), 'before an export the dialog says where one will be: ' + results.beforeExport);
+  await page.click('#btnDoExport');
+  await jobStarted();
+  await jobDone();
+  await page.waitForFunction(() => !document.querySelector('#btnVerifyExport').disabled, null, { timeout: 30000 });
+  const exportedBytes = await page.evaluate(() => window.__unflash.state.exportBlob.size);
+  await page.click('#btnCloseExport');
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+  await openClip('flash.webm', clip);
+  await page.click('#btnExport');
+  await page.waitForFunction(() => !document.querySelector('#exportModal').classList.contains('hidden'), null, { timeout: 30000 });
+  results.kept = { text: await page.textContent('#exportResult'), verify: !(await page.$eval('#btnVerifyExport', (b) => b.disabled)), download: !(await page.$eval('#exportDownload', (a) => a.classList.contains('hidden'))), bytes: await page.evaluate(() => window.__unflash.state.exportBlob && window.__unflash.state.exportBlob.size) };
+  console.log('after a reload:', JSON.stringify(results.kept));
+  assert(results.kept.verify && results.kept.download && results.kept.bytes === exportedBytes && /The export made at .* is still here/.test(results.kept.text), 'the export comes back with the video after a reload: ' + JSON.stringify(results.kept));
+  await page.click('#btnVerifyExport');
+  await jobStarted();
+  await jobDone();
+  await page.waitForFunction(() => /frames re-scanned/.test(document.querySelector('#exportResult').textContent), null, { timeout: 60000 });
+  // a file saved elsewhere, checked from the dialog
+  await page.setInputFiles('#verifyFileInput', path.join(MEDIA, 'steady.mp4'));
+  await jobStarted();
+  await jobDone();
+  await page.waitForFunction(() => /steady\.mp4: .*Passes WCAG/.test(document.querySelector('#exportResult').textContent), null, { timeout: 60000 });
+  await page.click('#btnCloseExport');
+  await page.evaluate(() => window.__unflash.state.project.save());
+
   // the same video again, as a new copy: its project is found by name and size
   await openClip('flash.webm', clip);
   results.reopen = { sections: await sectionsNow(), toast: await page.textContent('#toast') };
@@ -115,6 +147,13 @@ try {
   await page.setInputFiles('#projectInput', { name: 'flash.unflash.json', mimeType: 'application/json', buffer: Buffer.from(text) });
   await page.waitForFunction(() => !document.querySelector('#banner').classList.contains('hidden'), null, { timeout: 10000 });
   results.mismatch = await bannerText();
+  // another video opened: the export kept for the first is removed from the disk
+  results.leftOver = await page.evaluate(async () => {
+    const names = [];
+    for await (const n of (await navigator.storage.getDirectory()).keys()) if (n.startsWith('unflash-export-')) names.push(n);
+    return names;
+  });
+  assert(results.leftOver.length === 0, "another video's opening removes the kept export: " + results.leftOver);
   console.log('mismatch:', results.mismatch);
   assert(/The project is for flash\.webm \(300 frames/.test(results.mismatch) && (await sectionsNow()).length === 0, 'a project for another video is turned down: ' + results.mismatch);
   // and a file that is not a project

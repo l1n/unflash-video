@@ -6,7 +6,7 @@ const SEEN_KEY = 'unflash:changesSeen';
 /** Settings earlier versions kept: a browser that has them has been here before. */
 const OLD_KEYS = ['unflash:auto', 'unflash:playerSize', 'unflash:thumbSize', 'unflash.alerts'];
 
-function escapeHtml(s) {
+export function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 

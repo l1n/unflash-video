@@ -213,7 +213,8 @@ frame.
    is copied from the source as it is, and so is the audio, unless frames
    are held (**E**): then the sound is re-encoded with a second of silence
    under each held frame (see below). **Verify** re-scans the exported
-   file with the same detector.
+   file with the same detector; **verify a saved file…** does the same
+   for a file you saved earlier.
 
 **Auto-fix** (tick it in the header; off unless you do) does steps 2 to 7
 unattended: it softens stripes, tries the fewest removals (which end by
@@ -835,7 +836,10 @@ An export is streamed to disk wherever the browser allows it: to a file of
 your choosing (Chrome, Edge, Opera) or to the browser's private storage
 (Chrome, Firefox), from which it is offered for download. Only where neither
 exists (Safari) is it assembled in memory, and then only up to a size the
-device can hold; a larger one is left for you to export by hand. The
+device can hold; a larger one is left for you to export by hand. An export
+in private storage is kept until another video is opened (or the next
+export replaces it): open the same video again after a reload and it is
+offered again, to download or verify. The
 detector's clock is 32-bit microseconds with wrapping ages, so a film longer
 than the 71 minutes at which it wraps is analysed like any other. With a
 scan in hand, the live monitor reads the scan's per-frame numbers at the

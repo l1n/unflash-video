@@ -149,14 +149,26 @@ export function privateStorageAvailable() {
 
 const PRIVATE_PREFIX = 'unflash-export-';
 
+/** A short tag for the video an export was made from (its project key: name, size, modified time). */
+function ownerTag(key) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
 /**
  * A sink in the browser's private storage (the origin-private file system):
  * on disk, without a dialog or a user gesture, so an export need not fit in
  * memory. Chrome and Firefox; Safari's private storage cannot be written from
  * the page, so it falls back. Earlier exports there are removed first. Null
  * when unavailable or when `bytesNeeded` would not fit the storage quota.
+ * `owner` (the video's project key) names it, so that it can be found again
+ * when the same video is opened after the page is reloaded.
  */
-export async function privateFileSink(bytesNeeded = 0) {
+export async function privateFileSink(bytesNeeded = 0, owner = '') {
   try {
     if (!privateStorageAvailable()) return null;
     const root = await navigator.storage.getDirectory();
@@ -165,7 +177,7 @@ export async function privateFileSink(bytesNeeded = 0) {
       const { quota, usage } = await navigator.storage.estimate();
       if (quota && bytesNeeded && quota - (usage || 0) < bytesNeeded * 1.2) return null;
     }
-    const handle = await root.getFileHandle(`${PRIVATE_PREFIX}${Date.now()}.mp4`, { create: true });
+    const handle = await root.getFileHandle(`${PRIVATE_PREFIX}${ownerTag(owner)}-${Date.now()}.mp4`, { create: true });
     const writable = await handle.createWritable({ keepExistingData: false });
     return { sink: new FileSink(writable), handle, private: true };
   } catch (e) {
@@ -173,16 +185,45 @@ export async function privateFileSink(bytesNeeded = 0) {
   }
 }
 
-/** Remove every export written to private storage. */
-export async function discardPrivateExport(root = null) {
+/**
+ * Remove every export written to private storage, but the one made from the
+ * video `keep` (a project key), if any: a reload that opens the same video
+ * again finds its export where it was.
+ */
+export async function discardPrivateExport(root = null, keep = null) {
   try {
     if (!privateStorageAvailable()) return;
     const dir = root || (await navigator.storage.getDirectory());
+    const kept = keep ? `${PRIVATE_PREFIX}${ownerTag(keep)}-` : null;
     const names = [];
-    for await (const name of dir.keys()) if (name.startsWith(PRIVATE_PREFIX)) names.push(name);
+    for await (const name of dir.keys()) if (name.startsWith(PRIVATE_PREFIX) && !(kept && name.startsWith(kept))) names.push(name);
     for (const name of names) await dir.removeEntry(name).catch(() => {});
   } catch (e) {
     /* nothing to remove, or no private storage */
+  }
+}
+
+/**
+ * The export in private storage made from the video `owner` (a project key):
+ * { file, madeAt } of the latest, or null. (One the page went away in the
+ * middle of is empty: what a writable writes lands in the file only when it
+ * is closed.)
+ */
+export async function findPrivateExport(owner) {
+  try {
+    if (!privateStorageAvailable() || !owner) return null;
+    const dir = await navigator.storage.getDirectory();
+    const prefix = `${PRIVATE_PREFIX}${ownerTag(owner)}-`;
+    let best = null;
+    for await (const [name, handle] of dir.entries()) {
+      const m = name.startsWith(prefix) ? /-(\d+)\.mp4$/.exec(name) : null;
+      if (m && (!best || +m[1] > best.madeAt)) best = { handle, madeAt: +m[1] };
+    }
+    if (!best) return null;
+    const file = await best.handle.getFile();
+    return file.size > 0 ? { file, madeAt: best.madeAt } : null;
+  } catch (e) {
+    return null;
   }
 }
 

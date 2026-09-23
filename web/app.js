@@ -8,12 +8,12 @@ import { createDetector, gpuAdapter } from './detector.js';
 import { profile } from './profile.js';
 import { scanMovie, scanChunks, CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, BLEND_DEFAULT } from './analysis.js';
 import { Project, projectKey, dropCaches, lastSavedAt, projectFileText, readProjectFile, matchVideo } from './project.js';
-import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
+import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, findPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
 import { SectionSound } from './sound.js';
 import { FrameViewer } from './viewer.js';
 import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notifyState, systemNotify, titleProgress, titleMark } from './alerts.js';
-import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay } from './changes.js';
+import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay, escapeHtml } from './changes.js';
 import { TourGuide, TOURS } from './tours.js';
 import { watchPage, noteError, noteJob, noteFileName, debugReport } from './debug.js';
 
@@ -539,6 +539,8 @@ async function boot() {
   setStatus([`ready · WebGPU ${hasGpu ? 'yes' : 'no'} · WebCodecs ${hasCodecs ? 'yes' : 'no'}`]);
   $('fileInput').addEventListener('change', (e) => {
     const f = e.target.files && e.target.files[0];
+    // (emptied, so that the same file picked again opens again)
+    e.target.value = '';
     if (f) openFile(f);
   });
   // a file dropped anywhere on the page opens like one picked with the button
@@ -610,6 +612,11 @@ async function boot() {
   $('btnCloseExport').addEventListener('click', () => $('exportModal').classList.add('hidden'));
   $('btnDoExport').addEventListener('click', doExport);
   $('btnVerifyExport').addEventListener('click', verifyExport);
+  $('verifyFileInput').addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = '';
+    verifySavedFile(f);
+  });
   $('exportQuality').addEventListener('input', () => ($('exportQualityText').textContent = $('exportQuality').value));
   $('exportQuality').addEventListener('change', () => state.movie && renderExportChoice());
   $('exportCodec').addEventListener('change', () => renderExportChoice());
@@ -669,9 +676,11 @@ async function openFile(file) {
       onProgress: (p, container) => progress(0.05 + 0.3 * p, container === 'matroska' ? `reading through the file for its frames (MKV / WebM keep no index): ${Math.round(p * 100)}%` : 'reading the index'),
     });
     // the last file, its unattended run and its export go only now that
-    // the new one has opened
+    // the new one has opened (an export of this same video, kept on disk,
+    // stays: it is offered again below)
     if (state.movie) state.movie.close();
-    forgetExport();
+    const key = projectKey(file);
+    forgetExport(exportOwner(key));
     if (state.project) for (const s of state.project.sections) dropCaches(s);
     state.lastScan = null;
     state.lastVerify = null;
@@ -681,8 +690,8 @@ async function openFile(file) {
     movie.forceBuiltIn = builtInSetting();
     state.decode = await movie.decoderSupport();
     progress(0.4, 'starting the detector');
-    const key = projectKey(file);
     const project = await Project.load(key, movie.bounds, movie.keyframes);
+    await restoreExport(exportOwner(key), movie);
     state.project = project;
     if (project.scan && project.scan.trace) state.scanTrace = project.scan.trace;
     $('profileSel').value = project.profile;
@@ -3388,9 +3397,13 @@ async function openExport() {
   if (cands.some((c) => c.label === previous)) sel.value = previous;
   await renderExportChoice();
   $('btnDoExport').disabled = !cands.length || !state.decode.supported;
-  if (!state.exportBlob) $('exportResult').innerHTML = '';
+  if (!state.exportBlob) {
+    const kept = privateStorageAvailable() && !window.showSaveFilePicker;
+    $('exportResult').innerHTML = `<p class="hint">An export stays here, to download or verify, until another video is opened${kept ? ', and comes back with this video after the page is reloaded' : ''}. A file you saved can be checked with <b>verify a saved file…</b>.</p>`;
+  }
   $('exportDownload').classList.toggle('hidden', !(state.exportBlob && $('exportDownload').getAttribute('href')));
   $('btnVerifyExport').disabled = !state.exportBlob;
+  $('btnVerifyExport').title = state.exportBlob ? 'Scan the exported file again, every frame, with the current profile' : 'Export first (or check a file you saved with "verify a saved file…")';
   $('exportModal').classList.remove('hidden');
 }
 
@@ -3416,7 +3429,7 @@ async function doExport() {
   // storage on disk where it has that, memory as the last resort
   let sinkInfo = await pickSaveSink(exportName(movie));
   if (sinkInfo && sinkInfo.cancelled) return;
-  if (!sinkInfo) sinkInfo = await privateFileSink(estimateExportBytes(movie, quality, state.exportPlan));
+  if (!sinkInfo) sinkInfo = await privateFileSink(estimateExportBytes(movie, quality, state.exportPlan), exportOwner(state.project.key));
   $('exportModal').classList.add('hidden');
   const res = await runJob('Exporting', async (progress, cancelled) =>
     exportMovie(state.env, movie, state.project, {
@@ -3578,8 +3591,17 @@ function showExportResult(res, name) {
   a.download = name;
 }
 
-/** Drop the last file's unattended run and export, object URLs included. */
-function forgetExport() {
+/** Whose an export kept on disk is: the video's name and size, as a project is found again whatever its modified time. */
+function exportOwner(key) {
+  return key.replace(/:[^:]*$/, '');
+}
+
+/**
+ * Drop the last file's unattended run and export, object URLs included; an
+ * export in private storage made from the video `keep` (exportOwner) stays
+ * on disk.
+ */
+function forgetExport(keep = null) {
   if (state.auto && state.auto.blobUrl) URL.revokeObjectURL(state.auto.blobUrl);
   state.auto = null;
   renderAuto();
@@ -3591,7 +3613,36 @@ function forgetExport() {
   }
   a.classList.add('hidden');
   $('btnVerifyExport').disabled = true;
-  discardPrivateExport();
+  discardPrivateExport(null, keep);
+}
+
+/**
+ * An export of this video from before the page was reloaded, kept in private
+ * storage: offered again, to download or verify, as if just made.
+ */
+async function restoreExport(key, movie) {
+  const found = await findPrivateExport(key);
+  if (!found) return;
+  state.exportBlob = found.file;
+  const a = $('exportDownload');
+  a.href = URL.createObjectURL(found.file);
+  a.download = exportName(movie);
+  a.classList.remove('hidden');
+  $('btnVerifyExport').disabled = false;
+  const at = new Date(found.madeAt);
+  const when = at.toDateString() === new Date().toDateString() ? at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : at.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+  $('exportResult').innerHTML = `<p>The export made at ${when} (${fmtBytes(found.file.size)}) is still here, kept in this browser's storage: download it, or verify it. Exporting again replaces it.</p>`;
+}
+
+/** Check a file the user saved (an earlier export, say): scanned like the export, with the current profile. */
+async function verifySavedFile(file) {
+  if (!file || busy('verify a file')) return;
+  noteFileName(file.name);
+  $('exportModal').classList.add('hidden');
+  const v = await verifyBlob(file);
+  $('exportModal').classList.remove('hidden');
+  if (!v) return;
+  $('exportResult').innerHTML += `<p>${escapeHtml(file.name)}: ${v.html}</p>`;
 }
 
 async function verifyExport() {
@@ -3817,7 +3868,7 @@ async function autopilot({ rescan = false } = {}) {
     // only when it will fit
     const plan = await exportPlan(state.env, movie, project, { extS: EXT_S, codec: cands[0].config.codec, smartCut: smartCutSetting(), parallel: parallelSetting() });
     const need = estimateExportBytes(movie, quality, plan);
-    const sinkInfo = await privateFileSink(need);
+    const sinkInfo = await privateFileSink(need, exportOwner(project.key));
     if (!sinkInfo && need > memoryExportLimit()) {
       autoStep(auto, 'export', 'skipped', `about ${fmtBytes(need)}: more than this browser can build in memory`);
       autoStep(auto, 'verify', 'skipped');
