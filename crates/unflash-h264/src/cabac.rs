@@ -29,9 +29,117 @@ const NEXT_STATE: [u8; 256] = {
     t
 };
 
+/// The arithmetic decoding engine's registers (9.3.1.2), apart from the
+/// context variables: small and `Copy`, so that a hot loop can hold them in
+/// machine registers (`residual_block` works on a copy and writes it back;
+/// through `&mut self` every bin stored them and loaded them again).
+#[derive(Clone, Copy)]
+struct Engine {
+    range: u32,
+    /// codIOffset followed by the next `bits` bits of the stream, not yet
+    /// shifted into it: renormalising takes bits from there by counting
+    /// down, and four more bytes come in when fewer than eight are left, so
+    /// a bin costs no data-dependent branch (see `decision`)
+    value: u64,
+    bits: u32,
+    /// the next byte to fetch
+    pos: usize,
+}
+
+impl Engine {
+    /// Four more bytes of the stream below the bits `value` holds.
+    #[inline(always)]
+    fn refill(&mut self, data: &[u8]) {
+        self.value = (self.value << 32) | word(data, self.pos) as u64;
+        self.pos += 4;
+        self.bits += 32;
+    }
+
+    /// 9.3.3.2.1 DecodeDecision with context state `state`, without a
+    /// branch on the bin: the LPS path is a mask, the new range and state
+    /// come from selects and a table, and renormalisation only counts down
+    /// the bits held after codIOffset (a mispredicted MPS/LPS branch cost
+    /// more than the rest of a bin). The caller refills when `bits` < 8.
+    #[inline(always)]
+    fn bin(&mut self, state: &mut u8) -> u32 {
+        let s = *state as usize;
+        let lps = LPS_RANGE[((self.range as usize) & 0xC0) << 1 | s] as u32;
+        let rmps = self.range - lps;
+        let scaled = (rmps as u64) << self.bits;
+        let lps_path = (self.value >= scaled) as u32;
+        self.value -= scaled & (lps_path as u64).wrapping_neg();
+        let range = rmps ^ ((rmps ^ lps) & lps_path.wrapping_neg());
+        *state = NEXT_STATE[(lps_path as usize) << 7 | s];
+        // renormalise: codIRange back to nine bits, the bits after codIOffset shifted in
+        let n = range.leading_zeros() - 23;
+        self.range = range << n;
+        self.bits -= n;
+        (s as u32 & 1) ^ lps_path
+    }
+
+    /// 9.3.3.2.3 DecodeBypass (the caller refills when `bits` < 8).
+    #[inline(always)]
+    fn bypass_bin(&mut self) -> u32 {
+        self.bits -= 1;
+        let scaled = (self.range as u64) << self.bits;
+        let bin = (self.value >= scaled) as u64;
+        self.value -= scaled & bin.wrapping_neg();
+        bin as u32
+    }
+
+    /// A decision in a loop that holds the engine in registers.
+    #[inline(always)]
+    fn decision(&mut self, state: &mut u8, data: &[u8]) -> u32 {
+        let b = self.bin(state);
+        if self.bits < 8 {
+            self.refill(data);
+        }
+        b
+    }
+
+    /// A bypass bin in a loop that holds the engine in registers.
+    #[inline(always)]
+    fn bypass(&mut self, data: &[u8]) -> u32 {
+        let b = self.bypass_bin();
+        if self.bits < 8 {
+            self.refill(data);
+        }
+        b
+    }
+}
+
+/// The four bytes of `data` at `pos`, big-endian (zeros past its end).
+/// Cold: once every few bins, and kept away from the bins' code.
+#[cold]
+#[inline(never)]
+fn word(data: &[u8], pos: usize) -> u32 {
+    match data.get(pos..pos + 4) {
+        Some(b) => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+        None => (0..4).fold(0u32, |w, k| (w << 8) | data.get(pos + k).copied().unwrap_or(0) as u32),
+    }
+}
+
+/// Table 9-34: the context index offsets of significant_coeff_flag,
+/// last_significant_coeff_flag and coeff_abs_level_minus1 by frame / field
+/// macroblock and ctxBlockCat.
+const RESIDUAL_BASES: [[(u16, u16, u16); 6]; 2] = [
+    [(105, 166, 227), (120, 181, 237), (134, 195, 247), (149, 210, 257), (152, 213, 266), (402, 417, 426)],
+    [(277, 338, 227), (292, 353, 237), (306, 367, 247), (321, 382, 257), (324, 385, 266), (436, 451, 426)],
+];
+
+/// coeff_abs_level_minus1's contexts as a state machine over the levels
+/// decoded so far in a block (9.3.3.1.3, as ffmpeg keeps it): nodes 0..3
+/// are 0..3+ levels of 1 and none larger, 4..7 are 1..4+ larger ones. The
+/// ctxIdxInc of the first bin, of the others (chroma DC's row second),
+/// and the next node after a level of 1 / a larger one.
+const LEVEL1_INC: [u8; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
+const LEVEL_GT1_INC: [[u8; 8]; 2] = [[5, 5, 5, 5, 6, 7, 8, 9], [5, 5, 5, 5, 6, 7, 8, 8]];
+const LEVEL_NEXT: [[u8; 8]; 2] = [[1, 2, 3, 3, 4, 5, 6, 7], [4, 4, 4, 4, 5, 6, 7, 7]];
+
 /// ctxIdxInc of significant_coeff_flag / last_significant_coeff_flag for
-/// the block categories where it is the scan position.
-const CTX_IDENTITY: [u8; 63] = {
+/// the block categories where it is the scan position (chroma DC's
+/// Min(i, 2) too, with four coefficients in 4:2:0).
+const CTX_POSITION: [u8; 63] = {
     let mut t = [0u8; 63];
     let mut i = 0;
     while i < 63 {
@@ -40,20 +148,10 @@ const CTX_IDENTITY: [u8; 63] = {
     }
     t
 };
-/// The same for chroma DC: Min(i, 2).
-const CTX_CHROMA_DC: [u8; 3] = [0, 1, 2];
 
 pub struct Cabac<'a> {
     data: &'a [u8],
-    /// the next byte to fetch
-    pos: usize,
-    range: u32,
-    /// codIOffset followed by the next `bits` bits of the stream, not yet
-    /// shifted into it: renormalising takes bits from there by counting
-    /// down, and four more bytes come in when fewer than eight are left, so
-    /// a bin costs no data-dependent branch (see `decision`)
-    value: u64,
-    bits: u32,
+    eng: Engine,
     /// (pStateIdx << 1) | valMPS
     ctx: [u8; 1024],
 }
@@ -62,7 +160,7 @@ impl<'a> Cabac<'a> {
     /// Start decoding slice data at byte `byte_pos` of `data`, with the
     /// context variables initialised for the slice (9.3.1.1, 9.3.1.2).
     pub fn new(data: &'a [u8], byte_pos: usize, is_i_slice: bool, cabac_init_idc: u32, slice_qp: i32) -> Result<Cabac<'a>> {
-        let mut c = Cabac { data, pos: byte_pos, range: 510, value: 0, bits: 0, ctx: [0; 1024] };
+        let mut c = Cabac { data, eng: Engine { range: 510, value: 0, bits: 0, pos: byte_pos }, ctx: [0; 1024] };
         let qp = slice_qp.clamp(0, 51);
         let table: &[[i8; 2]; 1024] = if is_i_slice { &CABAC_INIT_I } else { &CABAC_INIT_PB[cabac_init_idc as usize] };
         for i in 0..1024 {
@@ -77,14 +175,12 @@ impl<'a> Cabac<'a> {
     /// (Re-)initialise the arithmetic decoding engine at a byte position
     /// (9.3.1.2; after PCM samples), keeping the context variables.
     pub fn restart(&mut self, byte_pos: usize) -> Result<()> {
-        self.pos = byte_pos;
-        self.range = 510;
-        self.value = 0;
-        self.bits = 0;
-        self.refill();
+        let e = &mut self.eng;
+        *e = Engine { range: 510, value: 0, bits: 0, pos: byte_pos };
+        e.refill(self.data);
         // codIOffset is the first nine bits
-        self.bits -= 9;
-        if self.value >> self.bits >= 510 {
+        e.bits -= 9;
+        if e.value >> e.bits >= 510 {
             return Err(Error::Bitstream("bad CABAC initialisation"));
         }
         Ok(())
@@ -95,74 +191,53 @@ impl<'a> Cabac<'a> {
     /// every bit before it (9.3.1.2), the ones it has fetched ahead of that
     /// are given back.
     pub fn byte_pos(&self) -> usize {
-        self.pos - (self.bits / 8) as usize
+        self.eng.pos - (self.eng.bits / 8) as usize
     }
 
     pub fn data(&self) -> &'a [u8] {
         self.data
     }
 
-    /// Four more bytes of the stream (zeros past its end) below the bits
-    /// `value` holds.
+    /// Four more bytes of the stream, out of line: a call on `self` is
+    /// the smallest code at the many places a bin is decoded.
+    #[cold]
     #[inline(never)]
     fn refill(&mut self) {
-        let w = match self.data.get(self.pos..self.pos + 4) {
-            Some(b) => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
-            None => (0..4).fold(0u32, |w, k| (w << 8) | self.data.get(self.pos + k).copied().unwrap_or(0) as u32),
-        };
-        self.pos += 4;
-        self.value = (self.value << 32) | w as u64;
-        self.bits += 32;
+        self.eng.refill(self.data);
     }
 
-    /// 9.3.3.2.1 DecodeDecision, without a branch on the bin: the LPS path
-    /// is a mask, the new range and state come from selects and a table,
-    /// and renormalisation only counts down the bits held after codIOffset
-    /// (a mispredicted MPS/LPS branch cost more than the rest of a bin).
+    /// 9.3.3.2.1 DecodeDecision with context `ctx_idx`.
     #[inline]
     pub fn decision(&mut self, ctx_idx: usize) -> u32 {
-        let s = self.ctx[ctx_idx] as usize;
-        let lps = LPS_RANGE[((self.range as usize) & 0xC0) << 1 | s] as u32;
-        let rmps = self.range - lps;
-        let scaled = (rmps as u64) << self.bits;
-        let lps_path = (self.value >= scaled) as u32;
-        self.value -= scaled & (lps_path as u64).wrapping_neg();
-        let range = rmps ^ ((rmps ^ lps) & lps_path.wrapping_neg());
-        self.ctx[ctx_idx] = NEXT_STATE[(lps_path as usize) << 7 | s];
-        // renormalise: codIRange back to nine bits, the bits after codIOffset shifted in
-        let n = range.leading_zeros() - 23;
-        self.range = range << n;
-        self.bits -= n;
-        if self.bits < 8 {
+        let b = self.eng.bin(&mut self.ctx[ctx_idx]);
+        if self.eng.bits < 8 {
             self.refill();
         }
-        (s as u32 & 1) ^ lps_path
+        b
     }
 
     /// 9.3.3.2.3 DecodeBypass.
     #[inline]
     pub fn bypass(&mut self) -> u32 {
-        self.bits -= 1;
-        let scaled = (self.range as u64) << self.bits;
-        let bin = (self.value >= scaled) as u64;
-        self.value -= scaled & bin.wrapping_neg();
-        if self.bits < 8 {
+        let b = self.eng.bypass_bin();
+        if self.eng.bits < 8 {
             self.refill();
         }
-        bin as u32
+        b
     }
 
     /// 9.3.3.2.4 DecodeTerminate.
     pub fn terminate(&mut self) -> u32 {
-        self.range -= 2;
-        let scaled = (self.range as u64) << self.bits;
-        if self.value >= scaled {
+        let e = &mut self.eng;
+        e.range -= 2;
+        let scaled = (e.range as u64) << e.bits;
+        if e.value >= scaled {
             return 1;
         }
-        if self.range < 256 {
-            self.range <<= 1;
-            self.bits -= 1;
-            if self.bits < 8 {
+        if e.range < 256 {
+            e.range <<= 1;
+            e.bits -= 1;
+            if e.bits < 8 {
                 self.refill();
             }
         }
@@ -412,86 +487,83 @@ impl<'a> Cabac<'a> {
     /// coefficients (16, 15, 16, 4, 15, 64). Levels are written to
     /// `coeffs[start + i]` in scan order (`start` = 1 for AC blocks).
     /// Returns the number of non-zero levels.
+    ///
+    /// The engine works on a copy of its registers here, so that they stay
+    /// in machine registers across the block's bins.
     pub fn residual_block(&mut self, cat: usize, max: usize, start: usize, coeffs: &mut [i32], field: bool) -> Result<u32> {
-        // Table 9-34: field macroblocks use their own significance contexts
-        let (sig0, last0) = if field { (277, 338) } else { (105, 166) };
-        let (sig_base, last_base, abs_base) = match cat {
-            0 => (sig0, last0, 227),
-            1 => (sig0 + 15, last0 + 15, 227 + 10),
-            2 => (sig0 + 29, last0 + 29, 227 + 20),
-            3 => (sig0 + 44, last0 + 44, 227 + 30),
-            4 => (sig0 + 47, last0 + 47, 227 + 39),
-            _ => (if field { 436 } else { 402 }, if field { 451 } else { 417 }, 426),
-        };
-        let (sig_tab, last_tab): (&[u8], &[u8]) = match cat {
-            3 => (&CTX_CHROMA_DC, &CTX_CHROMA_DC),
-            5 => (if field { &crate::tables::SIG_COEFF_8X8_FIELD } else { &crate::tables::SIG_COEFF_8X8 }, &crate::tables::LAST_COEFF_8X8),
-            _ => (&CTX_IDENTITY, &CTX_IDENTITY),
-        };
-        // positions of the significant coefficients, in scan order
-        let mut sig = [0u8; 64];
-        let mut nsig = 0usize;
-        let mut i = 0;
-        let mut last_found = false;
-        while i < max - 1 {
-            if self.decision(sig_base + sig_tab[i] as usize) != 0 {
-                sig[nsig] = i as u8;
-                nsig += 1;
-                if self.decision(last_base + last_tab[i] as usize) != 0 {
-                    last_found = true;
-                    break;
-                }
-            }
-            i += 1;
-        }
-        if !last_found {
-            sig[nsig] = (max - 1) as u8;
-            nsig += 1;
-        }
-        let mut num_gt1 = 0usize;
-        let mut num_eq1 = 0usize;
-        let abs_cap = 4 - (cat == 3) as usize;
-        for k in (0..nsig).rev() {
-            let i = sig[k] as usize;
-            // coeff_abs_level_minus1: prefix TU (cMax 14) then EG0 suffix
-            let inc0 = if num_gt1 != 0 { 0 } else { (1 + num_eq1).min(4) };
-            let mut abs_m1: u32;
-            if self.decision(abs_base + inc0) == 0 {
-                abs_m1 = 0;
-            } else {
-                let inc = 5 + num_gt1.min(abs_cap);
-                abs_m1 = 1;
-                while abs_m1 < 14 && self.decision(abs_base + inc) != 0 {
-                    abs_m1 += 1;
-                }
-                if abs_m1 >= 14 {
-                    let mut k = 0;
-                    while self.bypass() != 0 {
-                        abs_m1 += 1 << k;
-                        k += 1;
-                        if k > 24 {
-                            return Err(Error::Bitstream("coefficient too large"));
-                        }
-                    }
-                    while k > 0 {
-                        k -= 1;
-                        abs_m1 += self.bypass() << k;
-                    }
-                }
-            }
-            if abs_m1 == 0 {
-                num_eq1 += 1;
-            } else {
-                num_gt1 += 1;
-            }
-            let level = abs_m1 as i32 + 1;
-            coeffs[start + i] = if self.bypass() != 0 { -level } else { level };
-        }
-        Ok(nsig as u32)
+        let data = self.data;
+        let mut e = self.eng;
+        let r = residual(&mut e, &mut self.ctx, data, cat, max, start, coeffs, field);
+        self.eng = e;
+        r
     }
 
     /// end_of_slice_flag.
     pub fn end_of_slice(&mut self) -> bool {
         self.terminate() != 0
     }
+}
+
+/// `Cabac::residual_block` on the engine's registers `e`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn residual(e: &mut Engine, ctx: &mut [u8; 1024], data: &[u8], cat: usize, max: usize, start: usize, coeffs: &mut [i32], field: bool) -> Result<u32> {
+    let (sig_base, last_base, abs_base) = RESIDUAL_BASES[field as usize][cat];
+    let (sig_base, last_base, abs_base) = (sig_base as usize, last_base as usize, abs_base as usize);
+    let (sig_tab, last_tab): (&[u8; 63], &[u8; 63]) = match (cat, field) {
+        (5, false) => (&crate::tables::SIG_COEFF_8X8, &crate::tables::LAST_COEFF_8X8),
+        (5, true) => (&crate::tables::SIG_COEFF_8X8_FIELD, &crate::tables::LAST_COEFF_8X8),
+        _ => (&CTX_POSITION, &CTX_POSITION),
+    };
+    // the significance map (7.3.5.3.3): the scan positions of the non-zero
+    // coefficients, in scan order
+    let mut sig = [0u8; 64];
+    let mut nsig = 0;
+    let mut last = false;
+    for i in 0..max - 1 {
+        if e.decision(&mut ctx[sig_base + sig_tab[i] as usize], data) != 0 {
+            sig[nsig] = i as u8;
+            nsig += 1;
+            if e.decision(&mut ctx[last_base + last_tab[i] as usize], data) != 0 {
+                last = true;
+                break;
+            }
+        }
+    }
+    if !last {
+        // no last flag before the final position: it is significant
+        sig[nsig] = (max - 1) as u8;
+        nsig += 1;
+    }
+    let dc = (cat == 3) as usize;
+    let mut node = 0usize;
+    for &i in sig[..nsig].iter().rev() {
+        // coeff_abs_level_minus1: prefix TU (cMax 14) then EG0 suffix
+        let mut abs_m1 = e.decision(&mut ctx[abs_base + LEVEL1_INC[node] as usize], data);
+        if abs_m1 != 0 {
+            let state = &mut ctx[abs_base + LEVEL_GT1_INC[dc][node] as usize];
+            while abs_m1 < 14 && e.decision(state, data) != 0 {
+                abs_m1 += 1;
+            }
+            if abs_m1 >= 14 {
+                let mut k = 0;
+                while e.bypass(data) != 0 {
+                    abs_m1 += 1 << k;
+                    k += 1;
+                    if k > 24 {
+                        return Err(Error::Bitstream("coefficient too large"));
+                    }
+                }
+                while k > 0 {
+                    k -= 1;
+                    abs_m1 += e.bypass(data) << k;
+                }
+            }
+        }
+        node = LEVEL_NEXT[(abs_m1 != 0) as usize][node] as usize;
+        // coeff_sign_flag: negate without a branch
+        let neg = -(e.bypass(data) as i32);
+        coeffs[start + i as usize] = ((abs_m1 as i32 + 1) ^ neg) - neg;
+    }
+    Ok(nsig as u32)
 }
