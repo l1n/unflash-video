@@ -112,7 +112,11 @@ Files it reads:
    whichever of the light or dark frames are fewer and then puts back as
    many flashes as the rules allow (no more than three a second, fewer
    where the profile still objects, each try checked), so as little as
-   possible goes; *lower contrast* removes nothing: it blends those frames
+   possible goes; where that still leaves a picture frozen for half a
+   second or more (a long run of removed frames), frames come back into it
+   at the safe picture rate, spaced from the pictures either side too, so
+   it moves at a few pictures a second instead (checked; a stretch inside a
+   window that still fails is removed again); *lower contrast* removes nothing: it blends those frames
    with the frames around them instead, as little as passes; *reduce FPS*
    thins the section the way
    an editor does it by hand, trying twice the rate that can never fail
@@ -162,9 +166,10 @@ frame.
    re-scans the exported file with the same detector.
 
 **Auto-fix** (tick it in the header; off unless you do) does steps 2 to 7
-unattended: it softens stripes, tries keep dark, then keep light, then
-reduce FPS on every section, exports, verifies, and offers **Download fixed
-video**. A section it can't fix stops the run and is opened for editing.
+unattended: it softens stripes, tries the fewest removals (which end by
+letting frames back into long removed stretches, see below), then keep
+dark, then keep light, then reduce FPS on every section, exports,
+verifies, and offers **Download fixed video**. A section it can't fix stops the run and is opened for editing.
 Treat what it makes as a starting point: it can't tell which frames carry
 something that matters, so editing by hand, with the player, gives better
 results. Its changes to each section can be undone like any other.

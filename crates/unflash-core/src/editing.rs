@@ -318,6 +318,34 @@ struct Restore {
     fixed: bool,
 }
 
+/// A long run of removed frames the fewest-removals suggester lets some
+/// frames back into: from the picture on screen before it (`t0`) to the one
+/// after (`t1`), and the frames let back (`back`).
+#[derive(Clone, Debug)]
+struct ThinRun {
+    t0: f64,
+    t1: f64,
+    back: Vec<usize>,
+}
+
+/// The fewest-removals suggester's last phase: where a passing removal
+/// leaves a picture frozen for a while, frames come back at a rate that
+/// cannot fail by itself, so it moves instead (each try checked).
+#[derive(Clone, Debug)]
+struct Thin {
+    /// The passing removal it started from, and what was said about it.
+    base: BTreeSet<usize>,
+    note: String,
+    runs: Vec<ThinRun>,
+    /// The runs still let back into (one inside a failing window is removed again).
+    live: BTreeSet<usize>,
+    tries: usize,
+}
+
+/// Checks the thinning of long removed runs gets before it settles for the
+/// removal it started from.
+const THIN_TRIES: usize = 3;
+
 /// What a suggester run produced.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Suggestion {
@@ -351,6 +379,9 @@ pub struct Suggester {
     /// Remove as few frames as possible (`prefer` then holds the side kept).
     fewest: bool,
     restore: Option<Restore>,
+    /// Seconds between pictures that cannot fail (see [`Suggester::thin_long_gaps`]).
+    thin_gap: Option<f64>,
+    thin: Option<Thin>,
     only: Option<BTreeSet<usize>>,
     /// Frames the user marked "keep": never removed, and their own marks
     /// (a hold, say) stay in force.
@@ -373,6 +404,8 @@ impl Suggester {
             prefer: if prefer == Prefer::Fewest { Prefer::Dark } else { prefer },
             fewest: prefer == Prefer::Fewest,
             restore: None,
+            thin_gap: None,
+            thin: None,
             only,
             keep,
             base_edits: base_edits.clone(),
@@ -384,6 +417,18 @@ impl Suggester {
 
     pub fn max_rounds() -> usize {
         5
+    }
+
+    /// For the fewest removals: once the removal passes, let frames back
+    /// into long runs of removed frames (a picture frozen for half a second
+    /// or more), `min_gap` seconds apart and as far from the pictures either
+    /// side, the spacing of a rate that cannot fail by itself (the safe
+    /// picture rate). Each try is checked; a run inside a window that still
+    /// fails is removed again.
+    pub fn thin_long_gaps(&mut self, min_gap: f64) {
+        if self.fewest && min_gap.is_finite() && min_gap > 0.0 {
+            self.thin_gap = Some(min_gap);
+        }
     }
 
     fn allowed(&self, i: usize) -> bool {
@@ -559,7 +604,7 @@ impl Suggester {
                     if FEWEST_RATES[r.rate] == 3 { " (the most WCAG allows)" } else { "" }
                 )
             };
-            return SuggestStep::Done(Suggestion { edits: self.removals(), safe: true, rounds: self.attempt, note, fps: None, safe_fps: None, guaranteed: None });
+            return self.finish_fewest(note);
         }
         self.attempt += 1;
         let mut r = self.restore.take().unwrap();
@@ -599,10 +644,109 @@ impl Suggester {
             self.removed = r.full.clone();
             let note = format!("Passes after removing {} frames: every flash had to go (putting any back failed the check). The {kept_side} frames are the ones kept.", self.removed.len());
             self.restore = Some(r);
-            return SuggestStep::Done(Suggestion { edits: self.removals(), safe: true, rounds: self.attempt, note, fps: None, safe_fps: None, guaranteed: None });
+            return self.finish_fewest(note);
         }
         self.restore = Some(r);
         self.apply_restored();
+        self.last_proposal = self.proposal();
+        SuggestStep::Simulate(self.last_proposal.clone())
+    }
+
+    /// The fewest removals pass: done, or first some frames let back into
+    /// the long runs of removed frames.
+    fn finish_fewest(&mut self, note: String) -> SuggestStep {
+        if let (Some(gap), None) = (self.thin_gap, &self.thin) {
+            let runs = self.thin_runs(gap);
+            if !runs.is_empty() {
+                let live = (0..runs.len()).collect();
+                self.thin = Some(Thin { base: self.removed.clone(), note, runs, live, tries: 0 });
+                self.apply_thin();
+                self.last_proposal = self.proposal();
+                return SuggestStep::Simulate(self.last_proposal.clone());
+            }
+        }
+        SuggestStep::Done(Suggestion { edits: self.removals(), safe: true, rounds: self.attempt, note, fps: None, safe_fps: None, guaranteed: None })
+    }
+
+    /// The runs of removed frames with room for frames `gap` apart, and
+    /// `gap` from the pictures on screen either side, with those frames.
+    fn thin_runs(&self, gap: f64) -> Vec<ThinRun> {
+        let rel = &self.rel_pts;
+        let n = rel.len();
+        let fg = self.frame_gap();
+        let removed: Vec<usize> = self.removed.iter().copied().collect();
+        let mut out = Vec::new();
+        let mut k = 0;
+        while k < removed.len() {
+            let mut j = k;
+            while j + 1 < removed.len() && removed[j + 1] == removed[j] + 1 {
+                j += 1;
+            }
+            let (a, b) = (removed[k], removed[j]);
+            // the pictures either side (a frame removed outside the
+            // selection only moves them further off)
+            let t0 = if a > 0 { rel[a - 1] } else { rel[a] - fg };
+            let t1 = if b + 1 < n { rel[b + 1] } else { rel[b] + fg };
+            let mut last = t0;
+            let mut back = Vec::new();
+            for (i, &t) in rel.iter().enumerate().take(b + 1).skip(a) {
+                if t - last >= gap - 1e-9 && t1 - t >= gap - 1e-9 {
+                    back.push(i);
+                    last = t;
+                }
+            }
+            if !back.is_empty() {
+                out.push(ThinRun { t0, t1, back });
+            }
+            k = j + 1;
+        }
+        out
+    }
+
+    fn apply_thin(&mut self) {
+        let th = self.thin.as_ref().unwrap();
+        let mut removed = th.base.clone();
+        for &k in &th.live {
+            for i in &th.runs[k].back {
+                removed.remove(i);
+            }
+        }
+        self.removed = removed;
+    }
+
+    fn step_thin(&mut self, result: &AnalysisResult) -> SuggestStep {
+        let failing: Vec<Violation> = result.violations.iter().filter(|v| v.kind != ViolationKind::Pattern && result.reports(v.kind)).cloned().collect();
+        let mut th = self.thin.take().unwrap();
+        let done = |s: &Self, note: String| SuggestStep::Done(Suggestion { edits: s.removals(), safe: true, rounds: s.attempt, note, fps: None, safe_fps: None, guaranteed: None });
+        if failing.is_empty() {
+            let runs = th.live.len();
+            let back: usize = th.live.iter().map(|&k| th.runs[k].back.len()).sum();
+            let rate = self.thin_gap.map(|g| 1.0 / g).unwrap_or(0.0);
+            let note = format!(
+                "{} Then {back} frame{} came back into {runs} long stretch{} where the picture would have frozen, {:.1} a second (a rate that cannot flash by itself): {} removed in all.",
+                th.note,
+                if back == 1 { "" } else { "s" },
+                if runs == 1 { "" } else { "es" },
+                (rate * 10.0).floor() / 10.0,
+                self.removed.len()
+            );
+            self.thin = Some(th);
+            return done(self, note);
+        }
+        self.attempt += 1;
+        th.tries += 1;
+        let before = th.live.len();
+        let runs = &th.runs;
+        th.live.retain(|&k| !failing.iter().any(|v| runs[k].t1 >= v.onset.min(v.start) - 0.1 && runs[k].t0 <= v.end + 0.1));
+        if th.live.len() == before || th.live.is_empty() || th.tries >= THIN_TRIES {
+            // nothing to blame, nothing left, or enough tries: as it was
+            self.removed = th.base.clone();
+            let note = th.note.clone();
+            self.thin = Some(th);
+            return done(self, note);
+        }
+        self.thin = Some(th);
+        self.apply_thin();
         self.last_proposal = self.proposal();
         SuggestStep::Simulate(self.last_proposal.clone())
     }
@@ -628,6 +772,9 @@ impl Suggester {
             self.last_proposal = self.base_edits.clone();
             return SuggestStep::Simulate(self.last_proposal.clone());
         };
+        if self.thin.is_some() {
+            return self.step_thin(result);
+        }
         if self.restore.is_some() {
             return self.step_restore(result);
         }
@@ -1039,6 +1186,70 @@ mod tests {
         for w in stay.windows(4) {
             assert!(w[3] - w[0] > 1.0, "four flashes within a second: {w:?}");
         }
+    }
+
+    /// Steady dark frames with a strobe over most of the picture from 1 s
+    /// to 3 s (30 fps): the removal that passes is the whole strobe, the
+    /// picture frozen for two seconds.
+    fn strobe_burst() -> (Strobe, Vec<f64>, BTreeSet<usize>) {
+        let (w, h) = (64u32, 48u32);
+        let frames = (0..120)
+            .map(|i| {
+                let code = if (30..90).contains(&i) && i % 3 == 1 { 220u8 } else { 20 };
+                let mut f = vec![10u8; (w * h * 3) as usize];
+                for y in 0..h {
+                    for x in 0..w / 2 + 8 {
+                        let k = ((y * w + x) * 3) as usize;
+                        f[k..k + 3].copy_from_slice(&[code, code, code]);
+                    }
+                }
+                f
+            })
+            .collect();
+        let pts: Vec<f64> = (0..120).map(|i| i as f64 / 30.0).collect();
+        (Strobe { frames, w, h }, pts, (30..90).collect())
+    }
+
+    /// Drive a fewest-removals suggester from its last phase: `removed`
+    /// passing, frames let back `gap` apart.
+    fn thin_from(src: &Strobe, pts: &[f64], removed: &BTreeSet<usize>, gap: f64) -> Suggestion {
+        let mut s = Suggester::new(pts.to_vec(), &Edits::new(), Prefer::Fewest, None, BTreeSet::new());
+        s.thin_long_gaps(gap);
+        s.removed = removed.clone();
+        let mut step = s.finish_fewest("Passes.".into());
+        while let SuggestStep::Simulate(e) = step {
+            step = s.step(src, Some(&simulate(src, pts, &e)));
+        }
+        match step {
+            SuggestStep::Done(d) => d,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn fewest_removals_let_frames_back_into_long_gaps() {
+        let (src, pts, burst) = strobe_burst();
+        let removal: Edits = burst.iter().map(|&i| (i, FrameEdit::removed(Fill::Prev))).collect();
+        assert!(!simulate(&src, &pts, &Edits::new()).safe() && simulate(&src, &pts, &removal).safe());
+        let gap = 1.0 / 3.8;
+        let d = thin_from(&src, &pts, &burst, gap);
+        assert!(d.safe && simulate(&src, &pts, &d.edits).safe(), "{}", d.note);
+        // frames came back, at the safe spacing, from each other and the pictures either side
+        let back: Vec<usize> = burst.iter().copied().filter(|i| !d.edits.contains_key(i)).collect();
+        assert!(back.len() >= 5, "{back:?}: {}", d.note);
+        let mut times = vec![pts[29]];
+        times.extend(back.iter().map(|&i| pts[i]));
+        times.push(pts[90]);
+        assert!(times.windows(2).all(|w| w[1] - w[0] >= gap - 1e-9), "{times:?}");
+        assert!(d.note.contains("came back into 1 long stretch") && d.note.contains("3.8 a second"), "{}", d.note);
+        // too close together, the strobe is back: the run is removed again
+        let d = thin_from(&src, &pts, &burst, 1.0 / 15.0);
+        assert!(d.safe && simulate(&src, &pts, &d.edits).safe(), "{}", d.note);
+        assert_eq!(d.edits.keys().copied().collect::<BTreeSet<_>>(), burst, "{}", d.note);
+        assert_eq!(d.note, "Passes.");
+        // short runs (a flash's own frames) are left as they are
+        let d = thin_from(&src, &pts, &(30..90).filter(|i| i % 3 == 1).collect(), gap);
+        assert!(d.note == "Passes." && d.edits.len() == 20, "{}", d.note);
     }
 
     #[test]

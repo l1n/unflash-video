@@ -660,13 +660,19 @@ export function keepJson(sec) {
 }
 
 /**
- * Keep-light / keep-dark suggestion. `only` is an array of ordinals or null;
- * frames marked keep are never removed.
+ * Keep-light / keep-dark / fewest-removals suggestion. `only` is an array of
+ * ordinals or null; frames marked keep are never removed. The fewest
+ * removals, once passing, let frames back into long runs of removed frames
+ * at the safe picture rate (a frozen picture moves again), each try checked.
  */
 export async function suggestEdits(env, project, sec, prefer, only, { extS = 1.0, onProgress } = {}) {
-  const { wasm } = env;
+  const { wasm, config } = env;
   const shown = shownPts(wasm, sec);
   const sug = new wasm.Suggester(Float64Array.from(shown), JSON.stringify(sec.edits || {}), prefer, only ? JSON.stringify(only) : undefined, keepJson(sec));
+  // the fewest removals end by letting frames back into long removed
+  // stretches at the rate that cannot fail by itself
+  const safe = wasm.safe_picture_rate(config);
+  if (prefer === 'fewest' && safe > 0) sug.thin_long_gaps(1 / safe);
   const frames = sectionFrames(sec);
   let step = JSON.parse(sug.step(frames, undefined));
   let round = 0;

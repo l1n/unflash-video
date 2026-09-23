@@ -12,6 +12,7 @@ internals. -->
 
 ## 2026-09-23
 
+- <!-- 01:00 --> **Fewest removals don't freeze the picture.** Where taking the flashing out would still leave a picture frozen for half a second or more, some frames come back into that stretch at 3.8 a second (a rate that can't flash by itself), each try checked. **Auto-fix** now tries the fewest removals first, then keep dark, keep light and reduce FPS.
 - <!-- 00:40 --> **What's new** (this list): when you come back, the changes since your last visit are waiting on the start page, and the *What's new* button in the header has them all.
 - <!-- 00:40 --> **🐞 debug info**, bottom right: what your browser, GPU and video are and how long each job took (a scan step by step), ready to paste into a message when something is slow or goes wrong. It names no files.
 - <!-- 00:08 --> **Lower contrast instead of removing frames.** *Suggest: lower contrast* blends the flashing frames with the frames either side of them, as little as passes the check (and a bit more, to be safe). No frame is taken out and the timing stays. Mark frames yourself with **B**; the *blend* slider, shown once a section has B marks, sets how far (80% to begin with). The section player and the export show exactly what was checked. Where something moves, a blended frame shows a faint ghost of it.

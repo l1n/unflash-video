@@ -279,6 +279,8 @@ try {
   console.log('fewest removals:', JSON.stringify(results.fewest), '| keep dark removed', results.marks);
   assert(results.fewest.verdict.startsWith('passes'), 'fewest removals makes the section pass: ' + results.fewest.verdict);
   assert(results.fewest.removed > 0 && results.fewest.removed < results.marks, `fewest removals takes out fewer frames than keep dark (${results.fewest.removed} vs ${results.marks})`);
+  // where the picture would freeze, frames come back at the safe rate
+  assert(/came back into \d+ long stretch(es)? where the picture would have frozen, 3\.8 a second/.test(results.fewest.toast), 'the fewest removals let frames back into the long stretch: ' + results.fewest.toast);
 
   // --- reduce FPS from scratch ---------------------------------------------
   await page.click('#btnClearEdits');
@@ -998,7 +1000,7 @@ try {
   console.log('auto-fix flash.mp4:', results.autoFlash.ms, 'ms |', JSON.stringify(results.autoFlash));
   const st = results.autoFlash.steps;
   assert(st.scan.status === 'done' && /2 violations/.test(st.scan.text), 'auto-fix scans the file first: ' + JSON.stringify(st.scan));
-  assert(st.fix.status === 'done' && /keep dark|keep light|frame rate/.test(st.fix.text), 'auto-fix takes the flashing out: ' + JSON.stringify(st.fix));
+  assert(st.fix.status === 'done' && /fewest removals|keep dark|keep light|frame rate/.test(st.fix.text), 'auto-fix takes the flashing out: ' + JSON.stringify(st.fix));
   assert(st.export.status === 'done' && st.verify.status === 'done', 'auto-fix exports and checks the export: ' + JSON.stringify(st));
   assert(/Passes WCAG/.test(st.verify.text), 'the exported file passes WCAG: ' + st.verify.text);
   assert(/copied from the source/.test(st.export.text) && / re-encoded /.test(st.export.text), 'the automatic export copies the untouched GOPs and re-encodes the spans: ' + st.export.text);
@@ -1057,7 +1059,7 @@ try {
   await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('redflash.mp4'), null, { timeout: 60000 });
   results.autoDropped = await autoDone();
   console.log('auto-fix dropped redflash.mp4:', JSON.stringify(results.autoDropped));
-  assert(results.autoDropped.steps.fix.status === 'done' && /keep dark|keep light|frame rate/.test(results.autoDropped.steps.fix.text) && results.autoDropped.steps.verify.status === 'done' && /Passes WCAG/.test(results.autoDropped.steps.verify.text), 'the dropped red-flash clip is fixed and checked: ' + JSON.stringify(results.autoDropped.steps));
+  assert(results.autoDropped.steps.fix.status === 'done' && /fewest removals|keep dark|keep light|frame rate/.test(results.autoDropped.steps.fix.text) && results.autoDropped.steps.verify.status === 'done' && /Passes WCAG/.test(results.autoDropped.steps.verify.text), 'the dropped red-flash clip is fixed and checked: ' + JSON.stringify(results.autoDropped.steps));
   }
 } finally {
   fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 2));

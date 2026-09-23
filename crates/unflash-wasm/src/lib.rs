@@ -478,6 +478,13 @@ impl Suggester {
         Ok(Suggester { inner: editing::Suggester::new(rel_pts.to_vec(), &e, prefer, only, keep) })
     }
 
+    /// For the fewest removals: let frames back into long runs of removed
+    /// frames, `min_gap` seconds apart (the safe picture rate's spacing),
+    /// each try checked.
+    pub fn thin_long_gaps(&mut self, min_gap: f64) {
+        self.inner.thin_long_gaps(min_gap);
+    }
+
     /// Returns `{"simulate": edits}` (run the check on these and call again
     /// with the classified result) or `{"done": suggestion}`.
     pub fn step(&mut self, frames: &FrameCache, result_json: Option<String>) -> Result<String, JsValue> {

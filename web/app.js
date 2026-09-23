@@ -2933,10 +2933,12 @@ async function autopilot({ rescan = false } = {}) {
 
 /**
  * Prepare one section and make it pass: soften its stripes, then take the
- * flashing out by removing frames (keep dark, then keep light) and, when
- * that is not enough, by thinning to a rate that cannot flash fast enough
- * to fail. Returns what was done and where the section stands, or null when
- * a step failed or the run was stopped.
+ * flashing out by removing as few frames as it can (the fewest removals,
+ * which end by letting frames back into long removed stretches at the
+ * rate that cannot fail), else keep dark, then keep light, and when that is
+ * not enough, by thinning to a rate that cannot flash fast enough to fail.
+ * Returns what was done and where the section stands, or null when a step
+ * failed or the run was stopped.
  */
 async function autoFixSection(sec, auto) {
   const env = state.env;
@@ -2970,8 +2972,9 @@ async function autoFixSection(sec, auto) {
   // flashing: the gentle suggesters first, the guaranteed one last
   const flashing = violations(c).some((v) => v.kind === 'flash' || v.kind === 'red' || (v.kind === 'extended' && c.flag_extended));
   if (flashing) {
-    const rounds = (progress) => (r) => progress(0.2 + r * 0.15, `round ${r + 1}`);
+    const rounds = (progress) => (r) => progress(Math.min(0.95, 0.2 + r * 0.06), `check ${r + 1}`);
     const tries = [
+      ['fewest removals', (progress) => suggestEdits(env, project, sec, 'fewest', null, { extS: EXT_S, onProgress: rounds(progress) })],
       ['keep dark', (progress) => suggestEdits(env, project, sec, 'dark', null, { extS: EXT_S, onProgress: rounds(progress) })],
       ['keep light', (progress) => suggestEdits(env, project, sec, 'light', null, { extS: EXT_S, onProgress: rounds(progress) })],
       ['reduce the frame rate', (progress) => searchFrameRate(env, project, sec, null, { extS: EXT_S, sourceFps: state.movie.fps, onProgress: (p, r) => progress(p, `checking ${r} pictures/s`) })],
