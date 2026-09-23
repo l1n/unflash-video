@@ -16,24 +16,27 @@ pub const ADST_DCT: u8 = 1;
 pub const DCT_ADST: u8 = 2;
 pub const ADST_ADST: u8 = 3;
 
-/// The arithmetic of the transforms.
+/// The arithmetic of the transforms, on one value or several side by side.
 pub trait Lane: Copy {
-    fn from_i32(v: i32) -> Self;
     fn add(self, o: Self) -> Self;
     fn sub(self, o: Self) -> Self;
     fn neg(self) -> Self;
     fn mul(self, c: i32) -> Self;
     /// Round2(x, 14): after a multiplication by a 14-bit cosine.
     fn r14(self) -> Self;
+}
+
+/// One value: `i32` for 8-bit streams, `i64` for deeper ones.
+pub trait Scalar: Lane {
+    fn from_i32(v: i32) -> Self;
     /// Round2(x, shift) as a residual.
     fn round_to_i32(self, shift: u32) -> i32;
+    /// A row transform's output, kept in 32 bits between the passes (as
+    /// libvpx keeps it).
+    fn to_i32(self) -> i32;
 }
 
 impl Lane for i32 {
-    #[inline(always)]
-    fn from_i32(v: i32) -> Self {
-        v
-    }
     #[inline(always)]
     fn add(self, o: Self) -> Self {
         self.wrapping_add(o)
@@ -54,17 +57,24 @@ impl Lane for i32 {
     fn r14(self) -> Self {
         self.wrapping_add(1 << 13) >> 14
     }
+}
+
+impl Scalar for i32 {
+    #[inline(always)]
+    fn from_i32(v: i32) -> Self {
+        v
+    }
     #[inline(always)]
     fn round_to_i32(self, shift: u32) -> i32 {
         self.wrapping_add(1 << (shift - 1)) >> shift
     }
+    #[inline(always)]
+    fn to_i32(self) -> i32 {
+        self
+    }
 }
 
 impl Lane for i64 {
-    #[inline(always)]
-    fn from_i32(v: i32) -> Self {
-        v as i64
-    }
     #[inline(always)]
     fn add(self, o: Self) -> Self {
         self.wrapping_add(o)
@@ -85,9 +95,20 @@ impl Lane for i64 {
     fn r14(self) -> Self {
         self.wrapping_add(1 << 13) >> 14
     }
+}
+
+impl Scalar for i64 {
+    #[inline(always)]
+    fn from_i32(v: i32) -> Self {
+        v as i64
+    }
     #[inline(always)]
     fn round_to_i32(self, shift: u32) -> i32 {
         (self.wrapping_add(1 << (shift - 1)) >> shift) as i32
+    }
+    #[inline(always)]
+    fn to_i32(self) -> i32 {
+        self as i32
     }
 }
 
@@ -609,29 +630,36 @@ pub fn iadst16<L: Lane>(t: &mut [L; 16]) {
 pub fn reconstruct<P: Pixel>(coef: &mut [i32], tx_size: usize, tx_type: u8, lossless: bool, eob: usize, rows: usize, dst: &mut [P], stride: usize, bd: u32) {
     if lossless {
         wht_add(coef, dst, stride, bd);
-    } else if bd == 8 {
-        transform_add::<i32, P>(coef, tx_size, tx_type, eob, rows, dst, stride, bd);
+    } else if eob == 1 && tx_type == DCT_DCT {
+        if bd == 8 {
+            dc_add::<i32, P>(coef, tx_size, dst, stride, bd);
+        } else {
+            dc_add::<i64, P>(coef, tx_size, dst, stride, bd);
+        }
     } else {
-        transform_add::<i64, P>(coef, tx_size, tx_type, eob, rows, dst, stride, bd);
+        P::transform_add(coef, tx_size, tx_type, rows, dst, stride, bd);
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn transform_add<C: Lane, P: Pixel>(coef: &mut [i32], tx_size: usize, tx_type: u8, eob: usize, rows: usize, dst: &mut [P], stride: usize, bd: u32) {
+/// The shift of the residual's final rounding.
+const SHIFT: [u32; 4] = [4, 5, 6, 6];
+
+/// Only the DC coefficient: every row, then every column, is flat.
+fn dc_add<C: Scalar, P: Pixel>(coef: &mut [i32], tx_size: usize, dst: &mut [P], stride: usize, bd: u32) {
     let n = 4 << tx_size;
-    let shift = [4, 5, 6, 6][tx_size];
-    if eob == 1 && tx_type == DCT_DCT {
-        // only the DC coefficient: every row, then every column, is flat
-        let v = C::from_i32(coef[0]).mul(11585).r14().mul(11585).r14();
-        coef[0] = 0;
-        let d = v.round_to_i32(shift);
-        for row in dst.chunks_mut(stride).take(n) {
-            for s in &mut row[..n] {
-                *s = P::clip(s.get() + d, bd);
-            }
+    let d = C::from_i32(coef[0]).mul(11585).r14().mul(11585).r14().round_to_i32(SHIFT[tx_size]);
+    coef[0] = 0;
+    for row in dst.chunks_mut(stride).take(n) {
+        for s in &mut row[..n] {
+            *s = P::clip(s.get() + d, bd);
         }
-        return;
     }
+}
+
+/// A transform block (not DC-only) in scalar arithmetic.
+#[allow(clippy::too_many_arguments)]
+pub fn scalar_transform_add<C: Scalar, P: Pixel>(coef: &mut [i32], tx_size: usize, tx_type: u8, rows: usize, dst: &mut [P], stride: usize, bd: u32) {
+    let shift = SHIFT[tx_size];
     // rows (horizontal) take the ADST in DCT_ADST and ADST_ADST blocks,
     // columns (vertical) in ADST_DCT and ADST_ADST ones
     let row_adst = tx_type == DCT_ADST || tx_type == ADST_ADST;
@@ -644,30 +672,131 @@ fn transform_add<C: Lane, P: Pixel>(coef: &mut [i32], tx_size: usize, tx_type: u
     }
 }
 
+/// The row transforms, then the column transforms, in place (rows past
+/// `rows` hold only zeros, and so transform to zeros), then the residual
+/// added to the prediction row by row.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn two_d<C: Lane, P: Pixel, const N: usize>(coef: &mut [i32], rows: usize, dst: &mut [P], stride: usize, bd: u32, shift: u32, row: impl Fn(&mut [C; N]), col: impl Fn(&mut [C; N])) {
-    let zero = C::from_i32(0);
-    let mut tmp = [[zero; N]; N];
-    // rows past `rows` hold only zeros, and so transform to zeros
-    for (src, out) in coef.chunks_exact_mut(N).zip(tmp.iter_mut()).take(rows.min(N)) {
-        for (o, c) in out.iter_mut().zip(src.iter()) {
-            *o = C::from_i32(*c);
+fn two_d<C: Scalar, P: Pixel, const N: usize>(coef: &mut [i32], rows: usize, dst: &mut [P], stride: usize, bd: u32, shift: u32, row: impl Fn(&mut [C; N]), col: impl Fn(&mut [C; N])) {
+    let rows = rows.min(N);
+    let coef = &mut coef[..N * N];
+    for r in coef.chunks_exact_mut(N).take(rows) {
+        let mut t: [C; N] = std::array::from_fn(|j| C::from_i32(r[j]));
+        row(&mut t);
+        for (o, v) in r.iter_mut().zip(t) {
+            *o = v.to_i32();
         }
-        src.fill(0);
-        row(out);
     }
-    let mut cols = [[zero; N]; N];
-    for (j, out) in cols.iter_mut().enumerate() {
-        for (o, r) in out.iter_mut().zip(tmp.iter()) {
-            *o = r[j];
+    for j in 0..N {
+        let mut t = [C::from_i32(0); N];
+        for (i, v) in t.iter_mut().enumerate().take(rows) {
+            *v = C::from_i32(coef[i * N + j]);
         }
-        col(out);
+        col(&mut t);
+        for (i, v) in t.iter().enumerate() {
+            coef[i * N + j] = v.round_to_i32(shift);
+        }
     }
-    for (i, drow) in dst.chunks_mut(stride).take(N).enumerate() {
-        for (j, s) in drow[..N].iter_mut().enumerate() {
-            *s = P::clip(s.get() + cols[j][i].round_to_i32(shift), bd);
+    for (drow, r) in dst.chunks_mut(stride).zip(coef.chunks_exact_mut(N)) {
+        for (s, c) in drow[..N].iter_mut().zip(r) {
+            *s = P::clip(s.get() + *c, bd);
+            *c = 0;
         }
+    }
+}
+
+/// The 8-bit transforms of four rows or columns at once, in 32-bit SIMD
+/// lanes. They only pay where the lanes multiply natively: without SSE4.1,
+/// `wide` multiplies them one at a time, so plain x86-64 keeps the scalar
+/// transforms.
+#[cfg(feature = "simd")]
+pub mod simd {
+    use super::*;
+    use wide::i32x4;
+
+    /// Whether the target multiplies 32-bit lanes natively.
+    pub const NATIVE_MUL: bool = cfg!(any(target_feature = "sse4.1", target_feature = "simd128", all(target_arch = "aarch64", target_feature = "neon")));
+
+    impl Lane for i32x4 {
+        #[inline(always)]
+        fn add(self, o: Self) -> Self {
+            self + o
+        }
+        #[inline(always)]
+        fn sub(self, o: Self) -> Self {
+            self - o
+        }
+        #[inline(always)]
+        fn neg(self) -> Self {
+            i32x4::ZERO - self
+        }
+        #[inline(always)]
+        fn mul(self, c: i32) -> Self {
+            self * i32x4::splat(c)
+        }
+        #[inline(always)]
+        fn r14(self) -> Self {
+            (self + i32x4::splat(1 << 13)) >> 14_i32
+        }
+    }
+
+    /// A transform block of an 8-bit frame (not DC-only).
+    pub fn transform_add(coef: &mut [i32], tx_size: usize, tx_type: u8, rows: usize, dst: &mut [u8], stride: usize) {
+        let shift = SHIFT[tx_size];
+        let row_adst = tx_type == DCT_ADST || tx_type == ADST_ADST;
+        let col_adst = tx_type == ADST_DCT || tx_type == ADST_ADST;
+        match tx_size {
+            0 => two_d::<4>(coef, rows, dst, stride, shift, |t| if row_adst { iadst4(t) } else { idct4(t) }, |t| if col_adst { iadst4(t) } else { idct4(t) }),
+            1 => two_d::<8>(coef, rows, dst, stride, shift, |t| if row_adst { iadst8(t) } else { idct8(t) }, |t| if col_adst { iadst8(t) } else { idct8(t) }),
+            2 => two_d::<16>(coef, rows, dst, stride, shift, |t| if row_adst { iadst16(t) } else { idct16(t) }, |t| if col_adst { iadst16(t) } else { idct16(t) }),
+            _ => two_d::<32>(coef, rows, dst, stride, shift, idct32, idct32),
+        }
+    }
+
+    #[inline(always)]
+    fn load(s: &[i32]) -> i32x4 {
+        i32x4::from([s[0], s[1], s[2], s[3]])
+    }
+
+    /// Rows four at a time (transposed into lanes and back, in place), then
+    /// columns four at a time, added to the prediction.
+    #[inline(always)]
+    fn two_d<const N: usize>(coef: &mut [i32], rows: usize, dst: &mut [u8], stride: usize, shift: u32, row: impl Fn(&mut [i32x4; N]), col: impl Fn(&mut [i32x4; N])) {
+        // whole groups of four rows: those past `rows` are zeros, and
+        // transform to zeros
+        let rows = rows.min(N).div_ceil(4) * 4;
+        let coef = &mut coef[..N * N];
+        for g in (0..rows).step_by(4) {
+            let mut t = [i32x4::ZERO; N];
+            for j in (0..N).step_by(4) {
+                let v = i32x4::transpose(std::array::from_fn(|k| load(&coef[(g + k) * N + j..])));
+                t[j..j + 4].copy_from_slice(&v);
+            }
+            row(&mut t);
+            for j in (0..N).step_by(4) {
+                let v = i32x4::transpose([t[j], t[j + 1], t[j + 2], t[j + 3]]);
+                for (k, v) in v.iter().enumerate() {
+                    coef[(g + k) * N + j..][..4].copy_from_slice(v.as_array_ref());
+                }
+            }
+        }
+        let round = i32x4::splat(1 << (shift - 1));
+        for j in (0..N).step_by(4) {
+            let mut t = [i32x4::ZERO; N];
+            for (i, v) in t.iter_mut().enumerate().take(rows) {
+                *v = load(&coef[i * N + j..]);
+            }
+            col(&mut t);
+            for (i, v) in t.iter().enumerate() {
+                let d = &mut dst[i * stride + j..][..4];
+                let p = i32x4::from([d[0] as i32, d[1] as i32, d[2] as i32, d[3] as i32]);
+                let s = (p + ((*v + round) >> shift)).max(i32x4::ZERO).min(i32x4::splat(255));
+                for (d, s) in d.iter_mut().zip(s.as_array_ref()) {
+                    *d = *s as u8;
+                }
+            }
+        }
+        coef[..rows * N].fill(0);
     }
 }
 
@@ -725,6 +854,39 @@ mod tests {
         let mut t = [42, 96, 117, 417];
         iwht4(&mut t, 0);
         assert_eq!(t, [336, -198, 123, -177]);
+    }
+
+    /// The SIMD transforms agree with the scalar ones, overflowing or not.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn simd_matches_scalar() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for trial in 0..4000 {
+            let tx_size = trial % 4;
+            let n = 4 << tx_size;
+            let tx_type = if tx_size == 3 { DCT_DCT } else { (rnd() % 4) as u8 };
+            let rows = 1 + rnd() as usize % n;
+            let range = [64, 2048, 1 << 20][trial % 3];
+            let mut coef = vec![0i32; 32 * 32];
+            for c in coef[..rows * n].iter_mut() {
+                if rnd() % 3 == 0 {
+                    *c = (rnd() % (2 * range)) as i32 - range as i32;
+                }
+            }
+            let mut a: Vec<u8> = (0..n * n).map(|_| rnd() as u8).collect();
+            let mut b = a.clone();
+            let mut coef2 = coef.clone();
+            scalar_transform_add::<i32, u8>(&mut coef, tx_size, tx_type, rows, &mut a, n, 8);
+            simd::transform_add(&mut coef2, tx_size, tx_type, rows, &mut b, n);
+            assert_eq!(a, b, "trial {trial}");
+            assert!(coef.iter().chain(&coef2).all(|&c| c == 0));
+        }
     }
 
     /// The DC-only shortcut agrees with the full transform.

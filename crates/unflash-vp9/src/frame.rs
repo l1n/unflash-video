@@ -2,6 +2,7 @@
 //! samples, and the pixel type the prediction and filter code is generic
 //! over.
 
+use crate::idct::scalar_transform_add;
 use crate::inter::{predict_block, Mc};
 use crate::loopfilter::{filter_run_lines, Run};
 
@@ -22,6 +23,15 @@ pub trait Pixel: Copy + Default + PartialEq + Send + Sync + 'static {
     /// Interpolate an unscaled inter block from its filter footprint.
     fn predict(src: &[Self], ss: usize, dst: &mut [Self], ds: usize, mc: &Mc, tmp: &mut [i32]) {
         predict_block(src, ss, dst, ds, mc, tmp);
+    }
+
+    /// Add the inverse transform of a block (not DC-only) to the prediction.
+    fn transform_add(coef: &mut [i32], tx_size: usize, tx_type: u8, rows: usize, dst: &mut [Self], stride: usize, bd: u32) {
+        if bd == 8 {
+            scalar_transform_add::<i32, Self>(coef, tx_size, tx_type, rows, dst, stride, bd);
+        } else {
+            scalar_transform_add::<i64, Self>(coef, tx_size, tx_type, rows, dst, stride, bd);
+        }
     }
 }
 
@@ -47,6 +57,15 @@ impl Pixel for u8 {
     #[cfg(feature = "simd")]
     fn predict(src: &[u8], ss: usize, dst: &mut [u8], ds: usize, mc: &Mc, _tmp: &mut [i32]) {
         crate::inter::simd::predict(src, ss, dst, ds, mc);
+    }
+
+    #[cfg(feature = "simd")]
+    fn transform_add(coef: &mut [i32], tx_size: usize, tx_type: u8, rows: usize, dst: &mut [u8], stride: usize, bd: u32) {
+        if crate::idct::simd::NATIVE_MUL {
+            crate::idct::simd::transform_add(coef, tx_size, tx_type, rows, dst, stride);
+        } else {
+            scalar_transform_add::<i32, u8>(coef, tx_size, tx_type, rows, dst, stride, bd);
+        }
     }
 }
 
