@@ -85,7 +85,7 @@ impl Decoder {
     }
 
     /// Leave the loop filter out, for pictures used only for statistics:
-    /// a fifth to a third of the decoding time. The pictures are no longer
+    /// a tenth to a quarter of the decoding time. The pictures are no longer
     /// bit-exact (block edges keep their coding artefacts, and later frames
     /// predicted from them drift slightly), which is fine for flash
     /// detection but not for pictures that are shown or re-encoded. With
