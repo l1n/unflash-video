@@ -14,6 +14,7 @@ import { SectionSound } from './sound.js';
 import { FrameViewer } from './viewer.js';
 import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notifyState, systemNotify, titleProgress, titleMark } from './alerts.js';
 import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay } from './changes.js';
+import { TourGuide, TOURS } from './tours.js';
 import { watchPage, noteError, noteJob, noteFileName, debugReport } from './debug.js';
 
 const $ = (id) => document.getElementById(id);
@@ -164,6 +165,7 @@ async function runJob(name, fn) {
     return null;
   } finally {
     state.job = null;
+    state.jobEndedAt = performance.now();
     $('jobbar').classList.add('hidden');
     titleProgress('');
     ended(job.cancelled ? 'cancelled' : outcome);
@@ -340,10 +342,77 @@ async function initChanges() {
     else {
       seen = newest;
       markChangesSeen(newest);
+      state.firstVisit = true;
     }
   }
   state.changes = { log, newest, seen };
   renderChanges();
+  // the tours: getting started on a first visit, the new things' own after an update
+  const fresh = changesSince(log, seen).flatMap((d) => d.items.map((it) => it.tour).filter(Boolean));
+  tourGuide.plan({ firstVisit: !!state.firstVisit, tours: fresh });
+}
+
+// ---- the guided tour ------------------------------------------------------------
+//
+// tours.js says what each tour shows and when; here is where the app is (a
+// video open, a section ready) and whether it is busy.
+
+/** `?tour=0` never starts a tour by itself, `?tour=1` does even in an automated browser (tests). */
+function tourAutoSetting() {
+  const q = new URLSearchParams(location.search).get('tour');
+  if (q === '0' || q === 'off') return false;
+  if (q === '1' || q === 'on') return true;
+  return !navigator.webdriver;
+}
+
+/** The last click, key or scroll (ms), and whether a button is down: a tour waits for a quiet moment. */
+const input = { at: 0, down: false };
+
+const tourGuide = new TourGuide({
+  auto: tourAutoSetting(),
+  // (`byHand`: as it will be once the guide is put away for the tour; a
+  // video's part waits for its scan unless it is asked for)
+  where: (byHand = false) => {
+    const guide = !byHand && document.body.classList.contains('guide-open');
+    const sec = currentSection();
+    return {
+      any: true,
+      start: !state.movie,
+      video: !!state.movie && !guide && (byHand || !!(state.project && state.project.scan)),
+      section: !!(sec && sec.prepared && !guide && !$('wsBody').classList.contains('hidden') && /passes|fails/.test($('wsVerdict').textContent)),
+    };
+  },
+  quiet: () =>
+    !state.job &&
+    // (a job that ends is often followed by another: opening, then scanning)
+    performance.now() - (state.jobEndedAt || 0) > CHAIN_GRACE_MS &&
+    !(state.auto && state.auto.running) &&
+    !input.down &&
+    performance.now() - input.at > 1500 &&
+    document.visibilityState === 'visible' &&
+    ![...document.querySelectorAll('.modal, .viewer, .menu')].some((m) => !m.classList.contains('hidden')),
+  ready: (context) => {
+    if (context !== 'start' && context !== 'any' && state.movie) setGuide(false);
+  },
+});
+
+function wireTours() {
+  window.addEventListener('pointerdown', () => Object.assign(input, { at: performance.now(), down: true }), true);
+  window.addEventListener('pointerup', () => Object.assign(input, { at: performance.now(), down: false }), true);
+  window.addEventListener('keydown', () => (input.at = performance.now()), true);
+  window.addEventListener('wheel', () => (input.at = performance.now()), { capture: true, passive: true });
+  $('btnTour').addEventListener('click', () => tourGuide.gettingStarted());
+  // "show me" beside a change in What's new
+  for (const box of [$('newsList'), $('changesList')]) {
+    box.addEventListener('click', (e) => {
+      const b = e.target.closest('.show-me');
+      if (!b) return;
+      closeChanges();
+      if (tourGuide.request(b.dataset.tour)) return;
+      const t = TOURS[b.dataset.tour];
+      toast(`${t && t.context === 'section' ? 'Open a section of a video' : 'Open a video'} and the tour of this starts.`);
+    });
+  }
 }
 
 function renderChanges() {
@@ -464,6 +533,7 @@ async function boot() {
   $('btnNewsAll').addEventListener('click', openChanges);
   $('btnNewsSeen').addEventListener('click', changesAcknowledged);
   $('btnCloseChanges').addEventListener('click', closeChanges);
+  wireTours();
   $('changesModal').addEventListener('click', (e) => {
     if (e.target === $('changesModal')) closeChanges();
   });
@@ -3713,6 +3783,7 @@ window.__unflash = {
   },
   sectionSound,
   loadProjectFile,
+  tours: tourGuide,
   get lastProjectFile() {
     return state.lastProjectFile;
   },

@@ -26,6 +26,23 @@ port is tested against, bit for bit where the arithmetic allows.
 **This reduces risk. It is not a guarantee.** See
 [Limitations](#limitations).
 
+## What it looks like
+
+![A scanned test clip: the timeline with what the scan found and a section around it, the sections list, the player, and the flashing charted over the whole video with the numbers under the pointer](web/screenshots/scan.png)
+
+A scanned test clip: what the scan found along the timeline (orange for
+general flashes, magenta for red ones), a numbered section around it, and
+the flashing charted over the whole video, with the numbers under the
+pointer.
+
+| A section: what still fails, and how to fix it | The same section after *fewest removals*: it passes |
+|---|---|
+| ![A section of the red-flash clip, failing: an extended flash and a red flash listed with their frames and times, the suggestion buttons, and the frame grid](web/screenshots/section.png) | ![The same section passing, 45 frames marked](web/screenshots/fixed.png) |
+| **The export, verified** | **The guided tour, on a first visit** |
+| ![The export dialog after exporting and verifying: 240 frames re-encoded, passes WCAG](web/screenshots/export.png) | ![The start page dimmed, Open video lit up, and the tour's card beside it: Getting started, 2 of 6](web/screenshots/tour.png) |
+
+`node tests/e2e/screenshots.mjs` makes these again from the test clips.
+
 ## Using it
 
 **Hosted:** https://l1n.github.io/unflash-video/ — built and published from
@@ -36,7 +53,23 @@ site: the video never leaves your machine.
 `build.sh` puts a copy beside the page, and the app shows someone coming
 back the changes made since their last visit (on the start page, and
 behind *What's new* in the header). Each line starts with the time it goes
-live, in a comment; add one with every change people will notice.
+live, in a comment; add one with every change people will notice. A change
+with something on screen to show names its tour in the same comment
+(`<!-- 16:00 tour:findings -->`; the tours are in
+[`web/tours.js`](web/tours.js)).
+
+**The guided tour:** the first visit gets a tour of the page, a part at a
+time, each where it belongs: the start page, then the first video once
+its scan is done, then the first section once it is checked. One part of
+the page is lit at a time, with a card beside it saying what it is for
+(**→**/**←** or Enter to step, Esc to end); the page's own keys wait until
+it is over. A tour starts only when nothing else is going on (no job
+running, no dialog open, no click or key in the last moment), and each
+comes once. After an update, each change with something to see gets a
+short tour of its own, the first time you are where it is, and a *show
+me* beside it in What's new. **Take the tour**, in the guide, runs the
+part for where you are again. `?tour=0` turns the tours off; a browser
+driven by a test gets none unless it asks with `?tour=1`.
 
 **Locally:** open `web/` from any static web server over `http://localhost`
 or `https://` (WebGPU and WebCodecs need a secure context):
@@ -705,6 +738,8 @@ bash tests/media/av1/gen.sh               # AV1 decoder test streams and ffmpeg'
 cargo run --release -p unflash-av1 --example compare -- file.mkv   # decode an AV1 track, diff every picture against ffmpeg's libdav1d, time it
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
+node tests/e2e/tour.mjs                   # the guided tour, on a first visit and after an update
+node tests/e2e/screenshots.mjs            # the screenshots above, made again from the test clips (not a test)
 ```
 
 `crates/unflash-core/tests/reference_fixtures.rs` regenerates the frames the
@@ -723,6 +758,10 @@ built-in decoder (the test browser has no H.264); the VP9 exports copy
 their untouched GOPs. `tests/e2e/splice.mjs` runs the H.264 smart cut with
 a stand-in encoder that hands back a second encoding's samples, and
 requires every frame of the exported file to decode as its source did.
+`tests/e2e/tour.mjs` walks the guided tour as a first visitor and as one
+back after an update: every step lights something on screen with its card
+in view beside it, each part waits until its place is on screen and
+nothing is running, comes once, and holds back the page's own keys.
 
 To compare the two detectors on a real file rather than on synthetic
 frames, run both over it and line up the violations:

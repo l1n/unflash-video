@@ -20,19 +20,20 @@ function inline(s) {
 }
 
 /**
- * The changelog as `{ days: [{ date, label, items: [{ at, timed, html }] }] }`,
+ * The changelog as `{ days: [{ date, label, items: [{ at, timed, tour, html }] }] }`,
  * newest first as the file has them: a day per `## YYYY-MM-DD` heading, a
  * change per `- ` line (lines indented under it continue it), `at` the time
  * it went live in ms, from the `<!-- HH:MM -->` (UTC) it starts with, or the
- * day's noon when it has none (`timed` false). Comments on lines of their
- * own are notes to the file's editors.
+ * day's noon when it has none (`timed` false). `<!-- HH:MM tour:id -->`
+ * names the tour (tours.js) that shows the change. Comments on lines of
+ * their own are notes to the file's editors.
  */
 export function parseChangelog(md) {
   const days = [];
   let day = null;
   let item = null;
   const flush = () => {
-    if (item && day) day.items.push({ at: item.at, timed: item.timed, html: inline(item.text.trim()) });
+    if (item && day) day.items.push({ at: item.at, timed: item.timed, tour: item.tour, html: inline(item.text.trim()) });
     item = null;
   };
   for (const line of md.replace(/^\s*<!--[\s\S]*?-->[ \t]*$/gm, '').split(/\r?\n/)) {
@@ -47,11 +48,11 @@ export function parseChangelog(md) {
       days.push(day);
       continue;
     }
-    const bullet = /^[-*]\s+(?:<!--\s*(\d{1,2}):(\d{2})\s*-->\s*)?(.*)$/.exec(line);
+    const bullet = /^[-*]\s+(?:<!--\s*(\d{1,2}):(\d{2})(?:\s+tour:([\w-]+))?\s*-->\s*)?(.*)$/.exec(line);
     if (bullet && day) {
       flush();
       const timed = bullet[1] !== undefined;
-      item = { at: timed ? Date.UTC(day.y, day.m - 1, day.d, +bullet[1], +bullet[2]) : Date.UTC(day.y, day.m - 1, day.d, 12), timed, text: bullet[3] };
+      item = { at: timed ? Date.UTC(day.y, day.m - 1, day.d, +bullet[1], +bullet[2]) : Date.UTC(day.y, day.m - 1, day.d, 12), timed, tour: bullet[3] || null, text: bullet[4] };
       continue;
     }
     if (item && /^\s+\S/.test(line)) item.text += ' ' + line.trim();
@@ -106,8 +107,13 @@ export function hadEarlierSettings() {
   }
 }
 
-/** A day of changes as HTML (`isNew` marks the changes to highlight). */
+/**
+ * A day of changes as HTML (`isNew` marks the changes to highlight; a
+ * change with a tour gets a "show me" button, `data-tour` its id).
+ */
 export function renderDay(day, isNew = () => false) {
-  const items = day.items.map((it) => `<li${isNew(it) ? ' class="new"' : ''}>${it.html}</li>`).join('');
+  const items = day.items
+    .map((it) => `<li${isNew(it) ? ' class="new"' : ''}>${it.html}${it.tour ? ` <button class="small show-me" data-tour="${escapeHtml(it.tour)}" title="A short tour of this">show me</button>` : ''}</li>`)
+    .join('');
   return `<h3>${escapeHtml(day.label)}</h3><ul>${items}</ul>`;
 }

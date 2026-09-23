@@ -238,3 +238,26 @@ table.clips { border-collapse: collapse; font-size: 13px; margin: 6px 0; }
 table.clips th { text-align: left; color: var(--fg2); font-weight: 500; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); }
 table.clips td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 table.clips a { color: #9fc0ff; }
+
+/* ---- the guided tour (tour.js): the page dimmed but for one part, a card beside it ---- */
+.tour { position: fixed; inset: 0; z-index: 1000; }
+.tour-shade { position: fixed; inset: 0; background: transparent; }
+.tour.centred .tour-shade { background: rgba(8, 10, 14, .68); }
+.tour-spot { position: fixed; border-radius: 6px; box-shadow: 0 0 0 200vmax rgba(8, 10, 14, .68); outline: 2px solid var(--accent); pointer-events: none; }
+.tour.centred .tour-spot { display: none; }
+.tour-card { position: fixed; width: min(340px, calc(100vw - 24px)); background: var(--bg2); border: 1px solid var(--accent); border-radius: 8px; padding: 11px 14px 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, .5); color: var(--fg); font-size: 13px; line-height: 1.45; }
+.tour.moving .tour-spot, .tour.moving .tour-card { transition: left .2s ease, top .2s ease, width .2s ease, height .2s ease; }
+@media (prefers-reduced-motion: reduce) { .tour.moving .tour-spot, .tour.moving .tour-card { transition: none; } }
+.tour-count { font-size: 11px; color: var(--fg2); letter-spacing: .02em; margin-bottom: 2px; }
+.tour-title { margin: 0 0 6px; font-size: 15px; }
+.tour-actions { display: flex; gap: 6px; align-items: center; margin-top: 12px; }
+.tour-actions .spacer { flex: 1; }
+.tour-skip { background: none; border-color: transparent; color: var(--fg2); padding-left: 0; }
+.tour-skip:hover { color: var(--fg); background: none; }
+.tour-arrow { position: absolute; width: 12px; height: 12px; background: var(--bg2); border: 1px solid var(--accent); transform: rotate(45deg); display: none; }
+.tour-arrow.bottom { display: block; top: -7px; border-right: none; border-bottom: none; }
+.tour-arrow.top { display: block; bottom: -7px; border-left: none; border-top: none; }
+.tour-arrow.right { display: block; left: -7px; border-top: none; border-right: none; }
+.tour-arrow.left { display: block; right: -7px; border-bottom: none; border-left: none; }
+.tour-offer { display: flex; gap: 10px; align-items: center; margin: 4px 0 14px; color: var(--fg2); }
+.show-me { margin-left: 6px; }
