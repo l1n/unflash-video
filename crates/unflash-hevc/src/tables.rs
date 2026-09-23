@@ -1,5 +1,19 @@
-//! Constant tables: scan orders (6.5.3 – 6.5.5) and the default scaling
-//! lists (Table 7-5, Table 7-6).
+//! Constant tables: scan orders (6.5.3 – 6.5.5), the default scaling
+//! lists (Table 7-5, Table 7-6) and the chroma QP mapping (Table 8-10).
+
+/// QpC for qPi 30..=43 (Table 8-10).
+const QPC: [i32; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
+
+/// QpC as a function of qPi for 4:2:0 (Table 8-10).
+pub fn qpc(qpi: i32) -> i32 {
+    if qpi < 30 {
+        qpi
+    } else if qpi > 43 {
+        qpi - 6
+    } else {
+        QPC[(qpi - 30) as usize]
+    }
+}
 
 /// A scan of an n×n block: `(x, y)` per scan position.
 pub type Scan<const N: usize> = [(u8, u8); N];

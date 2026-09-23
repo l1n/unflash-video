@@ -9,24 +9,12 @@
 use crate::meta::{Meta, Motion, RefKey, SliceInfo, BYPASS, CODED, INTRA, NO_SLICE, PCM, PU_LEFT, PU_TOP, TU_LEFT, TU_TOP};
 use crate::picture::{Picture, Sample};
 use crate::ps::{Layout, Pps, Sps};
+use crate::tables::qpc;
 
 /// β′ (Table 8-12) by Q.
 const BETA: [u8; 52] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64];
 /// tC′ (Table 8-12) by Q.
 const TC: [u8; 54] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 6, 6, 7, 8, 9, 10, 11, 13, 14, 16, 18, 20, 22, 24];
-/// QpC for qPi 30..=43 (Table 8-10).
-const QPC: [i32; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
-
-fn qpc(qpi: i32) -> i32 {
-    if qpi < 30 {
-        qpi
-    } else if qpi > 43 {
-        qpi - 6
-    } else {
-        QPC[(qpi - 30) as usize]
-    }
-}
-
 /// Clip3 (5-4), for bounds that are ordered by construction.
 #[inline(always)]
 fn clip3(lo: i32, hi: i32, v: i32) -> i32 {

@@ -14,6 +14,7 @@ use crate::meta::{self, Meta, Motion, SaoParams, BYPASS, CODED, INTRA, PCM, PU_L
 use crate::picture::{Picture, Sample};
 use crate::ps::{Layout, Pps, Sps};
 use crate::slice::{SliceHeader, SliceType};
+use crate::tables::qpc;
 use crate::transform;
 use crate::{Error, Result};
 
@@ -57,9 +58,6 @@ struct Cu {
     chroma_mode: u32,
     max_trafo_depth: usize,
 }
-
-/// QpC as a function of qPi for 4:2:0 (Table 8-10), for qPi 30..=43.
-const QPC: [i32; 14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37];
 
 /// initType (9.3.2.2): which set of initialisation values the slice's
 /// contexts start from.
@@ -465,15 +463,7 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
     fn chroma_qp(&self, c: usize) -> i32 {
         let off = self.sps.qp_bd_offset();
         let o = if c == 1 { self.pps.cb_qp_offset + self.hdr.cb_qp_offset } else { self.pps.cr_qp_offset + self.hdr.cr_qp_offset } + self.cu_qp_offset[c - 1];
-        let qpi = (self.qp_y + o).clamp(-off, 57);
-        let qpc = if qpi < 30 {
-            qpi
-        } else if qpi > 43 {
-            qpi - 6
-        } else {
-            QPC[(qpi - 30) as usize]
-        };
-        qpc + off
+        qpc((self.qp_y + o).clamp(-off, 57)) + off
     }
 
     // ---- coding unit ----
