@@ -8,7 +8,7 @@ use crate::deblock::deblock;
 use crate::dpb::{apply_rps, picture_order_count, ref_lists, DpbEntry, RefSet};
 use crate::hash::{self, PictureHash};
 use crate::meta::{Meta, RefKey, SliceInfo, INTRA, NO_SLICE};
-use crate::picture::{ColMv, Picture, Sample, COL_L0, COL_L1, COL_LT0, COL_LT1};
+use crate::picture::{ColMv, Picture, Plane, Sample, COL_L0, COL_L1, COL_LT0, COL_LT1};
 use crate::ps::{parse_pps, parse_sps, Layout, Pps, Sps};
 use crate::sao::sao;
 use crate::slice::{nal, parse_slice_header, SliceHeader};
@@ -263,6 +263,15 @@ impl<P: Sample> Core<P> {
     }
 }
 
+/// The `w`×`h` area of `plane` at (`x0`, `y0`), each sample through `f`.
+fn crop<P: Sample, T>(plane: &Plane<P>, (x0, y0, w, h): (usize, usize, usize, usize), f: impl Fn(P) -> T) -> Vec<T> {
+    let mut out = Vec::with_capacity(w * h);
+    for y in y0..y0 + h {
+        out.extend(plane.data[y * plane.stride + x0..][..w].iter().map(|&s| f(s)));
+    }
+    out
+}
+
 /// Crop and convert a picture for output.
 fn to_frame<P: Sample>(pic: &Picture<P>, sps: &Sps, pts: f64, damaged: bool) -> Frame {
     let (l, _, t, _) = sps.conf_win;
@@ -270,46 +279,41 @@ fn to_frame<P: Sample>(pic: &Picture<P>, sps: &Sps, pts: f64, damaged: bool) -> 
     let (w, h, l, t) = (w as usize, h as usize, l as usize, t as usize);
     let bd = sps.bit_depth;
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let crop = |c: usize, x0: usize, y0: usize, pw: usize, ph: usize| -> Vec<u16> {
-        let p = &pic.planes[c];
-        let mut out = Vec::with_capacity(pw * ph);
-        for y in 0..ph {
-            out.extend(p.data[(y0 + y) * p.stride + x0..][..pw].iter().map(|s| s.get() as u16));
-        }
-        out
-    };
-    let to8 = |v: &[u16]| -> Vec<u8> {
-        if bd == 8 {
-            v.iter().map(|&s| s as u8).collect()
-        } else {
-            let (round, shift) = (1u32 << (bd - 9), bd - 8);
-            v.iter().map(|&s| ((s as u32 + round) >> shift).min(255) as u8).collect()
-        }
-    };
-    let y16 = crop(0, l, t, w, h);
-    let (u16p, v16p) = if sps.chroma_format_idc != 0 {
-        (crop(1, l / 2, t / 2, cw, ch), crop(2, l / 2, t / 2, cw, ch))
-    } else {
-        let mid = 1u16 << (bd - 1);
-        (vec![mid; cw * ch], vec![mid; cw * ch])
-    };
+    let areas = [(l, t, w, h), (l / 2, t / 2, cw, ch), (l / 2, t / 2, cw, ch)];
+    let chroma = sps.chroma_format_idc != 0;
+    let deep = bd > 8;
+    let (round, shift) = if deep { (1 << (bd - 9), bd - 8) } else { (0, 0) };
+    let planes8: [Vec<u8>; 3] = std::array::from_fn(|c| match (c, chroma) {
+        (1 | 2, false) => vec![128; cw * ch],
+        _ => crop(&pic.planes[c], areas[c], |s| ((s.get() as u32 + round) >> shift).min(255) as u8),
+    });
+    let planes16: Option<[Vec<u16>; 3]> = deep.then(|| {
+        std::array::from_fn(|c| match (c, chroma) {
+            (1 | 2, false) => vec![1 << (bd - 1); cw * ch],
+            _ => crop(&pic.planes[c], areas[c], |s| s.get() as u16),
+        })
+    });
     let vui = sps.vui.as_ref();
     let bt709 = match vui.map(|v| v.matrix_coeffs) {
         Some(1) => true,
         Some(5) | Some(6) => false,
         _ => h >= 720,
     };
-    let deep = bd > 8;
+    let [y, u, v] = planes8;
+    let (y16, u16, v16) = match planes16 {
+        Some([y, u, v]) => (Some(y), Some(u), Some(v)),
+        None => (None, None, None),
+    };
     Frame {
         width: w as u32,
         height: h as u32,
-        y: to8(&y16),
-        u: to8(&u16p),
-        v: to8(&v16p),
+        y,
+        u,
+        v,
         bit_depth: bd as u8,
-        y16: deep.then_some(y16),
-        u16: deep.then_some(u16p),
-        v16: deep.then_some(v16p),
+        y16,
+        u16,
+        v16,
         pts,
         damaged,
         bt709,

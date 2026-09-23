@@ -33,6 +33,166 @@ impl<P: Sample> Default for Scratch<P> {
     }
 }
 
+/// The filter taps of fractional position `f`.
+fn taps<const TAPS: usize>(f: usize) -> [i32; TAPS] {
+    std::array::from_fn(|k| if TAPS == 8 { LUMA[f][k] } else { CHROMA[f][k] })
+}
+
+/// Eight-lane versions of the row kernels (wasm simd128, SSE2 or NEON
+/// through `wide`), for the leading multiple of eight samples of a row;
+/// each returns how many it did. They compute exactly what the scalar
+/// loops compute, in 16-bit lanes throughout.
+#[cfg(feature = "simd")]
+mod simd {
+    use wide::i16x8;
+
+    use crate::picture::Sample;
+
+    /// Eight outputs of a filter pass, Σ `c[k]` · `v(k)` >> `shift`. The
+    /// sums of a first pass over samples deeper than 8 bits and of a second
+    /// pass over 16-bit intermediates need more than 16 bits, so each input
+    /// is split into its part above the shift and its low bits: the two
+    /// sums fit 16 bits (the first up to the wrap-around the 16-bit
+    /// intermediates have anyway), and their combination is the exact
+    /// shifted sum.
+    #[inline(always)]
+    fn taps8<const TAPS: usize>(v: impl Fn(usize) -> i16x8, c: &[i32; TAPS], shift: u32) -> i16x8 {
+        let c: [i16x8; TAPS] = std::array::from_fn(|k| i16x8::splat(c[k] as i16));
+        if shift == 0 {
+            let mut sum = i16x8::ZERO;
+            for (k, &ck) in c.iter().enumerate() {
+                sum += v(k) * ck;
+            }
+            sum
+        } else {
+            let mask = i16x8::splat((1 << shift) - 1);
+            let (mut high, mut low) = (i16x8::ZERO, i16x8::ZERO);
+            for (k, &ck) in c.iter().enumerate() {
+                let x = v(k);
+                high += (x >> shift) * ck;
+                low += (x & mask) * ck;
+            }
+            high + (low >> shift)
+        }
+    }
+
+    #[inline(always)]
+    pub fn filter_row<P: Sample, const TAPS: usize>(r: &[P], c: &[i32; TAPS], shift: u32, out: &mut [i16]) -> usize {
+        let mut i = 0;
+        while i + 8 <= out.len() {
+            // the window of these eight outputs, so that the loads need no checks
+            let win = &r[i..i + 7 + TAPS];
+            let v = taps8(|k| P::load8(&win[k..k + 8]), c, shift);
+            out[i..i + 8].copy_from_slice(v.as_array_ref());
+            i += 8;
+        }
+        i
+    }
+
+    #[inline(always)]
+    pub fn filter_column<P: Sample, const TAPS: usize>(rows: &[&[P]; TAPS], c: &[i32; TAPS], shift: u32, out: &mut [i16]) -> usize {
+        let mut i = 0;
+        while i + 8 <= out.len() {
+            let v = taps8(|k| P::load8(&rows[k][i..i + 8]), c, shift);
+            out[i..i + 8].copy_from_slice(v.as_array_ref());
+            i += 8;
+        }
+        i
+    }
+
+    #[inline(always)]
+    pub fn filter_column_i16<const TAPS: usize>(rows: &[&[i16]; TAPS], c: &[i32; TAPS], out: &mut [i16]) -> usize {
+        let mut i = 0;
+        while i + 8 <= out.len() {
+            let v = taps8(|k| i16x8::from_slice_unaligned(&rows[k][i..i + 8]), c, 6);
+            out[i..i + 8].copy_from_slice(v.as_array_ref());
+            i += 8;
+        }
+        i
+    }
+
+    #[inline(always)]
+    pub fn full_sample_row<P: Sample>(r: &[P], shift: u32, out: &mut [i16]) -> usize {
+        let mut i = 0;
+        while i + 8 <= out.len() {
+            out[i..i + 8].copy_from_slice((P::load8(&r[i..i + 8]) << shift).as_array_ref());
+            i += 8;
+        }
+        i
+    }
+
+    /// (s + offset) >> shift into `d`, clipped. Saturating the addition is
+    /// exact: whatever saturates is clipped to the maximum anyway.
+    #[inline(always)]
+    pub fn uni_row<P: Sample>(s: &[i16], offset: i32, shift: u32, max: i32, d: &mut [P]) -> usize {
+        let mut i = 0;
+        while i + 8 <= d.len() {
+            let v = i16x8::from_slice_unaligned(&s[i..i + 8]).saturating_add(i16x8::splat(offset as i16)) >> shift;
+            P::store8(v, max as i16, &mut d[i..i + 8]);
+            i += 8;
+        }
+        i
+    }
+
+    /// (a + b + offset) >> shift into `d`, clipped (saturating as above).
+    #[inline(always)]
+    pub fn bi_row<P: Sample>(a: &[i16], b: &[i16], offset: i32, shift: u32, max: i32, d: &mut [P]) -> usize {
+        let mut i = 0;
+        while i + 8 <= d.len() {
+            let (p, q) = (i16x8::from_slice_unaligned(&a[i..i + 8]), i16x8::from_slice_unaligned(&b[i..i + 8]));
+            let v = p.saturating_add(q).saturating_add(i16x8::splat(offset as i16)) >> shift;
+            P::store8(v, max as i16, &mut d[i..i + 8]);
+            i += 8;
+        }
+        i
+    }
+}
+
+/// One row of a horizontal filter pass over samples: `out[i]` =
+/// Σ `c[k]` · `r[i + k]` >> `shift`.
+#[inline(always)]
+fn filter_row<P: Sample, const TAPS: usize>(r: &[P], c: &[i32; TAPS], shift: u32, out: &mut [i16]) {
+    let r = &r[..out.len() + TAPS - 1];
+    #[cfg(feature = "simd")]
+    let done = simd::filter_row(r, c, shift, out);
+    #[cfg(not(feature = "simd"))]
+    let done = 0;
+    for (i, o) in out.iter_mut().enumerate().skip(done) {
+        let s: i32 = c.iter().zip(&r[i..i + TAPS]).map(|(&ck, v)| ck * v.get()).sum();
+        *o = (s >> shift) as i16;
+    }
+}
+
+/// One row of a vertical filter pass over samples, from the `TAPS` rows
+/// around it.
+#[inline(always)]
+fn filter_column<P: Sample, const TAPS: usize>(rows: [&[P]; TAPS], c: &[i32; TAPS], shift: u32, out: &mut [i16]) {
+    let rows = rows.map(|r| &r[..out.len()]);
+    #[cfg(feature = "simd")]
+    let done = simd::filter_column(&rows, c, shift, out);
+    #[cfg(not(feature = "simd"))]
+    let done = 0;
+    for (i, o) in out.iter_mut().enumerate().skip(done) {
+        let s: i32 = c.iter().zip(&rows).map(|(&ck, row)| ck * row[i].get()).sum();
+        *o = (s >> shift) as i16;
+    }
+}
+
+/// One row of the vertical second pass over the first pass's 16-bit
+/// intermediates (8-230, 8-243): shifted by 6, wrapping to 16 bits.
+#[inline(always)]
+fn filter_column_i16<const TAPS: usize>(rows: [&[i16]; TAPS], c: &[i32; TAPS], out: &mut [i16]) {
+    let rows = rows.map(|r| &r[..out.len()]);
+    #[cfg(feature = "simd")]
+    let done = simd::filter_column_i16(&rows, c, out);
+    #[cfg(not(feature = "simd"))]
+    let done = 0;
+    for (i, o) in out.iter_mut().enumerate().skip(done) {
+        let s: i32 = c.iter().zip(&rows).map(|(&ck, row)| ck * row[i] as i32).sum();
+        *o = (s >> 6) as i16;
+    }
+}
+
 /// Interpolate a `w`×`h` block of `plane` whose top-left full-sample
 /// position is (`xi`, `yi`) at fractional offset (`xf`, `yf`) (in
 /// 1/4 samples for luma, `TAPS` = 8, or 1/8 for chroma, `TAPS` = 4), into
@@ -50,78 +210,53 @@ fn interpolate<P: Sample, const TAPS: usize>(plane: &Plane<P>, xi: i32, yi: i32,
     let (src, base, ss): (&[P], usize, usize) = if x0 >= 0 && y0 >= 0 && x0 + ww as i32 <= pw && y0 + wh as i32 <= ph {
         (&plane.data, y0 as usize * plane.stride + x0 as usize, plane.stride)
     } else {
-        for j in 0..wh {
+        for (j, out) in win.chunks_exact_mut(ww).take(wh).enumerate() {
             let sy = (y0 + j as i32).clamp(0, ph - 1) as usize;
-            let row = &plane.data[sy * plane.stride..sy * plane.stride + plane.width];
-            for i in 0..ww {
-                win[j * ww + i] = row[(x0 + i as i32).clamp(0, pw - 1) as usize];
+            let row = &plane.data[sy * plane.stride..][..plane.width];
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = row[(x0 + i as i32).clamp(0, pw - 1) as usize];
             }
         }
         (&win[..], 0, ww)
     };
-    let filt = |f: usize| -> [i32; TAPS] {
-        let mut c = [0i32; TAPS];
-        for (k, v) in c.iter_mut().enumerate() {
-            *v = if TAPS == 8 { LUMA[f][k] } else { CHROMA[f][k] };
-        }
-        c
-    };
+    let row = |j: usize| &src[base + j * ss..][..ww];
+    let dst = &mut dst[..w * h];
     let shift1 = bit_depth - 8;
-    let shift3 = 14 - bit_depth;
     match (xf, yf) {
         (0, 0) => {
-            for j in 0..h {
-                let r = &src[base + (j + before) * ss + before..][..w];
-                for (d, s) in dst[j * w..j * w + w].iter_mut().zip(r) {
-                    *d = (s.get() << shift3) as i16;
+            let shift3 = 14 - bit_depth;
+            for (j, out) in dst.chunks_exact_mut(w).enumerate() {
+                let r = &row(j + before)[before..];
+                #[cfg(feature = "simd")]
+                let done = simd::full_sample_row(r, shift3, out);
+                #[cfg(not(feature = "simd"))]
+                let done = 0;
+                for (o, s) in out[done..].iter_mut().zip(&r[done..]) {
+                    *o = (s.get() << shift3) as i16;
                 }
             }
         }
         (_, 0) => {
-            let c = filt(xf);
-            for j in 0..h {
-                let r = &src[base + (j + before) * ss..][..ww];
-                for i in 0..w {
-                    let mut s = 0;
-                    for k in 0..TAPS {
-                        s += c[k] * r[i + k].get();
-                    }
-                    dst[j * w + i] = (s >> shift1) as i16;
-                }
+            let c = taps::<TAPS>(xf);
+            for (j, out) in dst.chunks_exact_mut(w).enumerate() {
+                filter_row(row(j + before), &c, shift1, out);
             }
         }
         (0, _) => {
-            let c = filt(yf);
-            for j in 0..h {
-                for i in 0..w {
-                    let mut s = 0;
-                    for k in 0..TAPS {
-                        s += c[k] * src[base + (j + k) * ss + before + i].get();
-                    }
-                    dst[j * w + i] = (s >> shift1) as i16;
-                }
+            let c = taps::<TAPS>(yf);
+            for (j, out) in dst.chunks_exact_mut(w).enumerate() {
+                filter_column(std::array::from_fn(|k| &row(j + k)[before..]), &c, shift1, out);
             }
         }
         _ => {
-            let (ch, cv) = (filt(xf), filt(yf));
-            for j in 0..wh {
-                let r = &src[base + j * ss..][..ww];
-                for i in 0..w {
-                    let mut s = 0;
-                    for k in 0..TAPS {
-                        s += ch[k] * r[i + k].get();
-                    }
-                    tmp[j * w + i] = (s >> shift1) as i16;
-                }
+            let (ch, cv) = (taps::<TAPS>(xf), taps::<TAPS>(yf));
+            let tmp = &mut tmp[..w * wh];
+            for (j, out) in tmp.chunks_exact_mut(w).enumerate() {
+                filter_row(row(j), &ch, shift1, out);
             }
-            for j in 0..h {
-                for i in 0..w {
-                    let mut s = 0;
-                    for k in 0..TAPS {
-                        s += cv[k] * tmp[(j + k) * w + i] as i32;
-                    }
-                    dst[j * w + i] = (s >> 6) as i16;
-                }
+            let tmp = &*tmp;
+            for (j, out) in dst.chunks_exact_mut(w).enumerate() {
+                filter_column_i16(std::array::from_fn(|k| &tmp[(j + k) * w..][..w]), &cv, out);
             }
         }
     }
@@ -157,8 +292,13 @@ pub fn put_uni<P: Sample>(src: &[i16], w: usize, h: usize, bit_depth: u32, dst: 
     let shift = 14 - bit_depth;
     let offset = 1 << (shift - 1);
     let max = (1 << bit_depth) - 1;
-    for j in 0..h {
-        for (d, &s) in dst[j * ds..j * ds + w].iter_mut().zip(&src[j * w..j * w + w]) {
+    for (j, s) in src[..w * h].chunks_exact(w).enumerate() {
+        let d = &mut dst[j * ds..j * ds + w];
+        #[cfg(feature = "simd")]
+        let done = simd::uni_row(s, offset, shift, max, d);
+        #[cfg(not(feature = "simd"))]
+        let done = 0;
+        for (d, &s) in d[done..].iter_mut().zip(&s[done..]) {
             *d = P::new(((s as i32 + offset) >> shift).clamp(0, max));
         }
     }
@@ -169,9 +309,13 @@ pub fn put_bi<P: Sample>(a: &[i16], b: &[i16], w: usize, h: usize, bit_depth: u3
     let shift = 15 - bit_depth;
     let offset = 1 << (shift - 1);
     let max = (1 << bit_depth) - 1;
-    for j in 0..h {
-        let (ra, rb) = (&a[j * w..j * w + w], &b[j * w..j * w + w]);
-        for ((d, &p), &q) in dst[j * ds..j * ds + w].iter_mut().zip(ra).zip(rb) {
+    for (j, (ra, rb)) in a[..w * h].chunks_exact(w).zip(b[..w * h].chunks_exact(w)).enumerate() {
+        let d = &mut dst[j * ds..j * ds + w];
+        #[cfg(feature = "simd")]
+        let done = simd::bi_row(ra, rb, offset, shift, max, d);
+        #[cfg(not(feature = "simd"))]
+        let done = 0;
+        for ((d, &p), &q) in d[done..].iter_mut().zip(&ra[done..]).zip(&rb[done..]) {
             *d = P::new(((p as i32 + q as i32 + offset) >> shift).clamp(0, max));
         }
     }

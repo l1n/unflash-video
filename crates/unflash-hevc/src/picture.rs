@@ -1,15 +1,24 @@
 //! Decoded pictures: sample planes (8-bit streams in `u8`, deeper ones in
 //! `u16`) and the motion data a later picture's temporal prediction reads.
 
+#[cfg(feature = "simd")]
+use wide::{i16x8, u8x16};
+
 /// A sample type: `u8` for 8-bit streams, `u16` for 9 to 12 bits. The
 /// reconstruction is generic over it, so 8-bit pictures take half the
 /// memory and bandwidth.
-pub trait Sample: Copy + Default + PartialEq + std::fmt::Debug + 'static {
+pub trait Sample: Copy + Default + PartialEq + Into<i32> + std::fmt::Debug + 'static {
     /// The largest bit depth the type holds.
     const MAX_BITS: u32;
     fn get(self) -> i32;
     /// From a value already in the range of the bit depth.
     fn new(v: i32) -> Self;
+    /// The first eight samples of `s` as 16-bit lanes.
+    #[cfg(feature = "simd")]
+    fn load8(s: &[Self]) -> i16x8;
+    /// Eight lanes into `d[..8]`, clamped to 0..=`max`.
+    #[cfg(feature = "simd")]
+    fn store8(v: i16x8, max: i16, d: &mut [Self]);
 }
 
 impl Sample for u8 {
@@ -22,6 +31,20 @@ impl Sample for u8 {
     fn new(v: i32) -> Self {
         v as u8
     }
+    #[cfg(feature = "simd")]
+    #[inline(always)]
+    fn load8(s: &[u8]) -> i16x8 {
+        let mut a = [0u8; 16];
+        a[..8].copy_from_slice(&s[..8]);
+        i16x8::from_u8x16_low(u8x16::from(a))
+    }
+    /// (8-bit pictures: the saturating narrowing is the clamp.)
+    #[cfg(feature = "simd")]
+    #[inline(always)]
+    fn store8(v: i16x8, _max: i16, d: &mut [u8]) {
+        let p = u8x16::narrow_i16x8(v, v);
+        d[..8].copy_from_slice(&p.as_array_ref()[..8]);
+    }
 }
 
 impl Sample for u16 {
@@ -33,6 +56,20 @@ impl Sample for u16 {
     #[inline(always)]
     fn new(v: i32) -> Self {
         v as u16
+    }
+    #[cfg(feature = "simd")]
+    #[inline(always)]
+    fn load8(s: &[u16]) -> i16x8 {
+        let s = &s[..8];
+        i16x8::new(std::array::from_fn(|i| s[i] as i16))
+    }
+    #[cfg(feature = "simd")]
+    #[inline(always)]
+    fn store8(v: i16x8, max: i16, d: &mut [u16]) {
+        let v = v.max(i16x8::ZERO).min(i16x8::splat(max));
+        for (o, &x) in d[..8].iter_mut().zip(v.as_array_ref()) {
+            *o = x as u16;
+        }
     }
 }
 

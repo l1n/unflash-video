@@ -508,7 +508,10 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     }
     let width = r.ue()?;
     let height = r.ue()?;
-    if width == 0 || height == 0 || width > 16888 || height > 16888 || width as u64 * height as u64 > 8192 * 4320 * 2 {
+    // the largest pictures any level allows (6.2: MaxLumaPs, and at most
+    // sqrt(8 * MaxLumaPs) wide or high), which also bounds the memory a
+    // damaged parameter set can make the decoder allocate
+    if width == 0 || height == 0 || width > 16888 || height > 16888 || width as u64 * height as u64 > 35_651_584 {
         return Err(Error::Unsupported("picture size"));
     }
     let (sub_w, sub_h) = if chroma_format_idc == 1 { (2, 2) } else { (1, 1) };

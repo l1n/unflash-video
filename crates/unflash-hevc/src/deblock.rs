@@ -37,15 +37,15 @@ struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    fn slice(&self, b: usize) -> Option<&'a SliceInfo> {
-        let (x4, y4) = (b % self.meta.w4, b / self.meta.w4);
-        let s = self.meta.ctb_slice[self.ctb(x4, y4)];
-        (s != NO_SLICE).then(|| &self.meta.slices[s as usize])
-    }
-
     fn ctb(&self, x4: usize, y4: usize) -> usize {
         let l = self.log2_ctb - 2;
         (y4 >> l) * self.layout.width_ctbs as usize + (x4 >> l)
+    }
+
+    /// The slice segment of the 4x4 block (`x4`, `y4`).
+    fn slice(&self, x4: usize, y4: usize) -> Option<&'a SliceInfo> {
+        let s = self.meta.ctb_slice[self.ctb(x4, y4)];
+        (s != NO_SLICE).then(|| &self.meta.slices[s as usize])
     }
 
     /// Whether the samples of block `b` are left as they are.
@@ -54,24 +54,28 @@ impl<'a> Ctx<'a> {
         f & BYPASS != 0 || (self.pcm_unfiltered && f & PCM != 0)
     }
 
-    /// 8.7.2.4: the boundary strength of the edge between block `p` and
-    /// block `q` (to its right or below); `tu` / `pu` are q's edge flags
-    /// for this direction.
-    fn strength(&self, p: usize, q: usize, tu: u8, pu: u8) -> u8 {
+    /// 8.7.2.4: the boundary strength of the edge between the 4x4 block
+    /// `p` and the block `q` to its right or below; `tu` / `pu` are q's
+    /// edge flags for this direction.
+    fn strength(&self, (px, py): (usize, usize), (qx, qy): (usize, usize), tu: u8, pu: u8) -> u8 {
+        let w4 = self.meta.w4;
+        let (p, q) = (py * w4 + px, qy * w4 + qx);
         let e = self.meta.edges[q];
         if e & (tu | pu) == 0 {
             return 0;
         }
-        let (Some(sq), Some(sp)) = (self.slice(q), self.slice(p)) else { return 0 };
-        if sq.deblocking_disabled || (sq.addr != sp.addr && !sq.loop_filter_across_slices) {
+        let (cp, cq) = (self.ctb(px, py), self.ctb(qx, qy));
+        let (np, nq) = (self.meta.ctb_slice[cp], self.meta.ctb_slice[cq]);
+        if np == NO_SLICE || nq == NO_SLICE {
             return 0;
         }
-        if !self.across_tiles {
-            let w4 = self.meta.w4;
-            let (cp, cq) = (self.ctb(p % w4, p / w4), self.ctb(q % w4, q / w4));
-            if self.layout.tile_id[cp] != self.layout.tile_id[cq] {
-                return 0;
-            }
+        let (sp, sq) = (&self.meta.slices[np as usize], &self.meta.slices[nq as usize]);
+        if sq.deblocking_disabled {
+            return 0;
+        }
+        // a coding tree block lies in one slice segment and one tile
+        if cp != cq && ((sq.addr != sp.addr && !sq.loop_filter_across_slices) || (!self.across_tiles && self.layout.tile_id[cp] != self.layout.tile_id[cq])) {
+            return 0;
         }
         let (fp, fq) = (self.meta.flags[p], self.meta.flags[q]);
         if (fp | fq) & INTRA != 0 {
@@ -118,45 +122,87 @@ fn motion_strength(mp: &Motion, rp: &[Vec<RefKey>; 2], mq: &Motion, rq: &[Vec<Re
     }
 }
 
-/// Filter one 4-sample luma edge segment (8.7.2.5.3, 8.7.2.5.4,
-/// 8.7.2.5.6, 8.7.2.5.7). `pos` is q0 of the first line; `n` steps across
-/// the edge (towards q), `along` along it.
-#[allow(clippy::too_many_arguments)]
-fn luma_edge<P: Sample>(d: &mut [P], pos: usize, n: isize, along: isize, beta: i32, tc: i32, no_p: bool, no_q: bool, max: i32) {
-    let at = |d: &[P], line: isize, i: isize| d[(pos as isize + line * along + i * n) as usize].get();
-    // p_i is at offset -(i + 1), q_i at i
-    let dp0 = (at(d, 0, -3) - 2 * at(d, 0, -2) + at(d, 0, -1)).abs();
-    let dp3 = (at(d, 3, -3) - 2 * at(d, 3, -2) + at(d, 3, -1)).abs();
-    let dq0 = (at(d, 0, 2) - 2 * at(d, 0, 1) + at(d, 0, 0)).abs();
-    let dq3 = (at(d, 3, 2) - 2 * at(d, 3, 1) + at(d, 3, 0)).abs();
-    let (dpq0, dpq3) = (dp0 + dq0, dp3 + dq3);
-    let (dp, dq) = (dp0 + dp3, dq0 + dq3);
-    if dpq0 + dpq3 >= beta {
-        return;
+/// The samples across an edge segment, gathered: `lines[k][i]` is sample
+/// `i` of line `k`, p3 p2 p1 p0 q0 q1 q2 q3 for luma (`N` = 8) and
+/// p1 p0 q0 q1 for chroma (`N` = 4). The edge at (`x`, `y`) is vertical
+/// (the lines are rows) or horizontal (the lines are columns).
+struct Segment<const N: usize> {
+    lines: [[i32; N]; 4],
+}
+
+impl<const N: usize> Segment<N> {
+    fn load<P: Sample>(d: &[P], stride: usize, x: usize, y: usize, vertical: bool, count: usize) -> Self {
+        let mut lines = [[0i32; N]; 4];
+        if vertical {
+            for (k, line) in lines.iter_mut().enumerate().take(count) {
+                let row = &d[(y + k) * stride + x - N / 2..][..N];
+                for (v, s) in line.iter_mut().zip(row) {
+                    *v = s.get();
+                }
+            }
+        } else {
+            for i in 0..N {
+                let row = &d[(y + i - N / 2) * stride + x..][..count];
+                for (line, s) in lines.iter_mut().zip(row) {
+                    line[i] = s.get();
+                }
+            }
+        }
+        Segment { lines }
     }
-    let sam = |d: &[P], line: isize, dpq: i32| -> bool {
-        let (p0, p3, q0, q3) = (at(d, line, -1), at(d, line, -4), at(d, line, 0), at(d, line, 3));
+
+    /// Write back the samples the filters may change (all but the outermost).
+    fn store<P: Sample>(&self, d: &mut [P], stride: usize, x: usize, y: usize, vertical: bool, count: usize) {
+        if vertical {
+            for (k, line) in self.lines.iter().enumerate().take(count) {
+                let row = &mut d[(y + k) * stride + x - N / 2..][..N];
+                for (s, &v) in row[1..N - 1].iter_mut().zip(&line[1..N - 1]) {
+                    *s = P::new(v);
+                }
+            }
+        } else {
+            for i in 1..N - 1 {
+                let row = &mut d[(y + i - N / 2) * stride + x..][..count];
+                for (s, line) in row.iter_mut().zip(&self.lines) {
+                    *s = P::new(line[i]);
+                }
+            }
+        }
+    }
+}
+
+/// Filter one 4-line luma edge segment (8.7.2.5.3, 8.7.2.5.4, 8.7.2.5.6,
+/// 8.7.2.5.7); returns whether any sample may have changed.
+fn luma_segment(seg: &mut Segment<8>, beta: i32, tc: i32, no_p: bool, no_q: bool, max: i32) -> bool {
+    // p_i is at 3 - i, q_i at 4 + i
+    let l = &seg.lines;
+    let dp = |k: usize| (l[k][1] - 2 * l[k][2] + l[k][3]).abs();
+    let dq = |k: usize| (l[k][6] - 2 * l[k][5] + l[k][4]).abs();
+    let (dp0, dp3, dq0, dq3) = (dp(0), dp(3), dq(0), dq(3));
+    let (dpq0, dpq3) = (dp0 + dq0, dp3 + dq3);
+    if dpq0 + dpq3 >= beta {
+        return false;
+    }
+    let sam = |k: usize, dpq: i32| -> bool {
+        let (p0, p3, q0, q3) = (l[k][3], l[k][0], l[k][4], l[k][7]);
         dpq < (beta >> 2) && (p3 - p0).abs() + (q0 - q3).abs() < (beta >> 3) && (p0 - q0).abs() < ((5 * tc + 1) >> 1)
     };
-    let strong = sam(d, 0, 2 * dpq0) && sam(d, 3, 2 * dpq3);
-    let dep = dp < ((beta + (beta >> 1)) >> 3);
-    let deq = dq < ((beta + (beta >> 1)) >> 3);
-    for line in 0..4 {
-        let base = pos as isize + line * along;
-        let idx = |i: isize| (base + i * n) as usize;
-        let (p0, p1, p2, p3) = (d[idx(-1)].get(), d[idx(-2)].get(), d[idx(-3)].get(), d[idx(-4)].get());
-        let (q0, q1, q2, q3) = (d[idx(0)].get(), d[idx(1)].get(), d[idx(2)].get(), d[idx(3)].get());
+    let strong = sam(0, 2 * dpq0) && sam(3, 2 * dpq3);
+    let side = (beta + (beta >> 1)) >> 3;
+    let (dep, deq) = (dp0 + dp3 < side, dq0 + dq3 < side);
+    for line in seg.lines.iter_mut() {
+        let [p3, p2, p1, p0, q0, q1, q2, q3] = *line;
         if strong {
             let tc2 = 2 * tc;
             if !no_p {
-                d[idx(-1)] = P::new(((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3).clamp(p0 - tc2, p0 + tc2));
-                d[idx(-2)] = P::new(((p2 + p1 + p0 + q0 + 2) >> 2).clamp(p1 - tc2, p1 + tc2));
-                d[idx(-3)] = P::new(((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(p2 - tc2, p2 + tc2));
+                line[3] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3).clamp(p0 - tc2, p0 + tc2);
+                line[2] = ((p2 + p1 + p0 + q0 + 2) >> 2).clamp(p1 - tc2, p1 + tc2);
+                line[1] = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(p2 - tc2, p2 + tc2);
             }
             if !no_q {
-                d[idx(0)] = P::new(((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(q0 - tc2, q0 + tc2));
-                d[idx(1)] = P::new(((p0 + q0 + q1 + q2 + 2) >> 2).clamp(q1 - tc2, q1 + tc2));
-                d[idx(2)] = P::new(((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(q2 - tc2, q2 + tc2));
+                line[4] = ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(q0 - tc2, q0 + tc2);
+                line[5] = ((p0 + q0 + q1 + q2 + 2) >> 2).clamp(q1 - tc2, q1 + tc2);
+                line[6] = ((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(q2 - tc2, q2 + tc2);
             }
         } else {
             let delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
@@ -165,34 +211,33 @@ fn luma_edge<P: Sample>(d: &mut [P], pos: usize, n: isize, along: isize, beta: i
             }
             let delta = delta.clamp(-tc, tc);
             if !no_p {
-                d[idx(-1)] = P::new((p0 + delta).clamp(0, max));
+                line[3] = (p0 + delta).clamp(0, max);
                 if dep {
                     let dp = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1).clamp(-(tc >> 1), tc >> 1);
-                    d[idx(-2)] = P::new((p1 + dp).clamp(0, max));
+                    line[2] = (p1 + dp).clamp(0, max);
                 }
             }
             if !no_q {
-                d[idx(0)] = P::new((q0 - delta).clamp(0, max));
+                line[4] = (q0 - delta).clamp(0, max);
                 if deq {
                     let dq = ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1).clamp(-(tc >> 1), tc >> 1);
-                    d[idx(1)] = P::new((q1 + dq).clamp(0, max));
+                    line[5] = (q1 + dq).clamp(0, max);
                 }
             }
         }
     }
+    true
 }
 
 /// Filter one chroma sample line across an edge (8.7.2.5.8).
-#[inline]
-fn chroma_sample<P: Sample>(d: &mut [P], q: usize, n: isize, tc: i32, no_p: bool, no_q: bool, max: i32) {
-    let at = |i: isize| (q as isize + i * n) as usize;
-    let (p0, p1, q0, q1) = (d[at(-1)].get(), d[at(-2)].get(), d[at(0)].get(), d[at(1)].get());
+fn chroma_line(line: &mut [i32; 4], tc: i32, no_p: bool, no_q: bool, max: i32) {
+    let [p1, p0, q0, q1] = *line;
     let delta = ((((q0 - p0) << 2) + p1 - q1 + 4) >> 3).clamp(-tc, tc);
     if !no_p {
-        d[at(-1)] = P::new((p0 + delta).clamp(0, max));
+        line[1] = (p0 + delta).clamp(0, max);
     }
     if !no_q {
-        d[at(0)] = P::new((q0 - delta).clamp(0, max));
+        line[2] = (q0 - delta).clamp(0, max);
     }
 }
 
@@ -200,84 +245,82 @@ fn chroma_sample<P: Sample>(d: &mut [P], q: usize, n: isize, tc: i32, no_p: bool
 pub fn deblock<P: Sample>(pic: &mut Picture<P>, meta: &Meta, sps: &Sps, pps: &Pps, layout: &Layout) {
     let cx = Ctx { meta, layout, log2_ctb: sps.log2_ctb, across_tiles: pps.loop_filter_across_tiles, pcm_unfiltered: sps.pcm_loop_filter_disabled };
     let (w4, h4) = (meta.w4, meta.h4);
-    let chroma = sps.chroma_format_idc != 0;
     let bd = sps.bit_depth;
     let bdc = sps.bit_depth_chroma;
-    let mut bs = vec![0u8; w4 * h4];
+    // the edges to filter in one direction: q block and boundary strength
+    let mut edges: Vec<(usize, usize, u8)> = Vec::new();
     for vertical in [true, false] {
-        // boundary strengths of this direction's edges, at their q block
+        // the edges lie on the 8x8 grid: every other column (row) of 4x4 blocks
         let (tu, pu) = if vertical { (TU_LEFT, PU_LEFT) } else { (TU_TOP, PU_TOP) };
-        for y4 in 0..h4 {
-            for x4 in 0..w4 {
-                let q = y4 * w4 + x4;
-                bs[q] = if vertical && x4 % 2 == 0 && x4 > 0 {
-                    cx.strength(q - 1, q, tu, pu)
-                } else if !vertical && y4 % 2 == 0 && y4 > 0 {
-                    cx.strength(q - w4, q, tu, pu)
-                } else {
-                    0
-                };
+        let before = |x4: usize, y4: usize| if vertical { (x4 - 1, y4) } else { (x4, y4 - 1) };
+        let grid = |n: usize| (1..n.div_ceil(2)).map(|k| 2 * k);
+        edges.clear();
+        let mut add = |x4: usize, y4: usize| {
+            let s = cx.strength(before(x4, y4), (x4, y4), tu, pu);
+            if s > 0 {
+                edges.push((x4, y4, s));
+            }
+        };
+        if vertical {
+            for y4 in 0..h4 {
+                grid(w4).for_each(|x4| add(x4, y4));
+            }
+        } else {
+            for y4 in grid(h4) {
+                (0..w4).for_each(|x4| add(x4, y4));
             }
         }
         // luma
-        {
-            let plane = &mut pic.planes[0];
-            let stride = plane.stride as isize;
-            let (n, along) = if vertical { (1, stride) } else { (stride, 1) };
-            let max = (1 << bd) - 1;
-            for y4 in 0..h4 {
-                for x4 in 0..w4 {
-                    let q = y4 * w4 + x4;
-                    let s = bs[q] as i32;
-                    if s == 0 {
-                        continue;
-                    }
-                    let p = if vertical { q - 1 } else { q - w4 };
-                    let Some(sq) = cx.slice(q) else { continue };
-                    let qpl = (meta.qp[p] as i32 + meta.qp[q] as i32 + 1) >> 1;
-                    let beta = BETA[(qpl + (sq.beta_offset_div2 << 1)).clamp(0, 51) as usize] as i32 * (1 << (bd - 8));
-                    let tc = TC[(qpl + 2 * (s - 1) + (sq.tc_offset_div2 << 1)).clamp(0, 53) as usize] as i32 * (1 << (bd - 8));
-                    let pos = (y4 * 4) * plane.stride + x4 * 4;
-                    luma_edge(&mut plane.data, pos, n, along, beta, tc, cx.unfiltered(p), cx.unfiltered(q), max);
-                }
+        let plane = &mut pic.planes[0];
+        let stride = plane.stride;
+        let max = (1 << bd) - 1;
+        for &(x4, y4, s) in &edges {
+            let (px, py) = before(x4, y4);
+            let (p, q) = (py * w4 + px, y4 * w4 + x4);
+            let Some(sq) = cx.slice(x4, y4) else { continue };
+            let qpl = (meta.qp[p] as i32 + meta.qp[q] as i32 + 1) >> 1;
+            let beta = BETA[(qpl + (sq.beta_offset_div2 << 1)).clamp(0, 51) as usize] as i32 * (1 << (bd - 8));
+            let tc = TC[(qpl + 2 * (s as i32 - 1) + (sq.tc_offset_div2 << 1)).clamp(0, 53) as usize] as i32 * (1 << (bd - 8));
+            let (x, y) = (x4 * 4, y4 * 4);
+            let mut seg = Segment::<8>::load(&plane.data, stride, x, y, vertical, 4);
+            if luma_segment(&mut seg, beta, tc, cx.unfiltered(p), cx.unfiltered(q), max) {
+                seg.store(&mut plane.data, stride, x, y, vertical, 4);
             }
         }
-        if !chroma {
+        if sps.chroma_format_idc == 0 {
             continue;
         }
-        // chroma: edges on the 8x8 chroma grid, strength 2 only; each
-        // 4-sample chroma segment takes the first of its two luma segments
+        // chroma: the edges of strength 2 on the 8x8 chroma grid (every
+        // other luma edge); a 4-line chroma segment spans two luma blocks
+        // and takes the first one's strength
+        let on_chroma_grid = |x4: usize, y4: usize| if vertical { x4 % 4 == 0 && y4 % 2 == 0 } else { y4 % 4 == 0 && x4 % 2 == 0 };
         let max = (1 << bdc) - 1;
         for c in 1..3 {
             let offset = if c == 1 { pps.cb_qp_offset } else { pps.cr_qp_offset };
             let plane = &mut pic.planes[c];
             let stride = plane.stride;
-            let n: isize = if vertical { 1 } else { stride as isize };
-            for y4 in (0..h4).step_by(2) {
-                for x4 in (0..w4).step_by(2) {
-                    let on_grid = if vertical { x4 % 4 == 0 } else { y4 % 4 == 0 };
-                    let q = y4 * w4 + x4;
-                    if !on_grid || bs[q] != 2 {
-                        continue;
-                    }
-                    let p = if vertical { q - 1 } else { q - w4 };
-                    let Some(sq) = cx.slice(q) else { continue };
-                    let qpi = ((meta.qp[p] as i32 + meta.qp[q] as i32 + 1) >> 1) + offset;
-                    let tc = TC[(qpc(qpi) + 2 + (sq.tc_offset_div2 << 1)).clamp(0, 53) as usize] as i32 * (1 << (bdc - 8));
-                    let (xc, yc) = (x4 * 2, y4 * 2);
-                    for k in 0..4 {
-                        // the luma blocks of this chroma sample line
-                        let (qb, pb) = if vertical {
-                            let row = ((yc + k) * 2 / 4) * w4;
-                            (row + x4, row + x4 - 1)
-                        } else {
-                            let col = (xc + k) * 2 / 4;
-                            (y4 * w4 + col, (y4 - 1) * w4 + col)
-                        };
-                        let pos = if vertical { (yc + k) * stride + xc } else { yc * stride + xc + k };
-                        chroma_sample(&mut plane.data, pos, n, tc, cx.unfiltered(pb), cx.unfiltered(qb), max);
-                    }
+            for &(x4, y4, _) in edges.iter().filter(|&&(x4, y4, s)| s == 2 && on_chroma_grid(x4, y4)) {
+                let (px, py) = before(x4, y4);
+                let (p, q) = (py * w4 + px, y4 * w4 + x4);
+                let Some(sq) = cx.slice(x4, y4) else { continue };
+                let qpi = ((meta.qp[p] as i32 + meta.qp[q] as i32 + 1) >> 1) + offset;
+                let tc = TC[(qpc(qpi) + 2 + (sq.tc_offset_div2 << 1)).clamp(0, 53) as usize] as i32 * (1 << (bdc - 8));
+                let (xc, yc) = (x4 * 2, y4 * 2);
+                // the chroma lines of the segment inside the plane
+                let count = 4.min(if vertical { plane.height.saturating_sub(yc) } else { plane.width.saturating_sub(xc) });
+                let mut seg = Segment::<4>::load(&plane.data, stride, xc, yc, vertical, count);
+                for (k, line) in seg.lines.iter_mut().enumerate().take(count) {
+                    // the luma blocks either side of this line
+                    let (qb, pb) = if vertical {
+                        let row = ((yc + k) / 2) * w4;
+                        (row + x4, row + x4 - 1)
+                    } else {
+                        let col = (xc + k) / 2;
+                        (y4 * w4 + col, (y4 - 1) * w4 + col)
+                    };
+                    chroma_line(line, tc, cx.unfiltered(pb), cx.unfiltered(qb), max);
                 }
+                seg.store(&mut plane.data, stride, xc, yc, vertical, count);
             }
         }
     }
