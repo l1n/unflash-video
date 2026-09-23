@@ -62,6 +62,12 @@ impl MbInfo {
     }
 }
 
+impl Default for MbInfo {
+    fn default() -> Self {
+        MbInfo::OUTSIDE
+    }
+}
+
 /// The frame-level parameters of the macroblock records.
 pub struct ModeParams<'a> {
     pub key_frame: bool,

@@ -176,7 +176,7 @@ mod simd {
         let mut mask = at_most((p0 - q0).abs() * 2i16 + ((p1 - q1).abs() >> 1), edge_limit);
         if !matches!(kind, Kind::Simple { .. }) {
             let steps = (p3 - p2).abs().max((p2 - p1).abs()).max((p1 - p0).abs()).max((q1 - q0).abs()).max((q2 - q1).abs()).max((q3 - q2).abs());
-            mask = mask & at_most(steps, interior);
+            mask &= at_most(steps, interior);
         }
         if mask.none() {
             return false;

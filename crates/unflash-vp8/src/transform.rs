@@ -42,9 +42,34 @@ fn mul_35468(x: i32) -> i32 {
     (x * 35468) >> 16
 }
 
+/// Add a 4x4 residual (raster order) to the prediction in `dst`, clipping
+/// to 0..=255. The transform's residual stays under 16000 in size (the
+/// second pass's gain on 16-bit rows, over 8), so it and the prediction
+/// plus it fit 16 bits; with `simd` two rows go through at once and the
+/// saturating narrowing is the clip.
 #[inline(always)]
-fn clip(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
+fn add_4x4(r: &[i16; 16], dst: &mut [u8], stride: usize) {
+    #[cfg(feature = "simd")]
+    {
+        use wide::{i16x8, u8x16};
+        for pair in 0..2 {
+            let (top, bottom) = (2 * pair * stride, (2 * pair + 1) * stride);
+            let mut p = [0u8; 16];
+            p[..4].copy_from_slice(&dst[top..top + 4]);
+            p[4..8].copy_from_slice(&dst[bottom..bottom + 4]);
+            let res: [i16; 8] = r[8 * pair..8 * pair + 8].try_into().unwrap();
+            let v = i16x8::from_u8x16_low(u8x16::from(p)) + i16x8::from(res);
+            let out = u8x16::narrow_i16x8(v, v);
+            dst[top..top + 4].copy_from_slice(&out.as_array_ref()[..4]);
+            dst[bottom..bottom + 4].copy_from_slice(&out.as_array_ref()[4..8]);
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    for (i, row) in r.chunks(4).enumerate() {
+        for (p, &v) in dst[i * stride..i * stride + 4].iter_mut().zip(row) {
+            *p = (*p as i32 + v as i32).clamp(0, 255) as u8;
+        }
+    }
 }
 
 /// 14.4: inverse DCT of a block (raster order) added to the prediction in
@@ -64,29 +89,25 @@ pub fn idct_add(c: &[i16; 16], dst: &mut [u8], stride: usize) {
         t[4 * i + 3] = (a - d) as i16;
     }
     // rows: t[4 * column + row]
+    let mut r = [0i16; 16];
     for i in 0..4 {
         let (t0, t1, t2, t3) = (t[i] as i32, t[4 + i] as i32, t[8 + i] as i32, t[12 + i] as i32);
         let a = t0 + t2;
         let b = t0 - t2;
         let cc = mul_35468(t1) - mul_20091(t3);
         let d = mul_20091(t1) + mul_35468(t3);
-        let row = &mut dst[i * stride..i * stride + 4];
-        row[0] = clip(row[0] as i32 + ((a + d + 4) >> 3));
-        row[1] = clip(row[1] as i32 + ((b + cc + 4) >> 3));
-        row[2] = clip(row[2] as i32 + ((b - cc + 4) >> 3));
-        row[3] = clip(row[3] as i32 + ((a - d + 4) >> 3));
+        r[4 * i] = ((a + d + 4) >> 3) as i16;
+        r[4 * i + 1] = ((b + cc + 4) >> 3) as i16;
+        r[4 * i + 2] = ((b - cc + 4) >> 3) as i16;
+        r[4 * i + 3] = ((a - d + 4) >> 3) as i16;
     }
+    add_4x4(&r, dst, stride);
 }
 
 /// A block whose only coefficient is the DC: the transform is a constant
 /// (the same as [`idct_add`] gives).
 pub fn idct_dc_add(dc: i16, dst: &mut [u8], stride: usize) {
-    let v = (dc as i32 + 4) >> 3;
-    for i in 0..4 {
-        for p in dst[i * stride..i * stride + 4].iter_mut() {
-            *p = clip(*p as i32 + v);
-        }
-    }
+    add_4x4(&[((dc as i32 + 4) >> 3) as i16; 16], dst, stride);
 }
 
 #[cfg(test)]

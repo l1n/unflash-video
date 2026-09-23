@@ -4,6 +4,7 @@
 
 use crate::{Error, Result};
 
+#[derive(Default)]
 pub struct Picture {
     pub y: Vec<u8>,
     pub u: Vec<u8>,

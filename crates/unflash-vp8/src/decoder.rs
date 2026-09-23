@@ -64,8 +64,7 @@ impl Decoder {
     /// `config`: codec configuration from the container. VP8 has none, so
     /// whatever the container gives (nothing in WebM, a `vpcC` in MP4) is
     /// not needed and not read.
-    pub fn new(config: &[u8]) -> Result<Decoder> {
-        let _ = config;
+    pub fn new(_config: &[u8]) -> Result<Decoder> {
         Ok(Decoder {
             state: State::default(),
             width: 0,
@@ -86,7 +85,7 @@ impl Decoder {
     }
 
     /// Leave the loop filter out, for pictures used only for statistics:
-    /// about a third of the decoding time. The pictures are no longer
+    /// a fifth to a third of the decoding time. The pictures are no longer
     /// bit-exact (block edges keep their coding artefacts, and later frames
     /// predicted from them drift slightly), which is fine for flash
     /// detection but not for pictures that are shown or re-encoded. With
@@ -113,7 +112,8 @@ impl Decoder {
             self.resize(h.width, h.height)?;
         }
         let cur = self.free_picture()?;
-        let mut pic = std::mem::replace(&mut self.pics[cur], Picture { y: Vec::new(), u: Vec::new(), v: Vec::new(), width: 0, height: 0 });
+        // taken out while the references are read
+        let mut pic = std::mem::take(&mut self.pics[cur]);
         let damaged = self.decode_macroblocks(&mut parsed, &state, &mut pic);
         self.pics[cur] = pic;
 
@@ -170,9 +170,7 @@ impl Decoder {
         let (mb_w, mb_h) = ((width as usize).div_ceil(16), (height as usize).div_ceil(16));
         let n = mb_w * mb_h;
         self.segments = try_alloc(n)?;
-        self.mbs = Vec::new();
-        self.mbs.try_reserve_exact(n).map_err(|_| Error::Unsupported("picture too large for the memory available"))?;
-        self.mbs.resize(n, MbInfo::OUTSIDE);
+        self.mbs = try_alloc(n)?;
         self.filters = try_alloc(n)?;
         self.above_nz = try_alloc(mb_w)?;
         self.width = width;
@@ -342,8 +340,8 @@ fn luma_edges(pic: &Picture, mb_x: usize, mb_y: usize, mb_w: usize) -> ([u8; 21]
         }
     }
     if mb_x > 0 {
-        for (j, l) in left.iter_mut().enumerate() {
-            *l = pic.y[(y0 + j) * stride + x0 - 1];
+        for (l, &v) in left.iter_mut().zip(pic.y[y0 * stride + x0 - 1..].iter().step_by(stride)) {
+            *l = v;
         }
     }
     (above, left)
@@ -360,8 +358,8 @@ fn chroma_edges(plane: &[u8], stride: usize, mb_x: usize, mb_y: usize) -> ([u8; 
         above[1..9].copy_from_slice(&row[x0..x0 + 8]);
     }
     if mb_x > 0 {
-        for (j, l) in left.iter_mut().enumerate() {
-            *l = plane[(y0 + j) * stride + x0 - 1];
+        for (l, &v) in left.iter_mut().zip(plane[y0 * stride + x0 - 1..].iter().step_by(stride)) {
+            *l = v;
         }
     }
     (above, left)
@@ -398,7 +396,7 @@ fn predict_intra(pic: &mut Picture, mb: &MbInfo, mb_x: usize, mb_y: usize, mb_w:
                 *v = if bx == 0 { left[4 * by + j] } else { pic.y[at + j * stride - 1] };
             }
             intra::predict_subblock(mb.bmodes[b], &e, &l, &mut pic.y[at..], stride);
-            add_block(&mut coeffs.blocks[b], coeffs.eob[b], &mut pic.y[at..], stride);
+            add_block(&mut coeffs.blocks[b], coeffs.eob[b], &mut pic.y, at, stride);
         }
     } else {
         intra::predict_block::<16>(mb.y_mode, &above, &left, mb_y > 0, mb_x > 0, &mut pic.y[y0..], stride);
@@ -422,68 +420,66 @@ fn chroma_average(mvs: &[Mv; 16], b: usize) -> Mv {
     Mv { x: avg([a.x, c.x, d.x, e.x]), y: avg([a.y, c.y, d.y, e.y]) }
 }
 
-/// 18: predict a luma block (`x`, `y`, `w`, `h` in the macroblock) and the
-/// chroma blocks under it from `r` with the vector `mv` (`uv` for chroma).
-#[allow(clippy::too_many_arguments)]
-fn predict_part(pic: &mut Picture, r: &Picture, mb_x: usize, mb_y: usize, part: (usize, usize, usize, usize), mv: Mv, filter: Filter, full_pixel: bool) {
-    let (x, y, w, h) = part;
-    let stride = pic.width;
-    let (px, py) = ((mb_x * 16 + x) as i32, (mb_y * 16 + y) as i32);
-    let at = py as usize * stride + px as usize;
-    inter::predict(&r.y, stride, r.width, r.height, px + (mv.x as i32 >> 2), py + (mv.y as i32 >> 2), (mv.x as usize & 3) * 2, (mv.y as usize & 3) * 2, w, h, filter, &mut pic.y[at..], stride);
-    predict_chroma(pic, r, (px / 2, py / 2, w / 2, h / 2), mv, filter, full_pixel);
+/// A block of a picture: position and size in samples of its plane.
+type Block = (usize, usize, usize, usize);
+
+/// 18: predict a luma block from `r` displaced by `mv` (quarter samples).
+fn predict_luma(pic: &mut Picture, r: &Picture, block: Block, mv: Mv, filter: Filter) {
+    let (x, y, w, h) = block;
+    let at = y * pic.width + x;
+    let (sx, sy) = (x as i32 + (mv.x as i32 >> 2), y as i32 + (mv.y as i32 >> 2));
+    inter::predict(&r.y, r.width, r.width, r.height, sx, sy, (mv.x as usize & 3) * 2, (mv.y as usize & 3) * 2, w, h, filter, &mut pic.y[at..], pic.width);
 }
 
-/// Predict a chroma block (`x`, `y` in the plane) of both planes with the
-/// vector `mv` in eighth samples.
-fn predict_chroma(pic: &mut Picture, r: &Picture, block: (i32, i32, usize, usize), mv: Mv, filter: Filter, full_pixel: bool) {
+/// 18: predict a block of both chroma planes from `r` displaced by `mv`
+/// (eighth samples; whole samples in version 3).
+fn predict_chroma(pic: &mut Picture, r: &Picture, block: Block, mv: Mv, filter: Filter, full_pixel: bool) {
     let (x, y, w, h) = block;
     let mv = if full_pixel { Mv { x: mv.x & !7, y: mv.y & !7 } } else { mv };
-    let uv_stride = pic.width / 2;
     let (pw, ph) = (r.width / 2, r.height / 2);
-    let at = y as usize * uv_stride + x as usize;
-    let (sx, sy) = (x + (mv.x as i32 >> 3), y + (mv.y as i32 >> 3));
+    let at = y * pw + x;
+    let (sx, sy) = (x as i32 + (mv.x as i32 >> 3), y as i32 + (mv.y as i32 >> 3));
     let (fx, fy) = (mv.x as usize & 7, mv.y as usize & 7);
-    inter::predict(&r.u, uv_stride, pw, ph, sx, sy, fx, fy, w, h, filter, &mut pic.u[at..], uv_stride);
-    inter::predict(&r.v, uv_stride, pw, ph, sx, sy, fx, fy, w, h, filter, &mut pic.v[at..], uv_stride);
+    inter::predict(&r.u, pw, pw, ph, sx, sy, fx, fy, w, h, filter, &mut pic.u[at..], pw);
+    inter::predict(&r.v, pw, pw, ph, sx, sy, fx, fy, w, h, filter, &mut pic.v[at..], pw);
 }
 
-/// 18: inter prediction of a macroblock from reference `r`.
+/// 18: inter prediction of a macroblock from reference `r`. A luma vector
+/// in quarter samples is the chroma vector in eighth samples; a 4x4 split
+/// gives each 4x4 chroma block the average of its four luma vectors.
 fn predict_inter(pic: &mut Picture, r: &Picture, mb: &MbInfo, mb_x: usize, mb_y: usize, filter: Filter, full_pixel: bool) {
-    let parts: &[(usize, usize, usize, usize, usize)] = match (mb.y_mode, mb.split) {
-        (SPLITMV, SPLIT_16X8) => &[(0, 0, 16, 8, 0), (0, 8, 16, 8, 8)],
-        (SPLITMV, SPLIT_8X16) => &[(0, 0, 8, 16, 0), (8, 0, 8, 16, 2)],
-        (SPLITMV, SPLIT_8X8) => &[(0, 0, 8, 8, 0), (8, 0, 8, 8, 2), (0, 8, 8, 8, 8), (8, 8, 8, 8, 10)],
+    let (x0, y0) = (mb_x * 16, mb_y * 16);
+    // the parts (in the macroblock) with the subblock whose vector they use
+    let parts: &[(Block, usize)] = match (mb.y_mode, mb.split) {
+        (SPLITMV, SPLIT_16X8) => &[((0, 0, 16, 8), 0), ((0, 8, 16, 8), 8)],
+        (SPLITMV, SPLIT_8X16) => &[((0, 0, 8, 16), 0), ((8, 0, 8, 16), 2)],
+        (SPLITMV, SPLIT_8X8) => &[((0, 0, 8, 8), 0), ((8, 0, 8, 8), 2), ((0, 8, 8, 8), 8), ((8, 8, 8, 8), 10)],
         (SPLITMV, _) => {
-            // sixteen luma vectors; each 4x4 chroma block averages four
-            let stride = pic.width;
             for b in 0..16 {
-                let (x, y) = ((mb_x * 16 + (b & 3) * 4) as i32, (mb_y * 16 + (b >> 2) * 4) as i32);
-                let mv = mb.mvs[b];
-                let at = y as usize * stride + x as usize;
-                inter::predict(&r.y, stride, r.width, r.height, x + (mv.x as i32 >> 2), y + (mv.y as i32 >> 2), (mv.x as usize & 3) * 2, (mv.y as usize & 3) * 2, 4, 4, filter, &mut pic.y[at..], stride);
+                predict_luma(pic, r, (x0 + (b & 3) * 4, y0 + (b >> 2) * 4, 4, 4), mb.mvs[b], filter);
             }
             for b in [0, 2, 8, 10] {
-                let (x, y) = ((mb_x * 8 + (b & 3) * 2) as i32, (mb_y * 8 + (b >> 2) * 2) as i32);
-                predict_chroma(pic, r, (x, y, 4, 4), chroma_average(&mb.mvs, b), filter, full_pixel);
+                predict_chroma(pic, r, (x0 / 2 + (b & 3) * 2, y0 / 2 + (b >> 2) * 2, 4, 4), chroma_average(&mb.mvs, b), filter, full_pixel);
             }
             return;
         }
-        _ => &[(0, 0, 16, 16, 0)],
+        _ => &[((0, 0, 16, 16), 0)],
     };
-    for &(x, y, w, h, b) in parts {
-        predict_part(pic, r, mb_x, mb_y, (x, y, w, h), mb.mvs[b], filter, full_pixel);
+    for &((x, y, w, h), b) in parts {
+        predict_luma(pic, r, (x0 + x, y0 + y, w, h), mb.mvs[b], filter);
+        predict_chroma(pic, r, ((x0 + x) / 2, (y0 + y) / 2, w / 2, h / 2), mb.mvs[b], filter, full_pixel);
     }
 }
 
-/// Add one block's residual to the prediction in `dst` and clear the block.
+/// Add one block's residual to the prediction at `plane[at]` and clear the
+/// block.
 #[inline]
-fn add_block(block: &mut [i16; 16], eob: u8, dst: &mut [u8], stride: usize) {
+fn add_block(block: &mut [i16; 16], eob: u8, plane: &mut [u8], at: usize, stride: usize) {
     if eob > 1 {
-        transform::idct_add(block, dst, stride);
+        transform::idct_add(block, &mut plane[at..], stride);
         *block = [0; 16];
     } else if block[0] != 0 {
-        transform::idct_dc_add(block[0], dst, stride);
+        transform::idct_dc_add(block[0], &mut plane[at..], stride);
         block[0] = 0;
     }
 }
@@ -503,16 +499,14 @@ fn add_residual(pic: &mut Picture, mb: &MbInfo, mb_x: usize, mb_y: usize, coeffs
         }
         let y0 = mb_y * 16 * stride + mb_x * 16;
         for b in 0..16 {
-            let at = y0 + (b >> 2) * 4 * stride + (b & 3) * 4;
-            add_block(&mut coeffs.blocks[b], coeffs.eob[b], &mut pic.y[at..], stride);
+            add_block(&mut coeffs.blocks[b], coeffs.eob[b], &mut pic.y, y0 + (b >> 2) * 4 * stride + (b & 3) * 4, stride);
         }
     }
     let uv_stride = stride / 2;
     let c0 = mb_y * 8 * uv_stride + mb_x * 8;
     for (plane, first) in [(&mut pic.u, 16), (&mut pic.v, 20)] {
         for k in 0..4 {
-            let at = c0 + (k >> 1) * 4 * uv_stride + (k & 1) * 4;
-            add_block(&mut coeffs.blocks[first + k], coeffs.eob[first + k], &mut plane[at..], uv_stride);
+            add_block(&mut coeffs.blocks[first + k], coeffs.eob[first + k], plane, c0 + (k >> 1) * 4 * uv_stride + (k & 1) * 4, uv_stride);
         }
     }
 }
