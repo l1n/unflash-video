@@ -1077,6 +1077,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "unflash-hevc"
+version = "0.1.0"
+dependencies = [
+ "md5",
+ "unflash-mp4",
+]
+
+[[package]]
 name = "unflash-mp4"
 version = "0.1.0"
 dependencies = [
