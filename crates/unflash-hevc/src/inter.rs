@@ -134,6 +134,32 @@ mod simd {
         i
     }
 
+    /// Explicit weighting, ((s · w + 2^(sh − 1)) >> sh) + o clipped, from
+    /// the 16-bit halves of the products: the high half scaled up plus the
+    /// low half's rounded share (((lo >> (sh − 1)) + 1) >> 1 is the rounded
+    /// lo >> sh). The high half is first held to where the result is out
+    /// of range anyway, which keeps everything in 16 bits and the
+    /// saturating additions exact. `sh` is at least 2 (log2WD includes
+    /// 14 − bitDepth).
+    #[inline(always)]
+    pub fn weighted_row<P: Sample>(s: &[i16], w: i32, o: i32, sh: u32, max: i32, d: &mut [P]) -> usize {
+        let wv = i16x8::splat(w as i16);
+        let mask = i16x8::splat(((1 << (17 - sh)) - 1) as i16);
+        let limit = 1i16 << (sh - 1);
+        let (low, high) = (i16x8::splat(-limit), i16x8::splat(limit - 1));
+        let (offset, one) = (i16x8::splat(o as i16), i16x8::splat(1));
+        let mut i = 0;
+        while i + 8 <= d.len() {
+            let p = i16x8::from_slice_unaligned(&s[i..i + 8]);
+            let hi = i16x8::mul_keep_high(p, wv).max(low).min(high);
+            let x = ((p * wv) >> (sh - 1)) & mask;
+            let v = (hi << (16 - sh)).saturating_add((x >> 1) + (x & one)).saturating_add(offset);
+            P::store8(v, max as i16, &mut d[i..i + 8]);
+            i += 8;
+        }
+        i
+    }
+
     /// (a + b + offset) >> shift into `d`, clipped (saturating as above).
     #[inline(always)]
     pub fn bi_row<P: Sample>(a: &[i16], b: &[i16], offset: i32, shift: u32, max: i32, d: &mut [P]) -> usize {
@@ -333,8 +359,13 @@ pub fn put_weighted_uni<P: Sample>(src: &[i16], w: usize, h: usize, bit_depth: u
     let max = (1 << bit_depth) - 1;
     let (w0, o0, sh) = (wt.w[l], wt.o[l], wt.log2wd);
     let round = if sh >= 1 { 1 << (sh - 1) } else { 0 };
-    for j in 0..h {
-        for (d, &s) in dst[j * ds..j * ds + w].iter_mut().zip(&src[j * w..j * w + w]) {
+    for (j, s) in src[..w * h].chunks_exact(w).enumerate() {
+        let d = &mut dst[j * ds..j * ds + w];
+        #[cfg(feature = "simd")]
+        let done = simd::weighted_row(s, w0, o0, sh, max, d);
+        #[cfg(not(feature = "simd"))]
+        let done = 0;
+        for (d, &s) in d[done..].iter_mut().zip(&s[done..]) {
             *d = P::new((((s as i32 * w0 + round) >> sh) + o0).clamp(0, max));
         }
     }
@@ -394,6 +425,41 @@ mod tests {
                     for j in 0..4 {
                         for i in 0..8 {
                             assert_eq!(dst[j * 8 + i] as i32, reference(&plane, x + i as i32, y + j as i32, [mvx, mvy]), "({x},{y}) mv ({mvx},{mvy})");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_weighting_matches_the_formula() {
+        let mut seed = 3u32;
+        let mut rand = |n: i32| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as i32 % n
+        };
+        for bit_depth in [8, 10, 12] {
+            let max = (1 << bit_depth) - 1;
+            for denom in 0..8 {
+                let log2wd = denom + 14 - bit_depth;
+                for _ in 0..50 {
+                    let w0 = (1 << denom) + rand(256) - 128;
+                    let o0 = (rand(256) - 128) << (bit_depth - 8);
+                    // intermediates across the whole 16-bit range, extremes included
+                    let src: Vec<i16> = (0..16).map(|k| if k < 2 { [i16::MIN, i16::MAX][k] } else { (rand(65536) - 32768) as i16 }).collect();
+                    let wt = Weights { log2wd, w: [w0, w0], o: [o0, o0] };
+                    let mut d = [0u16; 16];
+                    put_weighted_uni(&src, 16, 1, bit_depth, &wt, 0, &mut d, 16);
+                    let mut d8 = [0u8; 16];
+                    if bit_depth == 8 {
+                        put_weighted_uni(&src, 16, 1, bit_depth, &wt, 0, &mut d8, 16);
+                    }
+                    for (k, (&s, &v)) in src.iter().zip(&d).enumerate() {
+                        let want = (((s as i32 * w0 + (1 << (log2wd - 1))) >> log2wd) + o0).clamp(0, max);
+                        assert_eq!(v as i32, want, "bit depth {bit_depth} denom {denom} w {w0} o {o0} sample {k} ({s})");
+                        if bit_depth == 8 {
+                            assert_eq!(d8[k] as i32, want, "8-bit samples, denom {denom} w {w0} o {o0} sample {k} ({s})");
                         }
                     }
                 }
