@@ -1,8 +1,9 @@
-// Parallel decoding with the built-in H.264 decoder: the sample range is
-// split into groups of pictures at sync samples, each group goes to a Web
-// Worker (h264worker.js), and the pictures come back in presentation order.
+// Parallel decoding with a built-in decoder: the sample range is split into
+// groups of pictures at sync samples, each group goes to a Web Worker
+// (h264worker.js for H.264, softworker.js for HEVC, VP9, VP8 and AV1), and
+// the pictures come back in presentation order.
 //
-// Protocol (main -> worker): {type:'init', desc} once; {type:'decode', id,
+// Protocol (main -> worker): {type:'init', desc, codec} once; {type:'decode', id,
 // file, offset, size, pts, minPts, maxPts} per group (samples in decode
 // order; only pictures with minPts <= pts < maxPts are sent back, so the
 // leading pictures of an open GOP come from the group that holds their
@@ -16,6 +17,7 @@
 // decodeMs, decoded}.
 import { rawPicture } from './media.js';
 import { profile } from './profile.js';
+import { builtInFor } from './codecs.js';
 
 /** How many decoder workers to run: leave a core for the page itself. */
 export function defaultWorkerCount() {
@@ -43,17 +45,20 @@ function smallPicture(p) {
 }
 
 export class SoftwarePool {
-  constructor(movie, workers) {
+  constructor(movie, workers, codec) {
     this.movie = movie;
     this.workers = workers;
+    this.codec = codec;
     this.busy = false;
   }
 
   /** Spawn and initialise the workers (rejects when workers cannot run the decoder). */
   static async create(movie, size = defaultWorkerCount()) {
     if (typeof Worker === 'undefined') throw new Error('Web Workers are not available');
+    const codec = builtInFor(movie.video.codec);
+    if (!codec) throw new Error(`there is no built-in decoder for ${movie.video.codec}`);
     const desc = movie.dx.track_description(movie.video.index);
-    const url = new URL('./h264worker.js', import.meta.url);
+    const url = codec.id === 'h264' ? new URL('./h264worker.js', import.meta.url) : new URL('./softworker.js', import.meta.url);
     const workers = [];
     try {
       for (let k = 0; k < size; k++) workers.push(new Worker(url, { type: 'module' }));
@@ -80,7 +85,7 @@ export class SoftwarePool {
               };
               w.addEventListener('message', onMessage);
               w.addEventListener('error', onError);
-              w.postMessage({ type: 'init', desc });
+              w.postMessage({ type: 'init', desc, codec: codec.id });
             })
         )
       );
@@ -88,7 +93,7 @@ export class SoftwarePool {
       for (const w of workers) w.terminate();
       throw e;
     }
-    return new SoftwarePool(movie, workers);
+    return new SoftwarePool(movie, workers, codec);
   }
 
   close() {
@@ -224,7 +229,7 @@ export class SoftwarePool {
           o.damaged = m.damaged;
           o.error = m.error || null;
           if (m.decoded) profile.add('sw.decode', m.decodeMs, m.decoded);
-          if (m.error) console.warn('built-in H.264 decoder:', m.error);
+          if (m.error) console.warn(`built-in ${this.codec.name} decoder:`, m.error);
           inflight--;
           assign(w);
         }
@@ -280,7 +285,7 @@ export class SoftwarePool {
       this.workers.forEach((w, i) => w.removeEventListener('message', handlers[i]));
       this.busy = false;
     }
-    if (damaged) console.warn(`built-in H.264 decoder: ${damaged} damaged pictures`);
+    if (damaged) console.warn(`built-in ${this.codec.name} decoder: ${damaged} damaged pictures`);
     return frames;
   }
 }

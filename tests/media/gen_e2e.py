@@ -23,6 +23,10 @@ flash.mkv    flash_h264.mp4 remuxed into Matroska (H.264 + AAC, copied).
 flash.webm   flash.mp4 as WebM (VP9, the audio as Opus).
 flash_vorbis.webm  the same with Vorbis audio, which an MP4 cannot carry
              (the export re-encodes it).
+flash_hevc.mp4  the flash clip as HEVC (open GOPs, B-frames): the built-in
+             HEVC decoder, in a browser without one.
+flash_vp8.webm  the flash clip as VP8 in WebM.
+flash_av1.mp4   the flash clip as AV1.
 """
 import os
 import subprocess
@@ -51,13 +55,23 @@ def encode(name, frames, codec, secs, bitrate="1200k"):
     elif codec == "h264i":
         # interlaced (x264 codes MBAFF frames): the built-in decoder's field / frame macroblock pairs
         vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-g", "30", "-flags", "+ildct+ilme", "-x264-params", "interlaced=1"]
+    elif codec == "hevc":
+        # x265's defaults: open GOPs (CRA pictures with leading pictures) and B-frames
+        vcodec = ["-c:v", "libx265", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p", "-g", "30", "-tag:v", "hvc1", "-x265-params", "log-level=error"]
+    elif codec == "vp8":
+        vcodec = ["-c:v", "libvpx", "-b:v", bitrate, "-deadline", "realtime", "-cpu-used", "8", "-pix_fmt", "yuv420p", "-g", "30"]
+    elif codec == "av1":
+        vcodec = av1_encoder()
     else:
         vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-g", "30"]
+    # WebM holds Opus rather than AAC
+    audio = ["-c:a", "libopus", "-b:a", "64k"] if name.endswith(".webm") else ["-c:a", "aac", "-b:a", "64k"]
     cmd = ["ffmpeg", "-y", "-v", "error",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-",
            "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={secs}",
-           *vcodec, "-c:a", "aac", "-b:a", "64k", "-shortest", "-movflags", "+faststart", path]
-    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+           *vcodec, *audio, "-shortest", *([] if name.endswith(".webm") else ["-movflags", "+faststart"]), path]
+    # SVT-AV1 prints its settings unless told to keep to errors
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, env={**os.environ, "SVT_LOG": "1"})
     for fr in frames:
         p.stdin.write(np.ascontiguousarray(fr).tobytes())
     p.stdin.close()
@@ -65,6 +79,14 @@ def encode(name, frames, codec, secs, bitrate="1200k"):
     if p.returncode != 0:
         raise SystemExit(f"ffmpeg failed for {name}")
     print("wrote", path, os.path.getsize(path), "bytes")
+
+
+def av1_encoder():
+    """SVT-AV1 where this ffmpeg has it (fast), else libaom."""
+    have = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+    if "libsvtav1" in have:
+        return ["-c:v", "libsvtav1", "-preset", "10", "-crf", "35", "-pix_fmt", "yuv420p", "-g", "30"]
+    return ["-c:v", "libaom-av1", "-cpu-used", "8", "-row-mt", "1", "-crf", "35", "-b:v", "0", "-pix_fmt", "yuv420p", "-g", "30"]
 
 
 def flash_frames(secs=10.0, red=True):
@@ -152,6 +174,9 @@ if __name__ == "__main__":
     encode("stripes_h264.mp4", stripes_frames(), "h264", 10)
     encode("redflash_h264.mp4", redflash_frames(), "h264", 8)
     encode("flash_h264i.mp4", flash_frames(), "h264i", 10)
+    encode("flash_hevc.mp4", flash_frames(), "hevc", 10)
+    encode("flash_vp8.webm", flash_frames(), "vp8", 10)
+    encode("flash_av1.mp4", flash_frames(), "av1", 10)
     # the same pictures in Matroska / WebM
     for src, dst, audio in [("flash_h264.mp4", "flash.mkv", ["-c:a", "copy"]), ("flash.mp4", "flash.webm", ["-c:a", "libopus", "-b:a", "64k"]), ("flash.mp4", "flash_vorbis.webm", ["-c:a", "libvorbis", "-q:a", "3"])]:
         path = os.path.join(OUT, dst)

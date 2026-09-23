@@ -112,7 +112,7 @@ export function debugReport({ version, state, profile, gpu, segments, hybrid = n
     det.push(`pictures reach it as: ${f.route || 'nothing yet'}${f.routeDetail ? ` (${f.routeDetail})` : ''}${f.takesFrames === false && f.backend === 'webgpu' ? ' · this WebGPU takes no decoded frame' : ''}`);
     const m = state.movie;
     const scans = hybrid ? `scans hybrid: ${hybrid.hw} lane${hybrid.hw === 1 ? '' : 's'} of the browser's decoder${hybrid.sw ? ` + the built-in decoder in ${hybrid.sw} worker${hybrid.sw === 1 ? '' : 's'}` : ''}` : `scans in ${segments > 1 ? `up to ${segments} segments` : 'one piece'}`;
-    det.push(`decoding: ${state.decode && state.decode.software ? 'the built-in H.264 decoder' : m && m.decodeInWorkers ? 'WebCodecs, in workers' : 'WebCodecs, on the page'} · ${scans}`);
+    det.push(`decoding: ${state.decode && state.decode.software && m && m.builtIn ? `the built-in ${m.builtIn.name} decoder` : m && m.decodeInWorkers ? 'WebCodecs, in workers' : 'WebCodecs, on the page'} · ${scans}`);
     lines.push(...block('Detector', det));
   }
   const m = state.movie;

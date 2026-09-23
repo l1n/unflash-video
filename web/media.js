@@ -1,4 +1,5 @@
 import { profile } from './profile.js';
+import { builtInFor, loadDecoders } from './codecs.js';
 // Demuxing (through the WASM MP4 parser, served byte ranges from the File)
 // and decoding through WebCodecs.
 
@@ -200,7 +201,7 @@ export class Movie {
           this.pool = await SoftwarePool.create(this);
           return this.pool;
         } catch (e) {
-          console.warn('built-in H.264 decoder: decoding on the page instead of in workers:', e && e.message ? e.message : e);
+          console.warn(`built-in ${(builtInFor(this.video.codec) || { name: '' }).name} decoder: decoding on the page instead of in workers:`, e && e.message ? e.message : e);
           this.poolFailed = true;
           return null;
         }
@@ -223,29 +224,39 @@ export class Movie {
   }
 
   /**
-   * Whether the file can be decoded: by WebCodecs, or, for H.264 in a
-   * browser without an H.264 decoder, by the built-in software decoder
-   * (`software: true`). VideoFrame itself has to exist either way.
+   * Whether the file can be decoded: by WebCodecs, or, for a codec the
+   * browser has no decoder for (H.264 in some Chromium builds, HEVC in most
+   * browsers, VP9 or AV1 in some), by the app's built-in decoder for it
+   * (`software: true`; `builtIn` names it). With `forceBuiltIn` set, the
+   * built-in decoder is used whenever there is one. VideoFrame itself has
+   * to exist either way.
    */
   async decoderSupport() {
     this.software = false;
+    this.builtIn = null;
     if (typeof VideoDecoder === 'undefined' || typeof VideoFrame === 'undefined') return { supported: false, software: false, reason: 'WebCodecs is not available in this browser' };
     let reason = '';
-    try {
-      const r = await VideoDecoder.isConfigSupported(this.decoderConfig());
-      if (r.supported) return { supported: true, software: false, reason: '' };
-      reason = `this browser cannot decode ${this.video.codec}`;
-    } catch (e) {
-      reason = String(e);
-    }
-    if (/^avc[13]/.test(this.video.codec)) {
+    const b = builtInFor(this.video.codec);
+    if (this.forceBuiltIn && b) reason = 'the built-in decoder was asked for';
+    else {
       try {
-        const info = JSON.parse(this.wasm.h264_probe(this.dx.track_description(this.video.index)));
+        const r = await VideoDecoder.isConfigSupported(this.decoderConfig());
+        if (r.supported) return { supported: true, software: false, reason: '' };
+        reason = `this browser cannot decode ${this.video.codec}`;
+      } catch (e) {
+        reason = String(e);
+      }
+    }
+    if (b) {
+      try {
+        const desc = this.dx.track_description(this.video.index);
+        const info = JSON.parse(b.id === 'h264' ? this.wasm.h264_probe(desc) : (await loadDecoders()).probe(b.id, desc));
         this.software = true;
+        this.builtIn = b;
         this.softwareInfo = info;
         return { supported: true, software: true, reason: '' };
       } catch (e) {
-        reason += `, and the built-in H.264 decoder cannot read it: ${e && e.message ? e.message : e}`;
+        reason += `, and the built-in ${b.name} decoder cannot read it: ${e && e.message ? e.message : e}`;
       }
     }
     return { supported: false, software: false, reason };
@@ -630,6 +641,74 @@ export function decodeStretchesBuiltIn(movie, pool, next, onFrame, { cancel, shr
 }
 
 /**
+ * decodeRange on the page through one of the decoders module's built-in
+ * decoders (HEVC, VP9, VP8, AV1), for when its workers cannot run. Each
+ * picture is tagged with the index of the sample it came from, and handed
+ * on in presentation order (a decoder that gives them in decode order says
+ * how far out of order they can be).
+ */
+async function decodeRangeBuiltInInline(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null } = {}) {
+  const mod = await loadDecoders();
+  reader = reader || movie.reader || new ChunkReader(movie.file);
+  const { pts, offset, size } = movie.v;
+  const { startIdx, endIdx } = sampleRange(movie, startSec, endSec, fromIndex);
+  const d = new mod.SoftDecoder(movie.builtIn.id, movie.dx.track_description(movie.video.index), fast);
+  const reorder = d.reorder_depth();
+  const held = [];
+  let frames = 0;
+  let damaged = 0;
+  const collect = (n) => {
+    for (let k = 0; k < n && d.next(); k++) {
+      if (d.frame_damaged()) damaged++;
+      const data = new Uint8Array(mod.wasm_memory().buffer, d.frame_ptr(), d.frame_len()).slice();
+      let colorSpace = null;
+      try {
+        colorSpace = JSON.parse(d.color_json());
+      } catch (e) {
+        /* default colour space */
+      }
+      held.push(rawPicture(data, d.width(), d.height(), pts[d.frame_pts()], colorSpace));
+    }
+    held.sort((a, b) => a.timestamp - b.timestamp);
+  };
+  const release = async (keep) => {
+    while (held.length > keep) {
+      const pic = held.shift();
+      const t = pic.timestamp / 1e6;
+      if (t < startSec - 1e-6 || t >= endSec - 1e-9) continue;
+      await onFrame(raw ? pic : pic.toVideoFrame(), t);
+      frames++;
+    }
+  };
+  try {
+    for (let i = startIdx; i < endIdx && !(cancel && cancel()); i++) {
+      const data = await reader.read(offset[i], size[i]);
+      const td = performance.now();
+      let n = 0;
+      try {
+        n = d.decode(data, i);
+      } catch (e) {
+        console.warn(`built-in ${movie.builtIn.name} decoder:`, e);
+        damaged++;
+      }
+      profile.add('sw.decode', performance.now() - td);
+      collect(n);
+      await release(reorder);
+      if (onProgress && (i - startIdx) % 30 === 0) onProgress((i - startIdx) / Math.max(1, endIdx - startIdx));
+      if (i % 4 === 0) await yieldTask();
+    }
+    if (!(cancel && cancel())) {
+      collect(d.flush());
+      await release(0);
+    }
+  } finally {
+    d.free();
+  }
+  if (damaged) console.warn(`built-in ${movie.builtIn.name} decoder: ${damaged} damaged pictures`);
+  return frames;
+}
+
+/**
  * The same as decodeRange, through the built-in H.264 decoder in WASM.
  * Samples are decoded in file (decode) order and the pictures handed out in
  * presentation order once every earlier picture has been decoded.
@@ -647,6 +726,7 @@ async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, o
     // pictures for the detector are made small in the workers
     return pool.decodeRange(startIdx, endIdx, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, shrink: raw ? shrink : null });
   }
+  if (movie.builtIn && movie.builtIn.id !== 'h264') return decodeRangeBuiltInInline(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, fromIndex: startIdx, reader });
   const dec = new movie.wasm.H264Decoder(movie.dx.track_description(movie.video.index), fast);
   // presentation order of the samples this pass will decode
   const ptsSorted = [];

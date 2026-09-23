@@ -2,10 +2,11 @@
 
 import init, * as wasm from './pkg/unflash.js';
 import { defaultWorkerCount, SoftwarePool } from './h264pool.js';
+import { builtInFor } from './codecs.js';
 import { Movie, tick } from './media.js';
 import { createDetector, gpuAdapter } from './detector.js';
 import { profile } from './profile.js';
-import { scanMovie, HYBRID_CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, BLEND_DEFAULT } from './analysis.js';
+import { scanMovie, scanChunks, HYBRID_CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, BLEND_DEFAULT } from './analysis.js';
 import { Project, projectKey, dropCaches, lastSavedAt } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
@@ -560,6 +561,7 @@ async function openFile(file) {
     state.scanTrace = null;
     state.traceNorm = null;
     state.movie = movie;
+    movie.forceBuiltIn = builtInSetting();
     state.decode = await movie.decoderSupport();
     progress(0.4, 'starting the detector');
     const key = projectKey(file);
@@ -585,9 +587,12 @@ async function openFile(file) {
     if (!state.decode.supported) banner(`This browser cannot decode ${movie.video.codec} with WebCodecs (${state.decode.reason}). The live monitor still works while the player plays; scanning and section editing need a decodable file (H.264 in most browsers).`, 'info');
     else if (state.decode.software) {
       const info = movie.softwareInfo || {};
-      banner(`This browser cannot decode ${movie.video.codec} with WebCodecs, so Unflash uses its built-in H.264 decoder (profile ${info.profile_idc}, level ${info.level_idc}) for scanning, sections and export, decoding in ${defaultWorkerCount()} parallel workers. The player cannot play this file here, so the live monitor is off.`, 'info');
+      const about = movie.builtIn.id === 'h264' ? ` (profile ${info.profile_idc}, level ${info.level_idc})` : info.summary ? ` (${info.summary})` : '';
+      const why = movie.forceBuiltIn ? 'You asked for the built-in decoder' : `This browser cannot decode ${movie.video.codec} with WebCodecs`;
+      banner(`${why}, so Unflash uses its built-in ${movie.builtIn.name} decoder${about} for scanning, sections and export, decoding in ${defaultWorkerCount()} parallel workers.${movie.forceBuiltIn ? '' : ' The player cannot play this file here, so the live monitor is off.'}`, 'info');
     }
-    $('liveToggle').disabled = !!state.decode.software;
+    // the live monitor watches the player, which plays what the browser can decode
+    $('liveToggle').disabled = !!state.decode.software && !movie.forceBuiltIn;
     state.current = null;
     state.history.clear();
     setPlayerSource('video');
@@ -670,7 +675,7 @@ function updateStatus() {
   if (state.env) {
     const f = state.env.feeder;
     parts.push(`detector: <b>${f.backend === 'webgpu' ? 'WebGPU' : 'CPU (WASM)'}</b> at ${f.aw}×${f.ah} (window ${f.det.window_width()}×${f.det.window_height()}, area ≥ ${f.det.area_thresh()} px)`);
-    if (state.decode.software) parts.push('decoder: <b>built-in H.264</b> (no WebCodecs decoder for this codec)');
+    if (state.decode.software) parts.push(`decoder: <b>built-in ${state.movie.builtIn.name}</b> (${state.movie.forceBuiltIn ? 'asked for' : 'no WebCodecs decoder for this codec'})`);
     else if (state.movie && state.movie.decodeInWorkers) parts.push('decoder: WebCodecs <b>in workers</b> (this WebGPU takes no decoded frame, so pictures are copied out of the decoder off the page)');
     if (state.lastScan) {
       const s = state.lastScan;
@@ -710,7 +715,8 @@ function scanSegments() {
 /**
  * Whether a scan decodes with the browser's decoder and the built-in one at
  * the same time (a hybrid scan, analysis.js scanHybrid), and with how many
- * of each: for H.264 the browser decodes itself, on the GPU detector, on a
+ * of each: for a codec the browser decodes itself and the app has a
+ * decoder for (H.264, HEVC, VP9, VP8, AV1), on the GPU detector, on a
  * machine with six cores or more, for a file of two minutes or more (a
  * shorter one scans in seconds anyway). The browser's decoder gets two to
  * four lanes and the built-in decoder a worker for each core left over
@@ -729,7 +735,7 @@ function hybridPlan(movie, feeder) {
   const sim = !!h && h.startsWith('sim');
   if (sim) h = h.slice(4) || '1';
   if (!movie || (movie.software && !sim) || !feeder || feeder.backend !== 'webgpu') return null;
-  if (!/^avc[13]/.test(movie.video.codec)) return null;
+  if (!builtInFor(movie.video.codec)) return null;
   const cores = navigator.hardwareConcurrency || 4;
   const counts = /^(\d+),(\d+)$/.exec(h || '');
   let hw;
@@ -754,7 +760,8 @@ function hybridPlan(movie, feeder) {
  */
 async function scanWithPlan(env, movie, opts) {
   const plan = hybridPlan(movie, env.feeder);
-  if (!plan) return scanMovie(env, movie, opts);
+  // a file with keyframes too far apart to cut into chunks is scanned as before
+  if (!plan || scanChunks(movie, plan.chunkS).length < 2) return scanMovie(env, movie, opts);
   let pool = null;
   if (plan.sw > 0) {
     try {
@@ -785,6 +792,12 @@ function decodeWorkersSetting(feeder) {
   // a forced picture route is one taken on the page
   if (routeSetting()) return false;
   return !feeder.takesFrames;
+}
+
+/** `?builtin=1`: decode with the app's built-in decoder for the codec even where WebCodecs has one (tests; a browser whose decoder misbehaves). */
+function builtInSetting() {
+  const q = new URLSearchParams(location.search).get('builtin');
+  return q === '1' || q === 'on';
 }
 
 /** `?shrink=0`: pictures decoded in workers reach the page at full size (the detector shrinks them) rather than at its size. */
