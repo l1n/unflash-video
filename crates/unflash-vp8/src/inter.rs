@@ -253,7 +253,12 @@ fn filter_any(src: &[u8], origin: usize, ss: usize, fx: usize, fy: usize, w: usi
 /// samples plus (`fx`, `fy`) eighths of a sample.
 #[allow(clippy::too_many_arguments)]
 pub fn predict(src: &[u8], ps: usize, pw: usize, ph: usize, x: i32, y: i32, fx: usize, fy: usize, w: usize, h: usize, filter: Filter, dst: &mut [u8], ds: usize) {
-    let inside = x >= 2 && y >= 2 && x + w as i32 + 3 <= pw as i32 && y + h as i32 + 3 <= ph as i32;
+    // the six taps reach two samples before the block and three after in
+    // each direction with a fraction (the bilinear filter less far), and
+    // a whole-sample direction reads the block's own samples alone
+    let reach = |frac: usize| if frac == 0 { (0, 0) } else { (2, 3) };
+    let ((left, right), (above, below)) = (reach(fx), reach(fy));
+    let inside = x >= left && y >= above && x + w as i32 + right <= pw as i32 && y + h as i32 + below <= ph as i32;
     if inside {
         filter_any(src, y as usize * ps + x as usize, ps, fx, fy, w, h, filter, dst, ds);
         return;
@@ -270,9 +275,13 @@ pub fn predict(src: &[u8], ps: usize, pw: usize, ph: usize, x: i32, y: i32, fx: 
         let sy = (y + j as i32 - 2).clamp(0, ph as i32 - 1) as usize;
         let row = &src[sy * ps..sy * ps + pw];
         let out = &mut win[j * WIN..j * WIN + n as usize];
-        out[..a].fill(row[0]);
+        if a > 0 {
+            out[..a].fill(row[0]);
+        }
         out[a..b].copy_from_slice(&row[in0 as usize..in0 as usize + (b - a)]);
-        out[b..].fill(row[pw - 1]);
+        if b < out.len() {
+            out[b..].fill(row[pw - 1]);
+        }
     }
     filter_any(&win, 2 * WIN + 2, WIN, fx, fy, w, h, filter, dst, ds);
 }
