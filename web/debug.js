@@ -72,12 +72,21 @@ function block(label, lines) {
   return out.length ? out : [`${label.padEnd(LABEL)}none`];
 }
 
+/** What each decoder of a hybrid scan did. */
+function hybridLine(h) {
+  const lanes = h.lanes.map((l) => {
+    const fps = l.frames / Math.max(0.001, l.ms / 1000);
+    return `${l.kind === 'built-in' ? `built-in decoder ×${l.workers}` : "browser's decoder"}: ${int(l.frames)} frames, ${fps.toFixed(0)} fps${l.runs > 1 ? `, ${l.runs} runs` : ''}${l.failed ? `, gave up: ${l.failed}` : ''}`;
+  });
+  return [`hybrid: ${h.chunks} chunks of about ${h.chunkS} s, scanned in ${h.parts.length} run${h.parts.length === 1 ? '' : 's'}`, ...lanes];
+}
+
 /**
  * The report, from the page's `state` and `profile`, the app's `version`,
- * the WebGPU adapter's description of itself (`gpu`) and the number of
- * segments a scan would use.
+ * the WebGPU adapter's description of itself (`gpu`), the number of
+ * segments a scan would use and the hybrid plan it would follow (if any).
  */
-export function debugReport({ version, state, profile, gpu, segments }) {
+export function debugReport({ version, state, profile, gpu, segments, hybrid = null }) {
   const lines = [`Unflash debug info · ${new Date().toISOString().slice(0, 19).replace('T', ' ')} UTC`];
   lines.push(...block('App', [`${version} · ${location.origin}${location.pathname}${location.search ? ` · options ${location.search}` : ''}`]));
   const nav = navigator;
@@ -102,7 +111,8 @@ export function debugReport({ version, state, profile, gpu, segments }) {
     det.push(`${f.backend === 'webgpu' ? 'WebGPU' : 'CPU (WebAssembly)'} at ${f.aw}×${f.ah}${f.note ? ` (${f.note})` : ''}`);
     det.push(`pictures reach it as: ${f.route || 'nothing yet'}${f.routeDetail ? ` (${f.routeDetail})` : ''}${f.takesFrames === false && f.backend === 'webgpu' ? ' · this WebGPU takes no decoded frame' : ''}`);
     const m = state.movie;
-    det.push(`decoding: ${state.decode && state.decode.software ? 'the built-in H.264 decoder' : m && m.decodeInWorkers ? 'WebCodecs, in workers' : 'WebCodecs, on the page'} · scans in ${segments > 1 ? `up to ${segments} segments` : 'one piece'}`);
+    const scans = hybrid ? `scans hybrid: ${hybrid.hw} lane${hybrid.hw === 1 ? '' : 's'} of the browser's decoder${hybrid.sw ? ` + the built-in decoder in ${hybrid.sw} worker${hybrid.sw === 1 ? '' : 's'}` : ''}` : `scans in ${segments > 1 ? `up to ${segments} segments` : 'one piece'}`;
+    det.push(`decoding: ${state.decode && state.decode.software ? 'the built-in H.264 decoder' : m && m.decodeInWorkers ? 'WebCodecs, in workers' : 'WebCodecs, on the page'} · ${scans}`);
     lines.push(...block('Detector', det));
   }
   const m = state.movie;
@@ -120,7 +130,8 @@ export function debugReport({ version, state, profile, gpu, segments }) {
   const s = state.lastScan;
   if (s) {
     const fps = s.frames / Math.max(0.001, s.elapsedMs / 1000);
-    lines.push(...block('Scan', [`${int(s.frames)} frames in ${secs(s.elapsedMs)} = ${fps.toFixed(0)} fps${m && m.fps ? ` (${(fps / m.fps).toFixed(1)}× real time)` : ''} · ${s.segments || 1} segment${(s.segments || 1) === 1 ? '' : 's'}`]));
+    const head = `${int(s.frames)} frames in ${secs(s.elapsedMs)} = ${fps.toFixed(0)} fps${m && m.fps ? ` (${(fps / m.fps).toFixed(1)}× real time)` : ''}`;
+    lines.push(...block('Scan', s.hybrid ? [head, ...hybridLine(s.hybrid)] : [`${head} · ${s.segments || 1} segment${(s.segments || 1) === 1 ? '' : 's'}`]));
   }
   lines.push(...block('Jobs', jobs.map((j) => `${clock(j.at)} ${j.name}: ${secs(j.ms)} ${j.outcome}${j.hidden > 500 ? ` (${secs(j.hidden)} of it out of sight)` : ''}`)));
   const job = state.job;

@@ -2,7 +2,7 @@
 // same flow as the Python reference (analysis.py / editing.py), driving the
 // WASM detector over WebCodecs frames or cached section frames.
 
-import { decodeRange, tick } from './media.js';
+import { decodeRange, decodeStretchesBuiltIn, tick } from './media.js';
 import { profile } from './profile.js';
 import { dropCaches } from './project.js';
 
@@ -18,7 +18,8 @@ const MIN_SEGMENT_RUNUPS = 4;
  * results are then joined exactly. Returns { result, sections, summary,
  * trace, frames, elapsedMs, segments }.
  */
-export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, makeFeeder = null, moreFeeders = null, forceSegments = false } = {}) {
+export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, makeFeeder = null, moreFeeders = null, forceSegments = false, hybrid = null } = {}) {
+  if (hybrid) return scanHybrid(env, movie, { onProgress, cancel, makeFeeder, moreFeeders, hybrid });
   const { wasm, config, feeder } = env;
   profile.reset();
   const started = performance.now();
@@ -129,6 +130,348 @@ export async function scanMovie(env, movie, { onProgress, cancel, segments = 1, 
   const sections = JSON.parse(wasm.violations_to_sections(vjson, config, movie.tsMin, movie.tsMax, new Float64Array()));
   const summary = JSON.parse(wasm.timeline_summary(JSON.stringify(result), movie.tsMin, movie.tsMax, 1.0));
   return { result, sections, summary, trace, frames: count, elapsedMs: elapsed, segments: nseg, patternThresh: feeder.det.pattern_thresh(), profileText, profileOps };
+}
+
+/** A hybrid scan cuts the file into chunks about this long (seconds of video): the most a decoder takes at a time. */
+export const HYBRID_CHUNK_S = 30;
+
+/**
+ * Where a hybrid scan cuts the file: at sync samples about `chunkS` seconds
+ * apart (none within half that of the end). Chunk c holds the pictures shown
+ * in [t[c], t[c + 1]); its decode starts at sample idx[c] (a sync sample,
+ * but for the first chunk), and it holds about n[c] pictures.
+ */
+export function scanChunks(movie, chunkS = HYBRID_CHUNK_S) {
+  const { pts, sync } = movie.v;
+  const count = pts.length;
+  const end = movie.tsMax + 1;
+  const t = [movie.tsMin];
+  const idx = [0];
+  for (let i = 1; i < count; i++) {
+    if (!sync[i]) continue;
+    const ti = pts[i] / 1e6;
+    if (ti - t[t.length - 1] >= chunkS && end - ti >= chunkS / 2) {
+      t.push(ti);
+      idx.push(i);
+    }
+  }
+  t.push(end);
+  const n = idx.map((a, c) => (c + 1 < idx.length ? idx[c + 1] : count) - a);
+  return { t, idx, n, length: idx.length };
+}
+
+/** Running totals of `n`: cum[c] is the sum of n[0..c). */
+function runningTotals(n) {
+  const cum = [0];
+  for (let c = 0; c < n.length; c++) cum.push(cum[c] + n[c]);
+  return cum;
+}
+
+/**
+ * A hybrid scan's first shares: consecutive chunks for each lane in turn,
+ * in proportion to its `weight`, by the pictures each chunk holds (`n`).
+ * Sets each lane's `lo` and `hi`: the chunks [lo, hi) it has still to start.
+ */
+export function shareChunks(n, lanes) {
+  const cum = runningTotals(n);
+  const nc = n.length;
+  const weights = lanes.reduce((a, l) => a + l.weight, 0);
+  let c = 0;
+  let acc = 0;
+  for (const l of lanes) {
+    acc += l.weight;
+    const target = (cum[nc] * acc) / weights;
+    l.lo = c;
+    while (c < nc && Math.abs(cum[c + 1] - target) <= Math.abs(cum[c] - target)) c++;
+    l.hi = c;
+  }
+  if (lanes.length) lanes[lanes.length - 1].hi = nc;
+}
+
+/**
+ * More chunks for `thief`, a lane of a hybrid scan that has none left to
+ * start: the far end of the chunks the lane with the most time left has
+ * still to start (time by `speed(lane)`, pictures a millisecond), in
+ * proportion to the two lanes' speeds. A thief slower than that lane takes
+ * nothing from its last chunk. Returns the number of chunks taken.
+ */
+export function stealChunks(n, lanes, thief, speed) {
+  const cum = runningTotals(n);
+  let victim = null;
+  let most = 0;
+  for (const v of lanes) {
+    if (v === thief || v.hi <= v.lo) continue;
+    const time = (cum[v.hi] - cum[v.lo]) / speed(v);
+    if (time > most) {
+      most = time;
+      victim = v;
+    }
+  }
+  if (!victim) return 0;
+  const ts = speed(thief);
+  const left = victim.hi - victim.lo;
+  const take = Math.min(left, Math.round((left * ts) / (ts + speed(victim))));
+  if (take < 1) return 0;
+  thief.lo = victim.hi - take;
+  thief.hi = victim.hi;
+  victim.hi = thief.lo;
+  return take;
+}
+
+/**
+ * A whole-video scan by several decoders at once, a "hybrid" scan:
+ * `hybrid.hw` lanes on the browser's decoder and, given `hybrid.pool` (a
+ * SoftwarePool of the scan's own), one lane on the built-in decoder, each
+ * lane with a detector of its own. The file is cut into chunks at sync
+ * samples (scanChunks). Each lane begins with consecutive chunks in
+ * proportion to how fast it is guessed to be; a lane that runs out takes
+ * the far end of the chunks with the most time left (by the speeds the
+ * lanes have shown so far), in proportion to the two speeds, so that the
+ * lanes finish together. Each run of consecutive chunks a lane scans is
+ * scanned as a segment is, from a run-up before its first chunk, and the
+ * runs are joined exactly. A run the built-in decoder fails (a damaged
+ * picture) goes back to the browser's decoder. Returns what scanMovie
+ * does, and `hybrid`: the chunks and what each lane did. For tests,
+ * `hybrid.sim` stands the built-in decoder, on the page, in for the
+ * browser's (a browser without H.264 in WebCodecs, such as the test
+ * browser, can then run a hybrid scan), and `hybrid.failBuiltIn` makes the
+ * built-in decoder's first run fail.
+ */
+async function scanHybrid(env, movie, { onProgress, cancel, makeFeeder = null, moreFeeders = null, hybrid }) {
+  const { wasm, config, feeder } = env;
+  profile.reset();
+  const started = performance.now();
+  const now = () => performance.now();
+  const runup = wasm.context_seconds(config);
+  const chunkS = hybrid.chunkS || HYBRID_CHUNK_S;
+  const chunks = scanChunks(movie, chunkS);
+  const nc = chunks.length;
+  const pool = hybrid.pool || null;
+  const nhw = Math.max(1, Math.floor(hybrid.hw || 1));
+  const nlanes = nhw + (pool ? 1 : 0);
+  // detectors from `moreFeeders` are lent (kept by the caller), from `makeFeeder` made for this scan
+  const feeders = [feeder];
+  if (nlanes > 1) {
+    if (moreFeeders) feeders.push(...(await moreFeeders(nlanes - 1)));
+    else for (let k = 1; k < nlanes; k++) feeders.push(await makeFeeder());
+  }
+  const newTrace = () => ({ t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] });
+  const lanes = feeders.map((f, k) => {
+    const builtIn = !!pool && k === nlanes - 1;
+    return {
+      kind: builtIn ? 'built-in' : 'browser',
+      feeder: f,
+      // a first guess at the lane's share, which taking over chunks corrects
+      weight: builtIn ? hybrid.builtInWeight || 0.5 : 1,
+      lo: 0, // the chunks the lane has still to start: [lo, hi)
+      hi: 0,
+      first: 0, // the run in hand: chunks [first, last]
+      last: -1,
+      frames: 0,
+      runs: 0,
+      steals: 0,
+      ms: 0,
+      t0: 0,
+      // lanes read different parts of the file: a window each
+      reader: !builtIn && k > 0 && movie.reader ? movie.reader.fork() : null,
+      tr: newTrace(), // the run in hand's trace, and how much of it the timeline has
+      sent: 0,
+      failed: null,
+    };
+  });
+  shareChunks(chunks.n, lanes);
+
+  let failure = null;
+  const stop = () => failure !== null || !!(cancel && cancel());
+  const total = Math.max(1, movie.frameCount);
+  // what the timeline draws while the scan runs: the points the lanes add
+  const live = newTrace();
+  const grown = () => {
+    for (const l of lanes) {
+      for (const key of Object.keys(live)) for (let i = l.sent; i < l.tr.t.length; i++) live[key].push(l.tr[key][i]);
+      l.sent = l.tr.t.length;
+    }
+    return live;
+  };
+  const counted = () => lanes.reduce((a, l) => a + l.frames, 0);
+  const report = () => {
+    const count = counted();
+    if (onProgress) onProgress(Math.min(1, count / total), grown(), count, now() - started);
+    profile.reportEvery(5000, 'scan so far', count, now() - started);
+  };
+  // frames per ms: shown so far, or else guessed from the others' and the weights
+  const rate = (l, at) => (l.frames >= 30 && at > l.t0 ? l.frames / (at - l.t0) : 0);
+  const speed = (l, at) => {
+    const r = rate(l, at);
+    if (r > 0) return r;
+    let sum = 0;
+    let n = 0;
+    for (const o of lanes) {
+      const ro = rate(o, at);
+      if (ro > 0) {
+        sum += ro / o.weight;
+        n++;
+      }
+    }
+    return (n ? sum / n : 1) * l.weight;
+  };
+  const orphans = []; // chunks of runs the built-in decoder failed, for the browser's
+  /** More chunks for a lane that has run out: true when it got some. */
+  const steal = (thief) => {
+    if (thief.kind === 'browser' && orphans.length) {
+      const o = orphans.shift();
+      thief.lo = o.lo;
+      thief.hi = o.hi;
+      return true;
+    }
+    if (thief.failed) return false;
+    const at = now();
+    if (!stealChunks(chunks.n, lanes, thief, (l) => speed(l, at))) return false;
+    thief.steals++;
+    return true;
+  };
+  const parts = [];
+  const shrinkFor = (f) => (movie.shrinkInWorkers === false ? null : { aw: f.aw, ah: f.ah });
+  /** Scan the lane's chunks from `lo` on, one after another, as one run. */
+  const scanRun = async (lane) => {
+    const f = lane.feeder;
+    const first = lane.lo;
+    const from = chunks.t[first];
+    lane.first = first;
+    lane.last = first - 1;
+    lane.runs++;
+    f.reset();
+    const tr = lane.tr;
+    const collect = () => {
+      for (const r of f.records()) {
+        if (r.t < from - 1e-9) continue; // the run-up
+        tr.t.push(r.t);
+        tr.hazard.push(r.hazard);
+        tr.hazardRed.push(r.hazard_red);
+        tr.ext.push(Math.max(r.ext, r.ext_red));
+        tr.lum.push(r.lum);
+        tr.pattern.push(r.pattern);
+      }
+    };
+    let fed = 0;
+    let frames = 0;
+    // tests: the built-in decoder's first run fails part way
+    const failAt = hybrid.failBuiltIn && lane.kind === 'built-in' && lane.runs === 1 ? 10 : -1;
+    const onFrame = async (frame, t) => {
+      if (fed === failAt) {
+        frame.close();
+        throw new Error('the built-in decoder failed (a test)');
+      }
+      await f.videoFrame(frame, t, false);
+      if (t >= from - 1e-9) {
+        lane.frames++;
+        frames++;
+      }
+      if (++fed % 30 === 0) {
+        collect();
+        report();
+      }
+    };
+    // the run's stretches: the lane's chunks one after another (the first
+    // from a run-up), asked for as the decoder is ready for them, so that
+    // the chunks not yet asked for can still go to another lane
+    const next = () => {
+      if (stop() || lane.lo >= lane.hi) return null;
+      const c = lane.lo++;
+      lane.last = c;
+      if (c === first) return { startSec: c === 0 ? movie.tsMin : Math.max(movie.tsMin, chunks.t[c] - runup), endSec: chunks.t[c + 1], fromIndex: null };
+      return { startSec: chunks.t[c], endSec: chunks.t[c + 1], fromIndex: chunks.idx[c] };
+    };
+    try {
+      if (lane.kind === 'built-in') await decodeStretchesBuiltIn(movie, pool, next, onFrame, { cancel: stop, shrink: shrinkFor(f) });
+      else for (let s = next(); s; s = next()) await decodeRange(movie, s.startSec, s.endSec, onFrame, { cancel: stop, raw: true, reader: lane.reader, fromIndex: s.fromIndex, shrink: shrinkFor(f), inline: !!hybrid.sim });
+      await f.drain();
+      collect();
+    } catch (e) {
+      // its frames are scanned again elsewhere
+      lane.frames -= frames;
+      throw e;
+    }
+    if (stop()) return;
+    parts.push({ from, first, last: lane.last, kind: lane.kind, result: f.finish(true), trace: tr });
+    grown();
+    lane.tr = newTrace();
+    lane.sent = 0;
+  };
+  const laneLoop = async (lane) => {
+    const t0 = now();
+    if (!lane.t0) lane.t0 = t0;
+    try {
+      while (!stop()) {
+        if (lane.lo >= lane.hi && !steal(lane)) break;
+        try {
+          await scanRun(lane);
+        } catch (e) {
+          if (lane.kind !== 'built-in' || stop()) throw e;
+          // the built-in decoder could not decode this run: the browser's
+          // scans it again, and the rest of this lane's chunks
+          lane.failed = e && e.message ? e.message : String(e);
+          console.warn(`hybrid scan: ${lane.failed}; the browser's decoder takes the built-in decoder's chunks`);
+          orphans.push({ lo: lane.first, hi: lane.hi });
+          lane.lo = lane.hi;
+          break;
+        }
+      }
+    } catch (e) {
+      if (!failure) failure = e;
+      throw e;
+    } finally {
+      lane.ms += now() - t0;
+    }
+  };
+  try {
+    let settled = await Promise.allSettled(lanes.map(laneLoop));
+    // a built-in run that failed after the browser's lanes had finished
+    while (!stop() && orphans.length && settled.every((r) => r.status === 'fulfilled')) settled = await Promise.allSettled([laneLoop(lanes[0])]);
+    const bad = settled.find((r) => r.status === 'rejected');
+    if (bad) throw bad.reason;
+  } finally {
+    if (!moreFeeders) for (let k = 1; k < feeders.length; k++) feeders[k].det.free();
+  }
+  const count = counted();
+  const elapsed = now() - started;
+  parts.sort((a, b) => a.first - b.first);
+  if (!(cancel && cancel())) {
+    // every chunk once, in order
+    let c = 0;
+    for (const p of parts) {
+      if (p.first !== c) throw new Error(`hybrid scan: chunk ${c} was ${p.first > c ? 'not scanned' : 'scanned twice'}`);
+      c = p.last + 1;
+    }
+    if (c !== nc) throw new Error(`hybrid scan: chunk ${c} was not scanned`);
+  }
+  const what = `${movie.width}×${movie.height}, ${feeder.backend}, hybrid: ${nhw} browser decoder${nhw === 1 ? '' : 's'}${pool ? ` + built-in ×${pool.workers.length}` : ''}`;
+  profile.report(`scan of ${(movie.file && movie.file.name) || 'the file'} (${what})`, count, elapsed);
+  // kept for the debug report (the next job starts the profile afresh)
+  const profileText = profile.text(`scan (${what})`, count, elapsed);
+  const profileOps = profile.summary();
+  const result = JSON.parse(wasm.merge_scan_segments(config, movie.width, movie.height, JSON.stringify(parts.map((p) => ({ from: p.from, result: p.result })))));
+  // the merged run's own statistics are the trace; the rest need not stay
+  result.frame_stats = {};
+  const trace = newTrace();
+  for (const p of parts) for (const key of Object.keys(trace)) for (const v of p.trace[key]) trace[key].push(v);
+  const vjson = JSON.stringify(result.violations);
+  const sections = JSON.parse(wasm.violations_to_sections(vjson, config, movie.tsMin, movie.tsMax, new Float64Array()));
+  const summary = JSON.parse(wasm.timeline_summary(JSON.stringify(result), movie.tsMin, movie.tsMax, 1.0));
+  const laneStats = lanes.map((l) => ({ kind: l.kind, workers: l.kind === 'built-in' ? pool.workers.length : 1, frames: l.frames, runs: l.runs, steals: l.steals, ms: l.ms, failed: l.failed }));
+  return {
+    result,
+    sections,
+    summary,
+    trace,
+    frames: count,
+    elapsedMs: elapsed,
+    segments: parts.length,
+    patternThresh: feeder.det.pattern_thresh(),
+    profileText,
+    profileOps,
+    hybrid: { chunks: nc, chunkS, parts: parts.map((p) => ({ first: p.first, last: p.last, kind: p.kind })), lanes: laneStats },
+  };
 }
 
 /**

@@ -259,10 +259,11 @@ export class Movie {
  * come as plain I420 buffers (see rawPicture) instead of VideoFrames; with
  * `fast` it skips the deblocking filter (statistics only). Decoding starts
  * at the last keyframe at or before `startSec`, or at sample `fromIndex`
- * (decode order) when given.
+ * (decode order) when given. With `inline`, the built-in decoder decodes on
+ * the page rather than in its workers.
  */
-export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null, shrink = null } = {}) {
-  if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, fromIndex, reader });
+export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null, shrink = null, inline = false } = {}) {
+  if (movie.software) return decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, fromIndex, reader, shrink, inline });
   // pictures for the detector alone: decoded and copied in a worker where
   // the detector would copy them on the page anyway (and, with `shrink`
   // ({aw, ah}), made that small there)
@@ -372,6 +373,23 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
   return frames;
 }
 
+/**
+ * The samples (decode order) a decode of the pictures shown in [startSec,
+ * endSec) runs over: from sample `fromIndex`, or else the last sync sample
+ * at or before `startSec`, up to the first sample both decoded and shown at
+ * or after `endSec` (so the leading pictures of the next GOP, shown before
+ * `endSec` but decoded after its sync sample, are included).
+ */
+export function sampleRange(movie, startSec, endSec, fromIndex = null) {
+  const { pts, dts } = movie.v;
+  const n = pts.length;
+  const startIdx = fromIndex !== null && fromIndex !== undefined ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
+  const endUs = endSec * 1e6;
+  let endIdx = startIdx;
+  while (endIdx < n && !(dts[endIdx] >= endUs && pts[endIdx] >= endUs)) endIdx++;
+  return { startIdx, endIdx };
+}
+
 let workerJobs = 0;
 
 /**
@@ -380,15 +398,13 @@ let workerJobs = 0;
  * back. At most four pictures wait for the page at a time.
  */
 async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onProgress, fromIndex = null, shrink = null } = {}) {
-  const { pts, dts, offset, size, sync, dur } = movie.v;
-  const n = pts.length;
-  const startIdx = fromIndex !== null ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
+  const { pts, offset, size, sync, dur } = movie.v;
+  const { startIdx, endIdx } = sampleRange(movie, startSec, endSec, fromIndex);
   const endUs = endSec * 1e6;
-  let endIdx = startIdx;
-  while (endIdx < n && !(dts[endIdx] >= endUs && pts[endIdx] >= endUs)) endIdx++;
   const slot = movie.decodeWorker();
   const worker = slot.worker;
   const id = ++workerJobs;
+  const small = shrink && shrink.aw > 0 && shrink.ah > 0 ? { aw: shrink.aw, ah: shrink.ah } : null;
   const inbox = [];
   let done = false;
   let failed = null;
@@ -431,8 +447,10 @@ async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onP
     sync: sync.slice(startIdx, endIdx),
     startUs: startSec * 1e6,
     endUs,
-    window: 4,
-    shrink: shrink && shrink.aw > 0 && shrink.ah > 0 ? { aw: shrink.aw, ah: shrink.ah } : null,
+    // pictures made small cost little to hold: the decoder runs further
+    // ahead of the detector
+    window: small ? 32 : 4,
+    shrink: small,
   });
   const credit = (buffer) => (buffer ? worker.postMessage({ type: 'credit', n: 1, buffer }, [buffer]) : worker.postMessage({ type: 'credit', n: 1 }));
   let frames = 0;
@@ -595,21 +613,39 @@ export function softwarePicture(wasm, dec, timestampUs) {
 }
 
 /**
+ * Decode stretch after stretch with the built-in decoder through `pool` (a
+ * SoftwarePool of its own), whatever decoder the movie normally uses: a
+ * hybrid scan's built-in lane. `next()` hands out { startSec, endSec,
+ * fromIndex } (as decodeRange takes them) or null; the pictures reach
+ * `onFrame` in order, made the detector's size (`shrink`) in the workers,
+ * fully decoded (the deblocking filter too, so they are the pictures the
+ * browser's decoder gives). A damaged picture fails the pass.
+ */
+export function decodeStretchesBuiltIn(movie, pool, next, onFrame, { cancel, shrink = null } = {}) {
+  const stretch = () => {
+    const s = next();
+    return s ? { ...sampleRange(movie, s.startSec, s.endSec, s.fromIndex), startSec: s.startSec, endSec: s.endSec } : null;
+  };
+  return pool.decodeStretches(stretch, onFrame, { cancel, raw: true, fast: false, shrink, strict: true });
+}
+
+/**
  * The same as decodeRange, through the built-in H.264 decoder in WASM.
  * Samples are decoded in file (decode) order and the pictures handed out in
  * presentation order once every earlier picture has been decoded.
  */
-async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null } = {}) {
+async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null, shrink = null, inline = false } = {}) {
   reader = reader || movie.reader || new ChunkReader(movie.file);
   const { pts, dts, offset, size } = movie.v;
   const n = pts.length;
   const startIdx = fromIndex !== null ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
   const endUs = endSec * 1e6;
-  const pool = await movie.softwarePool();
+  // `inline`: on the page even with workers to hand (a simulated hybrid scan's lanes)
+  const pool = inline ? null : await movie.softwarePool();
   if (pool && !pool.busy) {
-    let endIdx = startIdx;
-    while (endIdx < n && !(dts[endIdx] >= endUs && pts[endIdx] >= endUs)) endIdx++;
-    return pool.decodeRange(startIdx, endIdx, startSec, endSec, onFrame, { cancel, onProgress, raw, fast });
+    const { endIdx } = sampleRange(movie, startSec, endSec, startIdx);
+    // pictures for the detector are made small in the workers
+    return pool.decodeRange(startIdx, endIdx, startSec, endSec, onFrame, { cancel, onProgress, raw, fast, shrink: raw ? shrink : null });
   }
   const dec = new movie.wasm.H264Decoder(movie.dx.track_description(movie.video.index), fast);
   // presentation order of the samples this pass will decode

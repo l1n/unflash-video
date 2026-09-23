@@ -373,8 +373,12 @@ own slice of the input planes as it arrives, and the passes that depend on
 the previous frame's state (the moved-pixel count, the pattern mask, the
 update, the row sums and the gather) run for the whole batch in one
 submission with one readback, so the submit-to-result latency is paid once
-per sixteen frames rather than once per frame. The live monitor asks for a
-batch of one, since it wants a result after every frame.
+per sixteen frames rather than once per frame. Up to **eight batches are in
+flight** at a time, so that the GPU always has the next one: a scan's pace
+is at most the frames in flight divided by the round trip, and Firefox's
+GPU runs in another process, about 300 ms from submission to result, which
+two batches held each detector to about a hundred frames a second. The live monitor asks
+for a batch of one, since it wants a result after every frame.
 
 A scan of a long file is also cut into up to four **segments scanned at the
 same time**, each with its own decoder and detector. Every segment after
@@ -415,10 +419,44 @@ converted a row at a time with the GPU's arithmetic), and the page gets
 scan in Firefox, where it also crosses to a separate GPU process: an hour
 of 1920×960 took 172 s of a 269 s scan uploading 7 MB pictures. The
 browser test prepares a section both ways and requires the same cached
-pictures (they are identical there). A worker keeps at most four
-pictures waiting. The export and the players, which need real frames,
-decode on the page. `?decodeworkers=0` / `=1` overrides the choice, and
-`?shrink=0` hands the pictures over whole.
+pictures (they are identical there). A worker keeps up to 32 small
+pictures waiting (four whole ones), so it decodes on while the page is
+busy. The built-in decoder's workers do the same for scans, straight from
+the decoder's own picture buffers (the full-size picture never leaves the
+worker's memory), and may each hold a long GOP's worth of small pictures:
+the page takes the groups of pictures in order, and a worker made to stop
+a few pictures into a later group left the pool little faster than one
+worker. The export and the players, which need real frames, decode on
+the page. `?decodeworkers=0` / `=1` overrides the choice, and `?shrink=0`
+hands the pictures over whole.
+
+### Both decoders at once
+
+The browser's decoder (usually hardware) has a speed of its own, and it
+leaves the processor's cores mostly idle. For H.264, where the app has a
+decoder of its own, a scan of a file of two minutes or more on a machine
+with six cores or more is a **hybrid scan**: two to four lanes decode with
+the browser's decoder and one with the built-in decoder, in a worker for
+each core left over (two stay for the page and the browser), each lane
+feeding a detector of its own. The file is cut into **chunks** of about 30
+seconds at keyframes. Each lane starts with consecutive chunks in
+proportion to how fast it is guessed to be; a lane that runs out takes over
+the far end of the chunks the lane with the most time left has still to
+start, in proportion to the speeds the two have shown, so the lanes finish
+together whichever decoder turns out faster. The built-in decoder is asked
+for its next chunk only when a worker is free for it, so its workers never
+wait at a seam and what it has not started can still go elsewhere. Every
+run of consecutive chunks a lane scans is a segment with its run-up, joined
+exactly as the segments are. The built-in decoder decodes fully here
+(deblocking filter and all), so its pictures are the browser's, and a run
+it cannot decode cleanly (a damaged picture) goes back to the browser's
+decoder. The debug report shows how many frames each decoder scanned and
+how fast. `?hybrid=0` turns it off, `?hybrid=1` on for any file,
+`?hybrid=H,S` sets H browser lanes and S built-in workers, and `?chunk=S`
+the chunks' length; the browser test, whose Chromium has no H.264, runs it
+with the built-in decoder standing in for the browser's (`?hybrid=sim:H,S`)
+and requires the scan of one decoder, also when the built-in decoder's
+first run fails (`?hybridfail=1`).
 
 ### Spans re-encoded, the rest copied
 

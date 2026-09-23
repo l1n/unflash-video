@@ -1,8 +1,10 @@
 // A Web Worker running the built-in H.264 decoder over one group of
 // pictures at a time (see h264pool.js for the protocol). Pictures leave as
-// plain I420 buffers (transferred, not copied).
+// plain I420 buffers (transferred, not copied), or, for a job with
+// `shrink`, made the detector's size here straight from the decoder's own
+// picture, so the full-size picture never leaves WebAssembly memory.
 import init, * as wasm from './pkg/unflash.js';
-import { ChunkReader } from './media.js';
+import { ChunkReader, yuvLayoutWords } from './media.js';
 
 const ready = init();
 let desc = null;
@@ -32,14 +34,31 @@ function picture(dec, timestamp) {
   return { data, width, height, timestamp, colorSpace };
 }
 
+/** The picture the decoder just made small (see `run`). */
+function smallPicture(dec, shrink, timestamp) {
+  const data = dec.small();
+  return { kind: 'rgba', data, width: shrink.aw, height: shrink.ah, timestamp, colorSpace: null, from: [dec.width(), dec.height()] };
+}
+
 async function run(job) {
-  const { id, file, offset, size, pts, minPts, maxPts, fast } = job;
+  const { id, file, offset, size, pts, minPts, maxPts, fast, shrink } = job;
   cancelled = false;
   // each worker keeps its own window over the file; a whole copy per worker would cost too much
   const reader = new ChunkReader(file, 8 * 1024 * 1024, 16 * 1024 * 1024);
   let dec;
   try {
     dec = new wasm.H264Decoder(desc, !!fast);
+    if (shrink) {
+      // the colour conversion the page would pick for these pictures
+      let colorSpace = null;
+      try {
+        colorSpace = JSON.parse(dec.color_json());
+      } catch (e) {
+        /* default colour space */
+      }
+      const words = yuvLayoutWords('I420', [{ offset: 0, stride: 0 }, { offset: 0, stride: 0 }, { offset: 0, stride: 0 }], colorSpace, dec.height());
+      dec.set_shrink(shrink.aw, shrink.ah, words[7] === 1, words[8] === 1);
+    }
   } catch (e) {
     postMessage({ type: 'done', id, emitted: 0, damaged: pts.length, decodeMs: 0, decoded: 0, error: String(e && e.message ? e.message : e) });
     return;
@@ -78,7 +97,7 @@ async function run(job) {
       decoded++;
       if (got) {
         if (dec.frame_damaged()) damaged++;
-        if (pts[i] >= minPts && pts[i] < maxPts) pictures.set(pts[i], picture(dec, pts[i]));
+        if (pts[i] >= minPts && pts[i] < maxPts) pictures.set(pts[i], shrink ? smallPicture(dec, shrink, pts[i]) : picture(dec, pts[i]));
       } else {
         // no picture for this sample: do not wait for it
         const k = order.indexOf(pts[i]);
@@ -106,7 +125,7 @@ self.onmessage = async (e) => {
       }
       break;
     case 'credit':
-      credits += m.n;
+      credits = m.reset ? m.n : credits + m.n;
       wake();
       break;
     case 'cancel':

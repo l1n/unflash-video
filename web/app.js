@@ -1,11 +1,11 @@
 // Unflash web app: wiring between the WASM detector, WebCodecs and the UI.
 
 import init, * as wasm from './pkg/unflash.js';
-import { defaultWorkerCount } from './h264pool.js';
+import { defaultWorkerCount, SoftwarePool } from './h264pool.js';
 import { Movie, tick } from './media.js';
 import { createDetector, gpuAdapter } from './detector.js';
 import { profile } from './profile.js';
-import { scanMovie, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, BLEND_DEFAULT } from './analysis.js';
+import { scanMovie, HYBRID_CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, BLEND_DEFAULT } from './analysis.js';
 import { Project, projectKey, dropCaches, lastSavedAt } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
@@ -385,7 +385,7 @@ function closeChanges() {
 // ---- debug info --------------------------------------------------------------------
 
 function makeDebugReport() {
-  return debugReport({ version: wasm.version(), state, profile, gpu: gpuAdapter, segments: scanSegments() });
+  return debugReport({ version: wasm.version(), state, profile, gpu: gpuAdapter, segments: scanSegments(), hybrid: state.env ? hybridPlan(state.movie, state.env.feeder) : null });
 }
 
 /** The report in a dialog, copied to the clipboard at once where the browser lets it. */
@@ -708,6 +708,71 @@ function scanSegments() {
 }
 
 /**
+ * Whether a scan decodes with the browser's decoder and the built-in one at
+ * the same time (a hybrid scan, analysis.js scanHybrid), and with how many
+ * of each: for H.264 the browser decodes itself, on the GPU detector, on a
+ * machine with six cores or more, for a file of two minutes or more (a
+ * shorter one scans in seconds anyway). The browser's decoder gets two to
+ * four lanes and the built-in decoder a worker for each core left over
+ * (two stay for the page and the browser). `?hybrid=0` turns it off,
+ * `?hybrid=1` on for any file, `?hybrid=H,S` makes H lanes for the
+ * browser's decoder and S workers for the built-in one (0: none), and
+ * `?chunk=S` sets the chunks' length in seconds.
+ */
+function hybridPlan(movie, feeder) {
+  const q = new URLSearchParams(location.search);
+  let h = q.get('hybrid');
+  if (h === '0' || h === 'off') return null;
+  // tests: `?hybrid=sim:H,S` runs the browser's lanes on the built-in
+  // decoder (the test browser has no H.264 in WebCodecs), `?hybridfail=1`
+  // fails the built-in decoder's first run
+  const sim = !!h && h.startsWith('sim');
+  if (sim) h = h.slice(4) || '1';
+  if (!movie || (movie.software && !sim) || !feeder || feeder.backend !== 'webgpu') return null;
+  if (!/^avc[13]/.test(movie.video.codec)) return null;
+  const cores = navigator.hardwareConcurrency || 4;
+  const counts = /^(\d+),(\d+)$/.exec(h || '');
+  let hw;
+  let sw;
+  if (counts) {
+    hw = Math.max(1, Math.min(8, +counts[1]));
+    sw = Math.min(16, +counts[2]);
+  } else {
+    if (!(h === '1' || h === 'on') && (cores < 6 || movie.duration < 120)) return null;
+    // decoding in workers, each lane also copies and shrinks its pictures on a core of its own
+    hw = movie.decodeInWorkers ? Math.min(4, Math.max(2, Math.round(cores * 0.4))) : Math.min(3, Math.max(2, Math.floor(cores / 4)));
+    sw = Math.max(1, Math.min(8, cores - hw - 2));
+  }
+  const chunk = parseFloat(q.get('chunk') || '');
+  return { hw, sw, chunkS: chunk > 0 ? chunk : HYBRID_CHUNK_S, sim, failBuiltIn: q.get('hybridfail') === '1' };
+}
+
+/**
+ * scanMovie, as a hybrid scan when hybridPlan makes one: the built-in
+ * decoder's workers start for the scan and stop after it (and when they
+ * cannot start, the scan goes on without them). `opts` as scanMovie's.
+ */
+async function scanWithPlan(env, movie, opts) {
+  const plan = hybridPlan(movie, env.feeder);
+  if (!plan) return scanMovie(env, movie, opts);
+  let pool = null;
+  if (plan.sw > 0) {
+    try {
+      pool = await SoftwarePool.create(movie, plan.sw);
+    } catch (e) {
+      const why = e && e.message ? e.message : String(e);
+      console.warn('hybrid scan: the built-in decoder cannot start:', why);
+      noteError(`hybrid scan without the built-in decoder: ${why}`);
+    }
+  }
+  try {
+    return await scanMovie(env, movie, { ...opts, hybrid: { hw: plan.hw, pool, chunkS: plan.chunkS, sim: plan.sim, failBuiltIn: plan.failBuiltIn } });
+  } finally {
+    if (pool) pool.close();
+  }
+}
+
+/**
  * Whether scans and prepares decode in workers: where WebGPU takes no
  * VideoFrame (Firefox), every picture is copied out of the decoder before
  * the GPU sees it, and that copy is better made off the page, several at
@@ -779,7 +844,7 @@ async function scan() {
   setLive(false);
   $('liveToggle').checked = false;
   const res = await runJob('Scanning for flashes', async (progress, cancelled) => {
-    const r = await scanMovie(state.env, state.movie, {
+    const r = await scanWithPlan(state.env, state.movie, {
       cancel: cancelled,
       segments: scanSegments(),
       forceSegments: segmentsForced(),
@@ -2684,7 +2749,7 @@ async function verifyBlob(blob) {
     m.decodeInWorkers = decodeWorkersSetting(feeder);
     m.shrinkInWorkers = shrinkSetting();
     try {
-      return await scanMovie({ wasm, config: state.config, feeder }, m, {
+      return await scanWithPlan({ wasm, config: state.config, feeder }, m, {
         cancel: cancelled,
         segments: scanSegments(),
         forceSegments: segmentsForced(),

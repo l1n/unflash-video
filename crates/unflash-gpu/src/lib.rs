@@ -50,8 +50,12 @@ const GEO_WORDS: usize = 8 + 64 + 64 + 4;
 const GEO_MAX_POS: usize = 64;
 const GEO_PAT_R: usize = 136;
 const PATTERN_WG: u32 = 64;
-/// Batches that may be in flight before `submit` refuses.
-pub const DEFAULT_SLOTS: usize = 2;
+/// Batches that may be in flight before `submit` refuses. A detector's
+/// throughput is at most slots × batch frames per submit-to-result
+/// latency, and that latency can be long (in Firefox every readback crosses
+/// to its GPU process: 300 ms was measured), so the page may run well
+/// ahead of the results. A slot costs only its small readback buffers.
+pub const DEFAULT_SLOTS: usize = 8;
 /// Frames per batch: one command buffer and one readback for this many
 /// frames, so the submit-to-result latency is paid once per batch.
 pub const DEFAULT_BATCH: usize = 16;

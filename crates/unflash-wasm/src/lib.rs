@@ -1274,6 +1274,18 @@ pub struct H264Decoder {
     width: u32,
     height: u32,
     color: String,
+    /// Pictures made small here instead of handed out whole (see `set_shrink`).
+    shrink: Option<SmallPictures>,
+}
+
+/// The analysis size and colour conversion pictures are made small to, and the last one.
+struct SmallPictures {
+    aw: u32,
+    ah: u32,
+    bt709: bool,
+    full_range: bool,
+    shrink: Option<unflash_core::resample::Shrink>,
+    last: Vec<u8>,
 }
 
 #[wasm_bindgen]
@@ -1288,7 +1300,20 @@ impl H264Decoder {
         inner.configure_avcc(avcc).map_err(js_err)?;
         let (width, height) = inner.first_sps().map(|s| s.cropped_size()).ok_or_else(|| js_err("no sequence parameter set in the file"))?;
         let color = color_space_json(inner.first_sps().unwrap());
-        Ok(H264Decoder { inner, frame: Vec::new(), pts: 0.0, damaged: false, width, height, color })
+        Ok(H264Decoder { inner, frame: Vec::new(), pts: 0.0, damaged: false, width, height, color, shrink: None })
+    }
+
+    /// From now on make each picture `analysis_width`×`analysis_height`
+    /// RGBA8 here, straight from the decoder's own picture (converted with
+    /// the BT.709 or BT.601 matrix, full or limited range, as the page
+    /// would convert it), instead of copying it out whole: `small` has it.
+    pub fn set_shrink(&mut self, analysis_width: u32, analysis_height: u32, bt709: bool, full_range: bool) {
+        self.shrink = Some(SmallPictures { aw: analysis_width.max(1), ah: analysis_height.max(1), bt709, full_range, shrink: None, last: Vec::new() });
+    }
+
+    /// The last picture made small (RGBA8 at the analysis size).
+    pub fn small(&self) -> Vec<u8> {
+        self.shrink.as_ref().map(|s| s.last.clone()).unwrap_or_default()
     }
 
     pub fn width(&self) -> u32 {
@@ -1303,19 +1328,37 @@ impl H264Decoder {
         match self.inner.decode_sample(sample, pts).map_err(js_err)? {
             None => Ok(false),
             Some(f) => {
-                let sps = self.inner.sps().ok_or_else(|| js_err("no active sequence"))?;
-                let (w, h) = sps.cropped_size();
-                to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut self.frame);
-                if self.width != w || self.height != h {
-                    self.color = color_space_json(sps);
-                }
-                self.width = w;
-                self.height = h;
-                self.pts = f.pic.pts;
-                self.damaged = f.damaged;
+                self.take(&f)?;
                 Ok(true)
             }
         }
+    }
+
+    /// A finished picture: copied out whole, or made small.
+    fn take(&mut self, f: &unflash_h264::DecodedFrame) -> Result<(), JsValue> {
+        let sps = self.inner.sps().ok_or_else(|| js_err("no active sequence"))?;
+        let (w, h) = sps.cropped_size();
+        let (cx, cy) = (sps.crop.0 as usize, sps.crop.2 as usize);
+        match &mut self.shrink {
+            Some(s) => {
+                if !s.shrink.as_ref().is_some_and(|k| k.fits(w, h, s.aw, s.ah)) {
+                    s.shrink = Some(unflash_core::resample::Shrink::new(w, h, s.aw, s.ah));
+                }
+                let pic = &f.pic;
+                let (lw, cw) = (pic.width, pic.width / 2);
+                let k = s.shrink.as_mut().unwrap();
+                k.yuv420_planes(&pic.y[cy * lw + cx..], lw, &pic.u[cy / 2 * cw + cx / 2..], cw, &pic.v[cy / 2 * cw + cx / 2..], cw, s.bt709, s.full_range, &mut s.last);
+            }
+            None => to_i420(&f.pic, (cx, cy, w as usize, h as usize), &mut self.frame),
+        }
+        if self.width != w || self.height != h {
+            self.color = color_space_json(sps);
+        }
+        self.width = w;
+        self.height = h;
+        self.pts = f.pic.pts;
+        self.damaged = f.damaged;
+        Ok(())
     }
 
     /// Flush the picture in progress at the end of the stream (Annex B
@@ -1324,13 +1367,7 @@ impl H264Decoder {
         match self.inner.flush().map_err(js_err)? {
             None => Ok(false),
             Some(f) => {
-                let sps = self.inner.sps().ok_or_else(|| js_err("no active sequence"))?;
-                let (w, h) = sps.cropped_size();
-                to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut self.frame);
-                self.width = w;
-                self.height = h;
-                self.pts = f.pic.pts;
-                self.damaged = f.damaged;
+                self.take(&f)?;
                 Ok(true)
             }
         }

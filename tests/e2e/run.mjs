@@ -835,6 +835,86 @@ try {
   }
   assert(results.segScan.held === results.gpuWhole.held, `held frames ${results.segScan.held} vs ${results.gpuWhole.held}`);
 
+  // ======== a hybrid scan (the browser's decoder and the built-in one side
+  // by side, over chunks they share out and take over from each other) must
+  // give the scan of one decoder. The test browser has no H.264 in
+  // WebCodecs, so `sim` stands the built-in decoder, on the page, in for the
+  // browser's; `hybridfail` fails the built-in decoder's first run, which
+  // the browser's lanes must then scan again
+  const hybridScan = async (query) => {
+    await page.goto(`http://127.0.0.1:${port}/?auto=0&${query}`);
+    await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+    await openFile('flash_h264.mp4');
+    scan = await scanCurrent();
+    return page.evaluate(() => {
+      const s = window.__unflash.lastScan;
+      return { ms: Math.round(s.elapsedMs), frames: s.frames, held: s.result.held, violations: s.result.violations, hybrid: s.hybrid || null, report: window.__unflash.debugReport() };
+    });
+  };
+  results.h264Whole = await hybridScan('hybrid=0');
+  assert(!results.h264Whole.hybrid, '?hybrid=0 scans with one decoder');
+  results.hybrid = await hybridScan('hybrid=sim:2,2&chunk=1');
+  results.hybridFail = await hybridScan('hybrid=sim:2,2&chunk=1&hybridfail=1');
+  for (const [name, r] of [
+    ['hybrid', results.hybrid],
+    ['hybrid, the built-in decoder failing', results.hybridFail],
+  ]) {
+    const h = r.hybrid;
+    console.log(`${name} scan:`, r.ms, 'ms |', JSON.stringify({ frames: r.frames, held: r.held, violations: r.violations.map((v) => [v.kind, v.start, v.end]), parts: h && h.parts.map((p) => `${p.first}-${p.last} ${p.kind}`), lanes: h && h.lanes.map((l) => [l.kind, l.frames, l.runs, l.steals, l.failed]) }));
+    assert(h && h.chunks >= 8, `${name}: a hybrid scan in chunks: ` + JSON.stringify(h));
+    assert(r.frames === results.h264Whole.frames && r.held === results.h264Whole.held, `${name}: frames ${r.frames} (held ${r.held}) vs ${results.h264Whole.frames} (held ${results.h264Whole.held})`);
+    assert(r.violations.length > 0 && r.violations.length === results.h264Whole.violations.length, `${name}: the violations of the one-decoder scan: ${JSON.stringify(r.violations)} vs ${JSON.stringify(results.h264Whole.violations)}`);
+    for (let i = 0; i < r.violations.length; i++) {
+      const a = r.violations[i];
+      const b = results.h264Whole.violations[i];
+      // the lanes hand the detector their pictures by different routes (a
+      // frame's difference at the edges, as between routes)
+      assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.05 && Math.abs(a.end - b.end) < 0.05, `${name}: violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
+    }
+    // every chunk once, in order
+    let c = 0;
+    for (const p of h.parts) {
+      assert(p.first === c, `${name}: the runs cover each chunk once: ${JSON.stringify(h.parts)}`);
+      c = p.last + 1;
+    }
+    assert(c === h.chunks, `${name}: the runs reach the last chunk: ${JSON.stringify(h.parts)}`);
+    assert(/Scan\s+.*\n\s+hybrid: \d+ chunks/.test(r.report) && /built-in decoder ×2/.test(r.report), `${name}: the debug report shows the lanes:\n${r.report}`);
+  }
+  assert(results.hybrid.hybrid.lanes.length === 3 && results.hybrid.hybrid.lanes.every((l) => l.frames > 0 && !l.failed), 'every lane scanned part of the file: ' + JSON.stringify(results.hybrid.hybrid.lanes));
+  const gaveUp = results.hybridFail.hybrid.lanes.find((l) => l.kind === 'built-in');
+  assert(gaveUp.failed && gaveUp.frames === 0 && results.hybridFail.hybrid.parts.every((p) => p.kind === 'browser'), 'the built-in lane gave up and the browser lanes scanned its chunks: ' + JSON.stringify(results.hybridFail.hybrid));
+  assert(/gave up: the built-in decoder failed/.test(results.hybridFail.report), 'the debug report says the built-in decoder gave up:\n' + results.hybridFail.report);
+  // how the lanes share the chunks out and take them over
+  results.shares = await page.evaluate(async () => {
+    const { shareChunks, stealChunks } = await import('./analysis.js');
+    const n = new Array(10).fill(30);
+    const lanes = [{ weight: 1 }, { weight: 1 }, { weight: 0.5 }];
+    shareChunks(n, lanes);
+    const first = lanes.map((l) => [l.lo, l.hi]);
+    // lane 0 has started all its chunks, lane 1 two of its four, the slow lane none of its two
+    lanes[0].lo = lanes[0].hi;
+    lanes[1].lo += 2;
+    const speeds = new Map([
+      [lanes[0], 2],
+      [lanes[1], 1],
+      [lanes[2], 0.5],
+    ]);
+    const took = stealChunks(n, lanes, lanes[0], (l) => speeds.get(l));
+    const after = lanes.map((l) => [l.lo, l.hi]);
+    // as fast as each other: half of what is left
+    const even = [{ lo: 3, hi: 3 }, { lo: 4, hi: 10 }];
+    const half = stealChunks(n, even, even[0], () => 1);
+    // a slower lane takes nothing from another's last chunk
+    const slow = [{ lo: 5, hi: 5 }, { lo: 9, hi: 10 }];
+    const none = stealChunks(n, slow, slow[0], (l) => (l === slow[0] ? 1 : 2));
+    return { first, took, after, half, even: even.map((l) => [l.lo, l.hi]), none };
+  });
+  console.log('hybrid shares:', JSON.stringify(results.shares));
+  assert(JSON.stringify(results.shares.first) === '[[0,4],[4,8],[8,10]]', 'first shares in proportion to the weights: ' + JSON.stringify(results.shares));
+  assert(results.shares.took === 2 && JSON.stringify(results.shares.after) === '[[8,10],[6,8],[8,8]]', 'the fast lane takes the slow lane\'s chunks: ' + JSON.stringify(results.shares));
+  assert(results.shares.half === 3 && JSON.stringify(results.shares.even) === '[[7,10],[4,7]]', 'equal speeds split what is left: ' + JSON.stringify(results.shares));
+  assert(results.shares.none === 0, 'a slower lane leaves a last chunk alone: ' + JSON.stringify(results.shares));
+
   // ======== a BGRX picture (what Firefox on a Mac decodes to), copied as it
   // is and put back in order by the GPU, must be analysed exactly like the
   // same picture handed over as RGBA

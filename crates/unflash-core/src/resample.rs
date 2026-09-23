@@ -128,10 +128,26 @@ impl Shrink {
 
     /// A 4:2:0 picture: each row converted to RGB pixel by pixel as the GPU
     /// converts it (the arithmetic of [`crate::yuv::to_rgba`]), then summed.
-    pub fn yuv420(&mut self, data: &[u8], layout: &crate::yuv::YuvLayout, out: &mut Vec<u8>) {
-        assert!(layout.fits(data.len(), self.sw, self.sh), "picture data too short for its layout");
+    pub fn yuv420(&mut self, data: &[u8], l: &crate::yuv::YuvLayout, out: &mut Vec<u8>) {
+        assert!(l.fits(data.len(), self.sw, self.sh), "picture data too short for its layout");
+        let planes = Planes { y: &data[l.y_off..], y_stride: l.y_stride, u: &data[l.u_off..], u_stride: l.u_stride, v: &data[l.v_off.min(data.len())..], v_stride: l.v_stride, nv12: l.nv12 };
+        self.shrink_planes(planes, l.coefficients(), out);
+    }
+
+    /// A 4:2:0 picture held as three planes (a decoder's own picture, from
+    /// the first visible sample of each plane), made small the same way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn yuv420_planes(&mut self, y: &[u8], y_stride: usize, u: &[u8], u_stride: usize, v: &[u8], v_stride: usize, bt709: bool, full_range: bool, out: &mut Vec<u8>) {
+        let (w, h, cw, ch) = (self.sw, self.sh, self.sw.div_ceil(2), self.sh.div_ceil(2));
+        assert!(y_stride >= w && y.len() >= (h - 1) * y_stride + w, "luma plane too short");
+        assert!(u_stride >= cw && u.len() >= (ch - 1) * u_stride + cw && v_stride >= cw && v.len() >= (ch - 1) * v_stride + cw, "chroma planes too short");
+        let coef = crate::yuv::YuvLayout::packed_i420(w, h, bt709, full_range).coefficients();
+        self.shrink_planes(Planes { y, y_stride, u, u_stride, v, v_stride, nv12: false }, coef, out);
+    }
+
+    fn shrink_planes(&mut self, planes: Planes, coef: [i32; 6], out: &mut Vec<u8>) {
         let buf = std::mem::take(&mut self.rgba);
-        let mut rows = YuvRows { data, l: layout, width: self.sw, buf, last: usize::MAX };
+        let mut rows = YuvRows { p: planes, coef, width: self.sw, buf, last: usize::MAX };
         self.shrink_rows(&mut rows, false, out);
         self.rgba = rows.buf;
     }
@@ -220,11 +236,23 @@ impl Rows for Packed<'_> {
     }
 }
 
+/// The planes of a 4:2:0 picture, each from its first visible sample (with
+/// `nv12`, `u` holds the interleaved chroma and `v` is unused).
+struct Planes<'a> {
+    y: &'a [u8],
+    y_stride: usize,
+    u: &'a [u8],
+    u_stride: usize,
+    v: &'a [u8],
+    v_stride: usize,
+    nv12: bool,
+}
+
 /// A 4:2:0 picture's rows converted to RGBX one at a time (a row two boxes
 /// share is converted once).
 struct YuvRows<'a> {
-    data: &'a [u8],
-    l: &'a crate::yuv::YuvLayout,
+    p: Planes<'a>,
+    coef: [i32; 6],
     width: usize,
     buf: Vec<u8>,
     last: usize,
@@ -234,10 +262,10 @@ impl Rows for YuvRows<'_> {
     fn row(&mut self, y: usize) -> &[u8] {
         if self.last != y {
             self.last = y;
-            let (l, w) = (self.l, self.width);
+            let (p, w) = (&self.p, self.width);
             self.buf.resize(w * 4, 255);
-            let [ky, kr, kgu, kgv, kb, yoff] = l.coefficients();
-            let yrow = &self.data[l.y_off + y * l.y_stride..][..w];
+            let [ky, kr, kgu, kgv, kb, yoff] = self.coef;
+            let yrow = &p.y[y * p.y_stride..][..w];
             let cy = y / 2;
             let cw = w.div_ceil(2);
             let out = &mut self.buf[..w * 4];
@@ -252,14 +280,14 @@ impl Rows for YuvRows<'_> {
                     o[2] = ((yy + cb) >> 16).clamp(0, 255) as u8;
                 }
             };
-            if l.nv12 {
-                let crow = &self.data[l.u_off + cy * l.u_stride..][..2 * cw];
+            if p.nv12 {
+                let crow = &p.u[cy * p.u_stride..][..2 * cw];
                 for cx in 0..cw {
                     pair(cx, crow[2 * cx] as i32 - 128, crow[2 * cx + 1] as i32 - 128);
                 }
             } else {
-                let urow = &self.data[l.u_off + cy * l.u_stride..][..cw];
-                let vrow = &self.data[l.v_off + cy * l.v_stride..][..cw];
+                let urow = &p.u[cy * p.u_stride..][..cw];
+                let vrow = &p.v[cy * p.v_stride..][..cw];
                 for cx in 0..cw {
                     pair(cx, urow[cx] as i32 - 128, vrow[cx] as i32 - 128);
                 }
@@ -375,6 +403,21 @@ mod tests {
         s.yuv420(&yuv, &l, &mut got);
         assert_eq!(got, want);
         assert!(s.fits(sw as u32, sh as u32, aw, ah) && !s.fits(sw as u32, sh as u32, aw, ah + 1));
+        // the same picture as a decoder holds it: planes padded, read from a crop offset
+        let (pad, cx, cy) = (72usize, 4usize, 2usize);
+        let mut yp = vec![0u8; pad * (sh + 8)];
+        let mut up = vec![0u8; pad / 2 * (sh / 2 + 4)];
+        let mut vp = vec![0u8; pad / 2 * (sh / 2 + 4)];
+        for r in 0..sh {
+            yp[(cy + r) * pad + cx..][..sw].copy_from_slice(&yuv[r * sw..][..sw]);
+        }
+        for r in 0..sh / 2 {
+            up[(cy / 2 + r) * pad / 2 + cx / 2..][..sw / 2].copy_from_slice(&yuv[sw * sh + r * sw / 2..][..sw / 2]);
+            vp[(cy / 2 + r) * pad / 2 + cx / 2..][..sw / 2].copy_from_slice(&yuv[sw * sh * 5 / 4 + r * sw / 2..][..sw / 2]);
+        }
+        let mut planes = Vec::new();
+        s.yuv420_planes(&yp[cy * pad + cx..], pad, &up[cy / 2 * pad / 2 + cx / 2..], pad / 2, &vp[cy / 2 * pad / 2 + cx / 2..], pad / 2, true, false, &mut planes);
+        assert_eq!(planes, want);
         // NV12 of an odd size, rows padded
         let (w, h) = (37usize, 23usize);
         let cw = w.div_ceil(2);
