@@ -27,6 +27,12 @@ fn qpc(qpi: i32) -> i32 {
     }
 }
 
+/// Clip3 (5-4), for bounds that are ordered by construction.
+#[inline(always)]
+fn clip3(lo: i32, hi: i32, v: i32) -> i32 {
+    v.max(lo).min(hi)
+}
+
 /// What the filter needs to know about the picture's blocks.
 struct Ctx<'a> {
     meta: &'a Meta,
@@ -199,33 +205,33 @@ fn luma_segment(seg: &mut Segment<8>, beta: i32, tc: i32, no_p: bool, no_q: bool
         if strong {
             let tc2 = 2 * tc;
             if !no_p {
-                line[3] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3).clamp(p0 - tc2, p0 + tc2);
-                line[2] = ((p2 + p1 + p0 + q0 + 2) >> 2).clamp(p1 - tc2, p1 + tc2);
-                line[1] = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(p2 - tc2, p2 + tc2);
+                line[3] = clip3(p0 - tc2, p0 + tc2, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+                line[2] = clip3(p1 - tc2, p1 + tc2, (p2 + p1 + p0 + q0 + 2) >> 2);
+                line[1] = clip3(p2 - tc2, p2 + tc2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
             }
             if !no_q {
-                line[4] = ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(q0 - tc2, q0 + tc2);
-                line[5] = ((p0 + q0 + q1 + q2 + 2) >> 2).clamp(q1 - tc2, q1 + tc2);
-                line[6] = ((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(q2 - tc2, q2 + tc2);
+                line[4] = clip3(q0 - tc2, q0 + tc2, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+                line[5] = clip3(q1 - tc2, q1 + tc2, (p0 + q0 + q1 + q2 + 2) >> 2);
+                line[6] = clip3(q2 - tc2, q2 + tc2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
             }
         } else {
             let delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
             if delta.abs() >= tc * 10 {
                 continue;
             }
-            let delta = delta.clamp(-tc, tc);
+            let delta = clip3(-tc, tc, delta);
             if !no_p {
-                line[3] = (p0 + delta).clamp(0, max);
+                line[3] = clip3(0, max, p0 + delta);
                 if dep {
-                    let dp = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1).clamp(-(tc >> 1), tc >> 1);
-                    line[2] = (p1 + dp).clamp(0, max);
+                    let dp = clip3(-(tc >> 1), tc >> 1, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1);
+                    line[2] = clip3(0, max, p1 + dp);
                 }
             }
             if !no_q {
-                line[4] = (q0 - delta).clamp(0, max);
+                line[4] = clip3(0, max, q0 - delta);
                 if deq {
-                    let dq = ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1).clamp(-(tc >> 1), tc >> 1);
-                    line[5] = (q1 + dq).clamp(0, max);
+                    let dq = clip3(-(tc >> 1), tc >> 1, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1);
+                    line[5] = clip3(0, max, q1 + dq);
                 }
             }
         }
@@ -236,12 +242,12 @@ fn luma_segment(seg: &mut Segment<8>, beta: i32, tc: i32, no_p: bool, no_q: bool
 /// Filter one chroma sample line across an edge (8.7.2.5.8).
 fn chroma_line(line: &mut [i32; 4], tc: i32, no_p: bool, no_q: bool, max: i32) {
     let [p1, p0, q0, q1] = *line;
-    let delta = ((((q0 - p0) << 2) + p1 - q1 + 4) >> 3).clamp(-tc, tc);
+    let delta = clip3(-tc, tc, (((q0 - p0) << 2) + p1 - q1 + 4) >> 3);
     if !no_p {
-        line[1] = (p0 + delta).clamp(0, max);
+        line[1] = clip3(0, max, p0 + delta);
     }
     if !no_q {
-        line[2] = (q0 - delta).clamp(0, max);
+        line[2] = clip3(0, max, q0 - delta);
     }
 }
 

@@ -446,7 +446,11 @@ impl Decoder {
 
     /// Decode one container sample (one access unit of length-prefixed NAL
     /// units). Returns the pictures it completes, in decoding order, each
-    /// carrying the pts of the sample it came from.
+    /// carrying the pts of the sample it came from. Damage inside slice
+    /// data is concealed (the picture is marked damaged); an error means a
+    /// NAL unit could not be used at all (an unsupported or broken
+    /// parameter set or slice header), and the pictures decoded anyway
+    /// come with the next call's.
     pub fn decode(&mut self, sample: &[u8], pts: f64) -> Result<Vec<Frame>> {
         let n = self.nal_length_size;
         let mut p = 0;

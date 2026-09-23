@@ -41,6 +41,7 @@ pub const DCT: [[i8; 32]; 32] = {
 /// The 4x4 DST of intra luma blocks (8-316), `[frequency][sample]`.
 const DST: [[i32; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
 
+#[cfg(any(not(feature = "simd"), test))]
 /// The `n`-point inverse DCT (`n` = 4, 8, 16 or 32) of `x`, of which only
 /// the first `count` values may be non-zero, into `out`. The even
 /// coefficients make the half-size transform (the matrix's even rows are
@@ -90,35 +91,140 @@ pub fn inverse_transform(c: &mut [i32], n: usize, dst: bool, bd_shift: u32, max_
     }
     let c = &mut c[..n * n];
     let res = &mut res[..n * n];
-    let transform = |x: &[i32], count: usize, out: &mut [i32]| {
-        if dst {
-            for (y, o) in out[..4].iter_mut().enumerate() {
-                *o = (0..count).map(|j| DST[j][y] * x[j]).sum();
-            }
-        } else {
-            idct(x, n, count, out);
-        }
-    };
     // columns: g[x][y] = Clip3(coeffMin, coeffMax, (Σ_j M[j][y] d[x][j] + 64) >> 7),
-    // written over the column's coefficients
-    let mut col = [0i32; 32];
-    let mut out = [0i32; 32];
-    for x in 0..=max_x {
-        for (j, v) in col[..=max_y].iter_mut().enumerate() {
-            *v = c[j * n + x];
+    // written over the column's coefficients; then the rows: r[x][y] =
+    // Σ_j M[j][x] g[j][y] with the bdShift rounding (the columns beyond
+    // max_x are still zero coefficients)
+    #[cfg(feature = "simd")]
+    {
+        simd::columns(c, n, dst, max_x, max_y);
+        simd::rows(c, n, dst, max_x, bd_shift, res);
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        let transform = |x: &[i32], count: usize, out: &mut [i32]| {
+            if dst {
+                for (y, o) in out[..4].iter_mut().enumerate() {
+                    *o = (0..count).map(|j| DST[j][y] * x[j]).sum();
+                }
+            } else {
+                idct(x, n, count, out);
+            }
+        };
+        let mut col = [0i32; 32];
+        let mut out = [0i32; 32];
+        for x in 0..=max_x {
+            for (j, v) in col[..=max_y].iter_mut().enumerate() {
+                *v = c[j * n + x];
+            }
+            transform(&col[..n], max_y + 1, &mut out[..n]);
+            for (y, &s) in out[..n].iter().enumerate() {
+                c[y * n + x] = ((s + 64) >> 7).clamp(-32768, 32767);
+            }
         }
-        transform(&col[..n], max_y + 1, &mut out[..n]);
-        for (y, &s) in out[..n].iter().enumerate() {
-            c[y * n + x] = ((s + 64) >> 7).clamp(-32768, 32767);
+        let round = 1 << (bd_shift - 1);
+        for (row, r) in c.chunks_exact(n).zip(res.chunks_exact_mut(n)) {
+            transform(row, max_x + 1, &mut out[..n]);
+            for (r, &s) in r.iter_mut().zip(&out[..n]) {
+                *r = (s + round) >> bd_shift;
+            }
         }
     }
-    // rows: r[x][y] = Σ_j M[j][x] g[j][y], then the bdShift rounding (the
-    // columns beyond max_x are still zero coefficients)
-    let round = 1 << (bd_shift - 1);
-    for (row, r) in c.chunks_exact(n).zip(res.chunks_exact_mut(n)) {
-        transform(row, max_x + 1, &mut out[..n]);
-        for (r, &s) in r.iter_mut().zip(&out[..n]) {
-            *r = (s + round) >> bd_shift;
+}
+
+/// The transforms as matrix products eight lanes at a time: each pair of
+/// coefficients, repeated across the lanes, is multiplied with the pair's
+/// two matrix rows at four sample positions and summed into 32 bits by one
+/// dot product instruction (pmaddwd on SSE2, i32x4.dot_i16x8_s in wasm
+/// simd128). The inputs fit 16 bits (the coefficients and the first
+/// stage's output are clipped to them) and the sums 32, so this is exact.
+#[cfg(feature = "simd")]
+mod simd {
+    use wide::{i16x8, i32x4};
+
+    use super::{DCT, DST};
+
+    /// transMatrix of the `n`-point transform, at frequency `k` and sample `s`.
+    const fn m(n: usize, dst: bool, k: usize, s: usize) -> i16 {
+        if dst {
+            DST[k][s] as i16
+        } else {
+            DCT[k * (32 / n)][s] as i16
+        }
+    }
+
+    /// The matrix in pairs of frequencies and quads of samples: entry
+    /// `[p * n / 4 + q]` is m(2p, 4q), m(2p + 1, 4q), m(2p, 4q + 1), ...
+    const fn pairs(n: usize, dst: bool) -> [[i16; 8]; 128] {
+        let mut t = [[0i16; 8]; 128];
+        let quads = if n < 4 { 1 } else { n / 4 };
+        let mut p = 0;
+        while p < n / 2 {
+            let mut q = 0;
+            while q < quads {
+                let mut i = 0;
+                while i < 4 {
+                    t[p * quads + q][2 * i] = m(n, dst, 2 * p, 4 * q + i);
+                    t[p * quads + q][2 * i + 1] = m(n, dst, 2 * p + 1, 4 * q + i);
+                    i += 1;
+                }
+                q += 1;
+            }
+            p += 1;
+        }
+        t
+    }
+
+    static TABLES: [[[i16; 8]; 128]; 5] = [pairs(4, true), pairs(4, false), pairs(8, false), pairs(16, false), pairs(32, false)];
+
+    fn table(n: usize, dst: bool) -> &'static [[i16; 8]; 128] {
+        &TABLES[match (n, dst) {
+            (_, true) => 0,
+            (4, _) => 1,
+            (8, _) => 2,
+            (16, _) => 3,
+            _ => 4,
+        }]
+    }
+
+    /// Σ_{k < count} m(k, s) · x(k) for the `n` samples s, four per lane group.
+    #[inline(always)]
+    fn product(x: impl Fn(usize) -> i32, t: &[[i16; 8]; 128], n: usize, count: usize, acc: &mut [i32x4; 8]) {
+        let quads = n / 4;
+        acc[..quads].fill(i32x4::ZERO);
+        for p in 0..count.div_ceil(2) {
+            let (a, b) = (x(2 * p) as i16, x(2 * p + 1) as i16);
+            let xv = i16x8::new([a, b, a, b, a, b, a, b]);
+            for (q, sum) in acc[..quads].iter_mut().enumerate() {
+                *sum += xv.dot(i16x8::new(t[p * quads + q]));
+            }
+        }
+    }
+
+    pub fn columns(c: &mut [i32], n: usize, dst: bool, max_x: usize, max_y: usize) {
+        let t = table(n, dst);
+        let mut acc = [i32x4::ZERO; 8];
+        let (lo, hi) = (i32x4::splat(-32768), i32x4::splat(32767));
+        for x in 0..=max_x {
+            product(|j| c[j * n + x], t, n, max_y + 1, &mut acc);
+            for (q, &sum) in acc[..n / 4].iter().enumerate() {
+                let g = ((sum + 64i32) >> 7i32).max(lo).min(hi);
+                for (i, &v) in g.to_array().iter().enumerate() {
+                    c[(4 * q + i) * n + x] = v;
+                }
+            }
+        }
+    }
+
+    pub fn rows(c: &[i32], n: usize, dst: bool, max_x: usize, bd_shift: u32, res: &mut [i32]) {
+        let t = table(n, dst);
+        let mut acc = [i32x4::ZERO; 8];
+        let round = 1 << (bd_shift - 1);
+        for (row, r) in c.chunks_exact(n).zip(res.chunks_exact_mut(n)) {
+            product(|k| row[k], t, n, max_x + 1, &mut acc);
+            for (out, &sum) in r.chunks_exact_mut(4).zip(&acc[..n / 4]) {
+                out.copy_from_slice(&((sum + round) >> bd_shift).to_array());
+            }
         }
     }
 }
@@ -174,6 +280,52 @@ mod tests {
                     let direct: i32 = (0..n).map(|k| DCT[k * (32 / n)][y] as i32 * x[k]).sum();
                     assert_eq!(o, direct, "n {n} count {count} y {y}");
                 }
+            }
+        }
+    }
+
+    /// 8.6.4 as written: the matrix products with the intermediate clip.
+    fn reference(c: &[i32], n: usize, dst: bool, bd_shift: u32) -> Vec<i32> {
+        let m = |k: usize, s: usize| if dst { DST[k][s] } else { DCT[k * (32 / n)][s] as i32 };
+        let mut g = vec![0i64; n * n];
+        for x in 0..n {
+            for y in 0..n {
+                let s: i64 = (0..n).map(|j| m(j, y) as i64 * c[j * n + x] as i64).sum();
+                g[y * n + x] = ((s + 64) >> 7).clamp(-32768, 32767);
+            }
+        }
+        let mut r = vec![0i32; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                let s: i64 = (0..n).map(|j| m(j, x) as i64 * g[y * n + j]).sum();
+                r[y * n + x] = ((s + (1 << (bd_shift - 1))) >> bd_shift) as i32;
+            }
+        }
+        r
+    }
+
+    #[test]
+    fn transforms_match_the_spec() {
+        let mut seed = 11u32;
+        let mut rand = |range: i32| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as i32 % (2 * range + 1) - range
+        };
+        for (n, dst) in [(4, true), (4, false), (8, false), (16, false), (32, false)] {
+            for round in 0..40 {
+                let (max_x, max_y) = ((rand(n as i32).unsigned_abs() as usize) % n, (rand(n as i32).unsigned_abs() as usize) % n);
+                // small levels, and full-range ones that saturate the intermediate clip
+                let range = if round % 2 == 0 { 300 } else { 32767 };
+                let mut c = vec![0i32; n * n];
+                for y in 0..=max_y {
+                    for x in 0..=max_x {
+                        c[y * n + x] = rand(range);
+                    }
+                }
+                let want = reference(&c, n, dst, 12);
+                let mut res = vec![0i32; n * n];
+                inverse_transform(&mut c, n, dst, 12, max_x, max_y, &mut res);
+                assert_eq!(res, want, "n {n} dst {dst} last ({max_x}, {max_y})");
             }
         }
     }
