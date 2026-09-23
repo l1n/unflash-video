@@ -18,7 +18,7 @@ fn clip(v: i32) -> u8 {
 /// (at most 255 × 52), the centre position's second pass runs in i32, and
 /// the final clip is the saturating narrowing to u8.
 #[cfg(feature = "simd")]
-mod simd {
+pub(crate) mod simd {
     use wide::{i16x8, i32x8, u8x16};
 
     /// Eight consecutive samples as i16 lanes.
