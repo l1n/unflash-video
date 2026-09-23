@@ -7,7 +7,7 @@
 //! to the last row and column). Unscaled blocks whose filter footprint lies
 //! inside the reference read it in place; others go through a small
 //! edge-replicated copy. Unscaled blocks are interpolated by
-//! `Pixel::predict`, in SIMD lanes for 8-bit frames.
+//! `Pixel::predict`, in SIMD lanes.
 
 use crate::frame::{Pixel, Plane};
 use crate::header::INTRA_FRAME;
@@ -261,68 +261,41 @@ fn predict_scaled<T: Pixel>(refp: &Plane<T>, cur: &mut Plane<T>, x: usize, y: us
     }
 }
 
-/// The 8-bit interpolation in 16-bit SIMD lanes, a strip of 8 columns (4
-/// for 4-wide blocks) at a time.
+/// The interpolation in 16-bit SIMD lanes, a strip of 8 columns (4 for
+/// 4-wide blocks) at a time.
 #[cfg(feature = "simd")]
 pub mod simd {
     use super::Mc;
-    use wide::{i16x8, u8x16};
-
-    /// Over all the filters, an 8-tap sum of 8-bit samples lies in
-    /// -13770..=46410: too wide for signed 16-bit lanes, but offset by
-    /// 108 * 128 (and the rounding 64) it is exact in wrapping 16-bit
-    /// arithmetic read as unsigned, and its logical shift right by 7 is the
-    /// rounded value plus 108.
-    const BIAS: i16 = 108 * 128 + 64;
-
-    /// 16 samples, from a slice of at least 16 (see `PAD`).
-    #[inline(always)]
-    fn load16(s: &[u8]) -> u8x16 {
-        u8x16::from(<[u8; 16]>::try_from(&s[..16]).unwrap())
-    }
-
-    /// Eight samples widened to 16-bit lanes.
-    #[inline(always)]
-    fn load(s: &[u8]) -> i16x8 {
-        i16x8::from_u8x16_low(load16(s))
-    }
-
-    /// Round2(the filtered value, 7) before clipping: -108..=363.
-    #[inline(always)]
-    fn taps(s: [i16x8; 8], f: &[i16x8; 8]) -> i16x8 {
-        let mut acc = i16x8::splat(BIAS);
-        for t in 0..8 {
-            acc = acc + s[t] * f[t];
-        }
-        ((acc >> 7_i32) & i16x8::splat(511)) - i16x8::splat(108)
-    }
+    use crate::lanes::Lanes;
+    use wide::i16x8;
 
     #[inline(always)]
-    fn clip(v: i16x8) -> i16x8 {
-        v.max(i16x8::ZERO).min(i16x8::splat(255))
+    fn clip(v: i16x8, max: i16x8) -> i16x8 {
+        v.max(i16x8::ZERO).min(max)
     }
 
     /// Store `N` samples, clipped, or their average with those there.
     #[inline(always)]
-    fn put<const N: usize>(v: i16x8, d: &mut [u8], average: bool) {
-        let v = if average { (clip(v) + load(d) + i16x8::splat(1)) >> 1_i32 } else { v };
-        d[..N].copy_from_slice(&u8x16::narrow_i16x8(v, v).as_array_ref()[..N]);
+    fn put<T: Lanes, const N: usize>(v: i16x8, d: &mut [T], average: bool, max: i16x8) {
+        let v = clip(v, max);
+        let v = if average { (v + T::load(d) + i16x8::splat(1)) >> 1_i32 } else { v };
+        T::store::<N>(v, d);
     }
 
-    pub fn predict(src: &[u8], ss: usize, dst: &mut [u8], ds: usize, mc: &Mc) {
+    pub fn predict<T: Lanes>(src: &[T], ss: usize, dst: &mut [T], ds: usize, mc: &Mc) {
         match (mc.w, mc.fx != 0, mc.fy != 0) {
-            (4, false, false) => columns::<4, false, false>(src, ss, dst, ds, mc),
-            (4, true, false) => columns::<4, true, false>(src, ss, dst, ds, mc),
-            (4, false, true) => columns::<4, false, true>(src, ss, dst, ds, mc),
-            (4, true, true) => columns::<4, true, true>(src, ss, dst, ds, mc),
+            (4, false, false) => columns::<T, 4, false, false>(src, ss, dst, ds, mc),
+            (4, true, false) => columns::<T, 4, true, false>(src, ss, dst, ds, mc),
+            (4, false, true) => columns::<T, 4, false, true>(src, ss, dst, ds, mc),
+            (4, true, true) => columns::<T, 4, true, true>(src, ss, dst, ds, mc),
             (w, h, v) => {
                 for c in (0..w).step_by(8) {
                     let (src, dst) = (&src[c..], &mut dst[c..]);
                     match (h, v) {
-                        (false, false) => columns::<8, false, false>(src, ss, dst, ds, mc),
-                        (true, false) => columns::<8, true, false>(src, ss, dst, ds, mc),
-                        (false, true) => columns::<8, false, true>(src, ss, dst, ds, mc),
-                        (true, true) => columns::<8, true, true>(src, ss, dst, ds, mc),
+                        (false, false) => columns::<T, 8, false, false>(src, ss, dst, ds, mc),
+                        (true, false) => columns::<T, 8, true, false>(src, ss, dst, ds, mc),
+                        (false, true) => columns::<T, 8, false, true>(src, ss, dst, ds, mc),
+                        (true, true) => columns::<T, 8, true, true>(src, ss, dst, ds, mc),
                     }
                 }
             }
@@ -331,36 +304,38 @@ pub mod simd {
 
     /// Whether to filter rows horizontally eight at a time through
     /// transposes, rather than one at a time from 8 overlapping loads: for
-    /// WebAssembly, compilers split overlapping loads into single bytes.
+    /// WebAssembly, compilers split overlapping loads of bytes into single
+    /// bytes.
     const TRANSPOSE: bool = cfg!(target_arch = "wasm32");
 
     /// `N` columns of a block, filtered horizontally if `H` and vertically
     /// if `V`: the rows of the footprint pass through a window of the 8 the
     /// vertical filter reads.
     #[inline(always)]
-    fn columns<const N: usize, const H: bool, const V: bool>(src: &[u8], ss: usize, dst: &mut [u8], ds: usize, mc: &Mc) {
+    fn columns<T: Lanes, const N: usize, const H: bool, const V: bool>(src: &[T], ss: usize, dst: &mut [T], ds: usize, mc: &Mc) {
         let fx = mc.filter[mc.fx].map(i16x8::splat);
         let fy = mc.filter[mc.fy].map(i16x8::splat);
+        let max = i16x8::splat((1 << mc.bd) - 1);
         let rows = mc.h + if V { 7 } else { 0 };
         let mut group = [i16x8::ZERO; 8];
         let mut win = [i16x8::ZERO; 8];
         for r in 0..rows {
             let v = if !H {
-                load(&src[r * ss..])
+                T::load(&src[r * ss..])
             } else if TRANSPOSE {
                 if r % 8 == 0 {
-                    group = filter_rows(src, ss, r, rows, &fx);
+                    group = filter_rows(src, ss, r, rows, &fx, mc.bd);
                 }
                 group[r % 8]
             } else {
-                filter_row(&src[r * ss..], &fx)
+                filter_row(&src[r * ss..], &fx, mc.bd)
             };
             if !V {
-                put::<N>(v, &mut dst[r * ds..], mc.average);
+                put::<T, N>(v, &mut dst[r * ds..], mc.average, max);
             } else {
                 win = [win[1], win[2], win[3], win[4], win[5], win[6], win[7], v];
                 if r >= 7 {
-                    put::<N>(taps(win, &fy), &mut dst[(r - 7) * ds..], mc.average);
+                    put::<T, N>(T::taps(win, &fy, mc.bd), &mut dst[(r - 7) * ds..], mc.average, max);
                 }
             }
         }
@@ -368,21 +343,22 @@ pub mod simd {
 
     /// One row of 8 columns, filtered horizontally.
     #[inline(always)]
-    fn filter_row(s: &[u8], f: &[i16x8; 8]) -> i16x8 {
+    fn filter_row<T: Lanes>(s: &[T], f: &[i16x8; 8], bd: u32) -> i16x8 {
         let s = &s[..7 + 16];
-        clip(taps(std::array::from_fn(|t| load(&s[t..])), f))
+        clip(T::taps(std::array::from_fn(|t| T::load(&s[t..])), f, bd), i16x8::splat((1 << bd) - 1))
     }
 
     /// Rows `r0..r0 + 8` (those below `rows`) of 8 columns, filtered
     /// horizontally: the rows are loaded whole and transposed, so that each
     /// tap is a column.
     #[inline(always)]
-    fn filter_rows(src: &[u8], ss: usize, r0: usize, rows: usize, f: &[i16x8; 8]) -> [i16x8; 8] {
-        let raw: [u8x16; 8] = std::array::from_fn(|k| if r0 + k < rows { load16(&src[(r0 + k) * ss..]) } else { u8x16::ZERO });
-        let lo = i16x8::transpose(raw.map(i16x8::from_u8x16_low));
-        let hi = i16x8::transpose(raw.map(i16x8::from_u8x16_high));
+    fn filter_rows<T: Lanes>(src: &[T], ss: usize, r0: usize, rows: usize, f: &[i16x8; 8], bd: u32) -> [i16x8; 8] {
+        let raw: [[i16x8; 2]; 8] = std::array::from_fn(|k| if r0 + k < rows { T::load2(&src[(r0 + k) * ss..]) } else { [i16x8::ZERO; 2] });
+        let lo = i16x8::transpose(raw.map(|r| r[0]));
+        let hi = i16x8::transpose(raw.map(|r| r[1]));
         let column = |j: usize| if j < 8 { lo[j] } else { hi[j - 8] };
-        i16x8::transpose(std::array::from_fn(|c| clip(taps(std::array::from_fn(|t| column(c + t)), f))))
+        let max = i16x8::splat((1 << bd) - 1);
+        i16x8::transpose(std::array::from_fn(|c| clip(T::taps(std::array::from_fn(|t| column(c + t)), f, bd), max)))
     }
 
     #[cfg(test)]
@@ -395,18 +371,21 @@ pub mod simd {
         #[test]
         fn transposed_rows() {
             let mut seed = 0x1234_5678_9abc_def0_u64;
-            let src: Vec<u8> = (0..24 * 8 + 16)
-                .map(|_| {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    seed as u8
-                })
-                .collect();
+            let mut rnd = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let low: Vec<u8> = (0..24 * 8 + 16).map(|_| rnd() as u8).collect();
+            let high: Vec<u16> = (0..24 * 8 + 16).map(|_| rnd() as u16 & 1023).collect();
             for f in SUBPEL_FILTERS.iter().flatten() {
                 let f = f.map(i16x8::splat);
-                for (r, v) in filter_rows(&src, 24, 0, 8, &f).iter().enumerate() {
-                    assert_eq!(*v, filter_row(&src[r * 24..], &f));
+                for (r, v) in filter_rows(&low, 24, 0, 8, &f, 8).iter().enumerate() {
+                    assert_eq!(*v, filter_row(&low[r * 24..], &f, 8));
+                }
+                for (r, v) in filter_rows(&high, 24, 0, 8, &f, 10).iter().enumerate() {
+                    assert_eq!(*v, filter_row(&high[r * 24..], &f, 10));
                 }
             }
         }
@@ -416,6 +395,21 @@ pub mod simd {
 #[cfg(all(test, feature = "simd"))]
 mod tests {
     use super::*;
+
+    fn check<T: crate::lanes::Lanes>(bd: u32, trials: usize, rnd: &mut impl FnMut() -> usize) {
+        let ss = 80;
+        let max = (1 << bd) - 1;
+        let mut tmp = vec![0; 64 * 71];
+        for trial in 0..trials {
+            let src: Vec<T> = (0..ss * 71).map(|_| T::new(if trial % 2 == 0 { (rnd() & max) as i32 } else { [0, max as i32][rnd() % 2] })).collect();
+            let mc = Mc { w: [4, 8, 16, 32, 64][trial % 5], h: [4, 8, 16, 32, 64][rnd() % 5], fx: rnd() % 16, fy: rnd() % 16, filter: &SUBPEL_FILTERS[rnd() % 4], bd, average: trial % 3 == 0 };
+            let mut a: Vec<T> = (0..64 * 64 + crate::frame::PAD).map(|_| T::new((rnd() & max) as i32)).collect();
+            let mut b = a.clone();
+            predict_block(&src, ss, &mut a, 64, &mc, &mut tmp);
+            simd::predict(&src, ss, &mut b, 64, &mc);
+            assert!(a == b, "{bd}-bit trial {trial}");
+        }
+    }
 
     /// The SIMD interpolation agrees with the portable one, for every
     /// filter, fraction and block width, at the extremes of the sums too.
@@ -428,16 +422,8 @@ mod tests {
             seed ^= seed << 17;
             seed as usize
         };
-        let ss = 80;
-        let mut tmp = vec![0; 64 * 71];
-        for trial in 0..6000 {
-            let src: Vec<u8> = (0..ss * 71).map(|_| if trial % 2 == 0 { rnd() as u8 } else { [0, 255][rnd() % 2] }).collect();
-            let mc = Mc { w: [4, 8, 16, 32, 64][trial % 5], h: [4, 8, 16, 32, 64][rnd() % 5], fx: rnd() % 16, fy: rnd() % 16, filter: &SUBPEL_FILTERS[rnd() % 4], bd: 8, average: trial % 3 == 0 };
-            let mut a: Vec<u8> = (0..64 * 64 + crate::frame::PAD).map(|_| rnd() as u8).collect();
-            let mut b = a.clone();
-            predict_block(&src, ss, &mut a, 64, &mc, &mut tmp);
-            simd::predict(&src, ss, &mut b, 64, &mc);
-            assert_eq!(a, b, "trial {trial}");
-        }
+        check::<u8>(8, 6000, &mut rnd);
+        check::<u16>(10, 3000, &mut rnd);
+        check::<u16>(12, 3000, &mut rnd);
     }
 }

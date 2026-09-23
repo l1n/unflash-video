@@ -7,7 +7,7 @@ use crate::inter::{predict_block, Mc};
 use crate::loopfilter::{filter_run_lines, Run};
 
 /// A sample type: `u8` for 8-bit streams, `u16` for 10 and 12-bit ones.
-/// The hot kernels are methods, so the 8-bit ones can use SIMD.
+/// The hot kernels are methods, so that each type can have SIMD ones.
 pub trait Pixel: Copy + Default + PartialEq + Send + Sync + 'static {
     fn get(self) -> i32;
     /// A value known to be in range.
@@ -50,8 +50,8 @@ impl Pixel for u8 {
     }
 
     #[cfg(feature = "simd")]
-    fn filter_run(d: &mut [u8], stride: usize, run: &Run, _bd: u32) {
-        crate::loopfilter::simd::filter_run(d, stride, run);
+    fn filter_run(d: &mut [u8], stride: usize, run: &Run, bd: u32) {
+        crate::loopfilter::simd::filter_run(d, stride, run, bd);
     }
 
     #[cfg(feature = "simd")]
@@ -81,6 +81,16 @@ impl Pixel for u16 {
     #[inline(always)]
     fn clip(v: i32, bd: u32) -> Self {
         v.clamp(0, (1 << bd) - 1) as u16
+    }
+
+    #[cfg(feature = "simd")]
+    fn filter_run(d: &mut [u16], stride: usize, run: &Run, bd: u32) {
+        crate::loopfilter::simd::filter_run(d, stride, run, bd);
+    }
+
+    #[cfg(feature = "simd")]
+    fn predict(src: &[u16], ss: usize, dst: &mut [u16], ds: usize, mc: &Mc, _tmp: &mut [i32]) {
+        crate::inter::simd::predict(src, ss, dst, ds, mc);
     }
 }
 

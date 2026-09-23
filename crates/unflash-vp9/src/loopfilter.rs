@@ -5,7 +5,8 @@
 //! The filter decisions of 8.8.2 - 8.8.4 are the same for runs of 8
 //! consecutive samples along an edge (one 8x8 block of the plane), so they
 //! are made once per run, and the run is filtered by `Pixel::filter_run`:
-//! 8 lines at once in SIMD lanes for 8-bit frames, line by line otherwise.
+//! 8 lines at once in SIMD lanes (line by line without the `simd`
+//! feature).
 
 use crate::frame::{Pixel, FrameBuf};
 use crate::header::{FrameHeader, SEG_LVL_ALT_L};
@@ -233,59 +234,51 @@ fn wide(s: &mut [i32; 16], log2: u32) {
     s[(8 - n) as usize..(8 + n) as usize].copy_from_slice(&out[(8 - n) as usize..(8 + n) as usize]);
 }
 
-/// The 8-bit filters on 8 lines at once, in 16-bit lanes (the largest
-/// intermediate, a 16-tap sum of samples, is 4080).
+/// The filters on 8 lines at once, in 16-bit lanes. Every intermediate
+/// fits them but the 16-tap sum of the widest filter, which at 12 bits
+/// needs all 16 bits unsigned.
 #[cfg(feature = "simd")]
 pub mod simd {
     use super::{Limits, Run};
-    use wide::{i16x8, u8x16, CmpGt, CmpLt};
+    use crate::lanes::Lanes;
+    use wide::{i16x8, CmpGt, CmpLt};
 
-    /// 16 samples (from a slice of at least 16: see `PAD`).
-    #[inline(always)]
-    fn load16(s: &[u8]) -> u8x16 {
-        u8x16::from(<[u8; 16]>::try_from(&s[..16]).unwrap())
-    }
-
-    #[inline(always)]
-    fn store8(v: i16x8, d: &mut [u8]) {
-        let p = u8x16::narrow_i16x8(v, v);
-        d[..8].copy_from_slice(&p.as_array_ref()[..8]);
-    }
-
-    /// Filter a run of 8-bit samples: gather p7..q7 of each line into lanes
-    /// (loads of rows for horizontal edges, a transpose for vertical ones),
-    /// filter, scatter back.
-    pub fn filter_run(d: &mut [u8], stride: usize, run: &Run) {
+    /// Filter a run: gather p7..q7 of each line into lanes (loads of rows
+    /// for horizontal edges, a transpose for vertical ones), filter,
+    /// scatter back.
+    pub fn filter_run<T: Lanes>(d: &mut [T], stride: usize, run: &Run, bd: u32) {
         let n = if run.size == 2 { 8 } else { 4 };
         let mut v = [i16x8::ZERO; 16];
         if run.vertical {
-            let rows: [u8x16; 8] = std::array::from_fn(|i| load16(&d[run.start + i * stride - n..]));
-            v[8 - n..8 - n + 8].copy_from_slice(&i16x8::transpose(rows.map(i16x8::from_u8x16_low)));
             if n == 8 {
-                v[8..16].copy_from_slice(&i16x8::transpose(rows.map(i16x8::from_u8x16_high)));
+                let rows: [[i16x8; 2]; 8] = std::array::from_fn(|i| T::load2(&d[run.start + i * stride - 8..]));
+                v[..8].copy_from_slice(&i16x8::transpose(rows.map(|r| r[0])));
+                v[8..].copy_from_slice(&i16x8::transpose(rows.map(|r| r[1])));
+            } else {
+                v[4..12].copy_from_slice(&i16x8::transpose(std::array::from_fn(|i| T::load(&d[run.start + i * stride - 4..]))));
             }
         } else {
             for (k, vk) in v.iter_mut().enumerate().take(8 + n).skip(8 - n) {
-                *vk = i16x8::from_u8x16_low(load16(&d[run.start + k * stride - 8 * stride..]));
+                *vk = T::load(&d[run.start + k * stride - 8 * stride..]);
             }
         }
         let active = i16x8::new([0, 1, 2, 3, 4, 5, 6, 7]).cmp_lt(i16x8::splat(run.count as i16));
         let old = v;
-        filter_lanes(&mut v, run.size, &run.limits, active);
+        filter_lanes(&mut v, run.size, &run.limits, active, bd);
         if run.vertical {
             let lo = i16x8::transpose(v[8 - n..8 - n + 8].try_into().unwrap());
             let hi = if n == 8 { i16x8::transpose(v[8..16].try_into().unwrap()) } else { lo };
             for i in 0..run.count {
                 let row = &mut d[run.start + i * stride - n..];
-                store8(lo[i], row);
+                T::store::<8>(lo[i], row);
                 if n == 8 {
-                    store8(hi[i], &mut row[8..]);
+                    T::store::<8>(hi[i], &mut row[8..]);
                 }
             }
         } else {
             for k in 8 - n..8 + n {
                 if v[k] != old[k] {
-                    store8(v[k], &mut d[run.start + k * stride - 8 * stride..]);
+                    T::store::<8>(v[k], &mut d[run.start + k * stride - 8 * stride..]);
                 }
             }
         }
@@ -298,26 +291,28 @@ pub mod simd {
 
     /// 8.8.5 on eight lines: `v` holds p7..q7 per lane.
     #[inline(always)]
-    fn filter_lanes(v: &mut [i16x8; 16], size: u8, l: &Limits, active: i16x8) {
+    fn filter_lanes(v: &mut [i16x8; 16], size: u8, l: &Limits, active: i16x8, bd: u32) {
+        let sh = bd - 8;
         let (p3, p2, p1, p0, q0, q1, q2, q3) = (v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
-        let limit = i16x8::splat(l.limit as i16);
+        let limit = i16x8::splat((l.limit << sh) as i16);
         let over = absd(p3, p2).max(absd(p2, p1)).max(absd(p1, p0)).max(absd(q1, q0)).max(absd(q2, q1)).max(absd(q3, q2)).cmp_gt(limit);
-        let edge = (absd(p0, q0) * 2i16 + (absd(p1, q1) >> 1_i32)).cmp_gt(i16x8::splat(l.blimit as i16));
+        let edge = (absd(p0, q0) * 2i16 + (absd(p1, q1) >> 1_i32)).cmp_gt(i16x8::splat((l.blimit << sh) as i16));
         let mask = active & !(over | edge);
         if mask.none() {
             return;
         }
-        let thresh = i16x8::splat(l.thresh as i16);
+        let thresh = i16x8::splat((l.thresh << sh) as i16);
         let hev = absd(p1, p0).cmp_gt(thresh) | absd(q1, q0).cmp_gt(thresh);
-        let one = i16x8::splat(1);
-        let flat = if size > 0 { mask & !(absd(p1, p0).max(absd(q1, q0)).max(absd(p2, p0)).max(absd(q2, q0)).max(absd(p3, p0)).max(absd(q3, q0)).cmp_gt(one)) } else { i16x8::ZERO };
-        let flat2 = if size == 2 && flat.any() { flat & !(absd(v[0], p0).max(absd(v[15], q0)).max(absd(v[1], p0)).max(absd(v[14], q0)).max(absd(v[2], p0)).max(absd(v[13], q0)).max(absd(v[3], p0)).max(absd(v[12], q0)).cmp_gt(one)) } else { i16x8::ZERO };
+        let flat_limit = i16x8::splat(1 << sh);
+        let flat = if size > 0 { mask & !(absd(p1, p0).max(absd(q1, q0)).max(absd(p2, p0)).max(absd(q2, q0)).max(absd(p3, p0)).max(absd(q3, q0)).cmp_gt(flat_limit)) } else { i16x8::ZERO };
+        let flat2 = if size == 2 && flat.any() { flat & !(absd(v[0], p0).max(absd(v[15], q0)).max(absd(v[1], p0)).max(absd(v[14], q0)).max(absd(v[2], p0)).max(absd(v[13], q0)).max(absd(v[3], p0)).max(absd(v[12], q0)).cmp_gt(flat_limit)) } else { i16x8::ZERO };
         let src = *v;
         // the narrow filter where the lines are not flat
         let narrow = mask & !flat;
         if narrow.any() {
-            let c = |x: i16x8| x.max(i16x8::splat(-128)).min(i16x8::splat(127));
-            let off = i16x8::splat(128);
+            let (lo, hi) = (i16x8::splat(-(1 << (bd - 1))), i16x8::splat((1 << (bd - 1)) - 1));
+            let c = |x: i16x8| x.max(lo).min(hi);
+            let off = i16x8::splat(0x80 << sh);
             let (ps1, ps0, qs0, qs1) = (p1 - off, p0 - off, q0 - off, q1 - off);
             let f = c(ps1 - qs1) & hev;
             let f = c(f + (qs0 - ps0) * 3i16);
@@ -325,7 +320,7 @@ pub mod simd {
             let f2 = c(f + i16x8::splat(3)) >> 3_i32;
             v[8] = narrow.blend(c(qs0 - f1) + off, v[8]);
             v[7] = narrow.blend(c(ps0 + f2) + off, v[7]);
-            let f = (f1 + one) >> 1_i32;
+            let f = (f1 + i16x8::splat(1)) >> 1_i32;
             let outer = narrow & !hev;
             v[9] = outer.blend(c(qs1 - f) + off, v[9]);
             v[6] = outer.blend(c(ps1 + f) + off, v[6]);
@@ -341,6 +336,8 @@ pub mod simd {
     }
 
     /// The wide filter (8.8.5.3) as a running sum, into the lanes of `m`.
+    /// The sum wraps as a signed value at 12 bits but is exact unsigned, so
+    /// the shift is a logical one.
     #[inline(always)]
     fn wide(s: &[i16x8; 16], v: &mut [i16x8; 16], log2: i32, m: i16x8) {
         let n = (1i32 << (log2 - 1)) - 1;
@@ -350,12 +347,13 @@ pub mod simd {
             t = t + at(-n + j);
         }
         let round = i16x8::splat(1 << (log2 - 1));
+        let low = i16x8::splat(((1 << (16 - log2)) - 1) as i16);
         for i in -n..n {
             if i > -n {
                 t = t - at(i - 1) + at(i) - at(i - 1 - n) + at(i + n);
             }
             let k = (8 + i) as usize;
-            v[k] = m.blend((t + round) >> log2, v[k]);
+            v[k] = m.blend(((t + round) >> log2) & low, v[k]);
         }
     }
 }
@@ -363,6 +361,33 @@ pub mod simd {
 #[cfg(all(test, feature = "simd"))]
 mod tests {
     use super::*;
+
+    fn check<T: crate::lanes::Lanes>(bd: u32, trials: usize, rnd: &mut impl FnMut() -> u64) {
+        let stride = 48;
+        let sh = bd - 8;
+        for trial in 0..trials {
+            // smooth data with steps, so that every filter gets chosen; near
+            // the top of the range too, where the widest sum needs 16 bits
+            let base = (rnd() % 256) as i32;
+            let step = (rnd() % 24) as i32 - 12;
+            let noise = 1 + (rnd() % [2, 3, 8, 40][trial % 4]) as i32;
+            let mut d = vec![T::default(); stride * 32];
+            for (i, s) in d.iter_mut().enumerate() {
+                let (x, y) = (i % stride, i / stride);
+                let edge = if (trial % 2 == 0 && x >= 16) || (trial % 2 == 1 && y >= 16) { step } else { 0 };
+                let fine = (rnd() % (1 << sh)) as i32;
+                *s = T::new((((base + edge + (rnd() % noise as u64) as i32) << sh) + fine).clamp(0, (1 << bd) - 1));
+            }
+            let level = (rnd() % 64) as i32;
+            let sharp = (rnd() % 8) as i32;
+            let limit = (level >> (sharp > 0) as i32 + (sharp > 4) as i32).clamp(1, if sharp > 0 { 9 - sharp } else { 63 });
+            let run = Run { start: 16 * stride + 16, vertical: trial % 2 == 0, count: 1 + (rnd() % 8) as usize, size: (rnd() % 3) as u8, limits: Limits { limit, blimit: 2 * (level + 2) + limit, thresh: level >> 4 } };
+            let mut a = d.clone();
+            filter_run_lines(&mut a, stride, &run, bd);
+            simd::filter_run(&mut d, stride, &run, bd);
+            assert!(a == d, "{bd}-bit trial {trial}");
+        }
+    }
 
     /// The SIMD filters agree with the line-by-line ones.
     #[test]
@@ -374,26 +399,8 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let stride = 48;
-        for trial in 0..20_000 {
-            // smooth data with steps, so that every filter gets chosen
-            let base = (rnd() % 200) as i32;
-            let step = (rnd() % 24) as i32 - 12;
-            let noise = 1 + (rnd() % [2, 3, 8, 40][trial % 4]) as i32;
-            let mut d = vec![0u8; stride * 32];
-            for (i, s) in d.iter_mut().enumerate() {
-                let (x, y) = (i % stride, i / stride);
-                let edge = if (trial % 2 == 0 && x >= 16) || (trial % 2 == 1 && y >= 16) { step } else { 0 };
-                *s = (base + edge + (rnd() % noise as u64) as i32).clamp(0, 255) as u8;
-            }
-            let level = (rnd() % 64) as i32;
-            let sharp = (rnd() % 8) as i32;
-            let limit = (level >> (sharp > 0) as i32 + (sharp > 4) as i32).clamp(1, if sharp > 0 { 9 - sharp } else { 63 });
-            let run = Run { start: 16 * stride + 16, vertical: trial % 2 == 0, count: 1 + (rnd() % 8) as usize, size: (rnd() % 3) as u8, limits: Limits { limit, blimit: 2 * (level + 2) + limit, thresh: level >> 4 } };
-            let mut a = d.clone();
-            filter_run_lines(&mut a, stride, &run, 8);
-            simd::filter_run(&mut d, stride, &run);
-            assert_eq!(a, d, "trial {trial}");
-        }
+        check::<u8>(8, 20_000, &mut rnd);
+        check::<u16>(10, 10_000, &mut rnd);
+        check::<u16>(12, 10_000, &mut rnd);
     }
 }

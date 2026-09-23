@@ -26,6 +26,8 @@ pub mod header;
 pub mod idct;
 pub mod inter;
 pub mod intra;
+#[cfg(feature = "simd")]
+pub mod lanes;
 pub mod loopfilter;
 pub mod mvpred;
 pub mod probs;
