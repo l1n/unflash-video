@@ -172,7 +172,13 @@ const WIN: usize = MAX_W + 5;
 
 /// Store `a` (or the rounded average of `a` and `b`) into `dst`, averaging
 /// with the previous contents when `avg` is set.
-#[inline(always)]
+///
+/// This and the filters below are out of line, one copy per block width:
+/// the sixteen sample positions are combinations of them, and inlining
+/// them all into every position and width made the luma prediction 41 KB
+/// of code, more than the instruction cache holds with the rest of a
+/// macroblock's decoding.
+#[inline(never)]
 fn emit<const W: usize>(a: &[u8], b: Option<&[u8]>, h: usize, dst: &mut [u8], ds: usize, avg: bool) {
     for j in 0..h {
         let ra = &a[j * W..j * W + W];
@@ -215,7 +221,7 @@ fn emit<const W: usize>(a: &[u8], b: Option<&[u8]>, h: usize, dst: &mut [u8], ds
 }
 
 /// Full-sample block whose top-left is `src[base]` (stride `ss`).
-#[inline(always)]
+#[inline(never)]
 fn full<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mut [u8]) {
     for j in 0..h {
         out[j * W..j * W + W].copy_from_slice(&src[base + j * ss..base + j * ss + W]);
@@ -223,7 +229,7 @@ fn full<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mut 
 }
 
 /// Horizontal half-sample positions (b) of the rows starting at `src[base]`.
-#[inline(always)]
+#[inline(never)]
 fn hhalf<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mut [u8]) {
     for j in 0..h {
         let r = &src[base + j * ss - 2..base + j * ss + W + 3];
@@ -240,7 +246,7 @@ fn hhalf<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mut
 }
 
 /// Vertical half-sample positions (h) of the columns starting at `src[base]`.
-#[inline(always)]
+#[inline(never)]
 fn vhalf<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mut [u8]) {
     for j in 0..h {
         let p = base + j * ss;
@@ -259,7 +265,7 @@ fn vhalf<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mut
 
 /// Centre half-sample positions (j): the vertical filter over the
 /// unclipped horizontal intermediates.
-#[inline(always)]
+#[inline(never)]
 fn center<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mut [u8]) {
     let mut t = [0i16; WIN * MAX_W];
     for j in 0..h + 5 {
@@ -291,8 +297,9 @@ fn center<const W: usize>(src: &[u8], base: usize, ss: usize, h: usize, out: &mu
 
 /// One W×h luma block at fractional position (`xf`, `yf`) whose integer
 /// position is `src[base]`; the source must have 2 samples of margin
-/// before and 3 after the block in both directions.
-#[inline(always)]
+/// before and 3 after the block in both directions. One copy per width,
+/// shared by blocks inside the picture and edge windows.
+#[inline(never)]
 fn luma_block<const W: usize>(src: &[u8], base: usize, ss: usize, xf: i32, yf: i32, h: usize, dst: &mut [u8], ds: usize, avg: bool) {
     let mut a = [0u8; MAX_W * MAX_W];
     let mut b = [0u8; MAX_W * MAX_W];
@@ -366,19 +373,25 @@ pub fn mc_luma(plane: &[u8], ps: usize, pw: usize, ph: usize, x: i32, y: i32, mv
     let yi = y + (mvy >> 2);
     let xf = mvx & 3;
     let yf = mvy & 3;
-    let inside = xi >= 2 && yi >= 2 && xi + w as i32 + 3 <= pw as i32 && yi + h as i32 + 3 <= ph as i32;
-    if inside {
-        let base = yi as usize * ps + xi as usize;
-        match w {
-            16 => luma_block::<16>(plane, base, ps, xf, yf, h, dst, ds, avg),
-            8 => luma_block::<8>(plane, base, ps, xf, yf, h, dst, ds, avg),
-            _ => luma_block::<4>(plane, base, ps, xf, yf, h, dst, ds, avg),
-        }
-        return;
+    let block = |src: &[u8], base: usize, ss: usize, dst: &mut [u8]| match w {
+        16 => luma_block::<16>(src, base, ss, xf, yf, h, dst, ds, avg),
+        8 => luma_block::<8>(src, base, ss, xf, yf, h, dst, ds, avg),
+        _ => luma_block::<4>(src, base, ss, xf, yf, h, dst, ds, avg),
+    };
+    if xi >= 2 && yi >= 2 && xi + w as i32 + 3 <= pw as i32 && yi + h as i32 + 3 <= ph as i32 {
+        block(plane, yi as usize * ps + xi as usize, ps, dst);
+    } else {
+        let mut win = [0u8; WIN * WIN];
+        block(edge_window(plane, ps, pw, ph, xi, yi, w, h, &mut win), 2 * (w + 5) + 2, w + 5, dst);
     }
-    // edge-replicated window of (w + 5) × (h + 5) samples
+}
+
+/// The (w + 5) × (h + 5) samples around a block reaching outside the
+/// picture, edges replicated, into `win` (stride w + 5).
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn edge_window<'a>(plane: &[u8], ps: usize, pw: usize, ph: usize, xi: i32, yi: i32, w: usize, h: usize, win: &'a mut [u8; WIN * WIN]) -> &'a [u8] {
     let ww = w + 5;
-    let mut win = [0u8; WIN * WIN];
     for j in 0..h + 5 {
         let sy = (yi + j as i32 - 2).clamp(0, ph as i32 - 1) as usize;
         let row = &plane[sy * ps..sy * ps + pw];
@@ -392,15 +405,13 @@ pub fn mc_luma(plane: &[u8], ps: usize, pw: usize, ph: usize, x: i32, y: i32, mv
             }
         }
     }
-    let base = 2 * ww + 2;
-    match w {
-        16 => luma_block::<16>(&win, base, ww, xf, yf, h, dst, ds, avg),
-        8 => luma_block::<8>(&win, base, ww, xf, yf, h, dst, ds, avg),
-        _ => luma_block::<4>(&win, base, ww, xf, yf, h, dst, ds, avg),
-    }
+    win
 }
 
-#[inline(always)]
+/// One W×h chroma block at eighth-sample position (`xf`, `yf`) from
+/// `src[base]` (one copy per width, shared by blocks inside the picture
+/// and edge windows).
+#[inline(never)]
 fn chroma_block<const W: usize>(src: &[u8], base: usize, ss: usize, xf: i32, yf: i32, h: usize, dst: &mut [u8], ds: usize, avg: bool) {
     if xf == 0 && yf == 0 {
         for j in 0..h {

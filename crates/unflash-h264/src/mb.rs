@@ -1878,13 +1878,13 @@ impl<'a> SliceDecoder<'a> {
                 }
                 ip.ref_idx[list][p] = r as i8;
                 // make the value visible to later contexts in this MB
-                let b8 = match ip.shape {
-                    Shape::P16x16 => [0, 1, 2, 3].to_vec(),
-                    Shape::P16x8 => vec![p * 2, p * 2 + 1],
-                    Shape::P8x16 => vec![p, p + 2],
-                    Shape::P8x8 => vec![p],
+                let (b8, n): ([usize; 4], usize) = match ip.shape {
+                    Shape::P16x16 => ([0, 1, 2, 3], 4),
+                    Shape::P16x8 => ([p * 2, p * 2 + 1, 0, 0], 2),
+                    Shape::P8x16 => ([p, p + 2, 0, 0], 2),
+                    Shape::P8x8 => ([p, 0, 0, 0], 1),
                 };
-                for b in b8 {
+                for &b in &b8[..n] {
                     self.cur.ref_idx8[list][b] = r as i8;
                 }
             }

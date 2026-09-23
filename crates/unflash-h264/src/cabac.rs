@@ -198,16 +198,18 @@ impl<'a> Cabac<'a> {
         self.data
     }
 
-    /// Four more bytes of the stream, out of line: a call on `self` is
-    /// the smallest code at the many places a bin is decoded.
-    #[cold]
-    #[inline(never)]
+    /// Four more bytes of the stream.
+    #[inline]
     fn refill(&mut self) {
         self.eng.refill(self.data);
     }
 
-    /// 9.3.3.2.1 DecodeDecision with context `ctx_idx`.
-    #[inline]
+    /// 9.3.3.2.1 DecodeDecision with context `ctx_idx`. Out of line: one
+    /// copy serves every syntax element but the coefficients (which have
+    /// their own in `residual_block`), instead of a copy inlined at each of
+    /// the many places a bin is decoded, which kept the macroblock layer's
+    /// code from fitting the instruction cache.
+    #[inline(never)]
     pub fn decision(&mut self, ctx_idx: usize) -> u32 {
         let b = self.eng.bin(&mut self.ctx[ctx_idx]);
         if self.eng.bits < 8 {
@@ -216,8 +218,8 @@ impl<'a> Cabac<'a> {
         b
     }
 
-    /// 9.3.3.2.3 DecodeBypass.
-    #[inline]
+    /// 9.3.3.2.3 DecodeBypass (out of line, as `decision`).
+    #[inline(never)]
     pub fn bypass(&mut self) -> u32 {
         let b = self.eng.bypass_bin();
         if self.eng.bits < 8 {
