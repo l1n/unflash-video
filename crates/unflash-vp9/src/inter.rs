@@ -6,7 +6,8 @@
 //! References extend infinitely past their edges (sample positions clamp
 //! to the last row and column). Unscaled blocks whose filter footprint lies
 //! inside the reference read it in place; others go through a small
-//! edge-replicated copy.
+//! edge-replicated copy. Unscaled blocks are interpolated by
+//! `Pixel::predict`, in SIMD lanes for 8-bit frames.
 
 use crate::frame::{Pixel, Plane};
 use crate::header::INTRA_FRAME;
@@ -113,71 +114,91 @@ fn tap8<T: Pixel>(s: &[T], f: &[i16; 8]) -> i32 {
     sum
 }
 
-/// An unscaled block (8.5.2.4 with steps of 16): a copy, one 8-tap pass or
-/// two, depending on which of the vector's components have a fraction.
+/// How to interpolate one block.
+pub struct Mc<'a> {
+    pub w: usize,
+    pub h: usize,
+    /// The fractions of the horizontal and vertical positions, in sixteenths.
+    pub fx: usize,
+    pub fy: usize,
+    pub filter: &'a [[i16; 8]; 16],
+    pub bd: u32,
+    /// Average with the prediction already there (the second reference of a
+    /// compound block) rather than overwrite it.
+    pub average: bool,
+}
+
+/// An unscaled block (8.5.2.4 with steps of 16): find the samples the
+/// filters need, in place or as an edge-replicated copy, and interpolate.
 #[allow(clippy::too_many_arguments)]
 fn predict_unscaled<T: Pixel>(refp: &Plane<T>, cur: &mut Plane<T>, x: usize, y: usize, w: usize, h: usize, start_x: i64, start_y: i64, filter: &[[i16; 8]; 16], bd: u32, average: bool, tmp: &mut [i32], edge: &mut [T]) {
-    let (fx, fy) = ((start_x & 15) as usize, (start_y & 15) as usize);
-    let (ix, iy) = (start_x >> 4, start_y >> 4);
     // the footprint of the filters: 3 samples before, 4 after
-    let (x0, y0) = (ix - 3, iy - 3);
+    let (x0, y0) = ((start_x >> 4) - 3, (start_y >> 4) - 3);
     let (fw, fh) = (w + 7, h + 7);
     let last_x = refp.width as i64 - 1;
     let last_y = refp.height as i64 - 1;
-    let (src, sstride, sx, sy): (&[T], usize, usize, usize) = if x0 >= 0 && y0 >= 0 && x0 + fw as i64 - 1 <= last_x && y0 + fh as i64 - 1 <= last_y {
-        (&refp.data, refp.stride, x0 as usize, y0 as usize)
+    let (src, sstride): (&[T], usize) = if x0 >= 0 && y0 >= 0 && x0 + fw as i64 - 1 <= last_x && y0 + fh as i64 - 1 <= last_y {
+        (&refp.data[y0 as usize * refp.stride + x0 as usize..], refp.stride)
     } else {
-        for r in 0..fh {
+        for (r, row) in edge.chunks_exact_mut(fw).take(fh).enumerate() {
             let yy = (y0 + r as i64).clamp(0, last_y) as usize * refp.stride;
-            for c in 0..fw {
-                edge[r * fw + c] = refp.data[yy + (x0 + c as i64).clamp(0, last_x) as usize];
+            for (c, e) in row.iter_mut().enumerate() {
+                *e = refp.data[yy + (x0 + c as i64).clamp(0, last_x) as usize];
             }
         }
-        (&*edge, fw, 0, 0)
+        (&*edge, fw)
     };
     let cs = cur.stride;
-    let dst = &mut cur.data[y * cs + x..];
-    match (fx != 0, fy != 0) {
+    let mc = Mc { w, h, fx: (start_x & 15) as usize, fy: (start_y & 15) as usize, filter, bd, average };
+    T::predict(src, sstride, &mut cur.data[y * cs + x..], cs, &mc, tmp);
+}
+
+/// Interpolate a block from `src`, the top left of its filter footprint
+/// (3 rows and columns before the block): a copy, one 8-tap pass or two,
+/// depending on which of the position's components have a fraction.
+pub fn predict_block<T: Pixel>(src: &[T], ss: usize, dst: &mut [T], ds: usize, mc: &Mc, tmp: &mut [i32]) {
+    let (w, h, bd, average) = (mc.w, mc.h, mc.bd, mc.average);
+    match (mc.fx != 0, mc.fy != 0) {
         (false, false) => {
             for r in 0..h {
-                let s = &src[(sy + 3 + r) * sstride + sx + 3..];
+                let s = &src[(3 + r) * ss + 3..];
                 for c in 0..w {
-                    store(&mut dst[r * cs + c], s[c].get(), average);
+                    store(&mut dst[r * ds + c], s[c].get(), average);
                 }
             }
         }
         (true, false) => {
-            let f = &filter[fx];
+            let f = &mc.filter[mc.fx];
             for r in 0..h {
-                let s = &src[(sy + 3 + r) * sstride + sx..];
+                let s = &src[(3 + r) * ss..];
                 for c in 0..w {
                     let v = T::clip((tap8(&s[c..c + 8], f) + 64) >> 7, bd).get();
-                    store(&mut dst[r * cs + c], v, average);
+                    store(&mut dst[r * ds + c], v, average);
                 }
             }
         }
         (false, true) => {
-            let f = &filter[fy];
+            let f = &mc.filter[mc.fy];
             for r in 0..h {
                 for c in 0..w {
                     let mut sum = 0;
                     for t in 0..8 {
-                        sum += f[t] as i32 * src[(sy + r + t) * sstride + sx + 3 + c].get();
+                        sum += f[t] as i32 * src[(r + t) * ss + 3 + c].get();
                     }
                     let v = T::clip((sum + 64) >> 7, bd).get();
-                    store(&mut dst[r * cs + c], v, average);
+                    store(&mut dst[r * ds + c], v, average);
                 }
             }
         }
         (true, true) => {
-            let f = &filter[fx];
-            for r in 0..fh {
-                let s = &src[(sy + r) * sstride + sx..];
+            let f = &mc.filter[mc.fx];
+            for r in 0..h + 7 {
+                let s = &src[r * ss..];
                 for c in 0..w {
                     tmp[r * w + c] = T::clip((tap8(&s[c..c + 8], f) + 64) >> 7, bd).get();
                 }
             }
-            let f = &filter[fy];
+            let f = &mc.filter[mc.fy];
             for r in 0..h {
                 for c in 0..w {
                     let mut sum = 0;
@@ -185,7 +206,7 @@ fn predict_unscaled<T: Pixel>(refp: &Plane<T>, cur: &mut Plane<T>, x: usize, y: 
                         sum += f[t] as i32 * tmp[(r + t) * w + c];
                     }
                     let v = T::clip((sum + 64) >> 7, bd).get();
-                    store(&mut dst[r * cs + c], v, average);
+                    store(&mut dst[r * ds + c], v, average);
                 }
             }
         }
@@ -227,6 +248,128 @@ fn predict_scaled<T: Pixel>(refp: &Plane<T>, cur: &mut Plane<T>, x: usize, y: us
             }
             let v = T::clip((sum + 64) >> 7, bd).get();
             store(&mut dst[r * cs + c], v, average);
+        }
+    }
+}
+
+/// The 8-bit interpolation in 16-bit SIMD lanes, a strip of 8 columns (4
+/// for 4-wide blocks) at a time.
+#[cfg(feature = "simd")]
+pub mod simd {
+    use super::Mc;
+    use wide::{i16x8, u8x16};
+
+    /// Over all the filters, an 8-tap sum of 8-bit samples lies in
+    /// -13770..=46410: too wide for signed 16-bit lanes, but offset by
+    /// 108 * 128 (and the rounding 64) it is exact in wrapping 16-bit
+    /// arithmetic read as unsigned, and its logical shift right by 7 is the
+    /// rounded value plus 108.
+    const BIAS: i16 = 108 * 128 + 64;
+
+    /// `N` samples (4 or 8) widened to 16-bit lanes.
+    #[inline(always)]
+    fn load<const N: usize>(s: &[u8]) -> i16x8 {
+        let mut a = [0u8; 16];
+        a[..N].copy_from_slice(&s[..N]);
+        i16x8::from_u8x16_low(u8x16::from(a))
+    }
+
+    /// Round2(the filtered value, 7) before clipping: -108..=363.
+    #[inline(always)]
+    fn taps(s: [i16x8; 8], f: &[i16x8; 8]) -> i16x8 {
+        let mut acc = i16x8::splat(BIAS);
+        for t in 0..8 {
+            acc = acc + s[t] * f[t];
+        }
+        ((acc >> 7_i32) & i16x8::splat(511)) - i16x8::splat(108)
+    }
+
+    #[inline(always)]
+    fn clip(v: i16x8) -> i16x8 {
+        v.max(i16x8::ZERO).min(i16x8::splat(255))
+    }
+
+    /// Store `N` samples, clipped, or their average with those there.
+    #[inline(always)]
+    fn put<const N: usize>(v: i16x8, d: &mut [u8], average: bool) {
+        let v = if average { (clip(v) + load::<N>(d) + i16x8::splat(1)) >> 1_i32 } else { v };
+        d[..N].copy_from_slice(&u8x16::narrow_i16x8(v, v).as_array_ref()[..N]);
+    }
+
+    pub fn predict(src: &[u8], ss: usize, dst: &mut [u8], ds: usize, mc: &Mc) {
+        match (mc.w, mc.fx != 0) {
+            (4, false) => columns::<4, false>(src, ss, dst, ds, mc),
+            (4, true) => columns::<4, true>(src, ss, dst, ds, mc),
+            (w, false) => {
+                for c in (0..w).step_by(8) {
+                    columns::<8, false>(&src[c..], ss, &mut dst[c..], ds, mc);
+                }
+            }
+            (w, true) => {
+                for c in (0..w).step_by(8) {
+                    columns::<8, true>(&src[c..], ss, &mut dst[c..], ds, mc);
+                }
+            }
+        }
+    }
+
+    /// `N` columns of a block, filtered horizontally if `H`.
+    #[inline(always)]
+    fn columns<const N: usize, const H: bool>(src: &[u8], ss: usize, dst: &mut [u8], ds: usize, mc: &Mc) {
+        let fx = mc.filter[mc.fx].map(i16x8::splat);
+        let fy = mc.filter[mc.fy].map(i16x8::splat);
+        // row r of the footprint, horizontally filtered or as it is
+        let row = |r: usize| {
+            let s = &src[r * ss..];
+            if H {
+                clip(taps(std::array::from_fn(|t| load::<N>(&s[t..])), &fx))
+            } else {
+                load::<N>(&s[3..])
+            }
+        };
+        if mc.fy == 0 {
+            for r in 0..mc.h {
+                put::<N>(row(3 + r), &mut dst[r * ds..], mc.average);
+            }
+        } else {
+            // a window of the 8 rows the vertical filter reads
+            let mut win = [i16x8::ZERO; 8];
+            for (r, v) in win[1..].iter_mut().enumerate() {
+                *v = row(r);
+            }
+            for r in 0..mc.h {
+                win = [win[1], win[2], win[3], win[4], win[5], win[6], win[7], row(r + 7)];
+                put::<N>(taps(win, &fy), &mut dst[r * ds..], mc.average);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "simd"))]
+mod tests {
+    use super::*;
+
+    /// The SIMD interpolation agrees with the portable one, for every
+    /// filter, fraction and block width, at the extremes of the sums too.
+    #[test]
+    fn simd_matches_scalar() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        let ss = 80;
+        let mut tmp = vec![0; 64 * 71];
+        for trial in 0..6000 {
+            let src: Vec<u8> = (0..ss * 71).map(|_| if trial % 2 == 0 { rnd() as u8 } else { [0, 255][rnd() % 2] }).collect();
+            let mc = Mc { w: [4, 8, 16, 32, 64][trial % 5], h: [4, 8, 16, 32, 64][rnd() % 5], fx: rnd() % 16, fy: rnd() % 16, filter: &SUBPEL_FILTERS[rnd() % 4], bd: 8, average: trial % 3 == 0 };
+            let mut a: Vec<u8> = (0..64 * 64).map(|_| rnd() as u8).collect();
+            let mut b = a.clone();
+            predict_block(&src, ss, &mut a, 64, &mc, &mut tmp);
+            simd::predict(&src, ss, &mut b, 64, &mc);
+            assert_eq!(a, b, "trial {trial}");
         }
     }
 }

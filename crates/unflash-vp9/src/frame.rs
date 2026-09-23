@@ -2,6 +2,7 @@
 //! samples, and the pixel type the prediction and filter code is generic
 //! over.
 
+use crate::inter::{predict_block, Mc};
 use crate::loopfilter::{filter_run_lines, Run};
 
 /// A sample type: `u8` for 8-bit streams, `u16` for 10 and 12-bit ones.
@@ -16,6 +17,11 @@ pub trait Pixel: Copy + Default + PartialEq + Send + Sync + 'static {
     /// Loop filter one run of up to 8 lines across an edge.
     fn filter_run(d: &mut [Self], stride: usize, run: &Run, bd: u32) {
         filter_run_lines(d, stride, run, bd);
+    }
+
+    /// Interpolate an unscaled inter block from its filter footprint.
+    fn predict(src: &[Self], ss: usize, dst: &mut [Self], ds: usize, mc: &Mc, tmp: &mut [i32]) {
+        predict_block(src, ss, dst, ds, mc, tmp);
     }
 }
 
@@ -36,6 +42,11 @@ impl Pixel for u8 {
     #[cfg(feature = "simd")]
     fn filter_run(d: &mut [u8], stride: usize, run: &Run, _bd: u32) {
         crate::loopfilter::simd::filter_run(d, stride, run);
+    }
+
+    #[cfg(feature = "simd")]
+    fn predict(src: &[u8], ss: usize, dst: &mut [u8], ds: usize, mc: &Mc, _tmp: &mut [i32]) {
+        crate::inter::simd::predict(src, ss, dst, ds, mc);
     }
 }
 
