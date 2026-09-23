@@ -15,7 +15,7 @@ pub trait Lanes: Pixel {
     /// Store the first `N` lanes, which are in range.
     fn store<const N: usize>(v: i16x8, d: &mut [Self]);
     /// Round2(the 8-tap sum, 7) of samples of depth `bd`, before clipping.
-    fn taps(s: [i16x8; 8], f: &[i16x8; 8], bd: u32) -> i16x8;
+    fn taps(s: &[i16x8; 8], f: &[i16x8; 8], bd: u32) -> i16x8;
 }
 
 /// 16 bytes (a whole-vector load is one instruction everywhere, where
@@ -45,7 +45,7 @@ impl Lanes for u8 {
     /// arithmetic read as unsigned, and its logical shift right by 7 is the
     /// rounded value plus 108.
     #[inline(always)]
-    fn taps(s: [i16x8; 8], f: &[i16x8; 8], _bd: u32) -> i16x8 {
+    fn taps(s: &[i16x8; 8], f: &[i16x8; 8], _bd: u32) -> i16x8 {
         let mut acc = i16x8::splat(108 * 128 + 64);
         for t in 0..8 {
             acc += s[t] * f[t];
@@ -74,7 +74,7 @@ impl Lanes for u16 {
     /// two sums (at most 63 * 182) taken apart, and recombined:
     /// Round2(2^k A + B, 7) = (A + ((B + 64) >> k)) >> (7 - k).
     #[inline(always)]
-    fn taps(s: [i16x8; 8], f: &[i16x8; 8], bd: u32) -> i16x8 {
+    fn taps(s: &[i16x8; 8], f: &[i16x8; 8], bd: u32) -> i16x8 {
         let k = bd / 2;
         let low = i16x8::splat((1 << k) - 1);
         let mut a = i16x8::ZERO;

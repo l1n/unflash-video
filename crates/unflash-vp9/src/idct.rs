@@ -681,7 +681,10 @@ fn two_d<C: Scalar, P: Pixel, const N: usize>(coef: &mut [i32], rows: usize, dst
     let rows = rows.min(N);
     let coef = &mut coef[..N * N];
     for r in coef.chunks_exact_mut(N).take(rows) {
-        let mut t: [C; N] = std::array::from_fn(|j| C::from_i32(r[j]));
+        let mut t = [C::from_i32(0); N];
+        for (t, &c) in t.iter_mut().zip(r.iter()) {
+            *t = C::from_i32(c);
+        }
         row(&mut t);
         for (o, v) in r.iter_mut().zip(t) {
             *o = v.to_i32();
@@ -769,7 +772,7 @@ pub mod simd {
         for g in (0..rows).step_by(4) {
             let mut t = [i32x4::ZERO; N];
             for j in (0..N).step_by(4) {
-                let v = i32x4::transpose(std::array::from_fn(|k| load(&coef[(g + k) * N + j..])));
+                let v = i32x4::transpose([0, 1, 2, 3].map(|k| load(&coef[(g + k) * N + j..])));
                 t[j..j + 4].copy_from_slice(&v);
             }
             row(&mut t);

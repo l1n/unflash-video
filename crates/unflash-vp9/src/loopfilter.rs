@@ -250,12 +250,20 @@ pub mod simd {
         let n = if run.size == 2 { 8 } else { 4 };
         let mut v = [i16x8::ZERO; 16];
         if run.vertical {
+            // (loops rather than `array::from_fn`, which compilers leave out
+            // of line for WebAssembly)
+            let (mut lo, mut hi) = ([i16x8::ZERO; 8], [i16x8::ZERO; 8]);
+            for i in 0..8 {
+                let row = &d[run.start + i * stride - n..];
+                if n == 8 {
+                    [lo[i], hi[i]] = T::load2(row);
+                } else {
+                    lo[i] = T::load(row);
+                }
+            }
+            v[8 - n..8 - n + 8].copy_from_slice(&i16x8::transpose(lo));
             if n == 8 {
-                let rows: [[i16x8; 2]; 8] = std::array::from_fn(|i| T::load2(&d[run.start + i * stride - 8..]));
-                v[..8].copy_from_slice(&i16x8::transpose(rows.map(|r| r[0])));
-                v[8..].copy_from_slice(&i16x8::transpose(rows.map(|r| r[1])));
-            } else {
-                v[4..12].copy_from_slice(&i16x8::transpose(std::array::from_fn(|i| T::load(&d[run.start + i * stride - 4..]))));
+                v[8..].copy_from_slice(&i16x8::transpose(hi));
             }
         } else {
             for (k, vk) in v.iter_mut().enumerate().take(8 + n).skip(8 - n) {

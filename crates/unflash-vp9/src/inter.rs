@@ -335,17 +335,24 @@ pub mod simd {
             } else {
                 win = [win[1], win[2], win[3], win[4], win[5], win[6], win[7], v];
                 if r >= 7 {
-                    put::<T, N>(T::taps(win, &fy, mc.bd), &mut dst[(r - 7) * ds..], mc.average, max);
+                    put::<T, N>(T::taps(&win, &fy, mc.bd), &mut dst[(r - 7) * ds..], mc.average, max);
                 }
             }
         }
     }
 
+    // The kernels build their arrays in loops rather than with
+    // `array::from_fn`, which compilers leave out of line for WebAssembly.
+
     /// One row of 8 columns, filtered horizontally.
     #[inline(always)]
     fn filter_row<T: Lanes>(s: &[T], f: &[i16x8; 8], bd: u32) -> i16x8 {
         let s = &s[..7 + 16];
-        clip(T::taps(std::array::from_fn(|t| T::load(&s[t..])), f, bd), i16x8::splat((1 << bd) - 1))
+        let mut taps = [i16x8::ZERO; 8];
+        for (t, v) in taps.iter_mut().enumerate() {
+            *v = T::load(&s[t..]);
+        }
+        clip(T::taps(&taps, f, bd), i16x8::splat((1 << bd) - 1))
     }
 
     /// Rows `r0..r0 + 8` (those below `rows`) of 8 columns, filtered
@@ -353,12 +360,19 @@ pub mod simd {
     /// tap is a column.
     #[inline(always)]
     fn filter_rows<T: Lanes>(src: &[T], ss: usize, r0: usize, rows: usize, f: &[i16x8; 8], bd: u32) -> [i16x8; 8] {
-        let raw: [[i16x8; 2]; 8] = std::array::from_fn(|k| if r0 + k < rows { T::load2(&src[(r0 + k) * ss..]) } else { [i16x8::ZERO; 2] });
-        let lo = i16x8::transpose(raw.map(|r| r[0]));
-        let hi = i16x8::transpose(raw.map(|r| r[1]));
-        let column = |j: usize| if j < 8 { lo[j] } else { hi[j - 8] };
+        let (mut lo, mut hi) = ([i16x8::ZERO; 8], [i16x8::ZERO; 8]);
+        for k in 0..(rows - r0).min(8) {
+            [lo[k], hi[k]] = T::load2(&src[(r0 + k) * ss..]);
+        }
+        let mut columns = [i16x8::ZERO; 16];
+        columns[..8].copy_from_slice(&i16x8::transpose(lo));
+        columns[8..].copy_from_slice(&i16x8::transpose(hi));
         let max = i16x8::splat((1 << bd) - 1);
-        i16x8::transpose(std::array::from_fn(|c| clip(T::taps(std::array::from_fn(|t| column(c + t)), f, bd), max)))
+        let mut out = [i16x8::ZERO; 8];
+        for (c, v) in out.iter_mut().enumerate() {
+            *v = clip(T::taps(columns[c..c + 8].try_into().unwrap(), f, bd), max);
+        }
+        i16x8::transpose(out)
     }
 
     #[cfg(test)]
