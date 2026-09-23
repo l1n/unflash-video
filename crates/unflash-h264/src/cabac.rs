@@ -5,32 +5,25 @@
 use crate::tables::{CABAC_INIT_I, CABAC_INIT_PB, RANGE_LPS, TRANS_LPS, TRANS_MPS};
 use crate::{Error, Result};
 
-/// rangeTabLPS indexed by the combined context state (pStateIdx << 1 | valMPS).
-const LPS_RANGE: [[u8; 4]; 128] = {
-    let mut t = [[0u8; 4]; 128];
-    let mut s = 0;
-    while s < 128 {
-        t[s] = RANGE_LPS[s >> 1];
-        s += 1;
+/// rangeTabLPS by the quarter of codIRange its bits 6 and 7 pick, then the
+/// combined context state (pStateIdx << 1 | valMPS): index `q << 7 | s`.
+const LPS_RANGE: [u8; 512] = {
+    let mut t = [0u8; 512];
+    let mut i = 0;
+    while i < 512 {
+        t[i] = RANGE_LPS[(i & 127) >> 1][i >> 7];
+        i += 1;
     }
     t
 };
-/// The next combined state after an MPS / an LPS.
-const NEXT_MPS: [u8; 128] = {
-    let mut t = [0u8; 128];
-    let mut s = 0;
-    while s < 128 {
-        t[s] = (TRANS_MPS[s >> 1] << 1) | (s as u8 & 1);
-        s += 1;
-    }
-    t
-};
-const NEXT_LPS: [u8; 128] = {
-    let mut t = [0u8; 128];
+/// The next combined state: after an MPS at `s`, after an LPS at `128 | s`.
+const NEXT_STATE: [u8; 256] = {
+    let mut t = [0u8; 256];
     let mut s = 0;
     while s < 128 {
         let mps = s as u8 & 1;
-        t[s] = (TRANS_LPS[s >> 1] << 1) | if s >> 1 == 0 { 1 - mps } else { mps };
+        t[s] = (TRANS_MPS[s >> 1] << 1) | mps;
+        t[128 + s] = (TRANS_LPS[s >> 1] << 1) | if s >> 1 == 0 { 1 - mps } else { mps };
         s += 1;
     }
     t
@@ -55,10 +48,12 @@ pub struct Cabac<'a> {
     /// the next byte to fetch
     pos: usize,
     range: u32,
-    /// codIOffset scaled by 2^7, with up to 7 not yet needed bits below it
-    value: u32,
-    /// shifts until the next byte must be fetched, minus 8 (-8..=-1)
-    bits_needed: i32,
+    /// codIOffset followed by the next `bits` bits of the stream, not yet
+    /// shifted into it: renormalising takes bits from there by counting
+    /// down, and four more bytes come in when fewer than eight are left, so
+    /// a bin costs no data-dependent branch (see `decision`)
+    value: u64,
+    bits: u32,
     /// (pStateIdx << 1) | valMPS
     ctx: [u8; 1024],
 }
@@ -67,7 +62,7 @@ impl<'a> Cabac<'a> {
     /// Start decoding slice data at byte `byte_pos` of `data`, with the
     /// context variables initialised for the slice (9.3.1.1, 9.3.1.2).
     pub fn new(data: &'a [u8], byte_pos: usize, is_i_slice: bool, cabac_init_idc: u32, slice_qp: i32) -> Result<Cabac<'a>> {
-        let mut c = Cabac { data, pos: byte_pos, range: 510, value: 0, bits_needed: -8, ctx: [0; 1024] };
+        let mut c = Cabac { data, pos: byte_pos, range: 510, value: 0, bits: 0, ctx: [0; 1024] };
         let qp = slice_qp.clamp(0, 51);
         let table: &[[i8; 2]; 1024] = if is_i_slice { &CABAC_INIT_I } else { &CABAC_INIT_PB[cabac_init_idc as usize] };
         for i in 0..1024 {
@@ -84,10 +79,12 @@ impl<'a> Cabac<'a> {
     pub fn restart(&mut self, byte_pos: usize) -> Result<()> {
         self.pos = byte_pos;
         self.range = 510;
-        self.value = (self.next_byte() as u32) << 8;
-        self.value |= self.next_byte() as u32;
-        self.bits_needed = -8;
-        if self.value >> 7 >= 510 {
+        self.value = 0;
+        self.bits = 0;
+        self.refill();
+        // codIOffset is the first nine bits
+        self.bits -= 9;
+        if self.value >> self.bits >= 510 {
             return Err(Error::Bitstream("bad CABAC initialisation"));
         }
         Ok(())
@@ -95,96 +92,81 @@ impl<'a> Cabac<'a> {
 
     /// The byte at which the PCM samples of an I_PCM macroblock start once
     /// its mb_type has been decoded: the arithmetic decoder has consumed
-    /// every bit before it (9.3.1.2).
+    /// every bit before it (9.3.1.2), the ones it has fetched ahead of that
+    /// are given back.
     pub fn byte_pos(&self) -> usize {
-        self.pos
+        self.pos - (self.bits / 8) as usize
     }
 
     pub fn data(&self) -> &'a [u8] {
         self.data
     }
 
-    #[inline(always)]
-    fn next_byte(&mut self) -> u8 {
-        match self.data.get(self.pos) {
-            Some(&b) => {
-                self.pos += 1;
-                b
-            }
-            None => 0,
-        }
+    /// Four more bytes of the stream (zeros past its end) below the bits
+    /// `value` holds.
+    #[inline(never)]
+    fn refill(&mut self) {
+        let w = match self.data.get(self.pos..self.pos + 4) {
+            Some(b) => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            None => (0..4).fold(0u32, |w, k| (w << 8) | self.data.get(self.pos + k).copied().unwrap_or(0) as u32),
+        };
+        self.pos += 4;
+        self.value = (self.value << 32) | w as u64;
+        self.bits += 32;
     }
 
-    /// 9.3.3.2.1 DecodeDecision.
+    /// 9.3.3.2.1 DecodeDecision, without a branch on the bin: the LPS path
+    /// is a mask, the new range and state come from selects and a table,
+    /// and renormalisation only counts down the bits held after codIOffset
+    /// (a mispredicted MPS/LPS branch cost more than the rest of a bin).
     #[inline]
     pub fn decision(&mut self, ctx_idx: usize) -> u32 {
         let s = self.ctx[ctx_idx] as usize;
-        let lps = LPS_RANGE[s][((self.range >> 6) & 3) as usize] as u32;
-        self.range -= lps;
-        let scaled = self.range << 7;
-        if self.value < scaled {
-            self.ctx[ctx_idx] = NEXT_MPS[s];
-            if scaled < (256 << 7) {
-                // one renormalisation shift at most on the MPS path
-                self.range = scaled >> 6;
-                self.value <<= 1;
-                self.bits_needed += 1;
-                if self.bits_needed == 0 {
-                    self.bits_needed = -8;
-                    self.value |= self.next_byte() as u32;
-                }
-            }
-            (s & 1) as u32
-        } else {
-            let n = lps.leading_zeros() - 23;
-            self.value = (self.value - scaled) << n;
-            self.range = lps << n;
-            self.ctx[ctx_idx] = NEXT_LPS[s];
-            self.bits_needed += n as i32;
-            if self.bits_needed >= 0 {
-                self.value |= (self.next_byte() as u32) << self.bits_needed;
-                self.bits_needed -= 8;
-            }
-            (!s & 1) as u32
+        let lps = LPS_RANGE[((self.range as usize) & 0xC0) << 1 | s] as u32;
+        let rmps = self.range - lps;
+        let scaled = (rmps as u64) << self.bits;
+        let lps_path = (self.value >= scaled) as u32;
+        self.value -= scaled & (lps_path as u64).wrapping_neg();
+        let range = rmps ^ ((rmps ^ lps) & lps_path.wrapping_neg());
+        self.ctx[ctx_idx] = NEXT_STATE[(lps_path as usize) << 7 | s];
+        // renormalise: codIRange back to nine bits, the bits after codIOffset shifted in
+        let n = range.leading_zeros() - 23;
+        self.range = range << n;
+        self.bits -= n;
+        if self.bits < 8 {
+            self.refill();
         }
+        (s as u32 & 1) ^ lps_path
     }
 
     /// 9.3.3.2.3 DecodeBypass.
     #[inline]
     pub fn bypass(&mut self) -> u32 {
-        self.value <<= 1;
-        self.bits_needed += 1;
-        if self.bits_needed >= 0 {
-            self.bits_needed = -8;
-            self.value |= self.next_byte() as u32;
+        self.bits -= 1;
+        let scaled = (self.range as u64) << self.bits;
+        let bin = (self.value >= scaled) as u64;
+        self.value -= scaled & bin.wrapping_neg();
+        if self.bits < 8 {
+            self.refill();
         }
-        let scaled = self.range << 7;
-        if self.value >= scaled {
-            self.value -= scaled;
-            1
-        } else {
-            0
-        }
+        bin as u32
     }
 
     /// 9.3.3.2.4 DecodeTerminate.
     pub fn terminate(&mut self) -> u32 {
         self.range -= 2;
-        let scaled = self.range << 7;
+        let scaled = (self.range as u64) << self.bits;
         if self.value >= scaled {
-            1
-        } else {
-            if scaled < (256 << 7) {
-                self.range = scaled >> 6;
-                self.value <<= 1;
-                self.bits_needed += 1;
-                if self.bits_needed == 0 {
-                    self.bits_needed = -8;
-                    self.value |= self.next_byte() as u32;
-                }
-            }
-            0
+            return 1;
         }
+        if self.range < 256 {
+            self.range <<= 1;
+            self.bits -= 1;
+            if self.bits < 8 {
+                self.refill();
+            }
+        }
+        0
     }
 
     // ---- binarizations (9.3.2) with their context assignments (Table 9-34) ----
