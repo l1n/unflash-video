@@ -1014,17 +1014,27 @@ try {
     await page.evaluate(() => {
       const v = document.querySelector('#player');
       v.muted = true;
-      v.currentTime = 2.0;
+      v.currentTime = 2.5;
       return v.play();
     });
     const liveSeen = new Set();
-    const liveUntil = Date.now() + 12000;
+    const liveUntil = Date.now() + 20000;
     // what matters here is that pictures reach the detector by this route: any
     // flashing it sees will do ("flashing below the limit" too, which is all
-    // a slow software GPU may get to), but "no flashing so far" is not it
+    // a slow software GPU may get to), but "no flashing so far" is not it.
+    // A software GPU busy with other work can fall behind the player and
+    // miss the flashing (3 to 5.5 s): the player goes back over it until
+    // the monitor reports it
     const liveReported = () => [...liveSeen].some((s) => /^flashing|violations? so far/.test(s));
     while (Date.now() < liveUntil && !liveReported()) {
       liveSeen.add(await page.textContent('#liveVerdict'));
+      await page.evaluate(() => {
+        const v = document.querySelector('#player');
+        if (v.currentTime > 6.5 || v.ended) {
+          v.currentTime = 2.5;
+          v.play();
+        }
+      });
       await page.waitForTimeout(200);
     }
     const liveTaken = await page.evaluate(() => window.__unflash.state.liveFeeder && window.__unflash.state.liveFeeder.route);
