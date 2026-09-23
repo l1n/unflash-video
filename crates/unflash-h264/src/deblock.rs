@@ -81,6 +81,32 @@ fn boundary_strength(pic: &Picture, p: &MbDeblockInfo, q: &MbDeblockInfo, pb: us
     motion_bs(pic, pb, qb, mvy_limit)
 }
 
+/// The strengths of the internal edges of an inter macroblock (edges 1..3,
+/// both directions; 1 and 3 left alone with the 8x8 transform): 2 where a
+/// block on either side has coefficients (tested for every segment at once
+/// on the coefficient bits), else the motion test.
+#[allow(clippy::too_many_arguments)]
+fn internal_bs(pic: &Picture, cur: &MbDeblockInfo, bx0: usize, by0: usize, w4: usize, mvy_limit: i32, bs_v: &mut [[u8; 4]; 4], bs_h: &mut [[u8; 4]; 4]) {
+    let nz = cur.nonzero;
+    // bit 4k + e - 1: block (e - 1, k) or (e, k) of vertical edge e has coefficients
+    let coef_v = nz | (nz >> 1);
+    // bit 4(e - 1) + k: block (k, e - 1) or (k, e) of horizontal edge e
+    let coef_h = nz | (nz >> 4);
+    for e in 1..4 {
+        if cur.transform8x8 && e % 2 == 1 {
+            continue;
+        }
+        for k in 0..4 {
+            // vertical edge e (x = 4e), segment k (rows 4k..)
+            let pb = (by0 + k) * w4 + bx0 + e - 1;
+            bs_v[e][k] = if (coef_v >> (4 * k + e - 1)) & 1 != 0 { 2 } else { motion_bs(pic, pb, pb + 1, mvy_limit) };
+            // horizontal edge e (y = 4e), segment k (columns 4k..)
+            let pb = (by0 + e - 1) * w4 + bx0 + k;
+            bs_h[e][k] = if (coef_h >> (4 * (e - 1) + k)) & 1 != 0 { 2 } else { motion_bs(pic, pb, pb + w4, mvy_limit) };
+        }
+    }
+}
+
 /// Whether all sixteen 4x4 blocks of the macroblock at (`bx0`, `by0`) (in
 /// 4x4 units) carry the same motion, so its internal edges need no filtering
 /// when it has no coefficients.
@@ -152,7 +178,8 @@ fn luma_line(s: &mut [u8; 8], bs: u8, alpha: i32, beta: i32, tc0: i32) {
 /// the segment is not filtered or gets bS 4).
 #[inline(always)]
 fn tc0_of(bs: [u8; 4], tc0s: [u8; 3]) -> [i16; 4] {
-    bs.map(|b| if b != 0 && b < 4 { tc0s[b as usize - 1] as i16 } else { 0 })
+    let t = [0, tc0s[0] as i16, tc0s[1] as i16, tc0s[2] as i16, 0, 0, 0, 0];
+    bs.map(|b| t[b as usize & 7])
 }
 
 /// Whether an edge gets the bS 4 filter (all its segments do, or none).
@@ -176,7 +203,7 @@ use scalar::{chroma_edge_h, chroma_edge_v, luma_edge_h, luma_edge_v};
 #[cfg(feature = "simd")]
 mod simd {
     use crate::inter::simd::{load8, store8};
-    use wide::{i16x8, u8x16, CmpLt};
+    use wide::{i16x8, u8x16, CmpGt, CmpLt};
 
     /// Lanes 0-3 from `a` and 4-7 from `b` (two four-line luma segments).
     #[inline(always)]
@@ -190,10 +217,10 @@ mod simd {
         i16x8::new([s[0], s[0], s[1], s[1], s[2], s[2], s[3], s[3]])
     }
 
-    /// A lane mask per segment: filtered at all (bS > 0).
+    /// Lanes set (all ones) where a segment is filtered at all (bS > 0).
     #[inline(always)]
-    fn on(bs: [u8; 4]) -> [i16; 4] {
-        bs.map(|b| -((b != 0) as i16))
+    fn on(v: i16x8) -> i16x8 {
+        v.cmp_gt(i16x8::ZERO)
     }
 
     /// The luma filter on eight lines (one per lane): `p` / `q` hold p0..p3
@@ -249,7 +276,6 @@ mod simd {
     #[allow(clippy::too_many_arguments)]
     pub fn luma_edge_v(pl: &mut [u8], at: usize, stride: usize, bs: [u8; 4], tc0: [i16; 4], strong_edge: bool, alpha: i32, beta: i32) {
         let (alpha, beta) = (i16x8::splat(alpha as i16), i16x8::splat(beta as i16));
-        let on = on(bs);
         for h in 0..2 {
             if bs[2 * h] == 0 && bs[2 * h + 1] == 0 {
                 continue;
@@ -257,7 +283,7 @@ mod simd {
             // lane k of vector j: sample j (p3 .. q3) of line k
             let base = at + 8 * h * stride - 4;
             let t = i16x8::transpose(std::array::from_fn(|r| load8(&pl[base + r * stride..])));
-            let (p, q) = luma8([t[3], t[2], t[1], t[0]], [t[4], t[5], t[6], t[7]], quads(on[2 * h], on[2 * h + 1]), quads(tc0[2 * h], tc0[2 * h + 1]), alpha, beta, strong_edge);
+            let (p, q) = luma8([t[3], t[2], t[1], t[0]], [t[4], t[5], t[6], t[7]], on(quads(bs[2 * h] as i16, bs[2 * h + 1] as i16)), quads(tc0[2 * h], tc0[2 * h + 1]), alpha, beta, strong_edge);
             let out = i16x8::transpose([t[0], p[2], p[1], p[0], q[0], q[1], q[2], t[7]]);
             for (r, v) in out.into_iter().enumerate() {
                 store8(v, &mut pl[base + r * stride..]);
@@ -271,7 +297,6 @@ mod simd {
     #[allow(clippy::too_many_arguments)]
     pub fn luma_edge_h(pl: &mut [u8], at: usize, stride: usize, bs: [u8; 4], tc0: [i16; 4], strong_edge: bool, alpha: i32, beta: i32) {
         let (alpha, beta) = (i16x8::splat(alpha as i16), i16x8::splat(beta as i16));
-        let on = on(bs);
         for h in 0..2 {
             if bs[2 * h] == 0 && bs[2 * h + 1] == 0 {
                 continue;
@@ -279,7 +304,7 @@ mod simd {
             let c = at + 8 * h;
             let p = [1, 2, 3, 4].map(|k| load8(&pl[c - k * stride..]));
             let q = [0, 1, 2, 3].map(|k| load8(&pl[c + k * stride..]));
-            let (p, q) = luma8(p, q, quads(on[2 * h], on[2 * h + 1]), quads(tc0[2 * h], tc0[2 * h + 1]), alpha, beta, strong_edge);
+            let (p, q) = luma8(p, q, on(quads(bs[2 * h] as i16, bs[2 * h + 1] as i16)), quads(tc0[2 * h], tc0[2 * h + 1]), alpha, beta, strong_edge);
             for k in 0..if strong_edge { 3 } else { 2 } {
                 store8(p[k], &mut pl[c - (k + 1) * stride..]);
                 store8(q[k], &mut pl[c + k * stride..]);
@@ -302,7 +327,7 @@ mod simd {
             s[4..].copy_from_slice(&v[o..o + 4]);
             load8(&s)
         }));
-        let on = pairs(on(bs));
+        let on = on(pairs(bs.map(|b| b as i16)));
         let (u0, u1) = chroma8(t[0], t[1], t[2], t[3], on, pairs(tc0[0]), i16x8::splat(alpha[0] as i16), i16x8::splat(beta[0] as i16), strong_edge);
         let (v0, v1) = chroma8(t[4], t[5], t[6], t[7], on, pairs(tc0[1]), i16x8::splat(alpha[1] as i16), i16x8::splat(beta[1] as i16), strong_edge);
         let out = i16x8::transpose([t[0], u0, u1, t[3], t[4], v0, v1, t[7]]);
@@ -321,7 +346,7 @@ mod simd {
     pub fn chroma_edge_h(pl: &mut [u8], at: usize, stride: usize, bs: [u8; 4], tc0: [i16; 4], strong_edge: bool, alpha: i32, beta: i32) {
         let row = |k: usize| load8(&pl[at + k * stride - 2 * stride..]);
         let (p1, p0, q0, q1) = (row(0), row(1), row(2), row(3));
-        let (p0, q0) = chroma8(p1, p0, q0, q1, pairs(on(bs)), pairs(tc0), i16x8::splat(alpha as i16), i16x8::splat(beta as i16), strong_edge);
+        let (p0, q0) = chroma8(p1, p0, q0, q1, on(pairs(bs.map(|b| b as i16))), pairs(tc0), i16x8::splat(alpha as i16), i16x8::splat(beta as i16), strong_edge);
         store8(p0, &mut pl[at - stride..]);
         store8(q0, &mut pl[at..]);
     }
@@ -485,19 +510,7 @@ pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize
                     bs_h[e] = [3; 4];
                 }
             } else if cur.nonzero != 0 || !uniform_motion(pic, bx0, by0, w4) {
-                for e in 1..4 {
-                    if cur.transform8x8 && e % 2 == 1 {
-                        continue;
-                    }
-                    for k in 0..4 {
-                        // vertical edge e (x = 4e), segment k (rows 4k..)
-                        let pb = (by0 + k) * w4 + bx0 + e - 1;
-                        bs_v[e][k] = boundary_strength(pic, &cur, &cur, pb, pb + 1, 1 << (k * 4 + e - 1), 1 << (k * 4 + e), false, mvy_limit);
-                        // horizontal edge e (y = 4e), segment k (columns 4k..)
-                        let pb = (by0 + e - 1) * w4 + bx0 + k;
-                        bs_h[e][k] = boundary_strength(pic, &cur, &cur, pb, pb + w4, 1 << ((e - 1) * 4 + k), 1 << (e * 4 + k), false, mvy_limit);
-                    }
-                }
+                internal_bs(pic, &cur, bx0, by0, w4, mvy_limit, &mut bs_v, &mut bs_h);
             }
             if crate::debug_flag("H264_DBG_MB").map_or(false, |v| v == format!("{mx},{row},{structure}")) {
                 eprintln!("deblock mb ({mx},{row}) struct {structure}: intra {} t8 {} qp {} qpc {:?} nz {:#x} slice {} idc {} a/b {}/{} left {:?} above {:?} bs_v {:?} bs_h {:?}", cur.intra, cur.transform8x8, cur.qp, cur.qpc, cur.nonzero, cur.slice, cur.filter_idc, cur.alpha_offset, cur.beta_offset, left.map(|l| (l.qp, l.slice, l.intra)), above.map(|a| (a.qp, a.slice, a.intra)), bs_v, bs_h);
@@ -665,17 +678,7 @@ fn filter_picture_mbaff(pic: &mut Picture, mbs: &[MbDeblockInfo], wm: usize, hm:
                         bs_h[e] = [3; 4];
                     }
                 } else if cur.nonzero != 0 || !uniform_motion(pic, bx0, by0, w4) {
-                    for e in 1..4 {
-                        if cur.transform8x8 && e % 2 == 1 {
-                            continue;
-                        }
-                        for k in 0..4 {
-                            let pb = (by0 + k) * w4 + bx0 + e - 1;
-                            bs_v[e][k] = boundary_strength(pic, &cur, &cur, pb, pb + 1, 1 << (k * 4 + e - 1), 1 << (k * 4 + e), false, mvy_limit);
-                            let pb = (by0 + e - 1) * w4 + bx0 + k;
-                            bs_h[e][k] = boundary_strength(pic, &cur, &cur, pb, pb + w4, 1 << ((e - 1) * 4 + k), 1 << (e * 4 + k), false, mvy_limit);
-                        }
-                    }
+                    internal_bs(pic, &cur, bx0, by0, w4, mvy_limit, &mut bs_v, &mut bs_h);
                 }
                 if crate::debug_flag("H264_DBG_MB").map_or(false, |v| v == format!("{mx},{my},4")) {
                     eprintln!("deblock mbaff mb ({mx},{my}) field {field}: intra {} t8 {} qp {} nz {:#x} mixed_left {mixed_left} double_top {double_top} above {:?} bs_left8 {:?} bs_v {:?} bs_h {:?}", cur.intra, cur.transform8x8, cur.qp, cur.nonzero, above_addr, bs_left8, bs_v, bs_h);
