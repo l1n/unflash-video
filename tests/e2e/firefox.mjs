@@ -8,7 +8,8 @@
 // answers all through a scan, and a second Scan click is turned away while
 // the first goes on; a section prepares, checks and is fixed by a Suggest
 // button; and in a scan in chunks, the built-in decoder takes over the
-// chunks Firefox's slow lanes hold up, with the same result.
+// chunks Firefox's slow lanes hold up, with the same result, and, rebalanced,
+// sets the slow lanes aside and grows into their cores.
 //   FIREFOX=/path/to/firefox node tests/e2e/firefox.mjs
 // (puppeteer-core found locally or globally: npm install -g puppeteer-core)
 import { createRequire } from 'node:module';
@@ -160,7 +161,7 @@ try {
 
   // --- a scan in chunks: Firefox's lanes made slow, the built-in decoder's idle
   // lane takes over the chunks the detector waits for, from the last picture in
-  const lanes = await newPage('auto=0&hybrid=2,2&chunk=1&order=file&hold=13&slowlanes=150');
+  const lanes = await newPage('auto=0&hybrid=2,2&chunk=1&order=file&hold=13&slowlanes=150&rebalance=0');
   await openClip(lanes);
   results.takenOver = await scan(lanes);
   const h = results.takenOver.chunked;
@@ -171,6 +172,18 @@ try {
   const builtIn = h.lanes.find((l) => l.kind === 'built-in');
   assert(builtIn && h.steals >= 1 && builtIn.steals === h.steals && h.lanes.some((l) => l.kind !== 'built-in' && l.stolen > 0), "the built-in lane took chunks over from Firefox's: " + JSON.stringify(h));
   await lanes.close();
+
+  // --- the same, rebalanced: once the lanes are timed, Firefox's slow ones are
+  // set aside and the built-in decoder grows into their cores, with the same result
+  const balanced = await newPage('auto=0&hybrid=2,2&chunk=1&order=file&hold=13&slowlanes=150');
+  await openClip(balanced);
+  results.rebalanced = await scan(balanced);
+  const b = results.rebalanced.chunked;
+  console.log('scan in chunks, rebalanced:', results.rebalanced.ms, 'ms |', JSON.stringify(b && { grown: b.grown, lanes: b.lanes.map((l) => [l.kind, l.workers, l.frames, l.chunks, l.steals, l.stolen, l.aside]) }));
+  same('rebalanced', results.rebalanced, results.cpu);
+  assert(b.lanes.reduce((a, l) => a + l.frames, 0) === results.rebalanced.frames, 'each picture decoded once: ' + JSON.stringify(b.lanes));
+  assert(b.rebalanced && b.lanes.filter((l) => l.kind !== 'built-in').every((l) => l.aside > 0) && b.grown >= 1, "Firefox's slow lanes were set aside and the built-in decoder grew: " + JSON.stringify(b));
+  await balanced.close();
 
   if (errors.length) throw new Error('page errors:\n' + errors.join('\n'));
   console.log('FIREFOX OK');

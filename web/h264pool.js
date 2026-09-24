@@ -53,6 +53,35 @@ function workerPicture(p) {
   return pic;
 }
 
+/** A worker of the built-in decoder for `codec`, started; `ready` settles once it can decode. */
+function startWorker(movie, codec) {
+  const url = codec.id === 'h264' ? new URL('./h264worker.js', import.meta.url) : new URL('./softworker.js', import.meta.url);
+  const w = new Worker(url, { type: 'module' });
+  w.ready = new Promise((resolve, reject) => {
+    const onMessage = (e) => {
+      if (e.data.type === 'ready') {
+        cleanup();
+        resolve();
+      } else if (e.data.type === 'error') {
+        cleanup();
+        reject(new Error(e.data.message));
+      }
+    };
+    const onError = (e) => {
+      cleanup();
+      reject(new Error(e.message || 'the decoder worker failed to start'));
+    };
+    const cleanup = () => {
+      w.removeEventListener('message', onMessage);
+      w.removeEventListener('error', onError);
+    };
+    w.addEventListener('message', onMessage);
+    w.addEventListener('error', onError);
+    w.postMessage({ type: 'init', desc: movie.dx.track_description(movie.video.index), codec: codec.id });
+  });
+  return w;
+}
+
 export class SoftwarePool {
   constructor(movie, workers, codec) {
     this.movie = movie;
@@ -66,38 +95,10 @@ export class SoftwarePool {
     if (typeof Worker === 'undefined') throw new Error('Web Workers are not available');
     const codec = builtInFor(movie.video.codec);
     if (!codec) throw new Error(`there is no built-in decoder for ${movie.video.codec}`);
-    const desc = movie.dx.track_description(movie.video.index);
-    const url = codec.id === 'h264' ? new URL('./h264worker.js', import.meta.url) : new URL('./softworker.js', import.meta.url);
     const workers = [];
     try {
-      for (let k = 0; k < size; k++) workers.push(new Worker(url, { type: 'module' }));
-      await Promise.all(
-        workers.map(
-          (w) =>
-            new Promise((resolve, reject) => {
-              const onMessage = (e) => {
-                if (e.data.type === 'ready') {
-                  cleanup();
-                  resolve();
-                } else if (e.data.type === 'error') {
-                  cleanup();
-                  reject(new Error(e.data.message));
-                }
-              };
-              const onError = (e) => {
-                cleanup();
-                reject(new Error(e.message || 'the decoder worker failed to start'));
-              };
-              const cleanup = () => {
-                w.removeEventListener('message', onMessage);
-                w.removeEventListener('error', onError);
-              };
-              w.addEventListener('message', onMessage);
-              w.addEventListener('error', onError);
-              w.postMessage({ type: 'init', desc, codec: codec.id });
-            })
-        )
-      );
+      for (let k = 0; k < size; k++) workers.push(startWorker(movie, codec));
+      await Promise.all(workers.map((w) => w.ready));
     } catch (e) {
       for (const w of workers) w.terminate();
       throw e;
@@ -105,7 +106,32 @@ export class SoftwarePool {
     return new SoftwarePool(movie, workers, codec);
   }
 
+  /**
+   * One more worker, for a scan that finds it has a core to spare (a lane
+   * of the browser's decoder it has set aside): it joins the pass under way
+   * too. Resolves to whether it could start.
+   */
+  async grow() {
+    if (this.closed) return false;
+    const w = startWorker(this.movie, this.codec);
+    try {
+      await w.ready;
+    } catch (e) {
+      w.terminate();
+      return false;
+    }
+    if (this.closed) {
+      w.terminate();
+      return false;
+    }
+    this.workers.push(w);
+    this.grown = (this.grown || 0) + 1;
+    if (this.joining) this.joining(w);
+    return true;
+  }
+
   close() {
+    this.closed = true;
     for (const w of this.workers) w.terminate();
     this.workers = [];
   }
@@ -232,7 +258,7 @@ export class SoftwarePool {
       inflight++;
       w.postMessage({ type: 'decode', id: k, file: this.movie.file, offset: offset.slice(g.a, g.ext), size: size.slice(g.a, g.ext), pts: pts.slice(g.a, g.ext), minPts: g.minPts, maxPts: g.maxPts, fast: !!fast, shrink: small });
     };
-    const handlers = this.workers.map((w) => {
+    const listen = (w) => {
       const h = (e) => {
         const m = e.data;
         if (m.type === 'frame') out[m.id].queue.push(workerPicture(m.pic));
@@ -252,7 +278,13 @@ export class SoftwarePool {
       // this pass's window, whatever an earlier pass left unused
       w.postMessage({ type: 'credit', n: window, reset: true });
       return h;
-    });
+    };
+    const handlers = this.workers.map(listen);
+    // a worker the pool gains while this pass runs (grow) joins it
+    this.joining = (w) => {
+      handlers.push(listen(w));
+      assign(w);
+    };
     let frames = 0;
     let damaged = 0;
     let stopped = false;
@@ -297,6 +329,7 @@ export class SoftwarePool {
       for (const w of this.workers) w.postMessage({ type: 'cancel' });
       while (inflight > 0) await wait();
       for (const o of out) o.queue.length = 0;
+      this.joining = null;
       this.workers.forEach((w, i) => w.removeEventListener('message', handlers[i]));
       this.busy = false;
     }

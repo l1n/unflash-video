@@ -245,14 +245,31 @@ export class ChunkPicker {
   /**
    * The first chunk nobody has, for a lane decoding for the detector; -1
    * when every chunk is taken, -2 when the budget has no room for it yet
-   * (the detector's own chunk always has room).
+   * (the detector's own chunk always has room). With `fits`, the first free
+   * chunk, in order, that `fits(c)` and the budget has room for beside the
+   * free chunks before it (which other lanes will take); -3 when none in
+   * the budget's reach does (-2 still when the first has no room).
    */
-  ahead() {
+  ahead(fits = null) {
     let c = this.cur;
     while (c < this.nc && this.taken[c]) c++;
     if (c >= this.nc) return -1;
-    if (c !== this.cur && this.used + this.need(c) > this.budget) return -2;
-    return this.take(c, false);
+    if (!fits) {
+      if (c !== this.cur && this.used + this.need(c) > this.budget) return -2;
+      return this.take(c, false);
+    }
+    // (the chunks passed over are the other lanes' to take, and need room too)
+    let passed = 0;
+    let passedOver = false;
+    for (; c < this.nc; c++) {
+      if (this.taken[c]) continue;
+      const need = c === this.cur ? 0 : this.need(c);
+      if (this.used + passed + need > this.budget) return passedOver ? -3 : -2;
+      if (fits(c)) return this.take(c, false);
+      passedOver = true;
+      passed += need;
+    }
+    return -3;
   }
 
   /**
@@ -378,12 +395,17 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
       pending: null,
       steals: 0,
       stolen: 0,
+      // set aside by the rebalancing: the other lanes finish every chunk in reach sooner
+      aside: false,
+      asideMs: 0,
+      asideT0: 0,
+      gave: false,
     });
   }
 
   // each chunk's pictures, in order, until the detector takes them
   const slots = [];
-  for (let c = 0; c < nc; c++) slots.push({ pics: [], head: 0, done: false, lastT: -Infinity, wake: null });
+  for (let c = 0; c < nc; c++) slots.push({ pics: [], head: 0, got: 0, done: false, lastT: -Infinity, wake: null });
   const wakeSlot = (s) => {
     if (s.wake) {
       const w = s.wake;
@@ -463,6 +485,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
       lane.pending = null;
       lane.stretches.push(s);
       lane.feeding++;
+      setAside(lane, false);
       return s;
     }
     const curFree = picker.cur < nc && !picker.taken[picker.cur];
@@ -474,11 +497,79 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
         return give(lane, run.first, run.last, { from: run.from, feeder: f, t0: now() });
       }
     }
-    const c = picker.ahead();
-    if (c >= 0) return give(lane, c, c);
+    const c = picker.ahead(rebalancing ? soonest(lane) : null);
+    if (c >= 0) {
+      setAside(lane, false);
+      return give(lane, c, c);
+    }
+    if (c === -3) {
+      setAside(lane, true);
+      return 'wait';
+    }
     if (c === -2) return 'wait';
     // every chunk is taken: a lane stays while another decodes one, to take it over if that one is slow
     return stealing && lanes.some((l) => l !== lane && l.stretches.some((s) => !s.look && !s.cut)) ? 'wait' : null;
+  };
+
+  /**
+   * The rebalancing: which chunks `lane`, free now, should take. The free
+   * chunks go, in order, each to the lane that would finish it first (what
+   * each lane already has to finish counted, and its pictures a second so
+   * far): `lane` takes the first that falls to it within the budget's
+   * reach, and none if the others would finish them all sooner (a lane of
+   * Firefox's decoder, whose copies are slow, beside the built-in decoder);
+   * then it is set aside, and the built-in decoder gets a worker for the
+   * core it leaves. Until every lane has been timed, the chunks go in
+   * order, as they come.
+   */
+  const soonest = (lane) => {
+    const mine = rate(lane);
+    const others = lanes.filter((l) => l !== lane && !l.failed);
+    if (!mine || !others.length || others.some((l) => !rate(l))) return null;
+    // when each lane will be free, and the lane each free chunk falls to
+    const free = new Map(others.map((l) => [l, busyFor(l)]));
+    free.set(lane, 0);
+    const rates = new Map([...others.map((l) => [l, rate(l)]), [lane, mine]]);
+    return (c) => {
+      let best = null;
+      let bestAt = Infinity;
+      for (const [l, at] of free) {
+        const done = at + chunks.n[c] / rates.get(l);
+        if (done < bestAt - 1e-9 || (done <= bestAt + 1e-9 && l === lane)) {
+          best = l;
+          bestAt = done;
+        }
+      }
+      if (best === lane) return true;
+      free.set(best, bestAt);
+      return false;
+    };
+  };
+  /** How long `lane` has yet to decode what it has (s), at its rate so far. */
+  const busyFor = (lane) => {
+    const r = rate(lane);
+    let left = 0;
+    for (const s of lane.stretches) {
+      if (s.cut) continue;
+      for (let c = s.first; c <= s.last; c++) left += Math.max(0, chunks.n[c] - slots[c].got);
+    }
+    if (lane.pending) left += chunks.n[lane.pending.first];
+    return r ? left / r : 0;
+  };
+  const rebalancing = chunked.rebalance !== false && nlanes > 1;
+  let grown = 0;
+  /** Set `lane` aside (or back to work); a lane of the browser's decoder set aside gives its core to the built-in decoder. */
+  const setAside = (lane, aside) => {
+    if (aside === lane.aside) return;
+    lane.aside = aside;
+    if (aside) lane.asideT0 = now();
+    else lane.asideMs += now() - lane.asideT0;
+    if (aside && !lane.gave && lane.kind === 'browser' && pool && !pool.closed && pool.workers.length < (chunked.poolMax || 0)) {
+      lane.gave = true;
+      pool.grow().then((ok) => {
+        if (ok) grown++;
+      });
+    }
   };
 
   /** A lane's pictures a second while it decodes, once there is enough to tell. */
@@ -600,6 +691,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
     if (s && c > s.first) chunksDone(s.first, c - 1);
     const held = hold(pic);
     slot.pics.push({ pic: held, t });
+    slot.got++;
     slot.lastT = t;
     heldBytes += held.data.byteLength;
     if (heldBytes > peak) peak = heldBytes;
@@ -772,7 +864,8 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
   const vjson = JSON.stringify(result.violations);
   const sections = JSON.parse(wasm.violations_to_sections(vjson, config, movie.tsMin, movie.tsMax, new Float64Array()));
   const summary = JSON.parse(wasm.timeline_summary(JSON.stringify(result), movie.tsMin, movie.tsMax, 1.0));
-  const laneStats = lanes.map((l) => ({ kind: l.kind, workers: l.kind === 'built-in' ? pool.workers.length : 1, frames: l.frames, chunks: l.chunks, looks: l.looks, ms: l.ms, failed: l.failed, steals: l.steals, stolen: l.stolen }));
+  for (const l of lanes) setAside(l, false);
+  const laneStats = lanes.map((l) => ({ kind: l.kind, workers: l.kind === 'built-in' ? pool.workers.length : 1, frames: l.frames, chunks: l.chunks, looks: l.looks, ms: l.ms, failed: l.failed, steals: l.steals, stolen: l.stolen, aside: Math.round(l.asideMs), fps: rate(l) }));
   return {
     result,
     sections,
@@ -784,7 +877,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
     patternThresh: feeder.det.pattern_thresh(),
     profileText,
     profileOps,
-    chunked: { chunks: nc, chunkS, order: triage ? 'triage' : 'file', hot: triage ? triage.order.slice(0, triage.hot) : [], taken: picker.log.slice(), looks, lanes: laneStats, budget, peak, steals },
+    chunked: { chunks: nc, chunkS, order: triage ? 'triage' : 'file', hot: triage ? triage.order.slice(0, triage.hot) : [], taken: picker.log.slice(), looks, lanes: laneStats, budget, peak, steals, rebalanced: rebalancing, grown },
   };
 }
 

@@ -4,7 +4,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.wasm': 'application/wasm', '.json': 'application/json', '.mp4': 'video/mp4', '.ts': 'text/plain' };
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.wasm': 'application/wasm', '.json': 'application/json', '.mp4': 'video/mp4', '.ts': 'text/plain', '.webp': 'image/webp', '.png': 'image/png', '.webm': 'video/webm' };
 
 export function serve(root, port = 0) {
   const srv = http.createServer((req, res) => {

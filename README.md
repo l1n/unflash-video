@@ -56,7 +56,20 @@ behind *What's new* in the header). Each line starts with the time it goes
 live, in a comment; add one with every change people will notice. A change
 with something on screen to show names its tour in the same comment
 (`<!-- 16:00 tour:findings -->`; the tours are in
-[`web/tours.js`](web/tours.js)).
+[`web/tours.js`](web/tours.js)). Every change has a film too, a few
+seconds of the app doing what it says, filmed in the app itself (in
+Firefox, for the changes about Firefox; a race, the old way above the new,
+for the speed-ups this 4-core test machine can show: one it cannot, with
+every core already busy either way, gets a film of what changed instead)
+and named the same way
+(`<!-- 16:00 tour:findings shot:findings -->`): What's new plays it, muted
+and looped, while it is in view, and shows its last picture instead to
+whoever asks their system for less motion. The scenes are in
+[`tests/e2e/whatsnew-scenes.mjs`](tests/e2e/whatsnew-scenes.mjs);
+`node tests/e2e/whatsnew.mjs NAME` films one into `web/whatsnew/` (VP9,
+and its last picture), and scans the film with Unflash under its
+strictest profile: one that flashes is not kept. CI checks that every
+change has its film and that the files are the ones that were scanned.
 
 **The guided tour:** the first visit gets a tour of the page, a part at a
 time, each where it belongs: the start page, then the first video once
@@ -278,8 +291,11 @@ Pages build regenerates them; for a local copy run
 with a slow or failing run needs, as text to paste into a message: the
 browser, the WebGPU adapter, the detector and how pictures reach it, the
 open video (container, codec, size, frame rate, length), each job of the
-visit with how long it took (and how much of that the tab spent out of
-sight), the last scan's time per operation and any errors. It copies it to
+visit with how long it took (how much of that the tab spent out of sight,
+and, for one of more than two seconds, the steps that took most of it:
+opening a video reads its index, asks the browser about its decoder,
+loads the project kept for it, looks for its export and starts the
+detector), the last scan's time per operation and any errors. It copies it to
 the clipboard where the browser allows, and saves it as a file. It names
 no files.
 
@@ -615,6 +631,34 @@ are the browser's, and each picture it sends says whether it is damaged:
 at the first damaged one it stops, and its chunk goes to the browser's
 decoder, which goes on from the last picture it gave.
 
+**Rebalancing and take-overs.** How fast each lane goes differs from one
+computer to the next (in Firefox on one Windows PC a lane of Firefox's
+decoder made 20 fps of 1080p where a built-in worker made 47; a hardware
+decoder with cheap copies can tip it the other way), so a scan does not
+go by its plan alone: it times each lane as it goes (the pictures it decodes per
+second of decoding). Until every lane has been timed the chunks go out in
+turn. After that, each free chunk goes, in order, to the lane that would
+finish it first, counting what each lane has yet to finish: a lane asking
+for work takes the first chunk that falls to it within the budget's
+reach, and one that would finish none of them sooner than the others is
+**set aside** instead of holding the detector up (and asked again
+whenever something changes). A lane of the browser's decoder set aside
+gives its core to the built-in decoder, which starts another worker (up to
+one for each lane of the plan; the worker joins the decode under way).
+A chunk handed out before the lanes were timed can still hold the
+detector up: when it waits on a chunk a slower lane is decoding and a
+faster lane is idle, the faster one **takes it over** from the keyframe
+at or before the last picture in, and the slow one stops. In a model of
+Firefox on such a PC here (four lanes of the browser's decoder slowed to
+a few pictures a second beside two built-in workers, two minutes of
+1080p60 H.264), take-overs alone scanned at 61 fps, and rebalancing, which
+set the four aside and grew the built-in decoder to six workers, at 103;
+in stock Firefox on this machine's four cores, its two lanes slowed the
+same way, 20 s of 1080p H.264 took 9.4 s with take-overs alone and 7.1 s
+rebalanced (the built-in decoder grown from two workers to four).
+`?rebalance=0` hands the chunks out in turn, `?steal=0` turns take-overs
+off.
+
 **Early looks.** Before any of it is decoded, `triage.js` scores each chunk
 from the file's index alone for how likely it is to flash (bytes per
 frame against the film's median, keyframes a second, frames that cost
@@ -632,7 +676,9 @@ shows what it has found so far, exactly up to where it has got and the
 early looks' findings after that.
 
 The debug report shows how many chunks and frames each decoder decoded,
-how fast, how many early looks it took and the most pictures held, for
+how fast, how many early looks it took, which lanes were set aside and
+for how long, how far the built-in decoder grew, and the most pictures
+held, for
 the last scan and for the last check of an export (a scan of the exported
 file), and how far apart the video's keyframes are.
 `?hybrid=0` turns the built-in decoder off, `?hybrid=1` on for any file,
@@ -643,7 +689,9 @@ H.264, runs hybrid scans with the built-in decoder standing in for the
 browser's (`?hybrid=sim:H,S`) and requires exactly the violations of the
 scan in one piece: with early looks, when the built-in decoder fails at
 its tenth picture (`?hybridfail=1`), with room for one chunk held
-(`?hold=5`), and on one lane with early looks.
+(`?hold=5`), on one lane with early looks, and with four lanes slowed
+down (`?slowlanes=MS`), taken over and rebalanced; the Firefox test does
+the last two with Firefox's own lanes.
 
 ### Spans re-encoded, the rest copied
 
@@ -772,6 +820,8 @@ node tests/e2e/tour.mjs                   # the guided tour, on a first visit an
 node tests/e2e/busy.mjs                   # the page while a job runs: a second start turned away, never a long freeze
 FIREFOX=/path/to/firefox node tests/e2e/firefox.mjs   # the app in headless Firefox, WebGPU on lavapipe (needs puppeteer-core)
 node tests/e2e/screenshots.mjs            # the screenshots above, made again from the test clips (not a test)
+FIREFOX=/path/to/firefox node tests/e2e/whatsnew.mjs [NAME...]   # What's new's films, made again and scanned for flashing (not a test)
+node tests/e2e/whatsnew-check.mjs         # every change has its film, and each is the file that was scanned
 ```
 
 `crates/unflash-core/tests/reference_fixtures.rs` regenerates the frames the

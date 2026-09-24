@@ -136,9 +136,10 @@ jobs:
       - name: End-to-end, ${{ matrix.part }} (headless Chromium, WebGPU on SwiftShader)
         if: matrix.part != 'formats' && matrix.part != 'firefox'
         run: node tests/e2e/run.mjs --part=${{ matrix.part }}
-      - name: Smart-cut splice, MKV and WebM, the sound of held frames, project files, the guided tour, the page while a job runs, the built-in HEVC, VP9, VP8 and AV1 decoders (headless Chromium), the shrink in WebAssembly
+      - name: Smart-cut splice, MKV and WebM, the sound of held frames, project files, the guided tour, the page while a job runs, the built-in HEVC, VP9, VP8 and AV1 decoders (headless Chromium), the shrink in WebAssembly, What's new's films
         if: matrix.part == 'formats'
         run: |
+          node tests/e2e/whatsnew-check.mjs
           node tests/e2e/splice.mjs
           node tests/e2e/mkv.mjs
           node tests/e2e/sound.mjs

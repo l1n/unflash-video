@@ -13,7 +13,7 @@ import { SectionPlayer } from './preview.js';
 import { SectionSound } from './sound.js';
 import { FrameViewer } from './viewer.js';
 import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notifyState, systemNotify, titleProgress, titleMark } from './alerts.js';
-import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay, escapeHtml } from './changes.js';
+import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay, wireShots, escapeHtml } from './changes.js';
 import { TourGuide, TOURS, PARTS } from './tours.js';
 import { watchPage, noteError, noteJob, noteFileName, debugReport } from './debug.js';
 
@@ -135,7 +135,7 @@ async function runJob(name, fn) {
   }
   const job = { name, cancelled: false, t0: performance.now(), pct: 0 };
   state.job = job;
-  const ended = noteJob(name);
+  const note = noteJob(name);
   chainStart(name);
   $('jobName').textContent = name;
   $('jobBar').style.width = '0%';
@@ -144,6 +144,7 @@ async function runJob(name, fn) {
   let shownPct = -1;
   let shownAt = 0;
   const progress = (p, msg) => {
+    if (msg !== undefined) note.step(msg);
     const pct = Math.round(Math.min(1, Math.max(0, p)) * 100);
     job.pct = pct;
     // a long scan reports thousands of times: the page shows ten a second
@@ -180,7 +181,7 @@ async function runJob(name, fn) {
     state.jobEndedAt = performance.now();
     $('jobbar').classList.add('hidden');
     titleProgress('');
-    ended(job.cancelled ? 'cancelled' : outcome);
+    note(job.cancelled ? 'cancelled' : outcome);
     chainEnd(job.cancelled ? 'cancelled' : outcome, message);
   }
 }
@@ -473,7 +474,8 @@ function renderChanges() {
   }
   const more = count - Math.min(count, NEWS_SHOWN);
   // (the headlines: each opens to say more, and What's new has them all in full)
-  $('newsList').innerHTML = days.map((d) => renderDay(d, () => false, true)).join('') + (more ? `<p class="news-more">…and ${more} more.</p>` : '');
+  $('newsList').innerHTML = days.map((d) => renderDay(d, () => false, true, c.log.shots)).join('') + (more ? `<p class="news-more">…and ${more} more.</p>` : '');
+  wireShots($('newsList'));
 }
 
 /** The changes so far count as seen: the card and the dot go until there are new ones. */
@@ -489,14 +491,17 @@ function openChanges() {
   const c = state.changes;
   if (!c) return toast('The list of changes could not be loaded');
   const seen = c.seen;
-  $('changesList').innerHTML = c.log.days.map((d) => renderDay(d, (it) => it.at > seen)).join('');
+  $('changesList').innerHTML = c.log.days.map((d) => renderDay(d, (it) => it.at > seen, false, c.log.shots)).join('');
   $('changesModal').classList.remove('hidden');
   $('changesList').scrollTop = 0;
+  wireShots($('changesList'), $('changesList'));
   changesAcknowledged();
 }
 
 function closeChanges() {
   $('changesModal').classList.add('hidden');
+  // (the films stop with it)
+  for (const v of $('changesList').querySelectorAll('video')) v.pause();
 }
 
 // ---- debug info --------------------------------------------------------------------
@@ -697,10 +702,13 @@ async function openFile(file) {
     state.traceNorm = null;
     state.movie = movie;
     movie.forceBuiltIn = builtInSetting();
+    progress(0.36, 'asking the browser about its decoder');
     state.decode = await movie.decoderSupport();
-    progress(0.4, 'starting the detector');
+    progress(0.38, 'loading the project kept for this video');
     const project = await Project.load(key, movie.bounds, movie.keyframes);
+    progress(0.39, 'looking for an export of it');
     await restoreExport(exportOwner(key), movie);
+    progress(0.4, 'starting the detector');
     state.project = project;
     if (project.scan && project.scan.trace) state.scanTrace = project.scan.trace;
     $('profileSel').value = project.profile;
@@ -910,7 +918,8 @@ function hybridPlan(movie, feeder) {
       sw = Math.max(1, Math.min(8, cores - hw - 2));
     }
   }
-  return { hw, sw, sim, failBuiltIn: q.get('hybridfail') === '1' };
+  // a lane of the browser's decoder that the scan sets aside, as slower than the rest, gives its core to the built-in decoder
+  return { hw, sw, poolMax: sw > 0 ? Math.min(16, sw + hw) : 0, sim, failBuiltIn: q.get('hybridfail') === '1' };
 }
 
 /**
@@ -923,9 +932,10 @@ function hybridPlan(movie, feeder) {
  * chunks triage finds likeliest to flash (`?order=file`: none); a shorter
  * file, or with `?chunked=0`, as before. `?chunk=S` sets the chunks' length
  * and `?hold=MB` how much of the pictures decoded ahead may be held;
- * `?steal=0` keeps a lane from taking over a slower lane's chunk, and (tests)
- * `?slowlanes=MS` holds back every picture of the browser's lanes. `opts`
- * as scanMovie's.
+ * `?steal=0` keeps a lane from taking over a slower lane's chunk,
+ * `?rebalance=0` hands the chunks out in turn rather than each to the lane
+ * that would finish it first, and (tests) `?slowlanes=MS` holds back every
+ * picture of the browser's lanes. `opts` as scanMovie's.
  */
 async function scanWithPlan(env, movie, opts) {
   const q = new URLSearchParams(location.search);
@@ -949,7 +959,7 @@ async function scanWithPlan(env, movie, opts) {
     return await scanMovie(env, movie, {
       ...opts,
       // (a plan that leans on the built-in decoder, without it, goes back to the browser's lanes)
-      chunked: { hw: plan && (pool || !plan.sw || plan.sim) ? plan.hw : scanSegments(), pool, chunkS, order, budget: hold > 0 ? hold * 1024 * 1024 : null, sim: !!(plan && plan.sim), failBuiltIn: !!(plan && plan.failBuiltIn), slow: parseFloat(q.get('slowlanes') || '') || 0, steal: q.get('steal') !== '0' },
+      chunked: { hw: plan && (pool || !plan.sw || plan.sim) ? plan.hw : scanSegments(), pool, poolMax: plan ? plan.poolMax : 0, chunkS, order, budget: hold > 0 ? hold * 1024 * 1024 : null, sim: !!(plan && plan.sim), failBuiltIn: !!(plan && plan.failBuiltIn), slow: parseFloat(q.get('slowlanes') || '') || 0, steal: q.get('steal') !== '0', rebalance: q.get('rebalance') !== '0' },
     });
   } finally {
     if (pool) pool.close();

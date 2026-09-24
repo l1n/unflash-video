@@ -327,6 +327,15 @@ table.clips td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); 
 .changes-list details.brief[open] > summary::after { content: " ‹"; }
 .changes-list details.brief[open] { display: block; color: var(--fg2); }
 .changes-list details.brief[open] > summary { color: var(--fg); }
+/* a change's film: at most its own size, its last picture until it plays */
+.changes-list .shot { margin: 6px 0 12px; }
+/* (on a mat, with a label, so that it reads as a picture of the page and not the page) */
+.shot-film { display: block; position: relative; width: 100%; padding: 18px 5px 5px; background: var(--bg3); border: 1px solid var(--line2); cursor: pointer; }
+.shot-film:hover, .shot-film:active { background: var(--bg3); border-color: var(--fg2); color: inherit; }
+.shot-film video { display: block; width: 100%; height: auto; border: 1px solid var(--line); }
+.shot-film::before { content: "film"; position: absolute; left: 6px; top: 2px; font-size: 10px; line-height: 14px; color: var(--fg2); }
+.shot-film::after { content: "click to pause"; position: absolute; right: 6px; top: 2px; font-size: 10px; line-height: 14px; color: var(--fg2); }
+.shot-film.paused::after { content: "▶ click to play"; color: var(--fg); }
 /* the guide over a video: the screen, part by part, and the keys */
 .guide-screen { display: none; margin: 0 0 16px; }
 body.has-movie .guide-screen { display: block; }

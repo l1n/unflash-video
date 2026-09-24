@@ -31,8 +31,9 @@ export async function createDetector(wasm, configJson, width, height, { preferGp
   if (!det) det = new wasm.Detector(configJson, width, height);
   const feeder = new Feeder(wasm, det, backend, note, probe, route);
   // can a decoded frame go to the GPU as it is? (a canvas-made frame asks
-  // WebGPU the same question as a decoder's)
-  feeder.takesFrames = false;
+  // WebGPU the same question as a decoder's; null: not asked, another route
+  // being forced)
+  feeder.takesFrames = route && route !== 'videoframe' ? null : false;
   if (backend === 'webgpu' && probe && typeof VideoFrame !== 'undefined' && typeof OffscreenCanvas !== 'undefined' && (!route || route === 'videoframe')) {
     try {
       const c = new OffscreenCanvas(2, 2);

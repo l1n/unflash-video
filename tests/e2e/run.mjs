@@ -746,6 +746,47 @@ try {
   await page.click('#debugText');
   await page.keyboard.press('Escape');
   assert(await page.$eval('#debugModal', (m) => m.classList.contains('hidden')), 'Esc closes the debug report, from its text too');
+  // a long job's report says where its time went: its big steps, in order
+  // (the page's clock run on by hand: a job of 7.5 s in no time)
+  const steps = await page.evaluate(async () => {
+    const { noteJob } = await import('./debug.js');
+    const real = performance.now.bind(performance);
+    let ahead = 0;
+    performance.now = () => real() + ahead;
+    try {
+      const end = noteJob('A long job');
+      end.step('reading the index');
+      ahead += 1200;
+      end.step('loading the project kept for this video');
+      ahead += 300;
+      end.step('reading 10 of 90 pieces · 30 MB/s');
+      ahead += 3000;
+      end.step('reading 90 of 90 pieces · 28 MB/s · the last one');
+      ahead += 3000;
+      end('ok');
+      // (a scan's running counts are one step: nothing to break down)
+      const scan = noteJob('A long scan');
+      scan.step('100 frames · 50 fps');
+      ahead += 3000;
+      scan.step('900 frames · 60 fps · 1 violation found so far');
+      ahead += 3000;
+      scan.step('1800 frames · 61 fps · 2 violations found so far');
+      scan('ok');
+      // (nor does a job of under two seconds)
+      const short = noteJob('A short job');
+      short.step('reading the index');
+      ahead += 1000;
+      short.step('starting the detector');
+      ahead += 800;
+      short('ok');
+    } finally {
+      performance.now = real;
+    }
+    return window.__unflash.debugReport();
+  });
+  assert(/A long job: 7\.5 s ok\n\s+reading the index 1\.2 s · reading … of … pieces 6\.0 s\n/.test(steps), "a long job's report lists its big steps (a step's changing numbers are one step): " + steps.split('\n').filter((l) => /long job|reading/.test(l)).join(' / '));
+  assert(/A long scan: 6\.0 s ok\n(?!\s+… frames)/.test(steps), "a scan's running counts are no steps: " + steps.split('\n').filter((l) => /long scan|frames/.test(l)).join(' / '));
+  assert(/A short job: 1\.8 s ok\n(?!\s+reading the index)/.test(steps), 'a job of under two seconds lists no steps');
 
   // --- what's new: someone coming back sees what changed since they were here ---
   {
@@ -825,6 +866,27 @@ try {
       fresh: document.querySelectorAll('#changesList li.new').length,
     }));
     assert(list.open && list.days === s.days && list.items === s.times.length && list.fresh === since, 'the whole list, the new ones marked: ' + JSON.stringify(list));
+    // each change with its film (whatsnew/): the first, in view, plays by itself, muted and looped
+    const films = await p.evaluate(() => ({ n: document.querySelectorAll('#changesList li .shot-film video').length, shots: Object.keys(window.__unflash.changes.log.shots || {}).length }));
+    assert(films.n === s.times.length && films.shots === s.times.length, "every change in What's new has its film: " + JSON.stringify({ ...films, changes: s.times.length }));
+    await p.waitForFunction(() => {
+      const v = document.querySelector('#changesList .shot-film video');
+      return v && !v.paused && v.muted && v.loop && v.currentTime > 0.3;
+    }, null, { timeout: 30000 });
+    // the rest wait until they are scrolled to
+    assert(await p.evaluate(() => [...document.querySelectorAll('#changesList .shot-film video')].slice(-1)[0].paused), 'a film out of view does not play');
+    await p.keyboard.press('Escape');
+    assert(await p.evaluate(() => [...document.querySelectorAll('#changesList video')].every((v) => v.paused)), 'closing What\'s new stops its films');
+    // with less motion asked for, none plays by itself; a click plays one
+    await p.emulateMedia({ reducedMotion: 'reduce' });
+    await p.click('#btnChanges');
+    await p.waitForTimeout(1500);
+    assert(await p.evaluate(() => [...document.querySelectorAll('#changesList video')].every((v) => v.paused)), 'with less motion asked for, no film plays by itself');
+    await p.click('#changesList .shot-film');
+    await p.waitForFunction(() => !document.querySelector('#changesList .shot-film video').paused, null, { timeout: 30000 });
+    await p.click('#changesList .shot-film');
+    assert(await p.evaluate(() => document.querySelector('#changesList .shot-film video').paused), 'and a click pauses it again');
+    await p.emulateMedia({ reducedMotion: 'no-preference' });
     await p.keyboard.press('Escape');
     s = await shown();
     assert(!(await p.$eval('#changesModal', (m) => !m.classList.contains('hidden'))) && !s.card && s.mark === s.newest, 'Esc closes it, and they count as seen');
@@ -937,7 +999,12 @@ try {
   // the chunk the detector waits for, from the last picture in. On the CPU
   // detector, which (unlike SwiftShader's WebGPU) is faster than the lanes
   results.h264WholeCpu = await hybridScan('cpu=1&hybrid=0');
-  results.overtaken = await hybridScan('cpu=1&hybrid=sim:4,2&chunk=1&order=file&hold=13&slowlanes=150');
+  results.overtaken = await hybridScan('cpu=1&hybrid=sim:4,2&chunk=1&order=file&hold=13&slowlanes=150&rebalance=0');
+  // the same, rebalanced: once each lane is timed, each chunk goes to the
+  // lane that would finish it first; the slow lanes, which would finish
+  // none sooner, are set aside, and the built-in decoder gets a worker for
+  // each of them
+  results.rebalanced = await hybridScan('cpu=1&hybrid=sim:4,2&chunk=1&order=file&hold=13&slowlanes=150');
   for (const [name, r] of [
     ['hybrid', results.hybrid],
     ['hybrid, the built-in decoder failing', results.hybridFail],
@@ -964,6 +1031,19 @@ try {
     // (without, the four slow lanes set the pace: 16 s here)
     assert(r.ms < 9000, 'and the scan went at its pace: ' + r.ms + ' ms');
     assert(/took over \d+ from slower lanes/.test(r.report) && /\d+ taken over by faster lanes/.test(r.report), 'the debug report tells of it:\n' + r.report);
+  }
+  {
+    const r = results.rebalanced;
+    const h = r.chunked;
+    console.log('slow browser lanes, rebalanced:', r.ms, 'ms (taken over only:', results.overtaken.ms, 'ms) |', JSON.stringify({ steals: h.steals, grown: h.grown, lanes: h.lanes.map((l) => [l.kind, l.workers, l.frames, l.chunks, l.steals, l.stolen, l.aside]) }));
+    sameAsWhole('rebalanced', r, results.h264WholeCpu);
+    assert(h.lanes.reduce((a, l) => a + l.frames, 0) === r.frames, 'rebalanced: each picture decoded once: ' + JSON.stringify(h.lanes));
+    const builtIn = h.lanes.find((l) => l.kind === 'built-in');
+    const slow = h.lanes.filter((l) => l.kind === 'browser');
+    assert(h.rebalanced && slow.every((l) => l.aside > 0) && builtIn.aside === 0 && builtIn.frames > (r.frames * 3) / 4, 'the slow lanes were set aside, the built-in decoder did the most: ' + JSON.stringify(h.lanes));
+    assert(h.grown >= 1 && builtIn.workers > 2, 'and grew into the cores they left: ' + JSON.stringify({ grown: h.grown, workers: builtIn.workers }));
+    assert(r.ms < results.overtaken.ms * 1.25 + 500, `and the scan was no slower than with take-overs alone: ${r.ms} ms against ${results.overtaken.ms}`);
+    assert(/each chunk to the lane that would finish it first, the built-in decoder grown by \d+ workers? for the lanes set aside/.test(r.report) && /set aside [\d.]+ s/.test(r.report), 'the debug report tells of it:\n' + r.report);
   }
   assert(/built-in decoder ×2/.test(results.hybrid.report), 'the debug report shows the built-in decoder:\n' + results.hybrid.report);
   const gaveUp = results.hybridFail.chunked.lanes.find((l) => l.kind === 'built-in');

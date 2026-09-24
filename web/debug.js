@@ -38,15 +38,43 @@ export function noteError(text) {
   if (errors.length > 20) errors.shift();
 }
 
-/** A job starts: returns what to call when it ends, with its outcome. */
+/**
+ * A job starts: returns what to call when it ends, with its outcome. Its
+ * `.step(message)` notes each thing the job says it is doing, so that the
+ * report of a long job says where the time went (a message whose numbers
+ * change as it goes, a count or a percentage, is one step, and so is one
+ * whose running status, after a " · ", changes: a scan's counts are one).
+ */
 export function noteJob(name) {
   const at = Date.now();
   const t0 = performance.now();
   const h0 = hiddenMs();
-  return (outcome) => {
-    jobs.push({ name, at, ms: performance.now() - t0, hidden: hiddenMs() - h0, outcome });
+  const steps = [];
+  const ended = (outcome) => {
+    const end = performance.now();
+    const timed = steps.map((s, k) => ({ what: s.varied ? s.label.replace(/#/g, '…') : s.first, ms: (k + 1 < steps.length ? steps[k + 1].t : end) - s.t }));
+    jobs.push({ name, at, ms: end - t0, hidden: hiddenMs() - h0, outcome, steps: timed });
     if (jobs.length > 40) jobs.shift();
   };
+  ended.step = (message) => {
+    const text = String(message).split(' · ')[0].trim();
+    if (!text) return;
+    const label = text.replace(/\d[\d.,]*/g, '#');
+    const last = steps[steps.length - 1];
+    if (last && last.label === label) {
+      if (text !== last.first) last.varied = true;
+      return;
+    }
+    steps.push({ label, first: text, varied: false, t: performance.now() });
+  };
+  return ended;
+}
+
+/** Where a job of more than two seconds spent its time: the steps that took a good part of it, in order. */
+function stepLine(j) {
+  if (j.ms < 2000 || !j.steps || j.steps.length < 2) return null;
+  const big = j.steps.filter((s) => s.ms >= Math.max(200, j.ms * 0.05)).slice(0, 6);
+  return big.length ? '  ' + big.map((s) => `${s.what} ${secs(s.ms)}`).join(' · ') : null;
 }
 
 const clock = (ms) => new Date(ms).toISOString().slice(11, 19);
@@ -79,10 +107,13 @@ function chunkedLines(h) {
     const fps = l.frames / Math.max(0.001, l.ms / 1000);
     const looks = l.looks ? `, ${l.looks} early look${l.looks === 1 ? '' : 's'}` : '';
     const over = `${l.steals ? `, took over ${l.steals} from slower lanes` : ''}${l.stolen ? `, ${l.stolen} taken over by faster lanes` : ''}`;
-    return `${l.kind === 'built-in' ? `built-in decoder ×${l.workers}` : "browser's decoder"}: ${int(l.frames)} frames, ${fps.toFixed(0)} fps, ${l.chunks} chunk${l.chunks === 1 ? '' : 's'}${looks}${over}${l.failed ? `, gave up: ${l.failed}` : ''}`;
+    // (set aside by the rebalancing: the other lanes would finish every chunk in reach sooner)
+    const aside = l.aside > 500 ? `, set aside ${secs(l.aside)}${l.fps ? ` (it decoded ${l.fps.toFixed(0)} fps)` : ''}` : '';
+    return `${l.kind === 'built-in' ? `built-in decoder ×${l.workers}` : "browser's decoder"}: ${int(l.frames)} frames, ${fps.toFixed(0)} fps, ${l.chunks} chunk${l.chunks === 1 ? '' : 's'}${looks}${over}${aside}${l.failed ? `, gave up: ${l.failed}` : ''}`;
   });
   const looks = h.order === 'triage' ? `, early looks at ${h.looks.length} of the ${h.hot.length} likeliest to flash` : '';
-  return [`chunked: ${h.chunks} chunks of about ${h.chunkS} s, detected in file order${looks}; at most ${bytes(h.peak)} of pictures held (${bytes(h.budget)} allowed)`, ...lanes];
+  const balance = h.rebalanced ? `; each chunk to the lane that would finish it first${h.grown ? `, the built-in decoder grown by ${h.grown} worker${h.grown === 1 ? '' : 's'} for the lanes set aside` : ''}` : '';
+  return [`chunked: ${h.chunks} chunks of about ${h.chunkS} s, detected in file order${looks}${balance}; at most ${bytes(h.peak)} of pictures held (${bytes(h.budget)} allowed)`, ...lanes];
 }
 
 /** The usual time between keyframes (the median, s), or null: how far apart a decoder can start. */
@@ -158,7 +189,7 @@ export function debugReport({ version, state, profile, gpu, segments, hybrid = n
   if (s) lines.push(...block('Scan', scanLines(s, m && m.fps)));
   // (the check of an export is a scan of its own, of the exported file)
   if (state.lastVerify) lines.push(...block('Verify', scanLines(state.lastVerify, m && m.fps)));
-  lines.push(...block('Jobs', jobs.map((j) => `${clock(j.at)} ${j.name}: ${secs(j.ms)} ${j.outcome}${j.hidden > 500 ? ` (${secs(j.hidden)} of it out of sight)` : ''}`)));
+  lines.push(...block('Jobs', jobs.flatMap((j) => [`${clock(j.at)} ${j.name}: ${secs(j.ms)} ${j.outcome}${j.hidden > 500 ? ` (${secs(j.hidden)} of it out of sight)` : ''}`, stepLine(j)])));
   const job = state.job;
   if (job) lines.push(...block('Running', [`${job.name}: ${secs(performance.now() - (job.t0 || performance.now()))} so far, ${job.pct || 0}% done (the report of it comes when it ends)`]));
   if (state.project) {
