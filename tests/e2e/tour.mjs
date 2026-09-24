@@ -136,6 +136,30 @@ try {
   assert(/^Fixing a section/.test(again.count) && !(await page.evaluate(() => document.body.classList.contains('guide-open'))), 'the guide closes and the section part runs again: ' + again.count);
   await page.keyboard.press('Escape');
   await page.waitForFunction(() => !document.querySelector('.tour'), null, { timeout: 5000 });
+
+  // the guide over a video lists every part of the screen, and each one's
+  // "show me" lights it up with its card (the switches a section shows only
+  // when it needs them say they are not on screen)
+  results.parts = [];
+  const partIds = await page.evaluate(() => [...document.querySelectorAll('#guideParts .show-part')].map((b) => b.dataset.part));
+  assert(partIds.length >= 20, 'the guide lists the parts of the screen: ' + partIds);
+  for (const id of partIds) {
+    await page.click('#btnHome');
+    await page.waitForFunction(() => document.body.classList.contains('guide-open'), null, { timeout: 5000 });
+    const before = await page.textContent('#toast');
+    await page.click(`#guideParts .show-part[data-part="${id}"]`);
+    await page.waitForFunction((t) => document.querySelector('.tour-card') || document.querySelector('#toast').textContent !== t, before, { timeout: 5000 });
+    const card = await tourNow(page);
+    results.parts.push({ id, title: card && card.title, guide: await page.evaluate(() => document.body.classList.contains('guide-open')) });
+    if (card) {
+      assert(!results.parts[results.parts.length - 1].guide, `"${id}": the guide makes way for the part`);
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => !document.querySelector('.tour'), null, { timeout: 5000 });
+    } else await page.keyboard.press('Escape');
+  }
+  const unseen = results.parts.filter((p) => !p.title).map((p) => p.id);
+  console.log('the screen, part by part:', results.parts.map((p) => p.title || `(${p.id}: not on screen)`).join(' · '));
+  assert(unseen.join() === 'soften,blend', 'every part of the screen lights up but the switches this section does not need: ' + unseen);
   await ctx.close();
 
   // --- back after an update ----------------------------------------------------------

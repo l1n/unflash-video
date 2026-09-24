@@ -68,8 +68,12 @@ running, no dialog open, no click or key in the last moment), and each
 comes once. After an update, each change with something to see gets a
 short tour of its own, the first time you are where it is, and a *show
 me* beside it in What's new. **Take the tour**, in the guide, runs the
-part for where you are again. `?tour=0` turns the tours off; a browser
-driven by a test gets none unless it asks with `?tour=1`.
+part for where you are again. With a video open, the guide also lists
+every part of the screen (the header's controls, the timeline, the
+sections, the chart, the player, and each part of a section's page) with a
+line on what it does and a *show me* that lights it up, and the keys.
+`?tour=0` turns the tours off; a browser driven by a test gets none unless
+it asks with `?tour=1`.
 
 **Locally:** open `web/` from any static web server over `http://localhost`
 or `https://` (WebGPU and WebCodecs need a secure context):
@@ -789,7 +793,10 @@ requires every frame of the exported file to decode as its source did.
 `tests/e2e/tour.mjs` walks the guided tour as a first visitor and as one
 back after an update: every step lights something on screen with its card
 in view beside it, each part waits until its place is on screen and
-nothing is running, comes once, and holds back the page's own keys.
+nothing is running, comes once, and holds back the page's own keys; and
+with a section open, every part of the screen the guide lists lights up
+from its *show me* (but the switches a section shows only when it needs
+them).
 `tests/e2e/busy.mjs` clicks Scan and opens another video while a scan
 runs (both turned away, the scan finishes whole), and watches the page's
 long tasks during a chunked scan whose detector is slowed down, so that

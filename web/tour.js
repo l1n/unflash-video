@@ -88,6 +88,8 @@ export class Tour {
     this.spot = el.querySelector('.tour-spot');
     this.card = el.querySelector('.tour-card');
     this.arrow = el.querySelector('.tour-arrow');
+    // (a single card has nothing to skip: done closes it)
+    el.querySelector('.tour-skip').classList.toggle('hidden', this.steps.length === 1);
     el.querySelector('.tour-skip').addEventListener('click', () => this.end('skipped'));
     el.querySelector('.tour-back').addEventListener('click', () => this.back());
     el.querySelector('.tour-next').addEventListener('click', () => this.next());

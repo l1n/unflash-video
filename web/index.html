@@ -251,6 +251,23 @@
     <h1>Unflash</h1>
     <p class="lead">Finds the flashing and the stripe patterns in a video that can trigger seizures, and helps you take them out without wrecking the footage. It all runs in this browser: nothing is uploaded.</p>
     <p class="tour-offer"><button id="btnTour" class="small primary">Take the tour</button><span>a minute's walk round the page</span></p>
+    <div id="guideScreen" class="guide-screen">
+      <h2>The screen, part by part</h2>
+      <div id="guideParts"></div>
+      <h3>Keys</h3>
+      <table class="keys">
+        <tr><td><kbd>R</kbd> <kbd>F</kbd></td><td>remove the selected frames: the frame before (R) or after (F) shows in their place</td></tr>
+        <tr><td><kbd>E</kbd></td><td>hold a frame on screen a second</td></tr>
+        <tr><td><kbd>K</kbd></td><td>keep: the suggestions leave it alone</td></tr>
+        <tr><td><kbd>B</kbd></td><td>blend with the frames either side</td></tr>
+        <tr><td><kbd>U</kbd></td><td>take every mark off (the same key again takes that one off)</td></tr>
+        <tr><td><kbd>Z</kbd>, double-click</td><td>the frame at full size</td></tr>
+        <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>step through the frames (with Shift, ten at a time)</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>undo; with Shift (or <kbd>Ctrl</kbd>+<kbd>Y</kbd>), redo</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>A</kbd></td><td>in the frames, select them all</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>close the full-size frame or this guide; clear the selection</td></tr>
+      </table>
+    </div>
     <ol class="steps">
       <li><b>Open a video</b>, or drop one on the page. It is scanned, and a numbered <i>section</i> goes round each problem.</li>
       <li><b>Fix each section</b>: mark frames, or let a <b>Suggest</b> button make a first pass. Every change is checked as you make it.</li>

@@ -26,7 +26,7 @@ export const TOURS = {
       { target: 'table.clips', placement: 'top', title: 'Or try a test clip', html: 'No video to hand? Each of these short clips has a known problem in it. <b>open</b> loads one straight in.' },
       { target: '#profileSel', title: 'What counts as a problem', html: 'The default flags WCAG failures, and also extended flashes and stripe patterns: WCAG lets those through, but they still affect some viewers. <i>Exact WCAG only</i> and <i>Stricter than WCAG</i> are the other two.' },
       { target: () => document.querySelector('#autoToggle') && document.querySelector('#autoToggle').closest('label'), title: 'Auto-fix', html: 'Tick this and a video is fixed unattended as soon as it opens: scanned, every problem fixed, exported and checked. Treat what it makes as a starting point: fixing by hand gives better results.' },
-      { target: '#btnHome', title: 'The guide', html: "Everything explained step by step, and this tour again. <b>What's new</b>, beside it, lists every change, and anything new gets a short tour of its own." },
+      { target: '#btnHome', title: 'The guide', html: "Everything explained: with a video open, every part of the screen, each with a <b>show me</b>, and the keys; and this tour again. <b>What's new</b>, beside it, lists every change, and anything new gets a short tour of its own." },
     ],
   },
   video: {
@@ -85,6 +85,65 @@ export const TOURS = {
     steps: [{ target: '#btnHome', title: 'A guided tour', html: 'Like this one. The guide has the whole tour whenever you want it, and anything new gets a short tour of its own the first time you are where it is.' }],
   },
 };
+
+/** The element a part of the screen lives in (its group, its label). */
+const around = (sel, up) => () => {
+  const el = document.querySelector(sel);
+  return el && el.closest(up);
+};
+
+/**
+ * The screen, part by part: the guide's list when a video is open, each
+ * part with a "show me" that lights it up with its card. `short` is the
+ * line in the list and the card both.
+ */
+export const PARTS = [
+  {
+    group: 'Along the top',
+    context: 'video',
+    parts: [
+      { id: 'open', target: 'label.filebtn.primary', name: 'Open video…', short: 'a video from your disk (MP4, MOV, MKV or WebM), or drop one anywhere on the page.' },
+      { id: 'scan', target: '#btnScan', name: 'Scan', short: 'every frame through the detector; a numbered section goes round each problem it finds.' },
+      { id: 'profile', target: '#profileSel', name: 'Profile', short: 'what counts as a problem: WCAG failures and extended flashes and stripes (the default), <i>Exact WCAG only</i>, or <i>Stricter than WCAG</i>.' },
+      { id: 'auto', target: around('#autoToggle', 'label'), name: 'Auto-fix', short: 'ticked, a video is fixed unattended as it opens: scanned, every problem fixed, exported and verified.' },
+      { id: 'live', target: around('#liveToggle', 'label'), name: 'Live monitor', short: 'a meter over the player: how much of the picture is flashing, frame by frame.' },
+      { id: 'export', target: '#btnExport', name: 'Export…', short: 'writes the fixed video (only the stretches round the sections are re-encoded), and verifies it.' },
+      { id: 'project', target: '#btnProject', name: 'Project…', short: 'the sections and marks to a file and back. They are kept in this browser as you work, too.' },
+      { id: 'alerts', target: '#btnAlerts', name: 'Alerts', short: 'a sound or a notification when a long job ends.' },
+      { id: 'debug', target: '#btnDebug', name: 'debug info', short: 'at the bottom: this browser, the video and each job, as text to paste when you ask for help.' },
+    ],
+  },
+  {
+    group: 'The whole video',
+    context: 'video',
+    parts: [
+      { id: 'timeline', target: '#timelineWrap', name: 'Timeline', short: 'what the scan found along the video (orange: flashes, magenta: red flashes, teal: stripes) and the numbered sections. Click to go there; drag across an empty stretch, or type times at the end, to add a section.' },
+      { id: 'sections', target: '#sections', placement: 'right', name: 'Sections', short: 'the whole video, then each section and where it stands: unsafe, passes, extended flash, stripes, re-check. Prepare, check or delete them all at once.' },
+      { id: 'chart', target: '.chart-box', name: 'Chart', short: 'how much of the picture flashes around the playhead: bars above the limit (the dashed line), the blue line at the limit rate, the brightness, stripes. 10 s to all of it; point at it for the numbers, click to play from there.' },
+      { id: 'player', target: '#playerBox', name: 'Player', short: 'a section with your marks, as the export will have it (the menu above it: the original, or the whole video), dimmed and small to start with; the sound is off until you turn it on.' },
+    ],
+  },
+  {
+    group: 'A section',
+    context: 'section',
+    parts: [
+      { id: 'verdict', target: '#wsVerdict', name: 'Verdict', short: 'passes, fails, or passes WCAG with extended flashes or stripes left; checked again at every change, with the video either side of it.' },
+      { id: 'range', target: '.range-edit', name: 'Range', short: "the section's start and end (apply range); beside it, re-prepare and delete." },
+      { id: 'findings', target: '#wsFindings', name: 'What still fails', short: 'each problem left, its frames and times, a button to select them, and what fixes it.' },
+      { id: 'suggest', target: around('#btnSuggestLight', '.group'), name: 'Suggest', short: 'a first pass: keep light, keep dark, fewest removals, blend frames, reduce FPS; with selection only, on the selected frames alone. Look at what it did.' },
+      { id: 'check', target: around('#btnCheck', '.group'), name: 'Check', short: 'auto-check checks every change as you make it (Check safety does it by hand); beside it, undo, redo and clear all marks.' },
+      { id: 'grid', target: '#frameGrid', placement: 'top', name: 'Frames', short: 'every frame: click one, shift-click a run, ctrl-click one more, Esc to clear; S to XL for bigger thumbnails.' },
+      { id: 'marks', target: '.grid-actions', name: 'Marks', short: 'R removes the selected frames (the frame before shows in their place), F the same with the frame after, E holds a frame a second, K keeps it from the suggestions, B blends it with its neighbours; the same key again takes the mark off, U every mark.' },
+      { id: 'legend', target: '.legend', name: 'The colours', short: "what the grid's outlines and badges mean: removed, held, keep, blended, in a flash, in a red flash, in an extended flash, stripes, softened, selected." },
+      { id: 'viewer', target: '#btnViewFrame', name: 'A frame at full size', short: 'double-click a frame, or Z: decoded from the file, to read a subtitle; ← → step through, and the mark keys work there too.' },
+      { id: 'soften', target: '#softenWrap', name: 'Soften stripes', short: 'there when the section has stripes: blurs them just enough, and only where they are.' },
+      { id: 'blend', target: '#blendWrap', name: 'Blend strength', short: 'there when frames are blended: how far.' },
+    ],
+  },
+];
+for (const g of PARTS) {
+  for (const p of g.parts) TOURS[`part:${p.id}`] = { label: g.group, context: g.context, steps: [{ target: p.target, placement: p.placement, title: p.name, html: p.short.replace(/^./, (c) => c.toUpperCase()) }] };
+}
 
 const KEY = 'unflash:tours';
 
@@ -188,6 +247,14 @@ export class TourGuide {
     delete this.state.done[id];
     if (!this.timer) this.timer = setInterval(() => this.poll(), 700);
     return false;
+  }
+
+  /** By hand, from the guide: part `id` of the screen lit up now, if it is on screen (true). */
+  showPart(id) {
+    const t = TOURS[`part:${id}`];
+    if (!t || !this.where(true)[t.context] || !t.steps.some(stepShowable)) return false;
+    this.show([`part:${id}`], { byHand: true });
+    return true;
   }
 
   /** The getting-started part for where the page is now, by hand. */

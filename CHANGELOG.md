@@ -10,6 +10,10 @@ compares that time with the visitor's last visit, so write it for every
 line. Say what someone using the app will see; leave out tests and
 internals. -->
 
+## 2026-09-24
+
+- <!-- 00:10 --> **The guide explains the main screen.** With a video open, the guide lists every part of the screen, from the controls along the top to each part of a section's page, with a line on what it does and a *show me* that lights it up on the page; and the keys, in a table.
+
 ## 2026-09-23
 
 - <!-- 23:54 --> **An export is still there after a reload.** Where exports are written to the browser's own storage (Firefox; Chrome asks where to save them instead), opening the same video again after reloading the page brings its export back, ready to download or verify: it used to be deleted just then. **verify a saved file…**, in the export dialog, checks a file you saved earlier without exporting again. And a video picked again, straight after, opens again.

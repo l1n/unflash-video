@@ -14,7 +14,7 @@ import { SectionSound } from './sound.js';
 import { FrameViewer } from './viewer.js';
 import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notifyState, systemNotify, titleProgress, titleMark } from './alerts.js';
 import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay, escapeHtml } from './changes.js';
-import { TourGuide, TOURS } from './tours.js';
+import { TourGuide, TOURS, PARTS } from './tours.js';
 import { watchPage, noteError, noteJob, noteFileName, debugReport } from './debug.js';
 
 const $ = (id) => document.getElementById(id);
@@ -433,6 +433,15 @@ function wireTours() {
   window.addEventListener('keydown', () => (input.at = performance.now()), true);
   window.addEventListener('wheel', () => (input.at = performance.now()), { capture: true, passive: true });
   $('btnTour').addEventListener('click', () => tourGuide.gettingStarted());
+  // the guide's list of the screen's parts, each with its "show me"
+  $('guideParts').innerHTML = PARTS.map((g) => `<h3>${g.group}</h3><ul>${g.parts.map((p) => `<li><b>${p.name}</b>: ${p.short}<button class="small show-part" data-part="${p.id}" title="Light this part up on the page">show me</button></li>`).join('')}</ul>`).join('');
+  $('guideParts').addEventListener('click', (e) => {
+    const b = e.target.closest('.show-part');
+    if (!b || tourGuide.showPart(b.dataset.part)) return;
+    const g = PARTS.find((x) => x.parts.some((p) => p.id === b.dataset.part));
+    const part = g.parts.find((p) => p.id === b.dataset.part);
+    toast(g.context === 'section' && !(currentSection() && currentSection().prepared) ? `${part.name} is part of a section: open one (in the list on the left) and it is there.` : `${part.name} is not on screen just now.`, 5000);
+  });
   // "show me" beside a change in What's new
   for (const box of [$('newsList'), $('changesList')]) {
     box.addEventListener('click', (e) => {
