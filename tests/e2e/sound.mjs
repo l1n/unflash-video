@@ -5,7 +5,11 @@
 // (VP9 + a 440 Hz tone in Opus) gets one E mark and is exported, and the
 // exported file's sound is decoded and must be silent exactly while the held
 // frame waits, and nowhere else. The section player's sound, turned on,
-// must have the same silence and keep to the pictures' clock.
+// must have the same silence, keep to the pictures' clock and reach the
+// speakers (the browser as it comes: sound only after a click); its button
+// says "sound on" only while there is sound to be had: at ½× it plays at
+// 1× only, and where the browser holds its audio back or can't decode the
+// sound, the button says so.
 //   node tests/e2e/sound.mjs
 import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
@@ -74,7 +78,7 @@ const { srv, port } = await serve(WEB);
 const browser = await chromium.launch({
   headless: true,
   channel: 'chromium',
-  args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--autoplay-policy=no-user-gesture-required'],
+  args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader'],
 });
 const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
 const errors = [];
@@ -216,9 +220,34 @@ try {
   // --- the section player's sound: off to start with; on, the same silence ---------
   assert((await page.getAttribute('#btnPreviewSound', 'aria-pressed')) === 'false', 'the section player starts without sound');
   await page.click('#btnPreviewSound');
-  assert((await page.getAttribute('#btnPreviewSound', 'aria-pressed')) === 'true', 'the sound button turns it on');
-  await page.evaluate(() => window.__unflash.playSection(0));
+  assert((await page.getAttribute('#btnPreviewSound', 'aria-pressed')) === 'true' && (await page.textContent('#btnPreviewSound')) === 'sound on', 'the sound button turns it on');
+  // at ½× there is none (it plays at 1× only), and the button says so
+  await page.selectOption('#previewSpeed', '0.5');
+  assert((await page.textContent('#btnPreviewSound')) === 'sound at 1× only', 'slowed, the button says the sound plays at 1× only: ' + (await page.textContent('#btnPreviewSound')));
+  await page.selectOption('#previewSpeed', '1');
+  // what reaches the speakers, from here on
+  await page.evaluate(() => {
+    const s = window.__unflash.sectionSound;
+    s.tap = s.ctx.createAnalyser();
+    s.tap.fftSize = 2048;
+    s.out.connect(s.tap);
+  });
+  await page.click('#btnPreviewPlay');
   await page.waitForFunction(() => window.__unflash.sectionSound.log.length > 0, null, { timeout: 60000 });
+  results.heard = await page.evaluate(async () => {
+    const s = window.__unflash.sectionSound;
+    const buf = new Float32Array(s.tap.fftSize);
+    let peak = 0;
+    for (let k = 0; k < 30; k++) {
+      s.tap.getFloatTimeDomainData(buf);
+      for (const x of buf) peak = Math.max(peak, Math.abs(x));
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    return { peak, output: s.ctx.state, button: document.querySelector('#btnPreviewSound').textContent, report: window.__unflash.debugReport().split('\n').find((l) => /section player's sound/.test(l)) || '' };
+  });
+  console.log('heard:', JSON.stringify(results.heard));
+  assert(results.heard.output === 'running' && results.heard.peak > 0.05, `the sound reaches the speakers: ${JSON.stringify(results.heard)}`);
+  assert(results.heard.button === 'sound on' && /section player's sound: on \(audio output running\)/.test(results.heard.report), 'the button and the debug report say it is on: ' + JSON.stringify(results.heard));
   results.player = await page.evaluate(async () => {
     const s = window.__unflash.sectionSound;
     const w = await s.windows.get(0);
@@ -251,6 +280,43 @@ try {
   await page.evaluate(() => window.__unflash.sectionPlayer.stop());
   await page.click('#btnPreviewSound');
   assert((await page.getAttribute('#btnPreviewSound', 'aria-pressed')) === 'false', 'and the button turns it off again');
+
+  // --- no sound to be had: the button says so, and why ------------------------
+  // (a browser whose audio never starts, as with nothing to play it on, and
+  // that can't decode the sound)
+  const quiet = await (await browser.newContext({ viewport: { width: 1400, height: 1000 } })).newPage();
+  await quiet.addInitScript(() => {
+    const Real = window.AudioContext;
+    window.AudioContext = class extends Real {
+      constructor(o) {
+        super(o);
+        this.suspend();
+      }
+      resume() {
+        return new Promise(() => {});
+      }
+    };
+    AudioDecoder.isConfigSupported = async (cfg) => ({ supported: false, config: cfg });
+  });
+  quiet.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+  await quiet.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0&tour=0`);
+  await quiet.waitForFunction(() => window.__unflash && window.__unflash.changes, null, { timeout: 60000 });
+  await quiet.setInputFiles('#fileInput', path.join(MEDIA, 'flash.webm'));
+  await quiet.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash.webm') && !window.__unflash.state.job, null, { timeout: 60000 });
+  await quiet.click('#btnScan');
+  await quiet.waitForFunction(() => window.__unflash.state.project.scan && !window.__unflash.state.job, null, { timeout: 300000 });
+  await quiet.click('#sectionList .sec-item');
+  await quiet.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent) && !window.__unflash.state.job, null, { timeout: 180000 });
+  await quiet.click('#btnPreviewSound');
+  await quiet.waitForFunction(() => document.querySelector('#btnPreviewSound').textContent === 'sound held back', null, { timeout: 10000 });
+  assert(/hasn't started the sound/.test(await quiet.getAttribute('#btnPreviewSound', 'title')), 'held back, the button says the browser has not started the sound');
+  await quiet.click('#btnPreviewPlay');
+  await quiet.waitForFunction(() => document.querySelector('#btnPreviewSound').textContent === 'no sound', null, { timeout: 30000 });
+  results.undecodable = await quiet.evaluate(() => ({ title: document.querySelector('#btnPreviewSound').title, toast: document.querySelector('#toast').textContent, report: window.__unflash.debugReport().split('\n').find((l) => /section player's sound/.test(l)) || '' }));
+  console.log('no sound:', JSON.stringify(results.undecodable));
+  assert(/can't decode this video's sound \(Opus, opus\)/.test(results.undecodable.title) && /^No sound: this browser can't decode/.test(results.undecodable.toast), "where the sound can't be decoded, the button and a note say so: " + JSON.stringify(results.undecodable));
+  assert(/section player's sound: none: this browser can't decode/.test(results.undecodable.report), 'and so does the debug report: ' + results.undecodable.report);
+  await quiet.close();
 
   if (errors.length) throw new Error('page errors:\n' + errors.join('\n'));
   console.log('SOUND OK');

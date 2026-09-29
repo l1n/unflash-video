@@ -411,6 +411,58 @@ export class Demo {
     return this.page.waitForFunction(fn, arg, { timeout, polling: 100 });
   }
 
+  /**
+   * From now on, record what the section player's sound plays (it must be
+   * on: its audio exists once "sound off" has been clicked), as the film's
+   * sound (a scene with `sound`). Each block of it keeps the moment it was
+   * heard, on the clock the film's pictures keep.
+   */
+  async recordSound() {
+    await this.eval(async () => {
+      const s = window.__unflash.sectionSound;
+      const ctx = s.ctx;
+      const code = "registerProcessor('demo-tap', class extends AudioWorkletProcessor { process(inputs) { const i = inputs[0]; if (i.length) this.port.postMessage({ t: currentTime, ch: i.map((c) => c.slice()) }); return true; } });";
+      await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
+      const tap = new AudioWorkletNode(ctx, 'demo-tap', { channelCount: 2, channelCountMode: 'explicit', channelInterpretation: 'speakers' });
+      // (it has to reach the speakers to be run, and must add nothing to them)
+      const mute = ctx.createGain();
+      mute.gain.value = 0;
+      tap.connect(mute);
+      mute.connect(ctx.destination);
+      s.out.connect(tap);
+      // a sample played at context time T is heard at ms (T - ctx0 + lat) after perf0, as sound.js reckons
+      const rec = { rate: ctx.sampleRate, blocks: [], lat: ctx.outputLatency || ctx.baseLatency || 0, perf0: performance.now(), ctx0: ctx.currentTime };
+      tap.port.onmessage = (e) => rec.blocks.push(e.data);
+      window.__demoSound = rec;
+    });
+  }
+
+  /** The sound recorded (recordSound), as 16-bit stereo: `{ rate, at (s since 1970, when its first sample is heard), pcm }`, or null. */
+  async recordedSound() {
+    const got = await this.eval(async () => {
+      const rec = window.__demoSound;
+      if (!rec || !rec.blocks.length) return null;
+      const blocks = rec.blocks.slice().sort((a, b) => a.t - b.t);
+      const t0 = blocks[0].t;
+      const last = blocks[blocks.length - 1];
+      const n = Math.round((last.t - t0) * rec.rate) + last.ch[0].length;
+      const pcm = new Int16Array(n * 2);
+      for (const b of blocks) {
+        const o = Math.round((b.t - t0) * rec.rate);
+        for (let j = 0; j < b.ch[0].length && o + j < n; j++) {
+          for (let c = 0; c < 2; c++) pcm[(o + j) * 2 + c] = Math.max(-32768, Math.min(32767, Math.round((b.ch[c] || b.ch[0])[j] * 32767)));
+        }
+      }
+      const url = await new Promise((r) => {
+        const f = new FileReader();
+        f.onload = () => r(f.result);
+        f.readAsDataURL(new Blob([pcm.buffer]));
+      });
+      return { rate: rec.rate, at: (performance.timeOrigin + rec.perf0 + (t0 - rec.ctx0 + rec.lat) * 1000) / 1000, data: url.slice(url.indexOf(',') + 1) };
+    });
+    return got && { rate: got.rate, at: got.at, pcm: Buffer.from(got.data, 'base64') };
+  }
+
   /** Until no job runs. */
   async idle(timeout = 300000) {
     await this.until(() => !window.__unflash.state.job && document.querySelector('#jobbar').classList.contains('hidden') && !(window.__unflash.state.auto && window.__unflash.state.auto.running), null, timeout);
@@ -788,13 +840,21 @@ function encode(name, parts) {
   const out = (ext) => path.join(OUT, `${name}.${ext}`);
   const inputs = lists.flatMap((l) => ['-f', 'concat', '-safe', '0', '-i', l]);
   const graph = parts.length === 1 ? ['-vf', `fps=${FPS},format=yuv420p`] : ['-filter_complex', `${parts.map((_, k) => `[${k}]fps=${FPS}[v${k}]`).join(';')};${parts.map((_, k) => `[v${k}]`).join('')}vstack=inputs=${parts.length},format=yuv420p`];
-  const common = [...inputs, ...graph, '-an'];
+  const sound = parts.length === 1 && parts[0].sound;
+  let audio = ['-an'];
+  if (sound) {
+    const ms = Math.round(sound.offset * 1000);
+    const place = ms >= 0 ? `adelay=${ms}|${ms}` : `atrim=start=${(-ms / 1000).toFixed(3)},asetpts=PTS-STARTPTS`;
+    inputs.push('-f', 's16le', '-ar', String(sound.rate), '-ac', '2', '-i', sound.file);
+    audio = ['-map', '0:v', '-map', `${lists.length}:a`, '-af', `${place},apad,atrim=end=${(total / 1000).toFixed(3)}`, '-c:a', 'libopus', '-b:a', '48k'];
+  }
+  const common = [...inputs, ...graph, ...audio];
   ffmpeg([...common, '-c:v', 'libvpx-vp9', '-crf', '33', '-b:v', '0', '-deadline', 'good', '-cpu-used', '1', '-row-mt', '1', out('webm')]);
   // the poster: the last picture
   const last = path.join(dir, 'last.png');
   ffmpeg(['-sseof', '-0.1', '-i', out('webm'), '-update', '1', last]);
   ffmpeg(['-i', last, '-c:v', 'libwebp', '-quality', '85', '-compression_level', '6', out('webp')]);
-  return { files: { webm: out('webm'), webp: out('webp') }, seconds: total / 1000, pictures: parts.reduce((a, p) => a + p.pictures.length, 0) };
+  return { files: { webm: out('webm'), webp: out('webp') }, seconds: total / 1000, pictures: parts.reduce((a, p) => a + p.pictures.length, 0), sound: !!sound };
 }
 
 /**
@@ -884,7 +944,18 @@ async function film(browsers, port, scene, part = {}) {
     await sleep(scene.hold === undefined ? 2200 : scene.hold);
     await f.stop();
     if (errors.length) throw new Error('page errors: ' + errors.join('; '));
-    return cutOut(path.join(WORK, scene.name, `part${part.k || 0}`), f, size);
+    const dir = path.join(WORK, scene.name, `part${part.k || 0}`);
+    const cut = cutOut(dir, f, size);
+    if (scene.sound) {
+      // (a film with its sound is filmed at its own pace throughout: no stretch sped up)
+      if (f.fast.length) throw new Error('a film with sound has no faster stretches');
+      const sound = await d.recordedSound();
+      if (!sound) throw new Error('the scene was to record its sound, and nothing played');
+      const file = path.join(dir, 'sound.s16');
+      fs.writeFileSync(file, sound.pcm);
+      cut.sound = { file, rate: sound.rate, offset: sound.at - Math.min(f.t0, f.frames[0].t) };
+    }
+    return cut;
   } catch (e) {
     // (what the page looked like when it went wrong)
     const shot = path.join(WORK, `${scene.name}-failed.png`);
@@ -951,7 +1022,7 @@ try {
       // (the pictures it was made from go, unless asked to stay)
       if (!process.env.WHATSNEW_KEEP) for (const f of fs.readdirSync(path.join(WORK, scene.name))) if (!f.endsWith('.png')) fs.rmSync(path.join(WORK, scene.name, f), { recursive: true, force: true });
       const sha = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
-      manifest[scene.name] = { w: SIZE.width, h: SIZE.height, seconds: +made.seconds.toFixed(1), alt: scene.alt, sha256: sha(made.files.webm), checked: { profile: 'strict', frames: checked.frames, violations: 0 } };
+      manifest[scene.name] = { w: SIZE.width, h: SIZE.height, seconds: +made.seconds.toFixed(1), alt: scene.alt, ...(made.sound ? { sound: true } : {}), sha256: sha(made.files.webm), checked: { profile: 'strict', frames: checked.frames, violations: 0 } };
       fs.writeFileSync(MANIFEST, JSON.stringify(Object.fromEntries(Object.entries(manifest).sort(([a], [b]) => a.localeCompare(b))), null, 1) + '\n');
     } catch (e) {
       console.error(`${scene.name}: FAILED: ${e.stack || e}`);

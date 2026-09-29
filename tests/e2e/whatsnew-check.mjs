@@ -3,8 +3,9 @@
 // (`shot:NAME`) that whatsnew-scenes.mjs has a scene for; shots.json
 // describes it; its files are in web/whatsnew/ and are the very files
 // Unflash scanned under its strictest profile and found nothing in (their
-// checksums are the ones whatsnew.mjs wrote down after the scan); and
-// nothing else is there.
+// checksums are the ones whatsnew.mjs wrote down after the scan); a film
+// has sound when its scene records it, and only then; and nothing else is
+// there.
 //   node tests/e2e/whatsnew-check.mjs
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -17,7 +18,7 @@ const DIR = path.join(ROOT, 'web/whatsnew');
 const problems = [];
 const log = parseChangelog(fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8'));
 const shots = JSON.parse(fs.readFileSync(path.join(DIR, 'shots.json'), 'utf8'));
-const scenes = new Set(SCENES.map((s) => s.name));
+const scenes = new Map(SCENES.map((s) => [s.name, s]));
 const sha = (f) => crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
 
 const named = [];
@@ -38,6 +39,8 @@ for (const day of log.days) {
     }
     if (!(s.w > 0 && s.h > 0 && s.seconds > 0 && s.alt && s.alt.length > 20)) problems.push(`${it.shot}: shots.json lacks its size, length or description`);
     if (!(s.checked && s.checked.profile === 'strict' && s.checked.violations === 0 && s.checked.frames > 0)) problems.push(`${it.shot}: not checked under the strict profile, or not clean: ${JSON.stringify(s.checked)}`);
+    const scene = scenes.get(it.shot);
+    if (scene && !!scene.sound !== !!s.sound) problems.push(`${it.shot}: its scene ${scene.sound ? 'records its sound' : 'has no sound'}, and its film ${s.sound ? 'has sound' : 'has none'}: film it again`);
     for (const ext of ['webm', 'webp']) {
       const f = path.join(DIR, `${it.shot}.${ext}`);
       if (!fs.existsSync(f)) problems.push(`${it.shot}.${ext} is missing`);

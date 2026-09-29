@@ -70,6 +70,12 @@ export function noteJob(name) {
   return ended;
 }
 
+/** The section player's sound, as its button says it, and the browser's audio output. */
+function soundLine({ status, failed, output }) {
+  const what = { off: 'off', on: 'on', slow: 'on (at 1× only; the player is slowed)', failed: `none: ${failed}`, held: 'held back by the browser' }[status] || status;
+  return `${what}${output ? ` (audio output ${output})` : ''}`;
+}
+
 /** Where a job of more than two seconds spent its time: the steps that took a good part of it, in order. */
 function stepLine(j) {
   if (j.ms < 2000 || !j.steps || j.steps.length < 2) return null;
@@ -143,7 +149,7 @@ function scanLines(s, fps0) {
  * the WebGPU adapter's description of itself (`gpu`), the number of
  * segments a scan would use and the hybrid plan it would follow (if any).
  */
-export function debugReport({ version, state, profile, gpu, segments, hybrid = null }) {
+export function debugReport({ version, state, profile, gpu, segments, hybrid = null, sound = null }) {
   const lines = [`Unflash debug info · ${new Date().toISOString().slice(0, 19).replace('T', ' ')} UTC`];
   lines.push(...block('App', [`${version} · ${location.origin}${location.pathname}${location.search ? ` · options ${location.search}` : ''}`]));
   const nav = navigator;
@@ -180,7 +186,7 @@ export function debugReport({ version, state, profile, gpu, segments, hybrid = n
     lines.push(
       ...block('Video', [
         [`${String(m.format || '?').toUpperCase()}${m.info && m.info.fragmented ? ' (fragmented)' : ''}`, v.codec, `${m.width}×${m.height}`, `${(m.fps || 0).toFixed(3)} fps`, duration(m.duration || 0), `${int(m.frameCount || 0)} frames`, m.file ? bytes(m.file.size) : null, keyframeSpacing(m) ? `keyframes every ${keyframeSpacing(m).toFixed(1)} s` : null].filter(Boolean).join(' · '),
-        a ? `audio ${a.codec}${a.copyable === false ? ' (re-encoded on export)' : ''}` : 'no audio',
+        a ? `audio ${a.codec}${a.copyable === false ? ' (re-encoded on export)' : ''}${sound ? ` · the section player's sound: ${soundLine(sound)}` : ''}` : 'no audio',
         state.decode && !state.decode.supported && state.decode.reason ? `cannot decode: ${state.decode.reason}` : null,
       ])
     );

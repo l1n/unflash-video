@@ -4,8 +4,10 @@
 // then plays (`play`, filmed) with the pointer, clicks, keys and camera of
 // `d` (whatsnew.mjs Demo). `alt` says what it shows, for whoever cannot see
 // it. `browser: 'firefox'` films it in Firefox; `race` films it once for
-// each of its parts (a query each), one above the other. Nothing in a
-// scene may flash: what plays in a player is a section once it passes.
+// each of its parts (a query each), one above the other; `sound` puts in
+// the film what the section player's sound played (d.recordSound, once the
+// sound is on). Nothing in a scene may flash: what plays in a player is a
+// section once it passes.
 
 /** The CPU detector (SwiftShader's WebGPU, in the test browser, leaves the page no time to draw), no tour. */
 const Q = 'cpu=1&tour=0';
@@ -427,13 +429,27 @@ export const SCENES = [
   },
   {
     name: 'section-sound',
-    alt: 'Sound off, under the section player, is clicked and lights up as sound on; the fixed section plays with its sound.',
+    sound: true,
+    alt: "Sound off, under the section player, is clicked and lights up as sound on; the fixed section plays with its sound (a steady tone), silent for the second a held frame waits. The film has its sound: turn it on with the film's own sound button.",
     query: Q,
-    setup: (d) => playable(d),
+    async setup(d) {
+      // (a clip whose sound this browser decodes: Opus)
+      await playable(d, 'flash.webm');
+      // a frame before the flashing, held a second (E)
+      await d.page.click('#frameGrid .frame:nth-child(13)');
+      await d.page.click('#wsTitle');
+      await d.page.keyboard.press('e');
+      await d.until(() => (window.__unflash.currentSection().edits[12] || {}).extended);
+      // (none selected: ▶ plays from the section's start, not from the held frame)
+      await d.page.keyboard.press('Escape');
+      await d.verdict(/^passes/);
+      await hideToast(d);
+    },
     view: (d) => d.around('#playerBox', 8),
     async play(d) {
       await d.click('#btnPreviewSound', { after: 900 });
-      await d.click('#btnPreviewPlay', { after: 3500 });
+      await d.recordSound();
+      await d.click('#btnPreviewPlay', { after: 4200 });
       await d.click('#btnPreviewStop');
     },
   },
@@ -1143,6 +1159,37 @@ export const SCENES = [
     ],
     // (1080p H.264: decoding is the slow part here, as on the PC; at 640×360 both wait on the detector)
     setup: (d) => d.open('flash-1080p.mp4'),
+  },
+
+  // ======== 2026-09-29 ==========================================================
+  {
+    name: 'sound-says',
+    alt: "The section player's sound is turned on: at ½× its button says sound at 1× only; back at 1×, ▶ plays the section, and in this browser, which can't decode AAC, the button says no sound, and a note says which sound it couldn't decode.",
+    query: Q,
+    // (an MP4 with AAC sound, which the test browser can't decode)
+    setup: (d) => playable(d),
+    view: (d) => d.around('#playerBox', 8),
+    async play(d) {
+      await d.click('#btnPreviewSound', { after: 900 });
+      await d.point('#previewSpeed', { ms: 500 });
+      await d.eval(() => {
+        const s = document.querySelector('#previewSpeed');
+        s.value = '0.5';
+        s.dispatchEvent(new Event('change'));
+      });
+      await d.wait(1600);
+      await d.eval(() => {
+        const s = document.querySelector('#previewSpeed');
+        s.value = '1';
+        s.dispatchEvent(new Event('change'));
+      });
+      await d.wait(900);
+      await d.click('#btnPreviewPlay');
+      await d.until(() => document.querySelector('#btnPreviewSound').textContent === 'no sound' && !document.querySelector('#toast').classList.contains('hidden'), null, 30000);
+      // the note that says which sound it is, beside the button
+      await d.camera(await d.around(['#btnPreviewSound', '#toast'], 12), { ms: 800 });
+      await d.wait(3200);
+    },
   },
 
   // ======== What's new itself, films and all: filmed last ======================

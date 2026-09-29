@@ -77,7 +77,7 @@ export const TOURS = {
   'section-sound': {
     label: 'New',
     context: 'section',
-    steps: [{ target: '#btnPreviewSound', title: 'Sound in the section player', html: 'Off to start with. Held frames are silent while they wait, as they are in the export.' }],
+    steps: [{ target: '#btnPreviewSound', title: 'Sound in the section player', html: 'Off to start with. Held frames are silent while they wait, as they are in the export. It plays at 1× only, and when there is no sound to be had the button says so, and why.' }],
   },
   tours: {
     label: 'New',

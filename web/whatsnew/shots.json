@@ -566,12 +566,13 @@
  "section-sound": {
   "w": 720,
   "h": 450,
-  "seconds": 9.9,
-  "alt": "Sound off, under the section player, is clicked and lights up as sound on; the fixed section plays with its sound.",
-  "sha256": "a21aa831483bc2ceb527f58d7e6be84b60ae09e1a5512269f117564b0ed96f9b",
+  "seconds": 10.8,
+  "alt": "Sound off, under the section player, is clicked and lights up as sound on; the fixed section plays with its sound (a steady tone), silent for the second a held frame waits. The film has its sound: turn it on with the film's own sound button.",
+  "sound": true,
+  "sha256": "f0f7b58ad17bc3c3e7ba522f940d7555834b6e69c9bd0bfa2a12b803761206d0",
   "checked": {
    "profile": "strict",
-   "frames": 298,
+   "frames": 325,
    "violations": 0
   }
  },
@@ -608,6 +609,18 @@
   "checked": {
    "profile": "strict",
    "frames": 829,
+   "violations": 0
+  }
+ },
+ "sound-says": {
+  "w": 720,
+  "h": 450,
+  "seconds": 11.8,
+  "alt": "The section player's sound is turned on: at ½× its button says sound at 1× only; back at 1×, ▶ plays the section, and in this browser, which can't decode AAC, the button says no sound, and a note says which sound it couldn't decode.",
+  "sha256": "2151f3766837783b2371e707847e0deafb093990cbafa7d1f7e44225e53ba4a2",
+  "checked": {
+   "profile": "strict",
+   "frames": 354,
    "violations": 0
   }
  },

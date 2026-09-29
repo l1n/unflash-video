@@ -175,6 +175,27 @@ export function sourceTime(holds, x) {
 
 /** Seconds of sound the section player decodes at a time. */
 const WINDOW_S = 20;
+/** How long the browser has to start the sound's output before it counts as held back (ms). */
+const WAKE_MS = 1500;
+/** What a codec string is called where people see it. */
+const CODEC_NAMES = [
+  [/^mp4a\.40\./, 'AAC'],
+  [/^(mp3|mp4a\.6b|mp4a\.69|mp4a\.40\.34)$/i, 'MP3'],
+  [/^opus$/, 'Opus'],
+  [/^vorbis$/, 'Vorbis'],
+  [/^flac$/, 'FLAC'],
+  [/^alac$/, 'ALAC'],
+  [/^(ac-3|mp4a\.a5)$/i, 'AC-3 (Dolby Digital)'],
+  [/^(ec-3|mp4a\.a6)$/i, 'E-AC-3 (Dolby Digital Plus)'],
+  [/^(dtsc|dtse|dtsh|dtsl|dts)/, 'DTS'],
+  [/^pcm-/, 'PCM'],
+];
+
+/** `codec` as people know it, with the codec string: "AAC, mp4a.40.2". */
+export function codecName(codec) {
+  const hit = CODEC_NAMES.find(([re]) => re.test(codec || ''));
+  return hit ? `${hit[1]}, ${codec}` : codec || 'unknown';
+}
 /** How long before a window ends the next is decoded. */
 const AHEAD_S = 8;
 
@@ -200,21 +221,61 @@ export class SectionSound {
     this.clock = null; // the section moment the sound plays at a wall time, while it plays
     this.speed = 1;
     this.failed = null; // why there is no sound, once known
+    this.heldBack = false; // the browser has not started the sound's output
     this.onFail = null;
+    this.onChange = null; // the status changed
     this.log = []; // what was started when (tests)
   }
 
   /** Turn the sound on or off (on: from a click). */
   async setOn(on) {
     this.on = on;
-    if (!on) return this.halt();
+    if (!on) {
+      this.heldBack = false;
+      this.changed();
+      return this.halt();
+    }
     if (!this.ctx) {
       this.ctx = new AudioContext({ latencyHint: 'playback' });
       this.out = this.ctx.createGain();
       this.out.connect(this.ctx.destination);
+      this.ctx.addEventListener('statechange', () => {
+        if (this.ctx.state === 'running') this.heldBack = false;
+        this.changed();
+      });
     }
-    if (this.ctx.state !== 'running') await this.ctx.resume().catch(() => {});
+    await this.wake();
     if (this.base) this.follow(this.base, this.speed);
+  }
+
+  /**
+   * Start the sound's output where the browser has not (from a click:
+   * browsers start sound only after one). One that has not started within
+   * WAKE_MS is held back (a browser waiting for a click, or with nothing to
+   * play sound on): the next click tries again.
+   */
+  async wake() {
+    const ctx = this.ctx;
+    if (!ctx || ctx.state === 'running' || ctx.state === 'closed') return;
+    const started = await Promise.race([ctx.resume().then(() => true, () => false), new Promise((r) => setTimeout(() => r(false), WAKE_MS))]);
+    this.heldBack = !started && ctx.state !== 'running';
+    this.changed();
+  }
+
+  /**
+   * How the sound stands: 'off'; 'failed' (`failed` says why: a codec
+   * this browser can't decode, say); 'held' (the browser has not started
+   * its output); or 'on'.
+   */
+  status() {
+    if (!this.on) return 'off';
+    if (this.failed) return 'failed';
+    if (this.heldBack && this.ctx && this.ctx.state !== 'running') return 'held';
+    return 'on';
+  }
+
+  changed() {
+    if (this.onChange) this.onChange();
   }
 
   /**
@@ -356,7 +417,7 @@ export class SectionSound {
     const desc = movie.dx.track_description(at.index);
     const cfg = { codec: at.codec, sampleRate: at.sample_rate, numberOfChannels: at.channels };
     if (desc.length) cfg.description = desc;
-    if (!(await AudioDecoder.isConfigSupported(cfg).catch(() => ({ supported: false }))).supported) throw new Error(`this browser can't decode the sound (${at.codec})`);
+    if (typeof AudioDecoder === 'undefined' || !(await AudioDecoder.isConfigSupported(cfg).catch(() => ({ supported: false }))).supported) throw new Error(`this browser can't decode this video's sound (${codecName(at.codec)})`);
     const reader = movie.reader ? movie.reader.fork() : null;
     const prefix = at.prefix && at.prefix.length ? Uint8Array.from(at.prefix) : null;
     let buffer = null;

@@ -139,17 +139,19 @@ export function renderDay(day, isNew = () => false, brief = false, shots = {}) {
 /**
  * A change's film: muted, looped, loaded only once it is in view; its last
  * picture stands for it until then (and for good, for whoever asks their
- * system for less motion). A click plays or pauses it.
+ * system for less motion). A click plays or pauses it. A film with sound
+ * has a button of its own for it, off to start with.
  */
 function shotHtml(name, shots) {
   const s = name && shots[name];
   if (!s) return '';
   const src = SHOTS + encodeURIComponent(name);
   const alt = escapeHtml(s.alt || '').replace(/"/g, '&quot;');
+  const sound = s.sound ? `<button type="button" class="small shot-sound" aria-pressed="false" title="Hear the film's sound (it starts again from the beginning)">sound off</button>` : '';
   return (
-    `<figure class="shot"><button type="button" class="shot-film paused" style="max-width:${s.w + 14}px" aria-label="${alt} (a film: play or pause it)" title="${alt}">` +
+    `<figure class="shot${s.sound ? ' has-sound' : ''}" style="max-width:${s.w + 14}px"><button type="button" class="shot-film paused" aria-label="${alt} (a film: play or pause it)" title="${alt}">` +
     `<video muted loop playsinline preload="none" poster="${src}.webp" width="${s.w}" height="${s.h}">` +
-    `<source src="${src}.webm" type="video/webm"></video></button></figure>`
+    `<source src="${src}.webm" type="video/webm"></video></button>${sound}</figure>`
   );
 }
 
@@ -170,7 +172,9 @@ export function briefly(html, film = '') {
 /**
  * Play the films in `box` while they are in view (at least half of one)
  * and pause them when they leave; with less motion asked for, none plays
- * by itself. A click plays or pauses one, and it stays as it was left.
+ * by itself. A click plays or pauses one, and it stays as it was left. A
+ * film's sound button plays it from the beginning with its sound (the
+ * others' sound goes off), or turns the sound off again.
  */
 export function wireShots(box, root = null) {
   // (the films the box held before are gone, and what watched them with them)
@@ -183,6 +187,11 @@ export function wireShots(box, root = null) {
     const p = v.play();
     if (p && p.catch) p.catch(() => {});
   };
+  const hush = (k) => {
+    k.setAttribute('aria-pressed', 'false');
+    k.textContent = 'sound off';
+    k.parentNode.querySelector('video').muted = true;
+  };
   for (const b of films) {
     const v = b.querySelector('video');
     v.addEventListener('play', () => b.classList.remove('paused'));
@@ -191,6 +200,18 @@ export function wireShots(box, root = null) {
       b.dataset.chosen = v.paused ? 'play' : 'pause';
       if (v.paused) play(v);
       else v.pause();
+    });
+    const k = b.parentNode.querySelector('.shot-sound');
+    if (!k) continue;
+    k.addEventListener('click', () => {
+      if (!v.muted) return hush(k);
+      for (const other of box.querySelectorAll('.shot-sound[aria-pressed="true"]')) hush(other);
+      k.setAttribute('aria-pressed', 'true');
+      k.textContent = 'sound on';
+      v.muted = false;
+      v.currentTime = 0;
+      b.dataset.chosen = 'play';
+      play(v);
     });
   }
   if (typeof IntersectionObserver === 'undefined') return;

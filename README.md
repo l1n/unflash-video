@@ -64,7 +64,9 @@ every core already busy either way, gets a film of what changed instead)
 and named the same way
 (`<!-- 16:00 tour:findings shot:findings -->`): What's new plays it, muted
 and looped, while it is in view, and shows its last picture instead to
-whoever asks their system for less motion. The scenes are in
+whoever asks their system for less motion. A film of the section player's
+sound has that sound in it, recorded as the player played it, and a
+button of its own to hear it. The scenes are in
 [`tests/e2e/whatsnew-scenes.mjs`](tests/e2e/whatsnew-scenes.mjs);
 `node tests/e2e/whatsnew.mjs NAME` films one into `web/whatsnew/` (VP9,
 and its last picture), and scans the film with Unflash under its
@@ -192,7 +194,13 @@ Files it reads:
    video), and with **live monitor** on shows the check's meter for that
    frame, which falls back slowly rather than following every flash. It starts small
    and dimmed (S, M, L and *dim* above it), and the line above it says what
-   is on screen and whether that passes.
+   is on screen and whether that passes. Its sound is off to start with
+   (*sound off* under it): on, it plays at 1×, with held frames silent as
+   in the export, and the button says *sound on* only while there is sound
+   to be had: *sound at 1× only* while the player is slowed, *no sound*
+   where the browser can't decode the video's sound (a note says which
+   sound it is), *sound held back* where the browser hasn't started its
+   audio (▶ tries again).
 6. A stripe pattern can't be removed a frame at a time; tick **soften
    stripes** and the frames that carry it are blurred just enough to take
    it under the threshold, in the check, the player and the export alike.

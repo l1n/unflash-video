@@ -507,7 +507,7 @@ function closeChanges() {
 // ---- debug info --------------------------------------------------------------------
 
 function makeDebugReport() {
-  return debugReport({ version: wasm.version(), state, profile, gpu: gpuAdapter, segments: scanSegments(), hybrid: state.env ? hybridPlan(state.movie, state.env.feeder) : null });
+  return debugReport({ version: wasm.version(), state, profile, gpu: gpuAdapter, segments: scanSegments(), hybrid: state.env ? hybridPlan(state.movie, state.env.feeder) : null, sound: { status: soundStatus(), failed: sectionSound.failed, output: sectionSound.ctx ? sectionSound.ctx.state : null } });
 }
 
 /** The report in a dialog, copied to the clipboard at once where the browser lets it. */
@@ -719,6 +719,7 @@ async function openFile(file) {
     loadPlayer(file, movie);
     $('videoInfo').textContent = `${file.name} · ${movie.width}×${movie.height} · ${movie.fps.toFixed(2)} fps · ${fmt(movie.duration)} · ${movie.video.codec}${movie.audio ? ' + ' + movie.audio.codec : ''}`;
     sectionSound.failed = null;
+    state.player.soundFailSaid = null;
     renderSoundButton();
     $('btnScan').disabled = !state.decode.supported;
     $('btnScan').title = state.decode.supported ? 'Decode every frame with WebCodecs and run the detector over it' : `Scanning needs WebCodecs: ${state.decode.reason}`;
@@ -1439,22 +1440,36 @@ function soundSetting() {
   }
 }
 
-/** The section player's sound button, as the sound stands. */
+/**
+ * How the section player's sound stands, as its button says it: 'off',
+ * 'on', 'slow' (on, but it plays at 1× only), 'failed' (no sound:
+ * sectionSound.failed says why) or 'held' (the browser has not started it).
+ * On from before, and not yet started, counts as on: the next ▶ starts it.
+ */
+function soundStatus() {
+  if (!soundSetting()) return 'off';
+  const s = sectionSound.on ? sectionSound.status() : 'on';
+  return s === 'on' && (parseFloat($('previewSpeed').value) || 1) !== 1 ? 'slow' : s;
+}
+
+/** The section player's sound button: it says "sound on" only when the sound can play. */
 function renderSoundButton() {
   const b = $('btnPreviewSound');
   const movie = state.movie;
   b.classList.toggle('hidden', !movie || !movie.audio);
   if (!movie || !movie.audio) return;
-  const on = soundSetting();
-  const slow = (parseFloat($('previewSpeed').value) || 1) !== 1;
-  b.setAttribute('aria-pressed', on ? 'true' : 'false');
-  b.textContent = on ? 'sound on' : 'sound off';
-  b.title = sectionSound.failed
-    ? `No sound: ${sectionSound.failed}.`
-    : on
-      ? `The section's sound plays along${slow ? ' at 1× (not at this speed)' : ''}; held frames are silent while they wait, as in the export. Click to turn it off.`
-      : "Play the section's sound too (off to start with). Held frames are silent while they wait, as in the export.";
-  b.classList.toggle('warn', !!sectionSound.failed && on);
+  const s = soundStatus();
+  const held = 'Held frames are silent while they wait, as in the export.';
+  b.setAttribute('aria-pressed', s === 'off' ? 'false' : 'true');
+  b.textContent = { off: 'sound off', on: 'sound on', slow: 'sound at 1× only', failed: 'no sound', held: 'sound held back' }[s];
+  b.title = {
+    off: `Play the section's sound too (off to start with). ${held}`,
+    on: `The section's sound plays along. ${held} Click to turn it off.`,
+    slow: `The section's sound plays at 1× only: at this speed there is none. ${held} Click to turn it off.`,
+    failed: `No sound: ${sectionSound.failed}. Click to turn it off.`,
+    held: "The browser hasn't started the sound: it may be waiting for a click on the page, or have nothing to play it on (no speakers or headphones it can use). ▶ tries again. Click to turn it off.",
+  }[s];
+  b.classList.toggle('warn', s === 'failed' || s === 'held');
 }
 
 function wirePlayer() {
@@ -1489,8 +1504,11 @@ function wirePlayer() {
   for (const b of document.querySelectorAll('.size-switch [data-size]')) b.addEventListener('click', () => setPlayerSize(b.dataset.size));
   $('playerSource').addEventListener('change', () => setPlayerSource($('playerSource').value));
   $('btnPreviewPlay').addEventListener('click', () => {
-    // sound starts only after a click: this one, when it was left on
-    if (soundSetting() && !sectionSound.on) sectionSound.setOn(true);
+    // sound starts only after a click: this one, when it was left on (or the browser held it back)
+    if (soundSetting()) {
+      if (!sectionSound.on) sectionSound.setOn(true);
+      else sectionSound.wake();
+    }
     if (sectionPlayer.active && !sectionPlayer.run.once && !sectionPlayer.paused) sectionPlayer.pause();
     else if (sectionPlayer.paused) sectionPlayer.resume();
     else playSection(state.selection.size ? Math.min(...state.selection) : 0);
@@ -1504,7 +1522,14 @@ function wirePlayer() {
     sectionPlayer.setSpeed(parseFloat($('previewSpeed').value) || 1);
     renderSoundButton();
   });
-  sectionSound.onFail = () => renderSoundButton();
+  sectionSound.onChange = () => renderSoundButton();
+  // (why there is no sound, said once for each reason, and on the button for as long as it lasts)
+  sectionSound.onFail = (why) => {
+    renderSoundButton();
+    if (why === state.player.soundFailSaid) return;
+    state.player.soundFailSaid = why;
+    toast(`No sound: ${why}.`, 9000);
+  };
 }
 
 /** Whether a section can be played: it needs the frame times its preparation records. */

@@ -14,6 +14,10 @@ it with node tests/e2e/whatsnew.mjs NAME (it is checked for flashing
 there, and tests/e2e/whatsnew-check.mjs holds every change to having
 one); tour:ID names a tour of it (web/tours.js). -->
 
+## 2026-09-29
+
+- <!-- 19:42 shot:sound-says --> **The section player's sound button says when there is no sound, and why.** It said *sound on* however things stood. Now it says *sound at 1× only* while the player is slowed (the sound plays at normal speed only), *no sound* where the browser can't decode the video's sound (a note says which sound that is), and *sound held back* where the browser hasn't started its sound (the next ▶ tries again); the debug report says which. What's new's film of the section player's sound has its sound now: turn it on with *sound off* on the film.
+
 ## 2026-09-24
 
 - <!-- 03:39 shot:films --> **Every change here comes with a film**: a few seconds of Unflash doing what the change says, filmed in the app itself (in Firefox for most of the changes about Firefox, and, for some of the ones about speed, the old way above the new, timed). A film plays, muted, while it is in view, and a click pauses it; if your system asks for less motion, it shows its last picture until you click it. Before it went in, each film was scanned by Unflash under its strictest profile, and none of them flashes.

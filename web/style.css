@@ -116,7 +116,8 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 #preview.dim { filter: brightness(.45); }
 .preview-bar { display: flex; gap: 8px; align-items: center; margin-top: 5px; flex-wrap: wrap; font-size: 11px; color: var(--fg2); }
 .sound-toggle[aria-pressed="true"] { background: var(--lit); color: var(--lit-fg); border-color: var(--lit); }
-.sound-toggle.warn { border-color: var(--warn); color: var(--warn); }
+/* (no sound to be had: not lit, whatever the setting, so that it doesn't read as on) */
+.sound-toggle.warn, .sound-toggle.warn[aria-pressed="true"] { background: var(--bg2); border-color: var(--warn); color: var(--warn); }
 .preview-info { font-variant-numeric: tabular-nums; }
 .player-head { display: flex; gap: 10px; align-items: center; color: var(--fg2); font-size: 11px; margin-bottom: 4px; }
 .player-wrap { position: relative; background: black; border: 1px solid var(--line); }
@@ -328,7 +329,10 @@ table.clips td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); 
 .changes-list details.brief[open] { display: block; color: var(--fg2); }
 .changes-list details.brief[open] > summary { color: var(--fg); }
 /* a change's film: at most its own size, its last picture until it plays */
-.changes-list .shot { margin: 6px 0 12px; }
+.changes-list .shot { margin: 6px 0 12px; position: relative; }
+/* a film's own sound button, on its mat beside the word "film" */
+.shot-sound { position: absolute; left: 34px; top: 1px; padding: 0 6px; font-size: 10px; line-height: 14px; letter-spacing: .04em; }
+.shot-sound[aria-pressed="true"] { background: var(--lit); color: var(--lit-fg); border-color: var(--lit); }
 /* (on a mat, with a label, so that it reads as a picture of the page and not the page) */
 .shot-film { display: block; position: relative; width: 100%; padding: 18px 5px 5px; background: var(--bg3); border: 1px solid var(--line2); cursor: pointer; }
 .shot-film:hover, .shot-film:active { background: var(--bg3); border-color: var(--fg2); color: inherit; }

@@ -886,6 +886,18 @@ try {
     await p.waitForFunction(() => !document.querySelector('#changesList .shot-film video').paused, null, { timeout: 30000 });
     await p.click('#changesList .shot-film');
     assert(await p.evaluate(() => document.querySelector('#changesList .shot-film video').paused), 'and a click pauses it again');
+    // a film with sound: its own button plays it with its sound (it has some), and turns it off again
+    const k = '#changesList .shot.has-sound .shot-sound';
+    assert(await p.$(k), 'a film with sound has a sound button');
+    await p.$eval(k, (b) => b.scrollIntoView({ block: 'center' }));
+    await p.click(k);
+    await p.waitForFunction((sel) => {
+      const b = document.querySelector(sel);
+      const v = b.parentNode.querySelector('video');
+      return !v.paused && !v.muted && b.getAttribute('aria-pressed') === 'true' && b.textContent === 'sound on' && v.webkitAudioDecodedByteCount > 0;
+    }, k, { timeout: 30000 });
+    await p.click(k);
+    assert(await p.$eval(k, (b) => b.parentNode.querySelector('video').muted && b.getAttribute('aria-pressed') === 'false' && b.textContent === 'sound off'), 'and the button turns the sound off again');
     await p.emulateMedia({ reducedMotion: 'no-preference' });
     await p.keyboard.press('Escape');
     s = await shown();
