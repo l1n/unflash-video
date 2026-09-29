@@ -234,14 +234,15 @@ try {
   });
   await page.click('#btnPreviewPlay');
   await page.waitForFunction(() => window.__unflash.sectionSound.log.length > 0, null, { timeout: 60000 });
+  // (listening for up to 4 s: the section holds a frame early on, and the second of silence under it may come first)
   results.heard = await page.evaluate(async () => {
     const s = window.__unflash.sectionSound;
     const buf = new Float32Array(s.tap.fftSize);
     let peak = 0;
-    for (let k = 0; k < 30; k++) {
+    for (let k = 0; k < 100 && peak <= 0.05; k++) {
       s.tap.getFloatTimeDomainData(buf);
       for (const x of buf) peak = Math.max(peak, Math.abs(x));
-      await new Promise((r) => setTimeout(r, 30));
+      await new Promise((r) => setTimeout(r, 40));
     }
     return { peak, output: s.ctx.state, button: document.querySelector('#btnPreviewSound').textContent, report: window.__unflash.debugReport().split('\n').find((l) => /section player's sound/.test(l)) || '' };
   });
