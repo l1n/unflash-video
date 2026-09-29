@@ -224,6 +224,32 @@ can go do something else during a long render.
 The video player is dimmed by default, and says whether what you're about to
 watch has passed the detector. The dimming is a courtesy, not a safeguard.
 
+## Extras
+
+### Bad Apple, but it's a Barnsley fern
+
+`extras/fern_apple.py` redraws a video as a meadow of
+[Barnsley ferns](https://en.wikipedia.org/wiki/Barnsley_fern). Every fern is
+grown from the four affine maps of the original IFS. Each patch of the
+picture gets a fern sized to its brightness, like halftone dots, and the
+ferns sway in a breeze that moves across the frame. High-contrast
+silhouette footage reads best, which is why it's named after Bad Apple.
+
+```
+python extras/fern_apple.py "Bad Apple.mp4" -o fern_apple.mp4
+python extras/fern_apple.py --demo -o fern_demo.mp4
+```
+
+The source's audio is copied over unchanged. `--demo` needs no source: it
+draws its own apple, which rolls in, spins and splits in two. `--cell` sets
+the fern size (smaller means a sharper picture but blurrier ferns),
+`--invert` grows ferns in the dark areas instead, and `--sway 0` stills the
+air. `--help` lists the rest.
+
+The ferns keep every flash in the source, and Bad Apple has some fast
+black-and-white inversions. Open the result in Unflash and scan it before
+you share it.
+
 ## Limitations
 
 - **This reduces risk. It does not guarantee safety.** Passing the detector
