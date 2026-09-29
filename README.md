@@ -237,9 +237,13 @@ frame.
    with the edits applied, several at a time; every GOP no section touches
    is copied from the source as it is, and so is the audio, unless frames
    are held (**E**): then the sound is re-encoded with a second of silence
-   under each held frame (see below). **Verify** re-scans the exported
-   file with the same detector; **verify a saved file…** does the same
-   for a file you saved earlier.
+   under each held frame (see below). *Save as* names the file (the
+   video's name with *.unflashed* to start with); Chrome and Edge then ask
+   which folder, and in Firefox, which has no save dialog for pages,
+   turning on *Always ask you where to save files* in its settings has
+   *Download* ask for the folder (the dialog says so). **Verify** re-scans
+   the exported file with the same detector; **verify a saved file…** does
+   the same for a file you saved earlier.
 
 **Auto-fix** (tick it in the header; off unless you do) does steps 2 to 7
 unattended: it softens stripes, tries the fewest removals (which end by

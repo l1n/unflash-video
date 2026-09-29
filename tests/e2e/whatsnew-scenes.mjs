@@ -1192,6 +1192,31 @@ export const SCENES = [
     },
   },
 
+  {
+    name: 'save-as',
+    browser: 'firefox',
+    alt: "In Firefox, the export dialog: Save as has the video's name with .unflashed, and a new name is typed in its place; under it, how to have Firefox ask which folder to save in (its setting Always ask you where to save files). Export writes the video, and Download offers it under the new name.",
+    query: FQ,
+    async setup(d) {
+      await fixedSection(d);
+      await click(d, '#btnExport');
+      await d.until(() => !document.querySelector('#btnDoExport').disabled && document.querySelector('#exportName').value);
+    },
+    view: (d) => d.around('#exportModal .modal-box', 4),
+    async play(d) {
+      await d.point('#exportName', { ms: 700 });
+      await d.wait(900);
+      await d.type('#exportName', 'my video, safe to watch');
+      await d.press('Tab', { after: 1800 });
+      await d.click('#btnDoExport');
+      await d.started();
+      await d.idle();
+      await d.until(() => !document.querySelector('#exportDownload').classList.contains('hidden') && document.querySelector('#exportDownload').download === 'my video, safe to watch.mp4');
+      await d.point('#exportDownload', { ms: 700 });
+      await d.wait(2000);
+    },
+  },
+
   // ======== What's new itself, films and all: filmed last ======================
   {
     name: 'films',

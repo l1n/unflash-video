@@ -625,6 +625,15 @@ export class Demo {
     await sleep(after);
   }
 
+  /** Click the text field `sel`, clear it and type `text` into it, a key at a time. */
+  async type(sel, text, { after = 500 } = {}) {
+    await this.click(sel, { after: 200 });
+    await this.eval((s) => document.querySelector(s).select(), sel);
+    await sleep(250);
+    await this.page.keyboard.type(text, { delay: 70 });
+    await sleep(after);
+  }
+
   /** A key, shown in the corner as it is pressed ('Control+Z' shows as Ctrl + Z). */
   async press(key, { after = 500, label } = {}) {
     const names = { Control: 'Ctrl', Shift: 'Shift', ArrowLeft: '←', ArrowRight: '→', ArrowUp: '↑', ArrowDown: '↓', Escape: 'Esc' };

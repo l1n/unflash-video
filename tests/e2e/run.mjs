@@ -471,6 +471,12 @@ try {
   results.exportCodecs = await page.$$eval('#exportCodec option', (o) => o.map((x) => x.textContent));
   console.log('encoders:', results.exportCodecs);
   assert(results.exportCodecs.length >= 1, 'an encoder must be available');
+  // what it is saved as: the video's name with .unflashed, or a name typed in, made fit for a file
+  results.exportName = await page.inputValue('#exportName');
+  assert(/\.unflashed\.mp4$/.test(results.exportName) && (await page.textContent('#exportWhere')).length > 20, 'the dialog names the file, and says where it goes: ' + results.exportName);
+  await page.fill('#exportName', ' my: export?/final ');
+  await page.press('#exportName', 'Tab');
+  assert((await page.inputValue('#exportName')) === 'my export final.mp4', 'a name typed in is made fit for a file: ' + (await page.inputValue('#exportName')));
   t0 = Date.now();
   await page.click('#btnDoExport');
   await jobStarted(page);
@@ -498,6 +504,9 @@ try {
     return btoa(s);
   });
   fs.writeFileSync(path.join(OUT, 'exported.mp4'), Buffer.from(exported, 'base64'));
+  // and it downloads under that name
+  const [saved] = await Promise.all([page.waitForEvent('download'), page.click('#exportDownload')]);
+  assert(saved.suggestedFilename() === 'my export final.mp4', 'the export downloads under the name typed: ' + saved.suggestedFilename());
   t0 = Date.now();
   await page.click('#btnVerifyExport');
   await jobStarted(page);

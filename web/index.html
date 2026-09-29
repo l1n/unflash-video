@@ -322,6 +322,8 @@
     <label title="Higher keeps the re-encoded frames closer to the original and makes a bigger file">Quality <input type="range" id="exportQuality" min="1" max="10" value="7"> <span id="exportQualityText">7</span> <span class="hint">(higher: closer to the original, bigger file)</span></label>
     <p id="exportPlan" class="hint"></p>
     <p id="exportSize" class="hint"></p>
+    <label class="export-name" title="The name the export is saved under (an .mp4 file)">Save as <input type="text" id="exportName" spellcheck="false" autocomplete="off"></label>
+    <p id="exportWhere" class="hint"></p>
     <div class="modal-actions">
       <button id="btnDoExport" class="primary">Export</button>
       <button id="btnVerifyExport" disabled>Verify exported file</button>

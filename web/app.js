@@ -625,6 +625,8 @@ async function boot() {
   wireProjectMenu();
   $('btnCloseExport').addEventListener('click', () => $('exportModal').classList.add('hidden'));
   $('btnDoExport').addEventListener('click', doExport);
+  $('exportName').addEventListener('input', () => onExportNameInput(false));
+  $('exportName').addEventListener('change', () => onExportNameInput(true));
   $('btnVerifyExport').addEventListener('click', verifyExport);
   $('verifyFileInput').addEventListener('change', (e) => {
     const f = e.target.files && e.target.files[0];
@@ -695,6 +697,8 @@ async function openFile(file) {
     if (state.movie) state.movie.close();
     const key = projectKey(file);
     forgetExport(exportOwner(key));
+    // (a name typed for the last video's export is not this one's)
+    state.exportFileName = null;
     if (state.project) for (const s of state.project.sections) dropCaches(s);
     state.lastScan = null;
     state.lastVerify = null;
@@ -3445,6 +3449,8 @@ async function openExport() {
     const kept = privateStorageAvailable() && !window.showSaveFilePicker;
     $('exportResult').innerHTML = `<p class="hint">An export stays here, to download or verify, until another video is opened${kept ? ', and comes back with this video after the page is reloaded' : ''}. A file you saved can be checked with <b>verify a saved file…</b>.</p>`;
   }
+  $('exportName').value = chosenExportName();
+  $('exportWhere').textContent = exportWhere();
   $('exportDownload').classList.toggle('hidden', !(state.exportBlob && $('exportDownload').getAttribute('href')));
   $('btnVerifyExport').disabled = !state.exportBlob;
   $('btnVerifyExport').title = state.exportBlob ? 'Scan the exported file again, every frame, with the current profile' : 'Export first (or check a file you saved with "verify a saved file…")';
@@ -3465,13 +3471,57 @@ async function renderExportChoice() {
   $('exportSize').textContent = chosen ? `About ${fmtBytes(need)}. ${window.showSaveFilePicker ? 'You will be asked where to save it.' : privateStorageAvailable() ? "It is written to the browser's private storage on disk and offered for download." : `It is assembled in memory and offered for download${need > memoryExportLimit() ? ', which is more than this browser is likely to hold' : ''}.`}` : '';
 }
 
+/**
+ * Where the export goes, and how to choose the folder: this browser's save
+ * dialog where it has one for pages (Chrome, Edge); elsewhere the download
+ * goes where the browser puts downloads, unless its settings have it ask.
+ */
+function exportWhere() {
+  if (window.showSaveFilePicker) return 'Export asks where to save it, starting from this name.';
+  const ua = navigator.userAgent;
+  if (/Firefox\//.test(ua)) return 'Firefox saves it to your Downloads folder. To choose the folder (and the name) each time, turn on "Always ask you where to save files" in Firefox\'s settings (General, Files and Applications): Download then asks.';
+  if (/Safari\//.test(ua) && !/Chrom(e|ium)\//.test(ua)) return 'Safari saves it to your Downloads folder. To choose the folder each time, set "File download location" to "Ask for each download" in Safari\'s settings (General).';
+  return "It goes where this browser puts downloads; its settings can have it ask where to save each one.";
+}
+
+/** The name the export is saved under: the one typed in the dialog, made fit for a file (an .mp4), or the video's own name with .unflashed. */
+function chosenExportName() {
+  const typed = state.exportFileName;
+  if (!typed || !state.movie) return state.movie ? exportName(state.movie) : '';
+  return typed;
+}
+
+/** `raw` as a file name: no characters a file system refuses, no path, ending in .mp4 (null: nothing left). */
+function cleanExportName(raw) {
+  let n = String(raw || '')
+    .replace(/[\u0000-\u001f<>:"/\\|?*]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^[.\s]+|[.\s]+$/g, '');
+  if (!n) return null;
+  if (!/\.mp4$/i.test(n)) n = n.replace(/\.(mov|m4v|mkv|webm|avi|mp4v)$/i, '') + '.mp4';
+  return n;
+}
+
+/** The name typed in the export dialog: kept for this video, and on an export already made. */
+function onExportNameInput(final) {
+  const clean = cleanExportName($('exportName').value);
+  state.exportFileName = clean;
+  const name = chosenExportName();
+  if (final) $('exportName').value = name;
+  const a = $('exportDownload');
+  if (a.getAttribute('href')) a.download = name;
+}
+
 async function doExport() {
   if (busy('export')) return;
   const movie = state.movie;
   const quality = +$('exportQuality').value;
   // a file of the user's choosing where the browser has the dialog, private
   // storage on disk where it has that, memory as the last resort
-  let sinkInfo = await pickSaveSink(exportName(movie));
+  onExportNameInput(true);
+  const name = chosenExportName();
+  let sinkInfo = await pickSaveSink(name);
   if (sinkInfo && sinkInfo.cancelled) return;
   if (!sinkInfo) sinkInfo = await privateFileSink(estimateExportBytes(movie, quality, state.exportPlan), exportOwner(state.project.key));
   $('exportModal').classList.add('hidden');
@@ -3493,7 +3543,7 @@ async function doExport() {
     return;
   }
   await readBackExport(res, sinkInfo);
-  showExportResult(res, exportName(movie));
+  showExportResult(res, name, sinkInfo && !sinkInfo.private && sinkInfo.handle ? sinkInfo.handle.name : null);
   if (res.saved) {
     state.exportBlob = res.saved;
     $('btnVerifyExport').disabled = false;
@@ -3617,9 +3667,9 @@ async function loadProjectFile(f) {
   toast(`Loaded ${f.name}: ${n} section${n === 1 ? '' : 's'}${p.scan ? ' and the scan' : ''}${m.same ? '' : '. It was saved for another copy of this video (its frames match)'}. Sections are prepared again when opened.`, 8000);
 }
 
-/** Show a finished export in the export dialog: what was written, a download link, and the verify button. */
-function showExportResult(res, name) {
-  const lines = [exportSummary(res), ...res.warnings];
+/** Show a finished export in the export dialog: what was written (and, `savedAs`, the file it went to), a download link, and the verify button. */
+function showExportResult(res, name, savedAs = null) {
+  const lines = [exportSummary(res) + (savedAs ? ` Saved as ${escapeHtml(savedAs)}.` : ''), ...res.warnings];
   $('exportResult').innerHTML = lines.map((l) => `<p>${l}</p>`).join('');
   // the dialog offers this export and no earlier one
   const a = $('exportDownload');
@@ -3670,7 +3720,7 @@ async function restoreExport(key, movie) {
   state.exportBlob = found.file;
   const a = $('exportDownload');
   a.href = URL.createObjectURL(found.file);
-  a.download = exportName(movie);
+  a.download = chosenExportName();
   a.classList.remove('hidden');
   $('btnVerifyExport').disabled = false;
   const at = new Date(found.madeAt);

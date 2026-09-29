@@ -527,6 +527,18 @@
    "violations": 0
   }
  },
+ "save-as": {
+  "w": 720,
+  "h": 450,
+  "seconds": 19.5,
+  "alt": "In Firefox, the export dialog: Save as has the video's name with .unflashed, and a new name is typed in its place; under it, how to have Firefox ask which folder to save in (its setting Always ask you where to save files). Export writes the video, and Download offers it under the new name.",
+  "sha256": "4a1267ffe31cd017c338d4d56bde0a539ce93a63640fca59ed9dff48ed2ab719",
+  "checked": {
+   "profile": "strict",
+   "frames": 584,
+   "violations": 0
+  }
+ },
  "scan-parts": {
   "w": 720,
   "h": 450,

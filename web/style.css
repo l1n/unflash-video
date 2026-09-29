@@ -264,6 +264,7 @@ table.clips td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); 
 .modal-box { background: var(--bg2); border: 1px solid var(--line2); padding: 14px 16px; width: min(720px, 92vw); max-height: 90vh; overflow: auto; display: flex; flex-direction: column; gap: 10px; }
 .modal-box h2 { margin: 0; font-size: 13px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
 .modal-box label { display: flex; gap: 8px; align-items: center; }
+.export-name input { flex: 1; max-width: 460px; }
 .modal-actions { display: flex; gap: 8px; align-items: center; }
 .scrollbox { max-height: 30vh; overflow: auto; font-size: 12px; }
 .scrollbox table { border-collapse: collapse; width: 100%; }

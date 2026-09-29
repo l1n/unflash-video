@@ -157,6 +157,12 @@ try {
   results.sectionAfter = await page.$eval('#wsVerdict', (e) => e.textContent);
   console.log('section:', results.sectionBefore, '→ after fewest removals:', results.sectionAfter);
   assert(/^passes/.test(results.sectionAfter), 'fewest removals fixes it: ' + results.sectionAfter);
+  // the export dialog: the file's name, and how to have Firefox ask where to save it (it has no save dialog for pages)
+  await page.click('#btnExport');
+  await page.waitForFunction(() => !document.querySelector('#exportModal').classList.contains('hidden') && document.querySelector('#exportName').value, { timeout: 30000, polling: 100 });
+  results.exportWhere = await page.evaluate(() => ({ name: document.querySelector('#exportName').value, where: document.querySelector('#exportWhere').textContent }));
+  assert(/\.unflashed\.mp4$/.test(results.exportWhere.name) && /Always ask you where to save files/.test(results.exportWhere.where), "in Firefox the export dialog says how to choose the folder: " + JSON.stringify(results.exportWhere));
+  await page.click('#btnCloseExport');
   await page.close();
 
   // --- a scan in chunks: Firefox's lanes made slow, the built-in decoder's idle
