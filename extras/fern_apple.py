@@ -1,19 +1,34 @@
 """Bad Apple, but it's a Barnsley fern.
 
-Redraws a black-and-white video as a halftone meadow of Barnsley ferns: the
-picture is cut into cells, and each cell grows a fern whose size follows the
-brightness underneath it, so the silhouettes read as dark shapes carved out
-of the undergrowth. The ferns sway in a breeze that rolls across the frame.
+Barnsley's fern is an iterated function system: four affine maps, each of
+which shrinks the whole picture into one part of itself, drawn with the
+chaos game (start anywhere, apply a randomly chosen map, plot, repeat). The
+leaf is made of smaller leaves because that is all the maps can make.
+
+This does the same to every frame of a video. The figure in the frame is
+covered with shrunken copies of itself, one affine map per copy: big copies
+inside the shape, smaller ones down its edges. Then the chaos game draws the
+attractor, so each figure is built out of tiny copies of itself, the way the
+fern is built out of ferns. Nothing is drawn per pixel: every dot on screen
+is a chaos-game walker.
+
+Each map shrinks the figure's bounding box rather than the whole frame, so
+the copies are of the figure, not of a mostly empty frame. And a share of the walkers restart somewhere inside the figure on each step
+(Barnsley's "IFS with condensation"), which keeps big shapes solid instead
+of letting them crumble into dust.
+
+The walkers carry on from frame to frame rather than starting over, so the
+figures flow into each other. Whenever the frame is blank (Bad Apple opens
+and closes on black) the maps become Barnsley's own, and the walkers settle
+into the fern.
 
     python extras/fern_apple.py "Bad Apple.mp4" -o fern_apple.mp4
     python extras/fern_apple.py --demo -o fern_demo.mp4
 
-Any video works, but high-contrast silhouette footage reads best. The audio
-of the source is copied across untouched. With --demo no source is needed:
-a procedurally drawn apple rolls, spins and splits in two instead.
-
-Bad Apple has fast black/white inversions in places, and this keeps every one
-of them. Scan the result with Unflash before you share it.
+Whichever of black or white covers less of the frame is drawn as the figure,
+so a black/white inversion doesn't flip the whole screen from dark to lit.
+It can still flash where the source does. Scan the result with Unflash
+before you share it.
 """
 
 import argparse
@@ -27,127 +42,217 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from unflash.ffio import CREATE_NO_WINDOW, FFMPEG, probe  # noqa: E402
 
-# Barnsley's original four maps: (a, b, c, d, e, f, probability)
+# Barnsley's original four maps: (a, b, c, d, e, f, probability),
+# taking (x, y) to (a x + b y + e, c x + d y + f)
 FERN_MAPS = np.array([
     (0.00, 0.00, 0.00, 0.16, 0.0, 0.00, 0.01),   # stem
-    (0.85, 0.04, -0.04, 0.85, 0.0, 1.60, 0.85),  # ever-smaller leaflets
+    (0.85, 0.04, -0.04, 0.85, 0.0, 1.60, 0.85),  # the rest of the fern, smaller
     (0.20, -0.26, 0.23, 0.22, 0.0, 1.60, 0.07),  # largest left leaflet
     (-0.15, 0.28, 0.26, 0.24, 0.0, 0.44, 0.07),  # largest right leaflet
 ])
-FERN_X = (-2.1820, 2.6558)
-FERN_Y = (0.0, 9.9983)
 
-BACKGROUND = np.array([6, 10, 6])
-FROND_DARK = np.array([18, 70, 28])
-FROND_LIGHT = np.array([190, 255, 120])
+# the silhouette is traced on this grid; 2**max depth must divide it
+MASK_SIZE = 128
+BLANK_FRACTION = 0.004  # a figure smaller than this counts as no figure
 
-
-def barnsley_points(n, seed=1):
-    """n points of the fern attractor, by the chaos game. Vectorised by
-    running many independent walkers at once rather than one long walk."""
-    rng = np.random.default_rng(seed)
-    walkers = 4096
-    steps = max(n // walkers, 1) + 20
-    xy = np.zeros((walkers, 2))
-    out = []
-    cum = np.cumsum(FERN_MAPS[:, 6])
-    for i in range(steps):
-        m = FERN_MAPS[np.searchsorted(cum, rng.random(walkers))]
-        x, y = xy[:, 0], xy[:, 1]
-        xy = np.stack([m[:, 0] * x + m[:, 1] * y + m[:, 4],
-                       m[:, 2] * x + m[:, 3] * y + m[:, 5]], axis=1)
-        if i >= 20:  # let each walker settle onto the attractor first
-            out.append(xy)
-    pts = np.concatenate(out)[:n]
-    # normalise: x centred on the stem, y from 0 (root) to 1 (tip)
-    pts[:, 0] /= FERN_Y[1]
-    pts[:, 1] /= FERN_Y[1]
-    return pts
+BACKGROUND = np.array([4, 8, 5])
+FROND_DARK = np.array([20, 90, 35])
+FROND_LIGHT = np.array([205, 255, 140])
 
 
-def rasterize(pts, cw, ch, scale, sway, supersample=6):
-    """One fern glyph, cw x ch, rooted at the bottom middle of the cell.
-    Each pixel is the share of its subpixels the attractor touches, rather
-    than a point density: density piles up at the tip, where every map
-    converges, and would leave the fronds themselves washed out."""
-    x = pts[:, 0] + sway * pts[:, 1] ** 2  # tips bend further than the stem
-    y = pts[:, 1]
-    # the fern's natural width is about half its height; fill the cell's
-    # height and let the width follow
-    px = (0.5 + x * scale * ch / cw) * cw * supersample
-    py = (1.0 - y * scale) * ch * supersample
-    hist, _, _ = np.histogram2d(
-        py, px, bins=(ch * supersample, cw * supersample),
-        range=((0, ch * supersample), (0, cw * supersample)))
-    cover = (hist > 0).reshape(ch, supersample, cw, supersample).mean(axis=(1, 3))
-    return (cover * 255).astype(np.uint8)
+class Maps:
+    """An IFS as arrays: point p goes to mat[i] @ p + off[i] with
+    probability prob[i]. Coordinates are 0..1 across and down the frame."""
+
+    TABLE = 1 << 16
+    condense = None  # (figure cells, probability): see silhouette_maps
+
+    def __init__(self, mat, off, prob):
+        self.mat = np.asarray(mat, np.float32)
+        self.off = np.asarray(off, np.float32)
+        # the silhouette's maps only stretch and shift, which is much cheaper
+        # to apply than a full matrix
+        m = self.mat
+        self.diag = m[:, [0, 1], [0, 1]].copy() if (
+            np.all(m[:, 0, 1] == 0) and np.all(m[:, 1, 0] == 0)) else None
+        # picking a map is a lookup: each map gets table slots in proportion
+        # to its probability (largest remainders, so they add up exactly)
+        p = np.asarray(prob, np.float64)
+        want = p / p.sum() * self.TABLE
+        counts = np.floor(want).astype(np.int64)
+        short = self.TABLE - counts.sum()
+        counts[np.argsort(counts - want)[:short]] += 1
+        self.table = np.repeat(np.arange(len(p), dtype=np.int32), counts)
+
+    def step(self, x, y, rng):
+        if self.condense is not None:
+            cells, p = self.condense
+            hit = np.flatnonzero(rng.random(len(x), np.float32) < p)
+            c = cells[rng.integers(0, len(cells), len(hit))]
+            x, y = x.copy(), y.copy()
+            x[hit] = (c % MASK_SIZE + rng.random(len(hit), np.float32)) / MASK_SIZE
+            y[hit] = (c // MASK_SIZE + rng.random(len(hit), np.float32)) / MASK_SIZE
+        i = self.table[rng.integers(0, self.TABLE, len(x), dtype=np.int32)]
+        ox, oy = self.off[i, 0], self.off[i, 1]
+        if self.diag is not None:
+            return self.diag[i, 0] * x + ox, self.diag[i, 1] * y + oy
+        m = self.mat[i]
+        return (m[:, 0, 0] * x + m[:, 0, 1] * y + ox,
+                m[:, 1, 0] * x + m[:, 1, 1] * y + oy)
 
 
-def build_glyphs(cw, ch, levels, phases, sway):
-    """glyphs[phase, mirror, level] -> (ch, cw) uint8. Level 0 is bare
-    ground; fern area grows linearly with level, like a halftone dot."""
-    # enough points to hit every subpixel the fern covers, several times over
-    pts = barnsley_points(min(3_000_000, 1500 * cw * ch))
-    glyphs = np.zeros((phases, 2, levels, ch, cw), np.uint8)
-    for p in range(phases):
-        s = sway * math.sin(2 * math.pi * p / phases)
-        for k in range(1, levels):
-            glyphs[p, 0, k] = rasterize(pts, cw, ch, math.sqrt(k / (levels - 1)), s)
-    # a mirrored fern leaning into the same breeze is the flip of an unmirrored
-    # one leaning the opposite way, which is the phase half a cycle round
-    for p in range(phases):
-        glyphs[p, 1] = glyphs[(phases - p) % phases, 0, :, :, ::-1]
-    return glyphs
+def fern_maps(aspect, sway):
+    """Barnsley's maps, conjugated into frame coordinates so the fern stands
+    upright in the middle of the frame, 90% of its height. `sway` (radians)
+    turns the main map a little, which bends the whole frond."""
+    h = 0.09  # frame heights per fern unit; the fern is 10 units tall
+    # fern -> frame: u = 0.5 + (x - 0.24) * h / aspect, v = 0.95 - y * h
+    T = np.array([[h / aspect, 0.0], [0.0, -h]])
+    t = np.array([0.5 - 0.24 * h / aspect, 0.95])
+    Ti = np.linalg.inv(T)
+    mats, offs = [], []
+    for k, (a, b, c, d, e, f, _) in enumerate(FERN_MAPS):
+        A = np.array([[a, b], [c, d]])
+        if k == 1 and sway:
+            cs, sn = math.cos(sway), math.sin(sway)
+            A = np.array([[cs, -sn], [sn, cs]]) @ A
+        # frame map = T . fern map . T^-1
+        M = T @ A @ Ti
+        mats.append(M)
+        offs.append(t + T @ np.array([e, f]) - M @ t)
+    return Maps(mats, offs, FERN_MAPS[:, 6])
+
+
+def silhouette_maps(region, max_depth, condense=0.0, min_depth=1):
+    """Cover `region` (MASK_SIZE x MASK_SIZE bool) with quadtree blocks and
+    return the maps that shrink the figure's bounding box into each one, so
+    the figure is made of copies of itself. A block is taken once the
+    figure fills it; at the finest level, once it half fills it. Blocks
+    that aren't well inside the box on both axes are split further, so
+    every map shrinks and the chaos game has something to converge to."""
+    rows, cols = np.nonzero(region.any(axis=1))[0], np.nonzero(region.any(axis=0))[0]
+    if not len(rows):
+        return None
+    bx0, by0 = cols[0] / MASK_SIZE, rows[0] / MASK_SIZE
+    bw, bh = (cols[-1] + 1) / MASK_SIZE - bx0, (rows[-1] + 1) / MASK_SIZE - by0
+    covered = np.zeros_like(region)
+    xs, ys, ss = [], [], []
+    for depth in range(min_depth, max_depth + 1):
+        n = 2 ** depth
+        if 1.0 / n > 0.6 * min(bw, bh):
+            continue
+        b = MASK_SIZE // n
+        frac = region.reshape(n, b, n, b).mean(axis=(1, 3))
+        taken = covered[::b, ::b]
+        need = 0.5 if depth == max_depth else 0.97
+        accept = (frac >= need) & ~taken
+        by, bx = np.nonzero(accept)
+        xs.append(bx / n)
+        ys.append(by / n)
+        ss.append(np.full(len(bx), 1.0 / n))
+        covered |= np.kron(accept, np.ones((b, b), bool))
+    if not sum(len(v) for v in ss):
+        return None
+    x, y, s = np.concatenate(xs), np.concatenate(ys), np.concatenate(ss)
+    sx, sy = s / bw, s / bh
+    mat = np.zeros((len(s), 2, 2))
+    mat[:, 0, 0], mat[:, 1, 1] = sx, sy
+    off = np.stack([x - sx * bx0, y - sy * by0], axis=1)
+    # weight by area, so every copy gets its fair share of walkers
+    maps = Maps(mat, off, s * s)
+    if condense:
+        # Barnsley's "IFS with condensation": some walkers restart anywhere
+        # in the figure, before this step's map shrinks them into a copy.
+        # Without it the figure is only as solid as the fraction of its
+        # box it fills, raised to the power of the depth.
+        maps.condense = (np.flatnonzero(region), condense)
+    return maps
+
+
+class FernRenderer:
+    def __init__(self, width, height, walkers, depth=6, steps=4, condense=0.25,
+                 trail=0.35, glow=2.0, blur=1, seed=1):
+        self.w, self.h = width, height
+        self.depth, self.steps, self.condense = depth, steps, condense
+        self.trail, self.glow, self.blur = trail, glow, blur
+        self.rng = np.random.default_rng(seed)
+        self.x = self.rng.random(walkers, np.float32)
+        self.y = self.rng.random(walkers, np.float32)
+        self.figure_dark = True
+        self.image = np.zeros(width * height, np.float32)
+        self.lut = colour_lut()
+
+    def pick_region(self, gray):
+        """The figure is whichever colour is the minority, with some
+        hysteresis so a frame hovering around half and half doesn't make
+        the figure and the background swap back and forth."""
+        dark = gray < 128
+        share = dark.mean()
+        if share > 0.62:
+            self.figure_dark = False
+        elif share < 0.38:
+            self.figure_dark = True
+        return dark if self.figure_dark else ~dark
+
+    def render(self, gray, frame_no, fps):
+        region = self.pick_region(gray)
+        maps = None
+        if region.mean() >= BLANK_FRACTION:
+            maps = silhouette_maps(region, self.depth, self.condense)
+        if maps is None:
+            sway = 0.035 * math.sin(2 * math.pi * frame_no / (fps * 3.0))
+            maps = fern_maps(self.w / self.h, sway)
+
+        hist = np.zeros(self.w * self.h, np.float32)
+        for k in range(self.steps):
+            self.x, self.y = maps.step(self.x, self.y, self.rng)
+            if k >= self.steps // 2:  # plot only once they've mostly settled
+                ix = np.clip((self.x * self.w).astype(np.int32), 0, self.w - 1)
+                iy = np.clip((self.y * self.h).astype(np.int32), 0, self.h - 1)
+                hist += np.bincount(iy * self.w + ix, minlength=hist.size)
+
+        # scale so the average lit pixel is 1, whatever the figure's size:
+        # a small figure shouldn't glare and a big one shouldn't go dim
+        lit = np.count_nonzero(hist)
+        if lit:
+            hist *= lit / hist.sum()
+        if self.blur:
+            hist = box_blur(hist.reshape(self.h, self.w), self.blur).ravel()
+        self.image = self.image * self.trail + hist * (1 - self.trail)
+        tone = 1.0 - np.exp(-self.image * self.glow)
+        idx = (tone * 255).astype(np.uint8).reshape(self.h, self.w)
+        return self.lut[idx]
+
+
+def box_blur(img, r):
+    """Mean over a (2r+1) square, by running sums along each axis."""
+    k = 2 * r + 1
+    for axis in (0, 1):
+        pad = [(0, 0), (0, 0)]
+        pad[axis] = (r + 1, r)
+        c = np.cumsum(np.pad(img, pad), axis=axis, dtype=np.float32)
+        n = img.shape[axis]
+        img = (np.take(c, range(k, k + n), axis=axis)
+               - np.take(c, range(0, n), axis=axis)) / k
+    return img
 
 
 def colour_lut():
     t = np.linspace(0, 1, 256)[:, None]
-    ramp = FROND_DARK + (FROND_LIGHT - FROND_DARK) * t
+    ramp = FROND_DARK + (FROND_LIGHT - FROND_DARK) * t ** 1.5
     lut = BACKGROUND + (ramp - BACKGROUND) * np.minimum(t * 3, 1)
     return np.clip(lut, 0, 255).astype(np.uint8)
 
 
-class FernRenderer:
-    def __init__(self, cols, rows, cell, levels, phases, sway, invert):
-        self.cols, self.rows = cols, rows
-        self.ch = cell
-        self.cw = max(2, int(round(cell * 0.6 / 2)) * 2)
-        self.levels, self.phases, self.invert = levels, phases, invert
-        self.glyphs = build_glyphs(self.cw, self.ch, levels, phases, sway)
-        self.lut = colour_lut()
-        rng = np.random.default_rng(7)
-        self.mirror = rng.integers(0, 2, (rows, cols))
-        gx, gy = np.meshgrid(np.arange(cols), np.arange(rows))
-        # a gust front travelling left to right, with a little jitter
-        self.wind_offset = gx * 0.35 + gy * 0.08 + rng.random((rows, cols)) * 0.6
-
-    @property
-    def size(self):
-        return self.cols * self.cw, self.rows * self.ch
-
-    def render(self, gray, frame_no):
-        """gray: (rows, cols) uint8, one value per cell -> (H, W, 3) RGB."""
-        v = gray.astype(np.float32) / 255.0
-        if self.invert:
-            v = 1.0 - v
-        level = np.clip(np.rint(v * (self.levels - 1)), 0, self.levels - 1).astype(int)
-        phase = (np.floor(frame_no * 0.25 + self.wind_offset * 2).astype(int)
-                 % self.phases)
-        tiles = self.glyphs[phase, self.mirror, level]  # (rows, cols, ch, cw)
-        img = tiles.transpose(0, 2, 1, 3).reshape(self.rows * self.ch,
-                                                  self.cols * self.cw)
-        return self.lut[img]
-
-
-def demo_frames(cols, rows, fps, seconds=12.0):
-    """A stand-in for Bad Apple: a black apple that rolls in, spins, splits
-    and lets the scene fade to negative. Every change is gradual, so the
-    demo itself has no flashing in it."""
+def demo_frames(fps, aspect, seconds=12.0):
+    """A stand-in for Bad Apple: after a moment of black, a black apple rolls
+    in, spins and splits in two, then the scene fades to negative. Every
+    change is gradual, so the demo itself has no flashing in it."""
     n = int(seconds * fps)
-    aspect = cols / rows * 0.6  # cells are 0.6 as wide as they are tall
-    yy, xx = np.mgrid[0:rows, 0:cols].astype(np.float32)
-    u = (xx / cols - 0.5) * aspect * 2
-    w = (yy / rows - 0.5) * 2
+    size = MASK_SIZE
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+    u = (xx / size - 0.5) * aspect * 2
+    w = (yy / size - 0.5) * 2
 
     def apple(cx, cy, r, angle, half=0):
         cu, cv = u - cx, w - cy
@@ -170,17 +275,19 @@ def demo_frames(cols, rows, fps, seconds=12.0):
     for i in range(n):
         t = i / n
         r = 0.55
-        if t < 0.3:  # roll in from the left
-            k = t / 0.3
+        if t < 0.15:  # a black opening, like Bad Apple's, shows the fern
+            mask = np.ones((size, size), bool)
+        elif t < 0.4:  # roll in from the left
+            k = (t - 0.15) / 0.25
             ease = 1 - (1 - k) ** 3
             cx, ang = -aspect - r + (aspect + r) * ease, -4 * math.pi * (1 - ease)
             mask = apple(cx, 0.1, r, ang)
-        elif t < 0.55:  # bob and spin in place
-            k = (t - 0.3) / 0.25
+        elif t < 0.6:  # bob and spin in place
+            k = (t - 0.4) / 0.2
             mask = apple(0.0, 0.1 - 0.1 * math.sin(k * math.pi * 2),
                          r * (1 + 0.15 * math.sin(k * math.pi)), k * 2 * math.pi)
         else:  # split in two, halves drift apart
-            k = (t - 0.55) / 0.45
+            k = (t - 0.6) / 0.4
             gap = 0.9 * k * k
             mask = apple(-gap, 0.1 + 0.3 * k * k, r, -0.4 * k, half=-1) | \
                    apple(gap, 0.1 + 0.3 * k * k, r, 0.4 * k, half=1)
@@ -191,20 +298,20 @@ def demo_frames(cols, rows, fps, seconds=12.0):
         yield (frame * 255).astype(np.uint8)
 
 
-def source_frames(path, cols, rows):
-    """Decode the source straight down to one grey value per cell."""
+def source_frames(path):
+    """Decode the source straight down to the silhouette-tracing grid."""
     cmd = [FFMPEG, "-v", "error", "-i", path, "-an",
-           "-vf", f"scale={cols}:{rows}:flags=area,format=gray",
+           "-vf", f"scale={MASK_SIZE}:{MASK_SIZE}:flags=area,format=gray",
            "-f", "rawvideo", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             creationflags=CREATE_NO_WINDOW)
-    size = cols * rows
+    size = MASK_SIZE * MASK_SIZE
     try:
         while True:
             buf = proc.stdout.read(size)
             if len(buf) < size:
                 break
-            yield np.frombuffer(buf, np.uint8).reshape(rows, cols)
+            yield np.frombuffer(buf, np.uint8).reshape(MASK_SIZE, MASK_SIZE)
     finally:
         proc.stdout.close()
         proc.wait()
@@ -212,30 +319,37 @@ def source_frames(path, cols, rows):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Redraw a video as a meadow of Barnsley ferns.")
+        description="Redraw a video as Barnsley-fern-style iterated function systems.")
     ap.add_argument("input", nargs="?", help="source video (omit with --demo)")
     ap.add_argument("-o", "--output", default="fern_apple.mp4")
     ap.add_argument("--demo", action="store_true",
                     help="render a built-in 12 s apple instead of a source video")
-    ap.add_argument("--width", type=int, default=1920,
-                    help="output width in pixels, rounded down to whole ferns (default 1920)")
-    ap.add_argument("--cell", type=int, default=40,
-                    help="fern height in pixels; smaller gives a sharper picture, "
-                         "bigger gives sharper ferns (default 40)")
-    ap.add_argument("--levels", type=int, default=7,
-                    help="fern sizes, counting bare ground (default 7)")
-    ap.add_argument("--sway", type=float, default=0.12,
-                    help="how far the breeze bends the tips; 0 for still air")
-    ap.add_argument("--invert", action="store_true",
-                    help="grow ferns in the dark areas instead of the light ones")
+    ap.add_argument("--height", type=int, default=1080,
+                    help="output height in pixels; width follows the source (default 1080)")
+    ap.add_argument("--walkers", type=float, default=1.5,
+                    help="chaos-game walkers, in millions (default 1.5)")
+    ap.add_argument("--depth", type=int, default=6, choices=range(2, 8),
+                    help="finest copy is 1/2^depth of the frame; lower gives "
+                         "fewer, bigger copies and a blockier outline (default 6)")
+    ap.add_argument("--steps", type=int, default=4,
+                    help="chaos-game steps per frame (default 4)")
+    ap.add_argument("--condense", type=float, default=0.25,
+                    help="share of walkers restarted inside the figure each step; "
+                         "0 gives pure fractal dust, higher gives solider shapes "
+                         "(default 0.25)")
+    ap.add_argument("--trail", type=float, default=0.35,
+                    help="how much of the last frame lingers, 0 to 0.95 (default 0.35)")
+    ap.add_argument("--glow", type=float, default=2.0,
+                    help="brightness of the dots (default 2.0)")
+    ap.add_argument("--blur", type=int, default=1,
+                    help="dot radius in pixels, 0 for single pixels (default 1)")
     ap.add_argument("--crf", type=int, default=20)
     args = ap.parse_args(argv)
 
     if bool(args.input) == args.demo:
         ap.error("give a source video, or --demo, but not both")
-    if args.levels < 2:
-        ap.error("--levels must be at least 2")
-    cell = max(4, args.cell // 2 * 2)  # even, so the output stays yuv420p-friendly
+    if args.steps < 1:
+        ap.error("--steps must be at least 1")
 
     if args.demo:
         src_w, src_h, fps, has_audio = 16, 9, 30.0, False
@@ -244,15 +358,15 @@ def main(argv=None):
         src_w, src_h = info["width"], info["height"]
         fps, has_audio = info["fps"] or 30.0, info["has_audio"]
 
-    cw = max(2, int(round(cell * 0.6 / 2)) * 2)
-    cols = max(1, args.width // cw)
-    rows = max(1, int(round(cols * cw * src_h / src_w / cell)))
-    fr = FernRenderer(cols, rows, cell, args.levels, 8, args.sway, args.invert)
-    out_w, out_h = fr.size
-    print(f"{cols}x{rows} ferns -> {out_w}x{out_h} @ {fps:.3f} fps", file=sys.stderr)
+    out_h = max(2, args.height // 2 * 2)
+    out_w = max(2, int(round(out_h * src_w / src_h / 2)) * 2)
+    fr = FernRenderer(out_w, out_h, int(args.walkers * 1e6), args.depth,
+                      args.steps, min(max(args.condense, 0.0), 0.9),
+                      min(max(args.trail, 0.0), 0.95), args.glow, max(args.blur, 0))
+    print(f"{out_w}x{out_h} @ {fps:.3f} fps", file=sys.stderr)
 
-    frames = demo_frames(cols, rows, fps) if args.demo else \
-        source_frames(args.input, cols, rows)
+    frames = demo_frames(fps, src_w / src_h) if args.demo else \
+        source_frames(args.input)
 
     cmd = [FFMPEG, "-v", "error", "-y",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{out_w}x{out_h}",
@@ -267,7 +381,7 @@ def main(argv=None):
     n = 0
     try:
         for n, gray in enumerate(frames, 1):
-            enc.stdin.write(fr.render(gray, n).tobytes())
+            enc.stdin.write(fr.render(gray, n, fps).tobytes())
             if n % 100 == 0:
                 print(f"\r{n} frames", end="", file=sys.stderr)
     except BrokenPipeError:

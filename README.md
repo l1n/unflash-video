@@ -228,12 +228,15 @@ watch has passed the detector. The dimming is a courtesy, not a safeguard.
 
 ### Bad Apple, but it's a Barnsley fern
 
-`extras/fern_apple.py` redraws a video as a meadow of
-[Barnsley ferns](https://en.wikipedia.org/wiki/Barnsley_fern). Every fern is
-grown from the four affine maps of the original IFS. Each patch of the
-picture gets a fern sized to its brightness, like halftone dots, and the
-ferns sway in a breeze that moves across the frame. High-contrast
-silhouette footage reads best, which is why it's named after Bad Apple.
+`extras/fern_apple.py` redraws a video the way Barnsley drew
+[his fern](https://en.wikipedia.org/wiki/Barnsley_fern): as an iterated
+function system, plotted with the chaos game. Every frame gets its own set
+of affine maps, each one shrinking the figure into a part of itself, so the
+figures come out built from tiny copies of themselves, the way the fern is
+built from ferns. The walkers carry on from one frame to the next, so the
+shapes flow into each other. Whenever the screen is blank, as it is at the
+start and end of Bad Apple, the maps turn into Barnsley's own four and the
+fern grows back.
 
 ```
 python extras/fern_apple.py "Bad Apple.mp4" -o fern_apple.mp4
@@ -241,14 +244,14 @@ python extras/fern_apple.py --demo -o fern_demo.mp4
 ```
 
 The source's audio is copied over unchanged. `--demo` needs no source: it
-draws its own apple, which rolls in, spins and splits in two. `--cell` sets
-the fern size (smaller means a sharper picture but blurrier ferns),
-`--invert` grows ferns in the dark areas instead, and `--sway 0` stills the
-air. `--help` lists the rest.
+draws its own apple, which rolls in, spins and splits in two. `--depth` sets
+how small the copies get, `--condense` trades fractal dust for solid shapes,
+and `--help` lists the rest.
 
-The ferns keep every flash in the source, and Bad Apple has some fast
-black-and-white inversions. Open the result in Unflash and scan it before
-you share it.
+Whichever of black or white covers less of the screen is drawn as the
+figure, so Bad Apple's black-and-white inversions don't flip the whole
+screen from dark to lit. It can still flash where the source does, though.
+Open the result in Unflash and scan it before you share it.
 
 ## Limitations
 
