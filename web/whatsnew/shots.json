@@ -119,6 +119,19 @@
    "violations": 0
   }
  },
+ "dolby-sound": {
+  "w": 720,
+  "h": 450,
+  "seconds": 14.2,
+  "alt": "A video whose sound is E-AC-3 (Dolby Digital Plus), which this browser can't decode: sound off is clicked, and the section plays with its sound (a steady tone), decoded by Unflash itself, as the debug report then says. The film has its sound: turn it on with the film's own sound button.",
+  "sound": true,
+  "sha256": "4744ea99fe96e94bf4411fca6775ac79a0c46110abc16bc5d53cddd4e458388e",
+  "checked": {
+   "profile": "strict",
+   "frames": 427,
+   "violations": 0
+  }
+ },
  "drop": {
   "w": 720,
   "h": 450,

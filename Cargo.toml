@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/unflash-ac3",
     "crates/unflash-av1",
     "crates/unflash-core",
     "crates/unflash-decoders",

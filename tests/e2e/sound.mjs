@@ -9,7 +9,9 @@
 // speakers (the browser as it comes: sound only after a click); its button
 // says "sound on" only while there is sound to be had: at ½× it plays at
 // 1× only, and where the browser holds its audio back or can't decode the
-// sound, the button says so.
+// sound, the button says so. E-AC-3 sound (Dolby Digital Plus), which no
+// browser's WebCodecs decodes, plays through the app's own decoder, and an
+// export with a held frame re-encodes it with the silence in place.
 //   node tests/e2e/sound.mjs
 import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
@@ -71,6 +73,72 @@ function assert(cond, msg) {
   assert(JSON.stringify(flat) === JSON.stringify([1, 2, 3, 4, 0, 0, 5, 6, 8, 9]), 'gaps silent, overlaps trimmed: ' + JSON.stringify(flat));
   console.log('SoundRun OK');
 }
+
+/**
+ * What an export holds (on page `p`, its download link): the pictures'
+ * times, and its sound decoded, with where it is quiet (5 ms windows).
+ */
+const exportedSound = (p) =>
+  p.evaluate(async () => {
+    const wasm = await import('./pkg/unflash.js');
+    const { Movie } = await import('./media.js');
+    const blob = await (await fetch(document.querySelector('#exportDownload').href)).blob();
+    const m = await Movie.open(new File([blob], 'exported.mp4'), wasm);
+    const pts = Array.from(m.v.pts).sort((a, b) => a - b).map((t) => t / 1e6);
+    const at = m.audio;
+    const a = m.a;
+    const desc = m.dx.track_description(at.index);
+    const cfg = { codec: at.codec, sampleRate: at.sample_rate, numberOfChannels: at.channels };
+    if (desc.length) cfg.description = desc;
+    const pieces = [];
+    let error = null;
+    const dec = new AudioDecoder({
+      output: (d) => {
+        const x = new Float32Array(d.numberOfFrames);
+        d.copyTo(x, { planeIndex: 0, format: 'f32-planar' });
+        pieces.push({ t: d.timestamp / 1e6, rate: d.sampleRate, x });
+        d.close();
+      },
+      error: (e) => (error = e),
+    });
+    dec.configure(cfg);
+    for (let i = 0; i < a.offset.length; i++) {
+      const bytes = await m.reader.read(a.offset[i], a.size[i]);
+      dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: a.pts[i], duration: a.dur[i], data: bytes.slice() }));
+    }
+    await dec.flush();
+    if (error) throw error;
+    // loud or quiet, in 5 ms windows along the sound's own timeline
+    const rate = pieces[0].rate;
+    const win = Math.round(rate * 0.005);
+    const t0 = pieces[0].t;
+    const total = pieces.reduce((s, p) => s + p.x.length, 0);
+    const all = new Float32Array(total);
+    let o = 0;
+    for (const p of pieces) {
+      all.set(p.x, o);
+      o += p.x.length;
+    }
+    const quiet = [];
+    for (let k = 0; k + win <= total; k += win) {
+      let peak = 0;
+      for (let j = k; j < k + win; j++) peak = Math.max(peak, Math.abs(all[j]));
+      quiet.push(peak < 0.01);
+    }
+    // the quiet stretches, in seconds
+    const runs = [];
+    for (let k = 0; k < quiet.length; ) {
+      if (!quiet[k]) {
+        k++;
+        continue;
+      }
+      let j = k;
+      while (j < quiet.length && quiet[j]) j++;
+      runs.push([t0 + (k * win) / rate, t0 + (j * win) / rate]);
+      k = j;
+    }
+    return { codec: at.codec, rate, soundStart: t0, soundSeconds: total / rate, quiet: runs.filter(([s, e]) => e - s >= 0.05), pts, duration: m.duration };
+  });
 
 // --- in the browser: an E mark exported -----------------------------------------
 const { chromium } = await loadPlaywright();
@@ -139,66 +207,7 @@ try {
   assert(/re-encoded to (Opus|AAC) to put 1 s of silence under each held frame/.test(results.exportResult), 'the export says where the silence went: ' + results.exportResult);
 
   // what the exported file holds: the pictures' times, and the sound decoded
-  results.exported = await page.evaluate(async () => {
-    const wasm = await import('./pkg/unflash.js');
-    const { Movie } = await import('./media.js');
-    const blob = await (await fetch(document.querySelector('#exportDownload').href)).blob();
-    const m = await Movie.open(new File([blob], 'exported.mp4'), wasm);
-    const pts = Array.from(m.v.pts).sort((a, b) => a - b).map((t) => t / 1e6);
-    const at = m.audio;
-    const a = m.a;
-    const desc = m.dx.track_description(at.index);
-    const cfg = { codec: at.codec, sampleRate: at.sample_rate, numberOfChannels: at.channels };
-    if (desc.length) cfg.description = desc;
-    const pieces = [];
-    let error = null;
-    const dec = new AudioDecoder({
-      output: (d) => {
-        const x = new Float32Array(d.numberOfFrames);
-        d.copyTo(x, { planeIndex: 0, format: 'f32-planar' });
-        pieces.push({ t: d.timestamp / 1e6, rate: d.sampleRate, x });
-        d.close();
-      },
-      error: (e) => (error = e),
-    });
-    dec.configure(cfg);
-    for (let i = 0; i < a.offset.length; i++) {
-      const bytes = await m.reader.read(a.offset[i], a.size[i]);
-      dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: a.pts[i], duration: a.dur[i], data: bytes.slice() }));
-    }
-    await dec.flush();
-    if (error) throw error;
-    // loud or quiet, in 5 ms windows along the sound's own timeline
-    const rate = pieces[0].rate;
-    const win = Math.round(rate * 0.005);
-    const t0 = pieces[0].t;
-    const total = pieces.reduce((s, p) => s + p.x.length, 0);
-    const all = new Float32Array(total);
-    let o = 0;
-    for (const p of pieces) {
-      all.set(p.x, o);
-      o += p.x.length;
-    }
-    const quiet = [];
-    for (let k = 0; k + win <= total; k += win) {
-      let peak = 0;
-      for (let j = k; j < k + win; j++) peak = Math.max(peak, Math.abs(all[j]));
-      quiet.push(peak < 0.01);
-    }
-    // the quiet stretches, in seconds
-    const runs = [];
-    for (let k = 0; k < quiet.length; ) {
-      if (!quiet[k]) {
-        k++;
-        continue;
-      }
-      let j = k;
-      while (j < quiet.length && quiet[j]) j++;
-      runs.push([t0 + (k * win) / rate, t0 + (j * win) / rate]);
-      k = j;
-    }
-    return { codec: at.codec, rate, soundStart: t0, soundSeconds: total / rate, quiet: runs.filter(([s, e]) => e - s >= 0.05), pts, duration: m.duration };
-  });
+  results.exported = await exportedSound(page);
   const ex = results.exported;
   console.log('exported:', JSON.stringify({ codec: ex.codec, rate: ex.rate, soundStart: ex.soundStart, soundSeconds: ex.soundSeconds, quiet: ex.quiet, duration: ex.duration }));
   // the pictures: the held frame stays up a second longer, from the hold on
@@ -318,6 +327,66 @@ try {
   assert(/can't decode this video's sound \(Opus, opus\)/.test(results.undecodable.title) && /^No sound: this browser can't decode/.test(results.undecodable.toast), "where the sound can't be decoded, the button and a note say so: " + JSON.stringify(results.undecodable));
   assert(/section player's sound: none: this browser can't decode/.test(results.undecodable.report), 'and so does the debug report: ' + results.undecodable.report);
   await quiet.close();
+
+  // --- Dolby sound (E-AC-3), which no browser's WebCodecs decodes: the app's own
+  // decoder plays it in the section player, and re-encodes it for an export with a held frame
+  const dolby = await (await browser.newContext({ viewport: { width: 1400, height: 1000 } })).newPage();
+  dolby.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+  await dolby.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0&tour=0`);
+  await dolby.waitForFunction(() => window.__unflash && window.__unflash.changes, null, { timeout: 60000 });
+  results.eac3Native = await dolby.evaluate(async () => (await AudioDecoder.isConfigSupported({ codec: 'ec-3', sampleRate: 48000, numberOfChannels: 1 }).catch(() => ({ supported: false }))).supported);
+  assert(!results.eac3Native, "this browser's WebCodecs does not decode E-AC-3 (else this test would not reach the built-in decoder)");
+  await dolby.setInputFiles('#fileInput', path.join(MEDIA, 'flash_eac3.mp4'));
+  await dolby.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash_eac3.mp4') && !window.__unflash.state.job, null, { timeout: 60000 });
+  await dolby.click('#btnScan');
+  await dolby.waitForFunction(() => window.__unflash.state.project.scan && !window.__unflash.state.job, null, { timeout: 300000 });
+  await dolby.click('#sectionList .sec-item');
+  await dolby.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent) && !window.__unflash.state.job, null, { timeout: 180000 });
+  await dolby.click(`#frameGrid .frame:nth-child(${slot + 1})`);
+  await dolby.click('#wsTitle');
+  await dolby.keyboard.press('e');
+  await dolby.keyboard.press('Escape');
+  await dolby.click('#btnPreviewSound');
+  await dolby.evaluate(() => {
+    const s = window.__unflash.sectionSound;
+    s.tap = s.ctx.createAnalyser();
+    s.tap.fftSize = 2048;
+    s.out.connect(s.tap);
+  });
+  await dolby.click('#btnPreviewPlay');
+  await dolby.waitForFunction(() => window.__unflash.sectionSound.log.length > 0 || window.__unflash.sectionSound.failed, null, { timeout: 60000 });
+  results.dolbyHeard = await dolby.evaluate(async () => {
+    const s = window.__unflash.sectionSound;
+    const buf = new Float32Array(s.tap.fftSize);
+    let peak = 0;
+    for (let k = 0; k < 100 && peak <= 0.05 && !s.failed; k++) {
+      s.tap.getFloatTimeDomainData(buf);
+      for (const x of buf) peak = Math.max(peak, Math.abs(x));
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    return { peak, failed: s.failed, button: document.querySelector('#btnPreviewSound').textContent, report: window.__unflash.debugReport().split('\n').find((l) => /section player's sound/.test(l)) || '' };
+  });
+  console.log('E-AC-3 heard:', JSON.stringify(results.dolbyHeard));
+  assert(!results.dolbyHeard.failed && results.dolbyHeard.peak > 0.05 && results.dolbyHeard.button === 'sound on', 'the E-AC-3 sound plays in the section player: ' + JSON.stringify(results.dolbyHeard));
+  assert(/decoded by the built-in AC-3 decoder/.test(results.dolbyHeard.report), 'by the built-in decoder, as the debug report says: ' + results.dolbyHeard.report);
+  await dolby.evaluate(() => window.__unflash.sectionPlayer.stop());
+  // the export: the held frame's second of silence goes into the sound it re-encodes
+  const dolbyHold = await dolby.evaluate(async () => {
+    const { sectionRenderPlan } = await import('./export.js');
+    const u = window.__unflash;
+    return sectionRenderPlan(u.state.env, u.state.movie, u.currentSection(), 1.0).holds[0];
+  });
+  await dolby.click('#btnExport');
+  await dolby.waitForSelector('#exportModal', { state: 'visible' });
+  await dolby.click('#btnDoExport');
+  await dolby.waitForFunction(() => !document.querySelector('#btnVerifyExport').disabled && !window.__unflash.state.job, null, { timeout: 600000 });
+  results.dolbyExport = await dolby.textContent('#exportResult');
+  console.log('E-AC-3 export:', results.dolbyExport);
+  assert(/re-encoded to (Opus|AAC) to put 1 s of silence under each held frame/.test(results.dolbyExport), 'the export re-encodes the E-AC-3 sound with silence under the held frame: ' + results.dolbyExport);
+  const dx = await exportedSound(dolby);
+  console.log('E-AC-3 exported:', JSON.stringify({ codec: dx.codec, quiet: dx.quiet, soundSeconds: dx.soundSeconds, hold: dolbyHold }));
+  assert(dx.quiet.length === 1 && Math.abs(dx.quiet[0][0] - dolbyHold.at) < 0.03 && Math.abs(dx.quiet[0][1] - (dolbyHold.at + 1)) < 0.03, `its sound is silent exactly under the hold: ${JSON.stringify(dx.quiet)} for ${JSON.stringify(dolbyHold)}`);
+  await dolby.close();
 
   if (errors.length) throw new Error('page errors:\n' + errors.join('\n'));
   console.log('SOUND OK');

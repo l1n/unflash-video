@@ -23,6 +23,8 @@ flash.mkv    flash_h264.mp4 remuxed into Matroska (H.264 + AAC, copied).
 flash.webm   flash.mp4 as WebM (VP9, the audio as Opus).
 flash_vorbis.webm  the same with Vorbis audio, which an MP4 cannot carry
              (the export re-encodes it).
+flash_eac3.mp4  flash.mp4 with its sound as E-AC-3 (Dolby Digital Plus),
+             which no browser's WebCodecs decodes: the built-in decoder.
 flash_hevc.mp4  the flash clip as HEVC (open GOPs, B-frames): the built-in
              HEVC decoder, in a browser without one.
 flash_vp8.webm  the flash clip as VP8 in WebM.
@@ -178,7 +180,7 @@ if __name__ == "__main__":
     encode("flash_vp8.webm", flash_frames(), "vp8", 10)
     encode("flash_av1.mp4", flash_frames(), "av1", 10)
     # the same pictures in Matroska / WebM
-    for src, dst, audio in [("flash_h264.mp4", "flash.mkv", ["-c:a", "copy"]), ("flash.mp4", "flash.webm", ["-c:a", "libopus", "-b:a", "64k"]), ("flash.mp4", "flash_vorbis.webm", ["-c:a", "libvorbis", "-q:a", "3"])]:
+    for src, dst, audio in [("flash_h264.mp4", "flash.mkv", ["-c:a", "copy"]), ("flash.mp4", "flash.webm", ["-c:a", "libopus", "-b:a", "64k"]), ("flash.mp4", "flash_vorbis.webm", ["-c:a", "libvorbis", "-q:a", "3"]), ("flash.mp4", "flash_eac3.mp4", ["-c:a", "eac3", "-b:a", "96k"])]:
         path = os.path.join(OUT, dst)
         subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", os.path.join(OUT, src), "-c:v", "copy", *audio, path], check=True)
         print("wrote", path, os.path.getsize(path), "bytes")

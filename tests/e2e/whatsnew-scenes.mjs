@@ -1217,6 +1217,23 @@ export const SCENES = [
     },
   },
 
+  {
+    name: 'dolby-sound',
+    sound: true,
+    alt: "A video whose sound is E-AC-3 (Dolby Digital Plus), which this browser can't decode: sound off is clicked, and the section plays with its sound (a steady tone), decoded by Unflash itself, as the debug report then says. The film has its sound: turn it on with the film's own sound button.",
+    query: Q,
+    setup: (d) => playable(d, 'flash_eac3.mp4'),
+    view: (d) => d.around('#playerBox', 8),
+    async play(d) {
+      await d.click('#btnPreviewSound', { after: 900 });
+      await d.recordSound();
+      await d.click('#btnPreviewPlay', { after: 3600 });
+      await d.click('#btnPreviewStop', { after: 600 });
+      await report(d, /^.*section player's sound: on, decoded by the built-in AC-3 decoder.*/);
+      await d.wait(2000);
+    },
+  },
+
   // ======== What's new itself, films and all: filmed last ======================
   {
     name: 'films',

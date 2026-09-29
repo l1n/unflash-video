@@ -13,6 +13,7 @@ import { decodeRange, ChunkReader, orTimeout } from './media.js';
 import { profile } from './profile.js';
 import { shownPts, softenPlan, blendMarks, blendStrength, blendSources, blendWeights } from './analysis.js';
 import { SoundRun, audioData } from './sound.js';
+import { soundDecoderFor } from './audiodec.js';
 
 function avcLevel(w, h, fps) {
   const mbs = Math.ceil(w / 16) * Math.ceil(h / 16);
@@ -1065,17 +1066,14 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
   // why the sound is re-encoded, and what happens when it can't be
   const why = held ? `Each held frame (E mark) needs ${silence} under it` : `The audio (${name}) can't go into an MP4 as it is`;
   const without = held && at.copyable ? `so the sound was copied as it is and runs ahead of the picture after each held frame (by ${secs(holds.reduce((s, h) => s + h.seconds, 0))} at the end)` : 'so the export has no sound';
-  if (typeof AudioDecoder === 'undefined' || typeof AudioEncoder === 'undefined') return { warning: `${why}, and this browser can't re-encode audio, ${without}.`, wrote: false };
+  if (typeof AudioEncoder === 'undefined') return { warning: `${why}, and this browser can't re-encode audio, ${without}.`, wrote: false };
   const desc = movie.dx.track_description(at.index);
   const dcfg = { codec: at.codec, sampleRate: at.sample_rate, numberOfChannels: at.channels };
   if (desc.length) dcfg.description = desc;
-  let can = false;
-  try {
-    can = (await AudioDecoder.isConfigSupported(dcfg)).supported;
-  } catch (e) {
-    can = false;
-  }
-  if (!can) return { warning: `${why}, and this browser can't decode the audio (${name}) to re-encode it, ${without}.`, wrote: false };
+  // (WebCodecs', or the app's own for AC-3 and E-AC-3, whose sound comes mixed down to stereo)
+  const found = await soundDecoderFor(dcfg);
+  if (!found) return { warning: `${why}, and this browser can't decode the audio (${name}) to re-encode it, ${without}.`, wrote: false };
+  const channelsIn = found.builtIn ? 2 : at.channels;
   const pick = async (rate, channels) => {
     for (const c of [
       { codec: 'mp4a.40.2', sampleRate: rate, numberOfChannels: channels, bitrate: 96000 * Math.min(2, channels) },
@@ -1089,8 +1087,8 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
     }
     return null;
   };
-  let ecfg = await pick(at.sample_rate, at.channels);
-  if (!ecfg) return { warning: `${why}, and this browser has no encoder for its ${at.channels} channels, ${without}.`, wrote: false };
+  let ecfg = await pick(at.sample_rate, channelsIn);
+  if (!ecfg) return { warning: `${why}, and this browser has no encoder for its ${channelsIn} channels, ${without}.`, wrote: false };
   let error = null;
   let wake = null;
   const kick = () => {
@@ -1111,7 +1109,7 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
   const decoded = []; // decoded, waiting to be placed
   let outCfg = null;
   let enc = null;
-  const dec = new AudioDecoder({
+  const dec = new found.Decoder({
     output: (data) => {
       decoded.push(data);
       kick();
@@ -1225,7 +1223,8 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
       /* closed */
     }
   }
-  const to = ecfg.codec === 'opus' ? 'Opus' : 'AAC';
+  // (a surround sound the built-in decoder read comes out in stereo)
+  const to = `${ecfg.codec === 'opus' ? 'Opus' : 'AAC'}${found.builtIn && at.channels > 2 ? `, in stereo (its ${at.channels} channels mixed down)` : ''}`;
   const placed = run ? run.placed : 0;
   if (held) {
     const after = holds.length - placed;

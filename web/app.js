@@ -507,7 +507,7 @@ function closeChanges() {
 // ---- debug info --------------------------------------------------------------------
 
 function makeDebugReport() {
-  return debugReport({ version: wasm.version(), state, profile, gpu: gpuAdapter, segments: scanSegments(), hybrid: state.env ? hybridPlan(state.movie, state.env.feeder) : null, sound: { status: soundStatus(), failed: sectionSound.failed, output: sectionSound.ctx ? sectionSound.ctx.state : null } });
+  return debugReport({ version: wasm.version(), state, profile, gpu: gpuAdapter, segments: scanSegments(), hybrid: state.env ? hybridPlan(state.movie, state.env.feeder) : null, sound: { status: soundStatus(), failed: sectionSound.failed, output: sectionSound.ctx ? sectionSound.ctx.state : null, builtIn: sectionSound.builtIn } });
 }
 
 /** The report in a dialog, copied to the clipboard at once where the browser lets it. */

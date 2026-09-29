@@ -1,6 +1,7 @@
 //! The built-in decoders for the codecs a browser's WebCodecs may lack
-//! (HEVC, VP9, VP8 and AV1; H.264's is in the main module), as a WebAssembly
-//! module of their own: the page loads it only for a file that needs one,
+//! (HEVC, VP9, VP8 and AV1; H.264's is in the main module; and the sound
+//! decoder for AC-3 and E-AC-3, `Ac3Decoder`), as a WebAssembly module of
+//! their own: the page loads it only for a file that needs one,
 //! and each decode worker (`web/softworker.js`) runs one decoder over a
 //! group of pictures at a time. Every decoder gives 8-bit 4:2:0 pictures
 //! (deeper ones rounded), bit-exact with ffmpeg's for what it supports;
@@ -234,6 +235,67 @@ impl SoftDecoder {
 pub fn probe(codec: &str, config: &[u8]) -> Result<String, JsValue> {
     let d = Inner::new(codec, config, false).map_err(js_err)?;
     Ok(serde_json::json!({ "codec": codec, "reorder": d.reorder_depth() }).to_string())
+}
+
+/// The AC-3 and E-AC-3 (Dolby Digital, Dolby Digital Plus) sound decoder,
+/// for the sound no browser's WebCodecs decodes: the section player plays
+/// it and the export re-encodes it (`web/audiodec.js`). Each `decode` takes
+/// a whole number of sync frames (an MP4 sample, a Matroska block) and
+/// gives their samples as f32 planes, one after the other, as an AudioData
+/// of format f32-planar takes them.
+#[wasm_bindgen]
+pub struct Ac3Decoder {
+    dec: unflash_ac3::Decoder,
+    out: Vec<Vec<f32>>,
+    last: unflash_ac3::Decoded,
+    rate: u32,
+}
+
+#[wasm_bindgen]
+impl Ac3Decoder {
+    /// A decoder; with `stereo`, every stream comes out mixed down to two channels.
+    #[wasm_bindgen(constructor)]
+    pub fn new(stereo: bool) -> Ac3Decoder {
+        let output = if stereo { unflash_ac3::Output::Stereo } else { unflash_ac3::Output::Native };
+        Ac3Decoder { dec: unflash_ac3::Decoder::new(output), out: Vec::new(), last: unflash_ac3::Decoded::default(), rate: 0 }
+    }
+
+    /// Decode `data`'s sync frames: every channel's samples, one plane after another.
+    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<f32>, JsValue> {
+        for plane in &mut self.out {
+            plane.clear();
+        }
+        self.last = self.dec.decode(data, &mut self.out).map_err(js_err)?;
+        if let Some(info) = self.dec.info() {
+            self.rate = info.sample_rate;
+        }
+        Ok(self.out.iter().flat_map(|p| p.iter().copied()).collect())
+    }
+
+    /// Samples each channel had in the last `decode`.
+    pub fn samples(&self) -> u32 {
+        self.last.samples as u32
+    }
+
+    /// Sync frames of the last `decode` that came out as silence (damaged).
+    pub fn damaged(&self) -> u32 {
+        self.last.damaged
+    }
+
+    /// Channels of the last `decode`'s output.
+    pub fn channels(&self) -> u32 {
+        self.out.len() as u32
+    }
+
+    /// The sample rate (Hz) of the last frame decoded.
+    pub fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// Forget the previous frame's overlap (after a seek).
+    pub fn reset(&mut self) {
+        self.dec.reset();
+    }
 }
 
 /// This module's memory, so JavaScript can read a picture in place

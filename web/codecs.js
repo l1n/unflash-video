@@ -23,7 +23,7 @@ export function builtInFor(codec) {
 
 let decoders = null;
 
-/** The decoders module (HEVC, VP9, VP8, AV1), loaded on first use. */
+/** The decoders module (HEVC, VP9, VP8, AV1, and the AC-3 / E-AC-3 sound decoder), loaded on first use. */
 export function loadDecoders() {
   if (!decoders)
     decoders = (async () => {

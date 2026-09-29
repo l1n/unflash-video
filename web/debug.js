@@ -71,9 +71,9 @@ export function noteJob(name) {
 }
 
 /** The section player's sound, as its button says it, and the browser's audio output. */
-function soundLine({ status, failed, output }) {
+function soundLine({ status, failed, output, builtIn }) {
   const what = { off: 'off', on: 'on', slow: 'on (at 1× only; the player is slowed)', failed: `none: ${failed}`, held: 'held back by the browser' }[status] || status;
-  return `${what}${output ? ` (audio output ${output})` : ''}`;
+  return `${what}${builtIn ? ', decoded by the built-in AC-3 decoder' : ''}${output ? ` (audio output ${output})` : ''}`;
 }
 
 /** Where a job of more than two seconds spent its time: the steps that took a good part of it, in order. */

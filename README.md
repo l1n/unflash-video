@@ -112,7 +112,11 @@ Browser support:
 \* platform dependent. A file in any of those five codecs is decoded by
 Unflash itself when the browser cannot decode it; a file whose codec
 neither can decode can still be watched with the live monitor where the
-player plays it.
+player plays it. So is sound in AC-3 or E-AC-3 (Dolby Digital, Dolby
+Digital Plus: TV recordings, films), which no browser's WebCodecs
+decodes: the section player plays it, mixed down to stereo, and an
+export whose held frames need silence put into the sound re-encodes it
+(in stereo); an export without held frames copies it as it is.
 
 Files it reads:
 
@@ -792,7 +796,8 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 | `crates/unflash-hevc` | the built-in HEVC decoder (Main, Main 10; 4:2:0, 4:0:0) |
 | `crates/unflash-vp9` | the built-in VP9 decoder (profiles 0 and 2) |
 | `crates/unflash-vp8` | the built-in VP8 decoder |
-| `crates/unflash-decoders` | the `wasm-bindgen` API of the built-in HEVC, VP9, VP8 and AV1 decoders: a module of its own, loaded when a file needs one |
+| `crates/unflash-ac3` | the built-in AC-3 and E-AC-3 sound decoder (Dolby Digital, Dolby Digital Plus), written to ATSC A/52 |
+| `crates/unflash-decoders` | the `wasm-bindgen` API of the built-in HEVC, VP9, VP8 and AV1 decoders and of the AC-3 / E-AC-3 sound decoder: a module of its own, loaded when a file needs one |
 | `crates/unflash-av1` | AV1 decoding (8- and 10-bit, film grain applied) into 8-bit 4:2:0 pictures: a small wrapper over rav1d, bit-exact with ffmpeg's libdav1d |
 | `third_party/rav1d` | rav1d 1.1.0, the Rust port of dav1d (BSD-2-Clause), without its assembly and patched to build for wasm32 (see its `UNFLASH.md`) |
 | `crates/unflash-wasm` | the `wasm-bindgen` API |
