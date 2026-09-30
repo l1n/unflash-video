@@ -644,7 +644,7 @@ impl Demuxer {
         self.inner.progress()
     }
 
-    /// `mp4` or `matroska` once the first bytes are in.
+    /// `mp4`, `matroska` or `mpegts` once the first bytes are in.
     pub fn container(&self) -> String {
         self.inner.container().into()
     }
@@ -676,7 +676,7 @@ impl Demuxer {
                 edit_shift: t.edit_shift,
                 frame_duration: t.frame_duration,
                 prefix: t.prefix.clone(),
-                copyable: !t.sample_entry.is_empty(),
+                copyable: t.copyable(),
                 name: t.name.clone(),
                 language: t.language.clone(),
                 note: t.note.clone(),
@@ -688,6 +688,7 @@ impl Demuxer {
             "fragmented": m.fragmented,
             "brands": m.brands,
             "format": m.format,
+            "packet_size": m.packet_size,
             "tracks": tracks,
         })
         .to_string())

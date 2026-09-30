@@ -37,6 +37,8 @@ mkdir -p mkv
   ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a eac3 -ac 2 -b:a 192k -shortest h264_eac3.mkv
   ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a flac -shortest h264_flac.mkv
   ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a pcm_s16le -shortest h264_pcm.mkv
+  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a pcm_s24be -shortest h264_pcm_be.mkv
+  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a dca -strict -2 -shortest h264_dts.mkv
   ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 2 -g 15 -c:a aac -shortest -live 1 -f matroska live.mkv
   ffmpeg $common $V $A48 -c:v libvpx-vp9 -b:v 100k -pix_fmt yuv420p -c:a libopus -b:a 48k -shortest vp9_opus.webm
   ffmpeg $common $V $A48 -c:v libvpx -b:v 100k -c:a libvorbis -shortest vp8_vorbis.webm
@@ -50,5 +52,46 @@ mkdir -p mkv
       ffprobe -v error -select_streams a:0 -show_data_hash adler32 -show_entries "packet=pts_time,flags,size,data_hash" -of json "$f" > "$b.audio.json"
     fi
   done
+)
+# uncompressed sound in MOV (QuickTime's forms) and MP4 (ipcm / fpcm), with
+# the bytes of each track as ffmpeg reads them (.pcm): the demuxer's packets
+# must hold the same bytes
+mkdir -p pcm
+(
+  cd pcm
+  V1="-f lavfi -i testsrc2=size=64x48:rate=30:duration=1"
+  A1="-f lavfi -i sine=frequency=440:sample_rate=48000:duration=1"
+  for c in s16le s16be s24le s24be s32le f32le f32be f64be u8 s8 mulaw alaw; do
+    ffmpeg $common $V1 $A1 -c:v libx264 -pix_fmt yuv420p -c:a pcm_$c -shortest pcm_$c.mov
+  done
+  for c in s16le s16be s24le f32le; do
+    ffmpeg $common $V1 $A1 -c:v libx264 -pix_fmt yuv420p -c:a pcm_$c -shortest pcm_$c.mp4
+  done
+  # six channels; 96 kHz (a rate the sample entry can't hold)
+  ffmpeg $common $V1 $A1 -filter_complex "[1:a]pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0[a]" -map 0:v -map "[a]" -c:v libx264 -pix_fmt yuv420p -c:a pcm_s24le -shortest pcm6_s24le.mov
+  ffmpeg $common $V1 -f lavfi -i sine=frequency=440:sample_rate=96000:duration=1 -c:v libx264 -pix_fmt yuv420p -c:a pcm_s24le -shortest pcm96_s24le.mp4
+  for f in *.mov *.mp4; do
+    ffmpeg $common -i "$f" -map 0:a -c copy -f data "$f.pcm"
+  done
+)
+# MPEG transport streams, and ffmpeg's MP4 of each (-c copy): the samples
+# the demuxer finds must be the MP4's
+mkdir -p ts
+(
+  cd ts
+  A48="-f lavfi -i sine=frequency=440:sample_rate=48000:duration=2"
+  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 2 -g 15 -c:a aac -b:a 64k -shortest h264_aac.ts
+  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a ac3 -b:a 192k -shortest -mpegts_m2ts_mode 1 h264_ac3.m2ts
+  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a eac3 -b:a 192k -shortest h264_eac3.ts
+  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -g 12 -c:a mp2 -shortest h264_mp2.ts
+  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -flags +ildct+ilme -x264-params interlaced=1 -c:a aac -shortest h264_mbaff.ts
+  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -g 12 -c:a dca -strict -2 -shortest h264_dts.ts
+  ffmpeg $common $V $A48 -c:v libx265 -x265-params log-level=none -pix_fmt yuv420p -g 15 -c:a libmp3lame -b:a 64k -shortest hevc_mp3.ts || echo "hevc skipped"
+  for f in *.ts *.m2ts; do
+    ffmpeg $common -i "$f" -map 0 -c copy -f mp4 "$f.mp4"
+  done
+  # Blu-ray's LPCM, which an MP4 can't hold: ffprobe's packets (a PES each, its header in)
+  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -g 12 -c:a pcm_bluray -shortest -mpegts_m2ts_mode 1 h264_lpcm.m2ts
+  ffprobe -v error -select_streams a:0 -show_entries "packet=pts_time,size" -of json h264_lpcm.m2ts > h264_lpcm.m2ts.audio.json
 )
 ls -la

@@ -4,7 +4,7 @@
 // the pictures come back in presentation order.
 //
 // Protocol (main -> worker): {type:'init', desc, codec} once; {type:'decode', id,
-// file, offset, size, pts, minPts, maxPts} per group (samples in decode
+// file, ts, offset, size, pts, minPts, maxPts} per group (samples in decode
 // order; only pictures with minPts <= pts < maxPts are sent back, so the
 // leading pictures of an open GOP come from the group that holds their
 // references); {type:'credit', n} after consuming n pictures (the worker
@@ -256,7 +256,7 @@ export class SoftwarePool {
       const g = groups[k];
       out[k].worker = w;
       inflight++;
-      w.postMessage({ type: 'decode', id: k, file: this.movie.file, offset: offset.slice(g.a, g.ext), size: size.slice(g.a, g.ext), pts: pts.slice(g.a, g.ext), minPts: g.minPts, maxPts: g.maxPts, fast: !!fast, shrink: small });
+      w.postMessage({ type: 'decode', id: k, file: this.movie.file, ts: this.movie.ts || null, offset: offset.slice(g.a, g.ext), size: size.slice(g.a, g.ext), pts: pts.slice(g.a, g.ext), minPts: g.minPts, maxPts: g.maxPts, fast: !!fast, shrink: small });
     };
     const listen = (w) => {
       const h = (e) => {

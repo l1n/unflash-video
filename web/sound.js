@@ -6,7 +6,7 @@
 // sound on the edited timeline by that list; the export encodes what it
 // makes, and the section player plays it.
 
-import { noSoundDecoder, soundDecoderFor } from './audiodec.js';
+import { noSoundDecoder, soundConfig, soundDecoderFor } from './audiodec.js';
 
 /**
  * The sound of the edited timeline as one unbroken run of samples, handed
@@ -190,13 +190,19 @@ const CODEC_NAMES = [
   [/^(ac-3|mp4a\.a5)$/i, 'AC-3 (Dolby Digital)'],
   [/^(ec-3|mp4a\.a6)$/i, 'E-AC-3 (Dolby Digital Plus)'],
   [/^(dtsc|dtse|dtsh|dtsl|dts)/, 'DTS'],
-  [/^pcm-/, 'PCM'],
+  [/^(pcm-|ulaw$|alaw$)/, 'PCM'],
 ];
 
 /** `codec` as people know it, with the codec string: "AAC, mp4a.40.2". */
 export function codecName(codec) {
   const hit = CODEC_NAMES.find(([re]) => re.test(codec || ''));
   return hit ? `${hit[1]}, ${codec}` : codec || 'unknown';
+}
+
+/** `codec` as people know it, alone ("AAC"): the codec string where it has no such name. */
+export function soundName(codec) {
+  const hit = CODEC_NAMES.find(([re]) => re.test(codec || ''));
+  return hit ? hit[1].replace(/ \(.*\)$/, '') : codec || 'unknown';
 }
 /** How long before a window ends the next is decoded. */
 const AHEAD_S = 8;
@@ -223,7 +229,7 @@ export class SectionSound {
     this.clock = null; // the section moment the sound plays at a wall time, while it plays
     this.speed = 1;
     this.failed = null; // why there is no sound, once known
-    this.builtIn = false; // decoded by the app's own decoder (AC-3, E-AC-3), not WebCodecs
+    this.builtIn = ''; // the app's own decoder it is decoded by (AC-3, PCM), when not WebCodecs
     this.heldBack = false; // the browser has not started the sound's output
     this.onFail = null;
     this.onChange = null; // the status changed
@@ -417,13 +423,11 @@ export class SectionSound {
     let last = first;
     while (last < pts.length && pts[last] / 1e6 < to) last++;
     if (last <= first) return null;
-    const desc = movie.dx.track_description(at.index);
-    const cfg = { codec: at.codec, sampleRate: at.sample_rate, numberOfChannels: at.channels };
-    if (desc.length) cfg.description = desc;
+    const cfg = soundConfig(at, movie.dx.track_description(at.index));
     // (WebCodecs', or the app's own for AC-3 and E-AC-3, which no browser's WebCodecs decodes)
     const found = await soundDecoderFor(cfg);
     if (!found) throw new Error(noSoundDecoder(at.codec, `this video's sound (${codecName(at.codec)})`));
-    this.builtIn = found.builtIn;
+    this.builtIn = found.builtIn ? found.name : '';
     const reader = movie.reader ? movie.reader.fork() : null;
     const prefix = at.prefix && at.prefix.length ? Uint8Array.from(at.prefix) : null;
     let buffer = null;

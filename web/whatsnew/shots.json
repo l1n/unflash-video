@@ -480,6 +480,19 @@
    "violations": 0
   }
  },
+ "pcm-sound": {
+  "w": 720,
+  "h": 450,
+  "seconds": 16.1,
+  "alt": "A video whose sound is uncompressed (24-bit PCM in a MOV, as cameras record it): sound off is clicked, and the section plays with its sound (a steady tone), read by Unflash itself, as the debug report then says. The film has its sound: turn it on with the film's own sound button.",
+  "sound": true,
+  "sha256": "8f574fff639ee3663b28046638ba64fb67167a3313052e575910b61d5a341045",
+  "checked": {
+   "profile": "strict",
+   "frames": 486,
+   "violations": 0
+  }
+ },
  "plainer-look": {
   "w": 720,
   "h": 450,
@@ -709,6 +722,18 @@
    "violations": 0
   }
  },
+ "sound-track": {
+  "w": 720,
+  "h": 450,
+  "seconds": 17.8,
+  "alt": "A video with two sound tracks, the first in a form no browser plays (ALAC): Unflash takes the second, and the line under the player says so (sound 2 of 2); the export keeps that track, and says why.",
+  "sha256": "a64ee638d132e53d40cde4a672a2b3efb9723fb95b32e79d661d335b8ab9a34d",
+  "checked": {
+   "profile": "strict",
+   "frames": 534,
+   "violations": 0
+  }
+ },
  "start-page": {
   "w": 720,
   "h": 450,
@@ -778,6 +803,18 @@
   "checked": {
    "profile": "strict",
    "frames": 484,
+   "violations": 0
+  }
+ },
+ "transport-streams": {
+  "w": 720,
+  "h": 450,
+  "seconds": 15,
+  "alt": "A Blu-ray .m2ts file opens: Unflash reads it through (a transport stream keeps no index), and the line under the player names its H.264 and AC-3; the scan finds its two flashes, as in the MP4 it was made from.",
+  "sha256": "031292b5e92723b61f2588de03dcec6d6cabb7e02869ee94f05de0cdaf0bf1ed",
+  "checked": {
+   "profile": "strict",
+   "frames": 451,
    "violations": 0
   }
  },

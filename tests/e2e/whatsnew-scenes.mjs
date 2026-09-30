@@ -1384,6 +1384,77 @@ export const SCENES = [
     },
   },
 
+  {
+    name: 'transport-streams',
+    alt: "A Blu-ray .m2ts file opens: Unflash reads it through (a transport stream keeps no index), and the line under the player names its H.264 and AC-3; the scan finds its two flashes, as in the MP4 it was made from.",
+    query: QA,
+    view: { x: 0, y: 0, width: 720, height: 450 },
+    async play(d) {
+      await d.pick('label.filebtn.primary', 'flash_ac3.m2ts');
+      await d.opened('flash_ac3.m2ts');
+      await d.point('#videoInfo', { dx: 0.7, ms: 700 });
+      await d.wait(2200);
+      await d.click('#btnScan');
+      await d.started();
+      await d.idle();
+      await d.wait(600);
+      await d.camera(await d.around(['#timelineWrap', '#sectionList'], 8), { ms: 800 });
+      await d.wait(2600);
+    },
+  },
+  {
+    name: 'dts-sound',
+    sound: true,
+    alt: "A video whose sound is DTS, which no browser decodes for a web page: sound off is clicked, and the section plays with its sound (a steady tone), decoded by Unflash itself, as the debug report then says. The film has its sound: turn it on with the film's own sound button.",
+    query: Q,
+    setup: (d) => playable(d, 'flash_dts.mkv'),
+    view: (d) => d.around('#playerBox', 8),
+    async play(d) {
+      await d.click('#btnPreviewSound', { after: 900 });
+      await d.recordSound();
+      await d.click('#btnPreviewPlay', { after: 3600 });
+      await d.click('#btnPreviewStop', { after: 600 });
+      await report(d, /^.*section player's sound: on, decoded by the built-in DTS decoder.*/);
+      await d.wait(2000);
+    },
+  },
+  {
+    name: 'pcm-sound',
+    sound: true,
+    alt: "A video whose sound is uncompressed (24-bit PCM in a MOV, as cameras record it): sound off is clicked, and the section plays with its sound (a steady tone), read by Unflash itself, as the debug report then says. The film has its sound: turn it on with the film's own sound button.",
+    query: Q,
+    setup: (d) => playable(d, 'flash_pcm.mov'),
+    view: (d) => d.around('#playerBox', 8),
+    async play(d) {
+      await d.click('#btnPreviewSound', { after: 900 });
+      await d.recordSound();
+      await d.click('#btnPreviewPlay', { after: 3600 });
+      await d.click('#btnPreviewStop', { after: 600 });
+      await report(d, /^.*section player's sound: on, decoded by the built-in PCM decoder.*/);
+      await d.wait(2000);
+    },
+  },
+  {
+    name: 'sound-track',
+    alt: 'A video with two sound tracks, the first in a form no browser plays (ALAC): Unflash takes the second, and the line under the player says so (sound 2 of 2); the export keeps that track, and says why.',
+    query: QA,
+    view: { x: 0, y: 0, width: 720, height: 450 },
+    async play(d) {
+      await d.pick('label.filebtn.primary', 'flash_2audio.mkv');
+      await d.opened('flash_2audio.mkv');
+      await d.point('#videoInfo', { dx: 0.85, ms: 700 });
+      await d.wait(2600);
+      await d.click('#btnExport');
+      await d.until(() => !document.querySelector('#btnDoExport').disabled);
+      await d.click('#btnDoExport');
+      await d.started();
+      await d.faster(() => d.idle(), 4);
+      await d.until(() => !document.querySelector('#btnVerifyExport').disabled);
+      await d.camera('#exportModal .modal-box', { pad: 6, ms: 600 });
+      await d.wait(3200);
+    },
+  },
+
   // ======== What's new itself, films and all: filmed last ======================
   {
     name: 'films',

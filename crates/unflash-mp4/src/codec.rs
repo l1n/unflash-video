@@ -174,6 +174,11 @@ pub fn mp4a_codec(esds: &[u8]) -> Result<CodecInfo, Error> {
             format!("mp4a.{oti:02X}.{aot}")
         }
         0x69 | 0x6B => "mp3".to_string(),
+        // DTS (as ffmpeg writes it): named as its sample entries name it
+        0xA9 => "dtsc".to_string(),
+        0xAA => "dtsh".to_string(),
+        0xAB => "dtsl".to_string(),
+        0xAC => "dtse".to_string(),
         other => format!("mp4a.{other:02X}"),
     };
     Ok(CodecInfo { codec, description: dsi })

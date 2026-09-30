@@ -12,8 +12,8 @@
 import { decodeRange, ChunkReader, orTimeout } from './media.js';
 import { profile } from './profile.js';
 import { shownPts, softenPlan, blendMarks, blendStrength, blendSources, blendWeights } from './analysis.js';
-import { SoundRun, audioData } from './sound.js';
-import { noSoundDecoder, soundDecoderFor } from './audiodec.js';
+import { SoundRun, audioData, soundName } from './sound.js';
+import { noSoundDecoder, soundConfig, soundDecoderFor } from './audiodec.js';
 
 function avcLevel(w, h, fps) {
   const mbs = Math.ceil(w / 16) * Math.ceil(h / 16);
@@ -364,7 +364,7 @@ class CutPoints {
     this.movie = movie;
     this.lenSize = avcLenSize; // 0: not H.264, every sync sample will do
     this.cache = new Map();
-    this.reader = movie.reader || new ChunkReader(movie.file);
+    this.reader = movie.reader || new ChunkReader(movie.file, undefined, undefined, null, movie.ts);
   }
   async ok(i) {
     const v = this.movie.v;
@@ -877,7 +877,7 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
   const mx = new wasm.Muxer();
   await out.write(mx.start());
   const samples = []; // { pts, sync, size } in file order
-  const reader = movie.reader || new ChunkReader(movie.file);
+  const reader = movie.reader || new ChunkReader(movie.file, undefined, undefined, null, movie.ts);
   const v = movie.v;
   const MAX_RUN = 8 * 1024 * 1024;
   // H.264: the track's parameter sets. With smart cut, the source's plus
@@ -1028,7 +1028,11 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
       }
     }
   }
-  if (movie.otherAudioTracks) warnings.push(`The source has ${movie.otherAudioTracks + 1} audio tracks; the export keeps the first (${movie.audio.language && movie.audio.language !== 'und' ? movie.audio.language : movie.audio.codec}).`);
+  if (movie.audioTracks > 1) {
+    const label = (t) => (t.language && t.language !== 'und' ? `${t.language}, ${soundName(t.codec)}` : soundName(t.codec));
+    const skipped = movie.audioSkipped || [];
+    warnings.push(`The source has ${movie.audioTracks} audio tracks; the export keeps one (${label(movie.audio)})${skipped.length ? `, the first that can be played here: not ${skipped.map(label).join(' or ')}` : ''}.`);
+  }
   if (movie.subtitleTracks) warnings.push(`The source's subtitle track${movie.subtitleTracks === 1 ? ' is' : 's are'} left out, as the original tool leaves them out: an MP4 export carries the picture and the sound.`);
 
   const moov = mx.finish();
@@ -1067,13 +1071,11 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
   const why = held ? `Each held frame (E mark) needs ${silence} under it` : `The audio (${name}) can't go into an MP4 as it is`;
   const without = held && at.copyable ? `so the sound was copied as it is and runs ahead of the picture after each held frame (by ${secs(holds.reduce((s, h) => s + h.seconds, 0))} at the end)` : 'so the export has no sound';
   if (typeof AudioEncoder === 'undefined') return { warning: `${why}, and this browser can't re-encode audio, ${without}.`, wrote: false };
-  const desc = movie.dx.track_description(at.index);
-  const dcfg = { codec: at.codec, sampleRate: at.sample_rate, numberOfChannels: at.channels };
-  if (desc.length) dcfg.description = desc;
-  // (WebCodecs', or the app's own for AC-3 and E-AC-3, whose sound comes mixed down to stereo)
+  const dcfg = soundConfig(at, movie.dx.track_description(at.index));
+  // (WebCodecs', or the app's own for AC-3 and E-AC-3, whose sound comes mixed down to stereo, and PCM)
   const found = await soundDecoderFor(dcfg);
   if (!found) return { warning: `${why}, and ${noSoundDecoder(at.codec, `the audio (${name})`)}, ${without}.`, wrote: false };
-  const channelsIn = found.builtIn ? 2 : at.channels;
+  const channelsIn = found.channels;
   const pick = async (rate, channels) => {
     for (const c of [
       { codec: 'mp4a.40.2', sampleRate: rate, numberOfChannels: channels, bitrate: 96000 * Math.min(2, channels) },
@@ -1224,7 +1226,7 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
     }
   }
   // (a surround sound the built-in decoder read comes out in stereo)
-  const to = `${ecfg.codec === 'opus' ? 'Opus' : 'AAC'}${found.builtIn && at.channels > 2 ? `, in stereo (its ${at.channels} channels mixed down)` : ''}`;
+  const to = `${ecfg.codec === 'opus' ? 'Opus' : 'AAC'}${found.channels < at.channels ? `, in stereo (its ${at.channels} channels mixed down)` : ''}`;
   const placed = run ? run.placed : 0;
   if (held) {
     const after = holds.length - placed;

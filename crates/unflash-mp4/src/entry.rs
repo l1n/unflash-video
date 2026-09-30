@@ -171,6 +171,24 @@ pub fn mpeg_audio_frame(h: &[u8]) -> Option<(u32, u32, u32)> {
     Some((rate, channels, samples))
 }
 
+/// What the head of a DTS core frame (sync 0x7FFE8001, 16-bit big endian;
+/// 11 bytes of it) says: (rate, channels, samples per frame, frame bytes).
+pub fn dts_frame(h: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    if h.len() < 11 || h[..4] != [0x7f, 0xfe, 0x80, 0x01] {
+        return None;
+    }
+    let mut r = Bits { b: h, at: 32 + 1 + 5 + 1 };
+    let blocks = r.u(7)? + 1;
+    let size = r.u(14)? + 1;
+    let amode = r.u(6)? as usize;
+    let rate = [0, 8000, 16000, 32000, 0, 0, 11025, 22050, 44100, 0, 0, 12000, 24000, 48000, 0, 0][r.u(4)? as usize];
+    r.u(5 + 5)?; // rate, then the fixed bit and four flags
+    r.u(3 + 1 + 1)?; // the extension's kind, its flag, the audio sync word flag
+    let lfe = r.u(2)? != 0;
+    let channels = [1u32, 2, 2, 2, 2, 3, 3, 4, 4, 5, 6, 6, 6, 7, 8, 8].get(amode).copied().unwrap_or(2) + lfe as u32;
+    (size >= 96 && rate > 0 && blocks >= 6).then_some((rate, channels, blocks * 32, size))
+}
+
 /// `Opus` + `dOps`, from an OpusHead (Ogg / Matroska / WebCodecs form).
 pub fn opus_entry(head: &[u8]) -> Result<Vec<u8>, Error> {
     if head.len() < 19 || &head[..8] != b"OpusHead" {
@@ -413,6 +431,11 @@ mod tests {
         assert_eq!(opus_packet_samples(&[0x7b, 0x03]), Some(2880)); // hybrid 20 ms, three frames
         assert_eq!(opus_packet_samples(&[0x81]), Some(240)); // CELT 2.5 ms, two frames (code 1)
         assert_eq!(mpeg_audio_frame(&[0xff, 0xfb, 0x90, 0x64]), Some((44100, 2, 1152)));
+        // DTS: 16 blocks (512 samples), 2013 bytes, stereo (amode 2) at 48 kHz, with LFE
+        let mut h = vec![0x7f, 0xfe, 0x80, 0x01];
+        let bits: u64 = (1 << 63) | (31 << 58) | (15 << 50) | (2012 << 36) | (2 << 30) | (13 << 26) | (15 << 21) | (1 << 9);
+        h.extend_from_slice(&bits.to_be_bytes()[..7]);
+        assert_eq!(dts_frame(&h), Some((48000, 3, 512, 2013)));
         assert_eq!(mpeg_audio_frame(&[0xff, 0xf3, 0x84, 0xc4]), Some((24000, 1, 576)));
     }
 }

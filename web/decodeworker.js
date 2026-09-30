@@ -11,7 +11,7 @@
 // the page hands the GPU 128 KB a frame instead of the whole picture: in
 // Firefox every upload also crosses to its GPU process.
 //
-// Protocol (page -> worker): {type:'decode', id, file, config, offset,
+// Protocol (page -> worker): {type:'decode', id, file, ts, config, offset,
 // size, pts, dur, sync, startUs, endUs, window, shrink?}: decode those
 // samples (in decode order) and send back the pictures with startUs <=
 // timestamp < endUs, at most `window` of them unconsumed; {type:'credit',
@@ -158,7 +158,7 @@ async function run(job) {
     }
   }
   // a window of its own over the file; a small file read whole
-  const reader = new ChunkReader(file, 8 * 1024 * 1024, 16 * 1024 * 1024);
+  const reader = new ChunkReader(file, 8 * 1024 * 1024, 16 * 1024 * 1024, null, job.ts);
   const queue = [];
   let error = null;
   const decoder = new VideoDecoder({

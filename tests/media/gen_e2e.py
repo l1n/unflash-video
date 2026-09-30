@@ -32,6 +32,15 @@ flash_av1.mp4   the flash clip as AV1.
 bursts.mp4   three bursts of five quick flashes (white and near-white,
              0.3 s), a second apart, from 3 s: each burst fails by itself,
              so every one has to go.
+flash.ts     flash_h264.mp4 as an MPEG transport stream (H.264 + AAC,
+             copied), and flash_ts.mp4, ffmpeg's MP4 of it (-c copy): the
+             same samples, for checking how the app reads the stream.
+flash_ac3.m2ts  the same as Blu-ray's .m2ts (192-byte packets), its sound
+             AC-3, and flash_ac3_m2ts.mp4, ffmpeg's MP4 of it.
+flash_pcm.mov   flash_h264.mp4 in a MOV, its sound 24-bit PCM (in24).
+flash_dts.mkv   flash.mp4 in an MKV, its sound DTS (the core).
+flash_2audio.mkv  flash.mp4 in an MKV with two sound tracks: ALAC, which
+             no browser plays, then Opus.
 """
 import os
 import subprocess
@@ -197,4 +206,20 @@ if __name__ == "__main__":
     for src, dst, audio in [("flash_h264.mp4", "flash.mkv", ["-c:a", "copy"]), ("flash.mp4", "flash.webm", ["-c:a", "libopus", "-b:a", "64k"]), ("flash.mp4", "flash_vorbis.webm", ["-c:a", "libvorbis", "-q:a", "3"]), ("flash.mp4", "flash_eac3.mp4", ["-c:a", "eac3", "-b:a", "96k"])]:
         path = os.path.join(OUT, dst)
         subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", os.path.join(OUT, src), "-c:v", "copy", *audio, path], check=True)
+        print("wrote", path, os.path.getsize(path), "bytes")
+    # transport streams, sound as PCM and DTS, and two sound tracks
+    for src, dst, args in [
+        ("flash_h264.mp4", "flash.ts", ["-c:a", "copy"]),
+        ("flash_h264.mp4", "flash_ac3.m2ts", ["-c:a", "ac3", "-b:a", "192k", "-mpegts_m2ts_mode", "1"]),
+        ("flash_h264.mp4", "flash_pcm.mov", ["-c:a", "pcm_s24le"]),
+        ("flash.mp4", "flash_dts.mkv", ["-c:a", "dca", "-strict", "-2"]),
+        ("flash.mp4", "flash_2audio.mkv", ["-map", "0:v", "-map", "0:a", "-map", "0:a", "-c:a:0", "alac", "-c:a:1", "libopus", "-b:a:1", "64k"]),
+    ]:
+        path = os.path.join(OUT, dst)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", os.path.join(OUT, src), "-c:v", "copy", *args, path], check=True)
+        print("wrote", path, os.path.getsize(path), "bytes")
+    # ffmpeg's MP4 of each transport stream: the samples the app must read out of it
+    for ts in ["flash.ts", "flash_ac3.m2ts"]:
+        path = os.path.join(OUT, ts.replace(".", "_") + ".mp4")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", os.path.join(OUT, ts), "-map", "0", "-c", "copy", "-f", "mp4", path], check=True)
         print("wrote", path, os.path.getsize(path), "bytes")

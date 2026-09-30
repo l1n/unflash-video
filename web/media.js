@@ -1,5 +1,7 @@
 import { profile } from './profile.js';
 import { builtInFor, loadDecoders } from './codecs.js';
+import { canPlaySound, soundConfig } from './audiodec.js';
+import { TS_BASE, readTsSample } from './ts.js';
 // Demuxing (through the WASM MP4 parser, served byte ranges from the File)
 // and decoding through WebCodecs.
 
@@ -58,20 +60,29 @@ export const orTimeout = (promise, ms) => Promise.race([promise, new Promise((r)
  * export, verify) costs no file access at all; a larger one is read through
  * a window that follows the reads. A Movie keeps one reader for all its
  * passes: some browsers charge a good fraction of a second for the first
- * read of a file, and that is paid once rather than per pass.
+ * read of a file, and that is paid once rather than per pass. For a
+ * transport stream (`ts`, as Movie.ts describes it) a sample's offset is a
+ * place its bytes are gathered from (ts.js).
  */
 export class ChunkReader {
-  constructor(file, chunkSize = 8 * 1024 * 1024, wholeLimit = 64 * 1024 * 1024, parent = null) {
+  constructor(file, chunkSize = 8 * 1024 * 1024, wholeLimit = 64 * 1024 * 1024, parent = null, ts = null) {
     this.file = file;
     this.chunk = chunkSize;
     this.wholeLimit = wholeLimit;
     this.parent = parent;
+    this.ts = ts || (parent && parent.ts) || null;
     this.whole = null; // the whole small file, read once (a promise, so readers at the same time share it)
     this.buf = null;
     this.start = 0;
     this.end = 0;
   }
-  async read(offset, size) {
+  /** The bytes of a sample (at a place, for a transport stream), a view good until the next read. */
+  read(offset, size) {
+    if (this.ts && offset >= TS_BASE) return readTsSample((o, n) => this.readFile(o, n), this.ts, offset, size);
+    return this.readFile(offset, size);
+  }
+  /** `size` bytes of the file from `offset`. */
+  async readFile(offset, size) {
     if (this.file.size <= this.wholeLimit) {
       const root = this.parent || this;
       if (!root.whole) root.whole = root.file.slice(0, root.file.size).arrayBuffer().then((b) => new Uint8Array(b));
@@ -93,7 +104,7 @@ export class ChunkReader {
    * the same time, which would otherwise take turns re-reading one window.
    */
   fork() {
-    return new ChunkReader(this.file, this.chunk, this.wholeLimit, this.parent || this);
+    return new ChunkReader(this.file, this.chunk, this.wholeLimit, this.parent || this, this.ts);
   }
   /** Forget the bytes read so far. */
   release() {
@@ -112,9 +123,10 @@ function median(arr) {
 }
 
 /**
- * An opened video file (MP4 / MOV / M4V, MKV / WebM): track info and sample
- * tables. An MP4's index is read on its own; a Matroska file keeps none, so
- * it is read through once (`onProgress(fraction)` follows that).
+ * An opened video file (MP4 / MOV / M4V, MKV / WebM, an MPEG transport
+ * stream): track info and sample tables. An MP4's index is read on its
+ * own; a Matroska file or a transport stream keeps none, so it is read
+ * through once (`onProgress(fraction)` follows that).
  */
 export class Movie {
   static async open(file, wasm, { onProgress = null } = {}) {
@@ -139,18 +151,34 @@ export class Movie {
     }
     if (!dx.is_done()) throw new Error('The file ended before its index could be read');
     const info = JSON.parse(dx.movie_json());
+    // a transport stream's samples are gathered from its packets (ts.js)
+    const ts = info.format === 'mpegts' ? { packet: info.packet_size, size: file.size, tracks: info.tracks.map((t) => ({ pid: t.id, annexb: t.kind === 'video' })) } : null;
+    reader.ts = ts;
     const vt = info.tracks.find((t) => t.kind === 'video' && t.samples > 0);
     if (!vt) {
       const unusable = info.tracks.find((t) => t.kind === 'video' && t.note);
       throw new Error(unusable ? `This file's video can't be read: ${unusable.note}` : 'No video track found in this file');
     }
-    const at = info.tracks.find((t) => t.kind === 'audio' && t.samples > 0) || null;
+    // the sound: the first track that can be played here (the file's default
+    // first: the demuxer puts it first), else the first
+    const audios = info.tracks.filter((t) => t.kind === 'audio' && t.samples > 0);
+    let at = null;
+    for (const t of audios) {
+      if (!t.note && (await canPlaySound(soundConfig(t, dx.track_description(t.index))))) {
+        at = t;
+        break;
+      }
+    }
     const m = new Movie();
+    // the tracks passed over for it, which can't be played here
+    m.audioSkipped = at ? audios.slice(0, audios.indexOf(at)) : [];
+    at = at || audios[0] || null;
     m.format = info.format || 'mp4';
-    // tracks an MP4 export leaves out: subtitles, other audio tracks
+    // tracks an MP4 export leaves out: subtitles, the other audio tracks
     m.subtitleTracks = info.tracks.filter((t) => t.kind === 'other' && /^S_/.test(t.codec)).length;
-    m.otherAudioTracks = info.tracks.filter((t) => t.kind === 'audio' && t.samples > 0).length - (at ? 1 : 0);
+    m.audioTracks = audios.length;
     m.file = file;
+    m.ts = ts;
     m.reader = reader;
     m.name = file.name;
     m.wasm = wasm;
@@ -317,7 +345,7 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, on
   // ({aw, ah}), made that small there)
   if (raw && (movie.decodeInWorkers || workers) && typeof Worker !== 'undefined') return decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onProgress, fromIndex, shrink });
   const cfg = movie.decoderConfig();
-  reader = reader || movie.reader || new ChunkReader(movie.file);
+  reader = reader || movie.reader || new ChunkReader(movie.file, undefined, undefined, null, movie.ts);
   const { pts, dts, offset, size, sync, dur } = movie.v;
   const n = pts.length;
   const startIdx = fromIndex !== null ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));
@@ -494,6 +522,7 @@ async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, onP
     type: 'decode',
     id,
     file: movie.file,
+    ts: movie.ts || null,
     config: movie.decoderConfig(),
     offset: offset.slice(startIdx, endIdx),
     size: size.slice(startIdx, endIdx),
@@ -721,7 +750,7 @@ export function decodeStretchesBuiltIn(movie, pool, next, onFrame, { cancel, shr
  */
 async function decodeRangeBuiltInInline(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null, shrink = null } = {}) {
   const mod = await loadDecoders();
-  reader = reader || movie.reader || new ChunkReader(movie.file);
+  reader = reader || movie.reader || new ChunkReader(movie.file, undefined, undefined, null, movie.ts);
   const { pts, offset, size } = movie.v;
   const { startIdx, endIdx } = sampleRange(movie, startSec, endSec, fromIndex);
   const d = new mod.SoftDecoder(movie.builtIn.id, movie.dx.track_description(movie.video.index), fast);
@@ -793,7 +822,7 @@ async function decodeRangeBuiltInInline(movie, startSec, endSec, onFrame, { canc
  * presentation order once every earlier picture has been decoded.
  */
 async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, onProgress, raw = false, fast = false, fromIndex = null, reader = null, shrink = null, inline = false } = {}) {
-  reader = reader || movie.reader || new ChunkReader(movie.file);
+  reader = reader || movie.reader || new ChunkReader(movie.file, undefined, undefined, null, movie.ts);
   const { pts, dts, offset, size } = movie.v;
   const n = pts.length;
   const startIdx = fromIndex !== null ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));

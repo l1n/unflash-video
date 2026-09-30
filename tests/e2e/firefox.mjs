@@ -9,9 +9,10 @@
 // what the CPU detector does; the page
 // answers all through a scan, and a second Scan click is turned away while
 // the first goes on; a section prepares, checks and is fixed by a Suggest
-// button; and in a scan in chunks, the built-in decoder takes over the
+// button; in a scan in chunks, the built-in decoder takes over the
 // chunks Firefox's slow lanes hold up, with the same result, and, rebalanced,
-// sets the slow lanes aside and grows into their cores.
+// sets the slow lanes aside and grows into their cores; and a transport
+// stream is read as ffmpeg reads it, scanned, and its AC-3 sound decoded.
 //   FIREFOX=/path/to/firefox node tests/e2e/firefox.mjs
 // (puppeteer-core found locally or globally: npm install -g puppeteer-core)
 import { createRequire } from 'node:module';
@@ -19,6 +20,7 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { serve } from './server.mjs';
+import { readsAsTheMp4 } from './ts-parity.mjs';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
 const WEB = path.join(ROOT, 'web');
@@ -211,6 +213,51 @@ try {
   assert(b.lanes.reduce((a, l) => a + l.frames, 0) === results.rebalanced.frames, 'each picture decoded once: ' + JSON.stringify(b.lanes));
   assert(b.rebalanced && b.lanes.filter((l) => l.kind !== 'built-in').every((l) => l.aside > 0) && b.grown >= 1, "Firefox's slow lanes were set aside and the built-in decoder grew: " + JSON.stringify(b));
   await balanced.close();
+
+  // --- a transport stream (Blu-ray's .m2ts): read as ffmpeg reads it, scanned,
+  // its AC-3 sound decoded by the app's own decoder
+  const ts = await newPage('cpu=1&auto=0&hybrid=0');
+  await ts.evaluate(() => {
+    const i = document.createElement('input');
+    i.type = 'file';
+    i.id = 'probeFiles';
+    i.multiple = true;
+    i.hidden = true;
+    document.body.append(i);
+  });
+  await (await ts.$('#probeFiles')).uploadFile(path.join(MEDIA, 'flash_ac3.m2ts'), path.join(MEDIA, 'flash_ac3_m2ts.mp4'));
+  results.tsParity = await ts.evaluate(readsAsTheMp4, '#probeFiles');
+  console.log('a transport stream, read as ffmpeg reads it:', JSON.stringify(results.tsParity));
+  const p = results.tsParity[0];
+  assert(p && p.format === 'mpegts' && p.packet === 192 && p.bad.length === 0 && p.videoSamples === 300 && p.audioSamples > 300, 'every sample of the .m2ts as in ffmpeg\'s MP4: ' + JSON.stringify(p));
+  await openClip(ts, 'flash_ac3.m2ts');
+  results.ts = await scan(ts);
+  const tsKinds = results.ts.violations.map((v) => `${v.kind} ${v.start.toFixed(1)}`);
+  console.log('the .m2ts scanned:', results.ts.frames, 'frames |', tsKinds.join(', '));
+  assert(results.ts.frames === 300 && results.ts.violations.some((v) => v.kind === 'flash' && Math.abs(v.start - 4) < 0.3) && results.ts.violations.some((v) => v.kind === 'red' && Math.abs(v.start - 8) < 0.3), 'the .m2ts flashes where the clip does: ' + JSON.stringify(results.ts.violations));
+  results.tsSound = await ts.evaluate(async () => {
+    const { soundConfig, soundDecoderFor } = await import('./audiodec.js');
+    const m = window.__unflash.state.movie;
+    const cfg = soundConfig(m.audio, m.dx.track_description(m.audio.index));
+    const found = await soundDecoderFor(cfg);
+    if (!found) return { none: true };
+    let frames = 0;
+    let error = null;
+    const dec = new found.Decoder({
+      output: (d) => {
+        frames += d.numberOfFrames;
+        d.close();
+      },
+      error: (e) => (error = String(e)),
+    });
+    dec.configure(cfg);
+    for (let i = 0; i < m.a.size.length; i++) dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: m.a.pts[i], data: (await m.reader.read(m.a.offset[i], m.a.size[i])).slice() }));
+    await dec.flush();
+    return { name: found.name, seconds: frames / 48000, error };
+  });
+  console.log('its sound:', JSON.stringify(results.tsSound));
+  assert(results.tsSound.name === 'AC-3' && !results.tsSound.error && Math.abs(results.tsSound.seconds - 10) < 0.1, "the .m2ts's AC-3 sound decodes by the app's own decoder: " + JSON.stringify(results.tsSound));
+  await ts.close();
 
   if (errors.length) throw new Error('page errors:\n' + errors.join('\n'));
   console.log('FIREFOX OK');

@@ -118,7 +118,12 @@ decodes: the section player plays it, mixed down to stereo, and an
 export whose held frames need silence put into the sound re-encodes it
 (in stereo); an export without held frames copies it as it is. (The
 whole-video player is the browser's own, and plays such a video without
-its sound.)
+its sound.) Uncompressed sound (PCM) is read by Unflash itself, in every
+form (big and little endian, 8 to 32 bits, float, G.711): WebCodecs has
+no name for some, and Chromium's decoder of 24-bit PCM crashes the page
+when its sound is copied out. Of several sound tracks, the first that
+can be played here is used (the file's default track first); the video's
+line and the debug report say which, and the export keeps that one.
 
 Where a browser has WebGPU but gives the page no graphics adapter
 (graphics acceleration turned off in its settings, or WebGPU turned off
@@ -129,7 +134,10 @@ what to look at.
 Files it reads:
 
 - **MP4, MOV, M4V, 3GP** (ISO base media), fragmented files and edit lists
-  included. Only the index is read when the file opens.
+  included. Only the index is read when the file opens. Uncompressed sound
+  in QuickTime's forms (`sowt`, `twos`, `in24`, `lpcm`, …) and ISO's
+  (`ipcm`, `fpcm`) is read as packets of 2048 frames, and re-encoded for
+  an export.
 - **MKV and WebM** (Matroska). Matroska keeps no index of its frames, so
   opening one reads through the whole file once (the job bar shows how far;
   the frames' contents are skipped over, not decoded). Video: H.264, HEVC,
@@ -138,20 +146,36 @@ Files it reads:
   E-AC-3) and is re-encoded with the browser's own encoder (AAC, else
   Opus) when it can't (Vorbis, PCM). Subtitle tracks are left out of the
   export, as the original tool leaves them out, and of several audio tracks
-  the first (the file's default) is kept; the export says so. Live
+  the one in use is kept (see above); the export says so. Live
   recordings (clusters of unknown size), laced audio and header stripping
   are handled, and a damaged stretch is skipped to the next cluster. A
   browser whose `<video>` won't play the MKV (Chrome and Firefox play WebM,
   and often MKV offered as WebM, which Unflash tries) still scans, edits,
   plays sections and exports; only the whole-video view says it can't.
-- Anything else (AVI, MPEG-TS, FLV, WMV, MPEG program streams, Ogg) is
-  named when it is opened, with how to convert or remux it.
+- **MPEG transport streams**: .ts (TV recordings, OBS and ffmpeg
+  recordings), .m2ts (Blu-ray) and .mts (AVCHD camcorders). A transport
+  stream keeps no index either, so it is read through once when it opens,
+  following each stream's packets. Video: H.264 (field pairs as one
+  picture, as an MP4 holds them) and HEVC, their decoder setup built from
+  the parameter sets in the stream. Sound: AAC (ADTS), AC-3, E-AC-3, MPEG
+  audio and Blu-ray's LPCM (and DTS, which is read but not yet played).
+  A recording that starts mid-GOP starts at
+  its first keyframe, the 33-bit clock is followed across its wrap, and a
+  jump of the clock (a recording across a discontinuity) is closed up.
+  MPEG-2 video (most TV recordings in standard definition, and DVDs), VC-1,
+  AAC in LATM and Dolby TrueHD are not read: the file opens with a note
+  saying so. The `<video>` element plays no transport stream, so the
+  whole-video view says so; scanning, sections and the export work as
+  usual.
+- Anything else (AVI, FLV, WMV, MPEG program streams, Ogg) is named when
+  it is opened, with how to convert or remux it.
 
 ### The short version
 
-1. **Open video** (MP4, MOV, MKV or WebM), or drop one anywhere on the
-   page. The file's index is read (an MP4's headers only; an MKV is read
-   through once, as it keeps no index; nothing is uploaded), the detector starts on
+1. **Open video** (MP4, MOV, MKV, WebM or a transport stream), or drop one
+   anywhere on the page. The file's index is read (an MP4's headers only;
+   an MKV or a transport stream is read through once, as it keeps no
+   index; nothing is uploaded), the detector starts on
    WebGPU or, failing that, on the CPU, the project is restored from the
    browser's storage if you have opened this file before, and the scan
    starts: every frame is decoded and pushed through the detector, and a
@@ -804,7 +828,7 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 |---|---|
 | `crates/unflash-core` | the detector: config and profiles, the per-pixel kernel (scalar and SIMD), grid reduction, temporal stage, violations, sections, editing helpers, the blend (blend frames). No I/O. |
 | `crates/unflash-gpu` | the WGSL pipeline on `wgpu` (native backends and the browser's WebGPU) |
-| `crates/unflash-mp4` | byte-range demuxers for WebCodecs, MP4 (fragmented files, edit lists) and Matroska / WebM (lacing, unknown sizes, header stripping), giving codec strings, decoder descriptions and sample tables; MP4 sample entries for Matroska audio; a muxer for the export |
+| `crates/unflash-mp4` | byte-range demuxers for WebCodecs, MP4 (fragmented files, edit lists, PCM) and Matroska / WebM (lacing, unknown sizes, header stripping) and MPEG transport streams (samples as an MP4 holds them, found again in the stream's packets by `web/ts.js`), giving codec strings, decoder descriptions and sample tables; MP4 sample entries for Matroska and transport stream audio; a muxer for the export |
 | `crates/unflash-h264` | the built-in H.264 decoder, for browsers whose WebCodecs has none |
 | `crates/unflash-hevc` | the built-in HEVC decoder (Main, Main 10; 4:2:0, 4:0:0) |
 | `crates/unflash-vp9` | the built-in VP9 decoder (profiles 0 and 2) |
@@ -848,7 +872,7 @@ WASM and runs the browser test on every push.
 ```
 cargo test --workspace                    # unit tests, the reference cross-check, GPU-vs-CPU (needs any Vulkan/Metal/DX12 adapter; lavapipe is enough)
 python3 tests/gen_fixtures.py             # regenerate the reference fixtures from unflash/analysis.py (needs numpy)
-bash tests/media/gen.sh                   # demuxer/muxer test files (needs ffmpeg)
+bash tests/media/gen.sh                   # demuxer/muxer test files: MP4, MKV, PCM, transport streams and ffmpeg's MP4 of each (needs ffmpeg)
 bash tests/media/h264/gen.sh              # H.264 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libx264)
 cargo run --release -p unflash-h264 --example compare -- file.mp4   # decode any MP4 and diff every frame against ffmpeg
 cargo run --release -p unflash-h264 --example conformance -- dir [filter]   # the JVT conformance streams (Annex B) against ffmpeg's framemd5 (dir/NAME.framemd5)
@@ -864,6 +888,7 @@ python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos 
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
 node tests/e2e/tour.mjs                   # the guided tour, on a first visit and after an update
 node tests/e2e/busy.mjs                   # the page while a job runs: a second start turned away, never a long freeze
+node tests/e2e/streams.mjs                # transport streams read as ffmpeg reads them, scanned and exported; PCM sound; the sound track that plays
 FIREFOX=/path/to/firefox node tests/e2e/firefox.mjs   # the app in headless Firefox, WebGPU on lavapipe (needs puppeteer-core)
 node tests/e2e/screenshots.mjs            # the screenshots above, made again from the test clips (not a test)
 FIREFOX=/path/to/firefox node tests/e2e/whatsnew.mjs [NAME...]   # What's new's films, made again and scanned for flashing (not a test)
@@ -972,10 +997,11 @@ player's position rather than detecting again, so it never misses a frame.
   each held frame; a browser that can't re-encode audio copies it as it
   is, and the sound then runs ahead of the picture after each hold (the
   export says so). Removals (R/F) do not change timing and need no audio
-  work. Subtitle tracks and all but the first audio track of an MKV are
+  work. Subtitle tracks and all but one audio track (the one in use) are
   left out.
-- MPEG transport streams (.ts, .m2ts), AVI and the other containers above
-  are not read; remux or convert them first.
+- AVI, FLV, WMV, MPEG program streams (.mpg, .vob) and Ogg are not read,
+  nor MPEG-2 or VC-1 video in a transport stream; remux or convert them
+  first.
 - The export copies the untouched GOPs only when the encoder's codec is the
   source's (H.264 into H.264, VP9 into VP9); an HEVC or AV1 source, or a
   browser without an H.264 encoder, gets a full re-encode.

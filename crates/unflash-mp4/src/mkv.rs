@@ -803,7 +803,7 @@ impl MkvDemuxer {
             return Err(if self.seen_segment { "no tracks found in this Matroska file".into() } else { "not a Matroska file (no segment found)".into() });
         }
         let doc = self.doc_type.clone();
-        let mut movie = Movie { timescale: 1000, duration_secs: 0.0, fragmented: false, brands: vec![doc.clone()], format: doc, tracks: Vec::new() };
+        let mut movie = Movie { timescale: 1000, duration_secs: 0.0, fragmented: false, brands: vec![doc.clone()], format: doc, tracks: Vec::new(), packet_size: 0 };
         if let Some(d) = self.duration {
             movie.duration_secs = d * self.scale as f64 / 1e9;
         }
@@ -1098,18 +1098,43 @@ fn setup(t: &MkvTrack, fps: f64, ts_timescale: u32) -> Setup {
                 s.fourcc = "fLaC".into();
             }
         }
+        _ if id == "A_DTS" || id.starts_with("A_DTS/") => {
+            // (the core is what the app decodes; DTS Express has none)
+            s.codec = match id {
+                "A_DTS/EXPRESS" => "dtse",
+                "A_DTS/LOSSLESS" => "dtsl",
+                _ => "dtsc",
+            }
+            .into();
+            if let Some((r, ch, per, _)) = entry::dts_frame(&t.first) {
+                s.rate = r;
+                s.channels = ch;
+                s.timescale = r;
+                s.packet = PacketLength::Fixed(per);
+            }
+        }
+        "A_ALAC" => {
+            // (named, for what says which sound this is: no browser decodes it)
+            s.codec = "alac".into();
+            s.description = Some(t.private.clone());
+        }
         "A_VORBIS" => {
             s.codec = "vorbis".into();
             s.description = Some(t.private.clone());
         }
-        "A_PCM/INT/LIT" | "A_PCM/FLOAT/IEEE" => {
+        "A_PCM/INT/LIT" | "A_PCM/INT/BIG" | "A_PCM/FLOAT/IEEE" => {
+            // (WebCodecs' names, little endian; the app's own for big endian and 64-bit float)
             let bytes = (t.bit_depth / 8).max(1);
             s.codec = match (id, t.bit_depth) {
                 ("A_PCM/FLOAT/IEEE", 32) => "pcm-f32".into(),
-                ("A_PCM/INT/LIT", 8) => "pcm-u8".into(),
+                ("A_PCM/FLOAT/IEEE", 64) => "pcm-f64".into(),
+                ("A_PCM/INT/LIT" | "A_PCM/INT/BIG", 8) => "pcm-u8".into(),
                 ("A_PCM/INT/LIT", 16) => "pcm-s16".into(),
                 ("A_PCM/INT/LIT", 24) => "pcm-s24".into(),
                 ("A_PCM/INT/LIT", 32) => "pcm-s32".into(),
+                ("A_PCM/INT/BIG", 16) => "pcm-s16be".into(),
+                ("A_PCM/INT/BIG", 24) => "pcm-s24be".into(),
+                ("A_PCM/INT/BIG", 32) => "pcm-s32be".into(),
                 _ => format!("{id} ({} bit)", t.bit_depth),
             };
             s.packet = PacketLength::Pcm(bytes * s.channels);

@@ -73,7 +73,7 @@ export function noteJob(name) {
 /** The section player's sound, as its button says it, and the browser's audio output. */
 function soundLine({ status, failed, output, builtIn }) {
   const what = { off: 'off', on: 'on', slow: 'on (at 1× only; the player is slowed)', failed: `none: ${failed}`, held: 'held back by the browser' }[status] || status;
-  return `${what}${builtIn ? ', decoded by the built-in AC-3 decoder' : ''}${output ? ` (audio output ${output})` : ''}`;
+  return `${what}${builtIn ? `, decoded by the built-in ${builtIn} decoder` : ''}${output ? ` (audio output ${output})` : ''}`;
 }
 
 /** Where a job of more than two seconds spent its time: the steps that took a good part of it, in order. */
@@ -188,7 +188,7 @@ export function debugReport({ version, build = null, state, profile, gpu, segmen
     lines.push(
       ...block('Video', [
         [`${String(m.format || '?').toUpperCase()}${m.info && m.info.fragmented ? ' (fragmented)' : ''}`, v.codec, `${m.width}×${m.height}`, `${(m.fps || 0).toFixed(3)} fps`, duration(m.duration || 0), `${int(m.frameCount || 0)} frames`, m.file ? bytes(m.file.size) : null, keyframeSpacing(m) ? `keyframes every ${keyframeSpacing(m).toFixed(1)} s` : null].filter(Boolean).join(' · '),
-        a ? `audio ${a.codec}${a.copyable === false ? ' (re-encoded on export)' : ''}${sound ? ` · the section player's sound: ${soundLine(sound)}` : ''}` : 'no audio',
+        a ? `audio ${a.codec}${a.copyable === false ? ' (re-encoded on export)' : ''}${m.audioTracks > 1 ? ` · track ${(m.audioSkipped || []).length + 1} of ${m.audioTracks}${(m.audioSkipped || []).length ? ` (${m.audioSkipped.map((t) => t.codec).join(', ')} before it can't be played here)` : ''}` : ''}${sound ? ` · the section player's sound: ${soundLine(sound)}` : ''}` : 'no audio',
         state.decode && !state.decode.supported && state.decode.reason ? `cannot decode: ${state.decode.reason}` : null,
       ])
     );

@@ -22,7 +22,7 @@ export const TOURS = {
         title: 'Welcome to Unflash',
         html: 'Unflash finds the flashing and the stripe patterns in a video that can trigger seizures, and helps you take them out without wrecking the footage. It all happens in this browser: nothing is uploaded.<br><br>This tour takes a minute. <b>Esc</b> ends it, and the guide has it again whenever you want it.',
       },
-      { target: 'label.filebtn.primary', title: 'Open a video', html: 'Start here: open a video from your disk (MP4, MOV, MKV or WebM), or drop one anywhere on the page. It is scanned as soon as it opens, every frame of it.' },
+      { target: 'label.filebtn.primary', title: 'Open a video', html: 'Start here: open a video from your disk (MP4, MOV, MKV, WebM or a transport stream: .ts, .m2ts, .mts), or drop one anywhere on the page. It is scanned as soon as it opens, every frame of it.' },
       { target: 'table.clips', placement: 'top', title: 'Or try a test clip', html: 'No video to hand? Each of these short clips has a known problem in it. <b>open</b> loads one straight in.' },
       { target: '#profileSel', title: 'What counts as a problem', html: 'The default flags WCAG failures, and also extended flashes and stripe patterns: WCAG lets those through, but they still affect some viewers. <i>Exact WCAG only</i> and <i>Stricter than WCAG</i> are the other two.' },
       { target: () => document.querySelector('#autoToggle') && document.querySelector('#autoToggle').closest('label'), title: 'Auto-fix', html: 'Tick this and a video is fixed unattended as soon as it opens: scanned, every problem fixed, exported and checked. Treat what it makes as a starting point: fixing by hand gives better results.' },
@@ -102,7 +102,7 @@ export const PARTS = [
     group: 'Along the top',
     context: 'video',
     parts: [
-      { id: 'open', target: 'label.filebtn.primary', name: 'Open video…', short: 'a video from your disk (MP4, MOV, MKV or WebM), or drop one anywhere on the page.' },
+      { id: 'open', target: 'label.filebtn.primary', name: 'Open video…', short: 'a video from your disk (MP4, MOV, MKV, WebM or a transport stream: .ts, .m2ts, .mts), or drop one anywhere on the page.' },
       { id: 'scan', target: '#btnScan', name: 'Scan', short: 'every frame through the detector; a numbered section goes round each problem it finds.' },
       { id: 'profile', target: '#profileSel', name: 'Profile', short: 'what counts as a problem: WCAG failures and extended flashes and stripes (the default), <i>Exact WCAG only</i>, or <i>Stricter than WCAG</i>.' },
       { id: 'auto', target: around('#autoToggle', 'label'), name: 'Auto-fix', short: 'ticked, a video is fixed unattended as it opens: scanned, every problem fixed, exported and verified.' },

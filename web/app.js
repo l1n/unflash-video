@@ -753,8 +753,8 @@ async function openFile(file) {
   const opened = await runJob('Opening video', async (progress) => {
     progress(0.05, 'reading the index');
     const movie = await Movie.open(file, wasm, {
-      // a Matroska file keeps no index: it is read through once
-      onProgress: (p, container) => progress(0.05 + 0.3 * p, container === 'matroska' ? `reading through the file for its frames (MKV / WebM keep no index): ${Math.round(p * 100)}%` : 'reading the index'),
+      // a Matroska file or a transport stream keeps no index: it is read through once
+      onProgress: (p, container) => progress(0.05 + 0.3 * p, container === 'matroska' || container === 'mpegts' ? `reading through the file for its frames (${container === 'mpegts' ? 'transport streams' : 'MKV / WebM'} keep no index): ${Math.round(p * 100)}%` : 'reading the index'),
     });
     // the last file, its unattended run and its export go only now that
     // the new one has opened (an export of this same video, kept on disk,
@@ -786,7 +786,7 @@ async function openFile(file) {
     movie.decodeInWorkers = decodeWorkersSetting(state.env.feeder);
     movie.shrinkInWorkers = shrinkSetting();
     loadPlayer(file, movie);
-    $('videoInfo').textContent = `${file.name} · ${movie.width}×${movie.height} · ${movie.fps.toFixed(2)} fps · ${fmt(movie.duration)} · ${movie.video.codec}${movie.audio ? ' + ' + movie.audio.codec : ''}`;
+    $('videoInfo').textContent = `${file.name} · ${movie.width}×${movie.height} · ${movie.fps.toFixed(2)} fps · ${fmt(movie.duration)} · ${movie.video.codec}${movie.audio ? ' + ' + movie.audio.codec : ''}${movie.audioTracks > 1 ? ` (sound ${movie.audioSkipped.length + 1} of ${movie.audioTracks})` : ''}`;
     sectionSound.failed = null;
     state.player.soundFailSaid = null;
     renderSoundButton();
@@ -1646,7 +1646,7 @@ function loadPlayer(file, movie) {
   const player = $('player');
   if (player.src) URL.revokeObjectURL(player.src);
   const token = (state.player.loadToken = (state.player.loadToken || 0) + 1);
-  const types = movie.format === 'mp4' ? [null] : [null, 'video/webm'];
+  const types = movie.format === 'matroska' || movie.format === 'webm' ? [null, 'video/webm'] : [null];
   let k = 0;
   state.player.playable = true;
   const next = () => {
@@ -1790,7 +1790,7 @@ function renderPlayerWarning() {
   let text = '';
   let ok = false;
   if (!state.movie) text = '';
-  else if (mode === 'video' && state.player.playable === false) text = `This browser's video player can't play this ${state.movie.format === 'webm' ? 'WebM' : state.movie.format === 'matroska' ? 'MKV' : ''} file, so the whole video can't be shown here. Scanning, sections (their player shows them, marks and all) and the export work as usual.`;
+  else if (mode === 'video' && state.player.playable === false) text = `This browser's video player can't play this ${{ webm: 'WebM', matroska: 'MKV', mpegts: 'transport stream (.ts, .m2ts, .mts)' }[state.movie.format] || ''} file, so the whole video can't be shown here. Scanning, sections (their player shows them, marks and all) and the export work as usual.`;
   else if (mode === 'video') text = `⚠ The whole video as it is: it may flash.${dim}`;
   else if (!sec) text = '';
   else if (mode === 'original') text = `⚠ Section #${sec.id} as it is: it may flash.${dim}`;

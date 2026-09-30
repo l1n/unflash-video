@@ -95,6 +95,12 @@ impl Track {
             (hi - lo) as f64 / self.timescale as f64
         }
     }
+    /// Whether an MP4 can carry the track's samples as they are: it has a
+    /// sample entry for them, and they are not uncompressed sound (whose
+    /// samples here are packets of many frames, which its entry doesn't say).
+    pub fn copyable(&self) -> bool {
+        !self.sample_entry.is_empty() && !is_pcm(&self.codec)
+    }
     /// Presentation times of sync samples, seconds, ascending.
     pub fn keyframe_times(&self) -> Vec<f64> {
         let mut v: Vec<f64> = self.samples.iter().filter(|s| s.sync).map(|s| s.pts as f64 / self.timescale as f64).collect();
@@ -121,10 +127,15 @@ pub struct Movie {
     pub duration_secs: f64,
     pub fragmented: bool,
     pub brands: Vec<String>,
-    /// The container: `mp4`, `matroska` or `webm`.
+    /// The container: `mp4`, `matroska`, `webm` or `mpegts`.
     #[serde(default)]
     pub format: String,
     pub tracks: Vec<Track>,
+    /// A transport stream's packet size (188, 192 or 204): its samples'
+    /// offsets are places a reader follows its packets from (see
+    /// [`crate::ts`]). 0 for the other containers.
+    #[serde(default)]
+    pub packet_size: u32,
 }
 
 impl Movie {
@@ -144,7 +155,8 @@ enum Stage {
 }
 
 /// Byte-range driven parser for any container Unflash reads (MP4 and
-/// QuickTime, Matroska and WebM), told apart by their first bytes. Loop:
+/// QuickTime, Matroska and WebM, MPEG transport streams), told apart by
+/// their first bytes. Loop:
 /// `need()` -> read that range -> `feed()` until `movie()` is `Some`.
 pub struct Demuxer {
     file_size: u64,
@@ -157,6 +169,7 @@ enum Inner {
     Sniff,
     Mp4(Mp4Demuxer),
     Mkv(crate::mkv::MkvDemuxer),
+    Ts(crate::ts::TsDemuxer),
 }
 
 const SNIFF_LEN: u64 = 1024;
@@ -185,12 +198,6 @@ fn foreign(b: &[u8]) -> Option<(&'static str, &'static str)> {
     if at(0, &[0x00, 0x00, 0x01, 0xBA]) {
         return Some(("an MPEG program stream (.mpg / .vob)", CONVERT));
     }
-    // transport streams: a sync byte every 188 bytes (every 192 with a timecode)
-    for (start, step) in [(0usize, 188usize), (4, 192)] {
-        if b.len() > start + 3 * step && (0..4).all(|k| b[start + k * step] == 0x47) {
-            return Some(("an MPEG transport stream (.ts / .m2ts)", REMUX));
-        }
-    }
     None
 }
 
@@ -205,6 +212,7 @@ impl Demuxer {
             Inner::Sniff => (self.file_size > 0).then(|| (0, SNIFF_LEN.min(self.file_size))),
             Inner::Mp4(d) => d.need(),
             Inner::Mkv(d) => d.need(),
+            Inner::Ts(d) => d.need(),
         }
     }
 
@@ -213,6 +221,7 @@ impl Demuxer {
             Inner::Sniff => self.file_size == 0,
             Inner::Mp4(d) => d.is_done(),
             Inner::Mkv(d) => d.is_done(),
+            Inner::Ts(d) => d.is_done(),
         }
     }
 
@@ -223,12 +232,13 @@ impl Demuxer {
                 Inner::Sniff => 0,
                 Inner::Mp4(d) => d.bytes_read(),
                 Inner::Mkv(d) => d.bytes_read(),
+                Inner::Ts(d) => d.bytes_read(),
             }
     }
 
     /// How far through the work of reading the index the parser is, 0 to
-    /// 1 (a Matroska file has to be read through; an MP4's index is one
-    /// box or a few).
+    /// 1 (a Matroska file or a transport stream has to be read through; an
+    /// MP4's index is one box or a few).
     pub fn progress(&self) -> f64 {
         match &self.inner {
             Inner::Sniff => 0.0,
@@ -240,15 +250,17 @@ impl Demuxer {
                 }
             }
             Inner::Mkv(d) => d.progress(),
+            Inner::Ts(d) => d.progress(),
         }
     }
 
-    /// `mp4`, `matroska`, or `` before the first bytes are seen.
+    /// `mp4`, `matroska`, `mpegts`, or `` before the first bytes are seen.
     pub fn container(&self) -> &'static str {
         match &self.inner {
             Inner::Sniff => "",
             Inner::Mp4(_) => "mp4",
             Inner::Mkv(_) => "matroska",
+            Inner::Ts(_) => "mpegts",
         }
     }
 
@@ -258,8 +270,10 @@ impl Demuxer {
                 self.sniffed += data.len() as u64;
                 if data.len() >= 4 && data[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
                     self.inner = Inner::Mkv(crate::mkv::MkvDemuxer::new(self.file_size));
+                } else if let Some((packet, first)) = crate::ts::sniff(data) {
+                    self.inner = Inner::Ts(crate::ts::TsDemuxer::new(self.file_size, packet, first));
                 } else if let Some((what, advice)) = foreign(data) {
-                    return Err(format!("This is {what}. Unflash reads MP4, MOV, M4V, MKV and WebM files. {advice}"));
+                    return Err(format!("This is {what}. Unflash reads MP4, MOV, M4V, MKV, WebM and MPEG transport stream (.ts, .m2ts, .mts) files. {advice}"));
                 } else {
                     self.inner = Inner::Mp4(Mp4Demuxer::new(self.file_size));
                 }
@@ -268,6 +282,7 @@ impl Demuxer {
             }
             Inner::Mp4(d) => d.feed(offset, data),
             Inner::Mkv(d) => d.feed(offset, data),
+            Inner::Ts(d) => d.feed(offset, data),
         }
     }
 
@@ -276,6 +291,7 @@ impl Demuxer {
             Inner::Sniff => None,
             Inner::Mp4(d) => d.movie(),
             Inner::Mkv(d) => d.movie(),
+            Inner::Ts(d) => d.movie(),
         }
     }
 
@@ -284,6 +300,7 @@ impl Demuxer {
             Inner::Sniff => None,
             Inner::Mp4(d) => d.into_movie(),
             Inner::Mkv(d) => d.into_movie(),
+            Inner::Ts(d) => d.into_movie(),
         }
     }
 }
@@ -471,6 +488,9 @@ struct Trex {
 
 struct TrakParts {
     id: u32,
+    /// The track header's enabled flag: the track a player plays (of a
+    /// kind, the one enabled; ffmpeg enables the default one).
+    enabled: bool,
     kind: TrackKind,
     width: u32,
     height: u32,
@@ -482,11 +502,38 @@ struct TrakParts {
     sample_rate: u32,
     channels: u32,
     stbl: Stbl,
+    /// Uncompressed sound: its form, and the bytes of one sample frame (0:
+    /// not PCM).
+    pcm: Option<PcmForm>,
+    pcm_frame: u32,
+}
+
+/// The form of uncompressed sound: bits per sample, float, little endian,
+/// signed (8-bit sound can be either).
+#[derive(Clone, Copy, Debug)]
+struct PcmForm {
+    bits: u32,
+    float: bool,
+    le: bool,
+    signed: bool,
+}
+
+/// What an audio sample entry says about its samples beyond the codec.
+#[derive(Clone, Copy, Default)]
+struct SoundDesc {
+    /// The entry's version: QuickTime's 1 and 2 add fields.
+    version: u16,
+    /// Bits per sample (per channel).
+    bits: u32,
+    /// Bytes per sample frame (QuickTime version 1 and 2), 0 when not given.
+    frame_bytes: u32,
+    /// QuickTime version 2's format flags (`lpcm`): float, big endian, signed.
+    flags: u32,
 }
 
 fn parse_moov(moov: &[u8]) -> Result<Movie, Error> {
     let body = &moov[box_header(moov)?.header_len as usize..];
-    let mut movie = Movie { timescale: 1000, duration_secs: 0.0, fragmented: false, brands: vec![], format: "mp4".into(), tracks: vec![] };
+    let mut movie = Movie { timescale: 1000, duration_secs: 0.0, fragmented: false, brands: vec![], format: "mp4".into(), tracks: vec![], packet_size: 0 };
     let mut traks: Vec<TrakParts> = Vec::new();
     let mut trex: Vec<(u32, Trex)> = Vec::new();
     for_each_box(body, |kind, b, _| {
@@ -527,7 +574,21 @@ fn parse_moov(moov: &[u8]) -> Result<Movie, Error> {
     if traks.is_empty() {
         return Err("moov has no tracks".into());
     }
-    for tp in traks {
+    // the tracks a player plays first, as the Matroska reader puts the default ones first
+    traks.sort_by_key(|t| !t.enabled);
+    for mut tp in traks {
+        // a sample size that the sample table's frames contradict (ffmpeg 6
+        // writes 24-bit ipcm as 32): the table's, which is how the bytes lie
+        let fixed = tp.stbl.fixed_size;
+        if let Some(form) = tp.pcm {
+            let ch = tp.channels.max(1);
+            if fixed > 1 && fixed != tp.pcm_frame && fixed % ch == 0 {
+                if let Some(c) = pcm_codec(PcmForm { bits: fixed / ch * 8, ..form }) {
+                    tp.codec = CodecInfo { codec: c.into(), description: None };
+                    tp.pcm_frame = fixed;
+                }
+            }
+        }
         let mut track = Track {
             id: tp.id,
             kind: tp.kind,
@@ -549,7 +610,13 @@ fn parse_moov(moov: &[u8]) -> Result<Movie, Error> {
             note: String::new(),
         };
         track.edit_shift = edit_shift(&tp.elst, movie.timescale, track.timescale);
-        track.samples = expand_samples(&tp.stbl)?;
+        if track.kind == TrackKind::Audio && track.sample_rate == 0 {
+            // (a rate the entry can't hold, and no 'srat': the track's clock is its rate)
+            track.sample_rate = track.timescale;
+        }
+        // uncompressed sound whose tables count each sample frame (sized as
+        // one frame, or as a byte in QuickTime's older files): in packets
+        track.samples = if tp.pcm_frame > 0 && tp.stbl.fixed_size != 0 && tp.stbl.fixed_size <= tp.pcm_frame { expand_pcm(&tp.stbl, tp.pcm_frame)? } else { expand_samples(&tp.stbl)? };
         movie.tracks.push(track);
     }
     // stash trex defaults for fragments on the track (by id) via a side table
@@ -584,6 +651,7 @@ fn edit_shift(elst: &[(i64, i64)], movie_ts: u32, track_ts: u32) -> i64 {
 fn parse_trak(trak: &[u8]) -> Result<TrakParts, Error> {
     let mut tp = TrakParts {
         id: 0,
+        enabled: true,
         kind: TrackKind::Other,
         width: 0,
         height: 0,
@@ -595,12 +663,15 @@ fn parse_trak(trak: &[u8]) -> Result<TrakParts, Error> {
         sample_rate: 0,
         channels: 0,
         stbl: Stbl::default(),
+        pcm: None,
+        pcm_frame: 0,
     };
     for_each_box(trak, |kind, b, _| {
         match &kind {
             b"tkhd" => {
                 let mut r = Reader::new(b);
-                let (v, _) = r.version_flags()?;
+                let (v, flags) = r.version_flags()?;
+                tp.enabled = flags & 1 != 0;
                 if v == 1 {
                     r.skip(16)?;
                     tp.id = r.u32()?;
@@ -674,7 +745,9 @@ fn parse_stbl(stbl: &[u8], tp: &mut TrakParts) -> Result<(), Error> {
         let mut r = Reader::new(b);
         match &kind {
             b"stsd" => {
-                r.version_flags()?;
+                // (an ISO audio entry of version 1 lives in an stsd of version 1;
+                // QuickTime's versions 1 and 2, with their fields, in one of 0)
+                let (stsd_version, _) = r.version_flags()?;
                 let n = r.u32()?;
                 if n == 0 {
                     return Err("empty stsd".into());
@@ -689,6 +762,7 @@ fn parse_stbl(stbl: &[u8], tp: &mut TrakParts) -> Result<(), Error> {
                     tp.fourcc = fourcc;
                     tp.entry = whole.to_vec();
                     let mut er = Reader::new(body);
+                    let mut sound = None;
                     match tp.kind {
                         TrackKind::Video => {
                             er.skip(6 + 2 + 2 + 2 + 12)?;
@@ -707,18 +781,43 @@ fn parse_stbl(stbl: &[u8], tp: &mut TrakParts) -> Result<(), Error> {
                             let version = er.u16()?;
                             er.skip(2 + 4)?;
                             tp.channels = er.u16()? as u32;
-                            er.skip(2 + 2 + 2)?;
+                            let bits = er.u16()? as u32;
+                            er.skip(2 + 2)?;
                             tp.sample_rate = er.u32()? >> 16;
-                            if version == 1 {
-                                er.skip(16)?;
-                            } else if version == 2 {
-                                er.skip(36)?;
+                            let mut sd = SoundDesc { version, bits, ..Default::default() };
+                            if stsd_version == 0 && version == 1 {
+                                // samples per packet, bytes per packet, bytes per frame, bytes per sample
+                                er.skip(8)?;
+                                sd.frame_bytes = er.u32()?;
+                                er.skip(4)?;
+                            } else if stsd_version == 0 && version == 2 {
+                                er.skip(4)?; // the size of these fields
+                                tp.sample_rate = f64::from_bits(er.u64()?).round() as u32;
+                                tp.channels = er.u32()?;
+                                er.skip(4)?; // 0x7F000000
+                                sd.bits = er.u32()?;
+                                sd.flags = er.u32()?;
+                                let packet_bytes = er.u32()?;
+                                let packet_frames = er.u32()?;
+                                sd.frame_bytes = if packet_frames > 0 { packet_bytes / packet_frames } else { 0 };
                             }
+                            sound = Some(sd);
                         }
                         TrackKind::Other => {}
                     }
                     let children = er.rest();
                     tp.codec = from_sample_entry(&fourcc, children).unwrap_or_else(|_| CodecInfo { codec: fourcc_str(&fourcc), description: None });
+                    if let Some(sd) = sound {
+                        // a rate the 16.16 field can't hold (96 kHz and up): an 'srat' box's
+                        if let Some(srat) = crate::reader::find_box(children, b"srat").filter(|b| b.len() >= 8) {
+                            tp.sample_rate = u32::from_be_bytes([srat[4], srat[5], srat[6], srat[7]]);
+                        }
+                        if let Some((codec, form, frame)) = pcm_layout(&fourcc, &sd, tp.channels, children) {
+                            tp.codec = CodecInfo { codec: codec.into(), description: None };
+                            tp.pcm = Some(form);
+                            tp.pcm_frame = frame;
+                        }
+                    }
                     Ok(())
                 })?;
             }
@@ -906,6 +1005,136 @@ fn expand_samples(s: &Stbl) -> Result<Vec<Sample>, Error> {
         dts += dur[i] as i64;
     }
     Ok(out)
+}
+
+/// Frames of uncompressed sound in a packet (43 ms at 48 kHz).
+const PCM_PACKET: u32 = 2048;
+
+/// The samples of uncompressed sound whose sample tables count every
+/// sample frame: each chunk's frames, which lie one after another, in
+/// packets of up to [`PCM_PACKET`] frames, so a film's sound is a few
+/// hundred thousand packets rather than hundreds of millions of samples.
+fn expand_pcm(s: &Stbl, frame_bytes: u32) -> Result<Vec<Sample>, Error> {
+    let n = s.sample_count as u64;
+    if n == 0 {
+        return Ok(vec![]);
+    }
+    if s.chunk_offsets.is_empty() || s.stsc.is_empty() {
+        return Err("stbl without chunk offsets".into());
+    }
+    // the durations, walked as the frames go by (past the table, its last goes on)
+    let mut runs = s.stts.iter().copied();
+    let (mut left, mut delta) = runs.next().unwrap_or((u32::MAX, 1));
+    let mut ticks = |mut k: u32| -> u64 {
+        let mut sum = 0u64;
+        while k > 0 {
+            if left == 0 {
+                match runs.next() {
+                    Some((c, d)) => (left, delta) = (c, d),
+                    None => left = u32::MAX,
+                }
+                continue;
+            }
+            let m = k.min(left);
+            sum += m as u64 * delta as u64;
+            k -= m;
+            left -= m;
+        }
+        sum
+    };
+    let mut out = Vec::new();
+    let mut done = 0u64;
+    let mut dts = 0i64;
+    for (ci, &coff) in s.chunk_offsets.iter().enumerate() {
+        let chunk_no = (ci + 1) as u32;
+        let mut spc = s.stsc[0].1;
+        for &(first, count, _) in &s.stsc {
+            if first <= chunk_no {
+                spc = count;
+            } else {
+                break;
+            }
+        }
+        let mut frames = (spc as u64).min(n - done) as u32;
+        done += frames as u64;
+        let mut pos = coff;
+        while frames > 0 {
+            let k = frames.min(PCM_PACKET);
+            let dur = ticks(k);
+            out.push(Sample { offset: pos, size: k * frame_bytes, dts, pts: dts, duration: dur as u32, sync: true });
+            pos += k as u64 * frame_bytes as u64;
+            dts += dur as i64;
+            frames -= k;
+        }
+        if done >= n {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Uncompressed sound, in QuickTime's forms and ISO's (`ipcm`, `fpcm`): the
+/// codec string it goes by, its form and the bytes of one sample frame;
+/// None when the entry is not PCM.
+fn pcm_layout(fourcc: &[u8; 4], sd: &SoundDesc, channels: u32, children: &[u8]) -> Option<(&'static str, PcmForm, u32)> {
+    let channels = channels.max(1);
+    // QuickTime's 'enda' (in the 'wave' box, or on its own): 1 for little endian
+    let little = || {
+        let enda = crate::reader::find_box(children, b"wave").and_then(|w| crate::reader::find_box(w, b"enda")).or_else(|| crate::reader::find_box(children, b"enda"));
+        enda.map(|e| e.len() >= 2 && u16::from_be_bytes([e[0], e[1]]) != 0).unwrap_or(false)
+    };
+    let form = |bits: u32, float: bool, le: bool, signed: bool| PcmForm { bits, float, le, signed };
+    let f = match fourcc {
+        b"raw " | b"NONE" => form(if sd.bits == 16 { 16 } else { 8 }, false, false, false),
+        b"twos" => form(sd.bits.max(8), false, false, true),
+        b"sowt" => form(sd.bits.max(8), false, true, true),
+        b"in24" => form(24, false, little(), true),
+        b"in32" => form(32, false, little(), true),
+        b"fl32" => form(32, true, little(), true),
+        b"fl64" => form(64, true, little(), true),
+        b"ulaw" => return Some(("ulaw", form(8, false, false, false), channels)),
+        b"alaw" => return Some(("alaw", form(8, false, false, false), channels)),
+        b"lpcm" => form(sd.bits, sd.flags & 1 != 0, sd.flags & 2 == 0, sd.flags & 4 != 0),
+        b"ipcm" | b"fpcm" => {
+            // (a full box: version and flags, the format flags, the sample size)
+            let c = crate::reader::find_box(children, b"pcmC").filter(|c| c.len() >= 6)?;
+            form(c[5] as u32, fourcc == b"fpcm", c[4] & 1 != 0, true)
+        }
+        _ => return None,
+    };
+    let frame = if sd.version > 0 && sd.frame_bytes > 0 { sd.frame_bytes } else { f.bits / 8 * channels };
+    Some((pcm_codec(f)?, f, frame))
+}
+
+/// The codec string of a form of PCM: WebCodecs' where it has one
+/// (`pcm-s16` and the like, little endian), else named alike by the app
+/// (`pcm-s16be`, `pcm-f64`).
+fn pcm_codec(f: PcmForm) -> Option<&'static str> {
+    Some(match (f.bits, f.float, f.le) {
+        (8, false, _) => {
+            if f.signed {
+                "pcm-s8"
+            } else {
+                "pcm-u8"
+            }
+        }
+        (16, false, true) => "pcm-s16",
+        (16, false, false) => "pcm-s16be",
+        (24, false, true) => "pcm-s24",
+        (24, false, false) => "pcm-s24be",
+        (32, false, true) => "pcm-s32",
+        (32, false, false) => "pcm-s32be",
+        (32, true, true) => "pcm-f32",
+        (32, true, false) => "pcm-f32be",
+        (64, true, true) => "pcm-f64",
+        (64, true, false) => "pcm-f64be",
+        _ => return None,
+    })
+}
+
+/// Whether `codec` is uncompressed sound (the PCM codec strings, G.711).
+pub fn is_pcm(codec: &str) -> bool {
+    codec.starts_with("pcm-") || codec == "ulaw" || codec == "alaw"
 }
 
 fn finish_track(t: &mut Track) {

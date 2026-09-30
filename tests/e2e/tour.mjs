@@ -45,12 +45,41 @@ const tourNow = (page) =>
     };
   });
 
+/**
+ * Until the tour's light and card are still: nothing of it gliding, and in
+ * the same place three frames running. (They glide a fifth of a second to
+ * a new part, and again whenever the part they light moves: a section's
+ * player takes its size a moment after it opens. Measured mid-glide, the
+ * card can be crossing the light.)
+ */
+const tourSettled = (page) =>
+  page.waitForFunction(
+    () => {
+      const t = document.querySelector('.tour');
+      if (!t) return true;
+      if (t.getAnimations({ subtree: true }).some((a) => a.playState === 'running')) {
+        window.__tourStill = 0;
+        return false;
+      }
+      const c = t.querySelector('.tour-card').getBoundingClientRect();
+      const s = t.querySelector('.tour-spot').getBoundingClientRect();
+      const key = [c.left, c.top, s.left, s.top, s.width, s.height].map(Math.round).join();
+      if (key !== window.__tourKey) {
+        window.__tourKey = key;
+        window.__tourStill = 0;
+        return false;
+      }
+      return ++window.__tourStill >= 3;
+    },
+    null,
+    { timeout: 10000, polling: 'raf' }
+  );
+
 /** Step through the tour on screen with the keyboard, checking every step; returns the titles. */
 async function walk(page, name) {
   const titles = [];
   for (let k = 0; k < 20; k++) {
-    // (the light glides a fifth of a second from one part to the next)
-    await page.waitForTimeout(300);
+    await tourSettled(page);
     const t = await tourNow(page);
     if (!t) break;
     titles.push(t.title);
