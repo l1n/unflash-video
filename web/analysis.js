@@ -1437,15 +1437,22 @@ export async function suggestEdits(env, project, sec, prefer, only, { extS = 1.0
   const frames = sectionFrames(sec);
   let step = JSON.parse(sug.step(frames, undefined));
   let round = 0;
-  let last = null;
   while (step.simulate) {
     if (onProgress) onProgress(round);
-    last = await checkSection(env, project, sec, step.simulate, { extS });
-    step = JSON.parse(sug.step(frames, JSON.stringify(last.raw)));
+    const tried = await checkSection(env, project, sec, step.simulate, { extS });
+    step = JSON.parse(sug.step(frames, JSON.stringify(tried.raw)));
     round++;
   }
   sug.free();
-  return { ...step.done, verdict: last };
+  // the verdict is the check of the marks as the section will have them: the
+  // last one tried may have been taken back (a flash put back that failed,
+  // frames let back into a long removed stretch), and what it hands back
+  // then is an earlier set, whose check says nothing about the last
+  const done = step.done;
+  const marks = JSON.parse(wasm.apply_suggestion(JSON.stringify(sec.edits || {}), JSON.stringify(done.edits), only ? JSON.stringify(only) : undefined, keepJson(sec)));
+  const verdict = await checkSection(env, project, sec, marks, { extS });
+  const note = done.safe && !verdict.safe ? `${done.note} Checked again as applied, though, it does not pass: see the verdict.` : done.note;
+  return { ...done, note, verdict };
 }
 
 /** "Reduce FPS": thin to a rate from timestamps alone, then check. */

@@ -29,6 +29,9 @@ flash_hevc.mp4  the flash clip as HEVC (open GOPs, B-frames): the built-in
              HEVC decoder, in a browser without one.
 flash_vp8.webm  the flash clip as VP8 in WebM.
 flash_av1.mp4   the flash clip as AV1.
+bursts.mp4   three bursts of five quick flashes (white and near-white,
+             0.3 s), a second apart, from 3 s: each burst fails by itself,
+             so every one has to go.
 """
 import os
 import subprocess
@@ -145,6 +148,16 @@ def extended_frames(secs=10.0):
         yield f
 
 
+def bursts_frames(secs=8.0):
+    n = int(secs * FPS)
+    for i in range(n):
+        f = scene(i)
+        k = i - 90
+        if 0 <= k < 90 and k % 30 < 9:
+            f[...] = 255 if k % 2 == 0 else 225
+        yield f
+
+
 def stripes_frames(secs=10.0):
     """Stationary high-contrast gratings: 8 px light / 8 px dark bars, so
     well over five pairs cover the whole picture and the bars survive the
@@ -179,6 +192,7 @@ if __name__ == "__main__":
     encode("flash_hevc.mp4", flash_frames(), "hevc", 10)
     encode("flash_vp8.webm", flash_frames(), "vp8", 10)
     encode("flash_av1.mp4", flash_frames(), "av1", 10)
+    encode("bursts.mp4", bursts_frames(), "vp9", 8)
     # the same pictures in Matroska / WebM
     for src, dst, audio in [("flash_h264.mp4", "flash.mkv", ["-c:a", "copy"]), ("flash.mp4", "flash.webm", ["-c:a", "libopus", "-b:a", "64k"]), ("flash.mp4", "flash_vorbis.webm", ["-c:a", "libvorbis", "-q:a", "3"]), ("flash.mp4", "flash_eac3.mp4", ["-c:a", "eac3", "-b:a", "96k"])]:
         path = os.path.join(OUT, dst)

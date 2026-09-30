@@ -53,6 +53,8 @@ const state = {
   live: { on: false, fromScan: false, t: [], hazard: [], hazardRed: [], pattern: [], violations: 0, lastCheck: 0 },
   decode: { supported: false, reason: '' },
   exportBlob: null,
+  exportHolds: null, // the export's held frames ({ at, seconds } on the video's clock), when it was made here
+  selectOnOpen: null, // { id, lo, hi, kind }: the frames to select once section `id` is prepared (a verify found `kind` at lo..hi in the video)
   checkTimer: null,
   checkRunning: false,
   checkAgain: false,
@@ -628,12 +630,25 @@ async function boot() {
   $('exportName').addEventListener('input', () => onExportNameInput(false));
   $('exportName').addEventListener('change', () => onExportNameInput(true));
   $('btnVerifyExport').addEventListener('click', verifyExport);
+  // a verify's "section #N": that section, with the frames it found flashing selected
+  $('exportResult').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-open-at]');
+    if (!b) return;
+    const [id, lo, hi] = b.dataset.openAt.split(':').map(Number);
+    $('exportModal').classList.add('hidden');
+    state.selectOnOpen = { id, lo, hi, kind: b.dataset.kind };
+    openSection(id);
+  });
   $('verifyFileInput').addEventListener('change', (e) => {
     const f = e.target.files && e.target.files[0];
     e.target.value = '';
     verifySavedFile(f);
   });
-  $('exportQuality').addEventListener('input', () => ($('exportQualityText').textContent = $('exportQuality').value));
+  // the setting and the scale ("7 of 10"), and what the slider holds when the
+  // page starts (a browser can put back the last value on a reload)
+  const showQuality = () => ($('exportQualityText').textContent = `${$('exportQuality').value} of ${$('exportQuality').max}`);
+  $('exportQuality').addEventListener('input', showQuality);
+  showQuality();
   $('exportQuality').addEventListener('change', () => state.movie && renderExportChoice());
   $('exportCodec').addEventListener('change', () => renderExportChoice());
   $('btnAddSection').addEventListener('click', () => {
@@ -1667,7 +1682,7 @@ function onPreviewFrame(info, t, plan) {
   let what = '';
   if (k >= 0) {
     const e = state.player.mode === 'edited' ? (sec.edits || {})[k] || {} : {};
-    what = `frame ${k}${info.src !== k ? `, showing ${info.src}` : ''}${e.removed ? ' (removed)' : e.extended ? ' (held 1 s)' : ''}${info.blended ? `, blended ${Math.round(blendStrength(sec) * 100)}%` : ''}${info.softened ? ', softened' : ''}`;
+    what = `frame ${k} at ${fmt(frameVideoTime(sec, k))}${info.src !== k ? `, showing ${info.src}` : ''}${e.removed ? ' (removed)' : e.extended ? ' (held 1 s)' : ''}${info.blended ? `, blended ${Math.round(blendStrength(sec) * 100)}%` : ''}${info.softened ? ', softened' : ''}`;
   }
   $('previewInfo').textContent = `${fmt(Math.max(0, rel))} / ${fmt(total)} · ${what}`;
   if (state.live.on) previewMeter(sec, k, t);
@@ -2019,6 +2034,7 @@ function currentSection() {
 
 function openSection(id) {
   const changed = state.current !== id;
+  if (state.selectOnOpen && state.selectOnOpen.id !== id) state.selectOnOpen = null;
   if (changed) closeViewer();
   state.current = id;
   state.selection.clear();
@@ -2334,7 +2350,7 @@ function renderVerdict(sec) {
     v.textContent = kinds.length ? `passes WCAG, ${kinds.join(' and ')} remain${kinds.length === 1 && kinds[0] === 'extended flash' ? 's' : ''}` : 'passes WCAG';
   } else {
     v.className = 'verdict unsafe';
-    v.textContent = describeFailure(c);
+    v.textContent = describeFailure(sec, c);
   }
   $('btnSelectUnsafe').classList.toggle('hidden', !(c && !c.safe && c.flagged && c.flagged.length));
   renderFindings(sec);
@@ -2359,6 +2375,30 @@ function findings(sec) {
     out.push({ v, kind: v.kind, frames, first: frames[0], last: frames[frames.length - 1], label: `the ${KIND_LABEL[v.kind] || v.kind} at frames ${frames[0]}–${frames[frames.length - 1]}` });
   }
   return out;
+}
+
+/** When frame `i` of a prepared section is, on the whole video's clock. */
+function frameVideoTime(sec, i) {
+  return sec.start + sec.pts[i];
+}
+
+/**
+ * A moment on a section's checked timeline (seconds from its first frame,
+ * the seconds its held frames add included), on the whole video's clock:
+ * while a frame is held, that frame's own time.
+ */
+function videoTimeAt(sec, t) {
+  const seqT = sec.check && sec.check.seq ? sec.check.seq.t : null;
+  if (!seqT || !seqT.length || !sec.pts || t <= seqT[0]) return sec.start + (sec.pts && sec.pts.length ? sec.pts[0] : 0) + t;
+  let i = 0;
+  while (i + 1 < seqT.length && seqT[i + 1] <= t) i++;
+  const own = i + 1 < seqT.length ? sec.pts[i + 1] - sec.pts[i] : Infinity;
+  return frameVideoTime(sec, i) + Math.min(t - seqT[i], own);
+}
+
+/** A moment on a section's checked timeline, in words: "0:03.503 into the section". */
+function intoSection(t) {
+  return t < -0.0005 ? `${fmt(-t)} before the section` : `${fmt(t)} into the section`;
 }
 
 /**
@@ -2408,7 +2448,8 @@ function selectFrames(sec, frames, what) {
   state.anchor = frames[0];
   renderGridMarks();
   const tile = $('frameGrid').children[frames[0]];
-  if (tile) tile.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  // (once the rest of this turn has scrolled: opening a section brings its top into view)
+  if (tile) requestAnimationFrame(() => tile.scrollIntoView({ block: 'center', behavior: 'smooth' }));
   toast(`Selected ${frames.length} frame${frames.length === 1 ? '' : 's'}: ${what}. A Suggest button with "selection only" ticked works on just these.`, 6000);
   drawChart();
 }
@@ -2435,7 +2476,7 @@ function renderFindings(sec) {
   }
   const label = (kind) => (KIND_LABEL[kind] || kind).replace(/^./, (m) => m.toUpperCase());
   const openButton = (o) => (o ? `<button class="small" data-open-section="${o.id}">open section #${o.id}</button>` : '');
-  const dur = (f) => `${fmt(sec.check.seq.t[f.first])} – ${fmt(sec.check.seq.t[f.last])} into the section`;
+  const dur = (f) => `${fmt(frameVideoTime(sec, f.first))} – ${fmt(frameVideoTime(sec, f.last))} in the video, ${fmt(sec.check.seq.t[f.first])} – ${fmt(sec.check.seq.t[f.last])} into the section`;
   const how = {
     flash: 'Flashing faster than 3 times a second over enough of the screen: remove (R, F) or blend (B) frames, or let a Suggest button pick them.',
     red: 'Red flashing faster than 3 times a second: remove or blend frames, or let a Suggest button pick them.',
@@ -2457,12 +2498,12 @@ function renderFindings(sec) {
   box.innerHTML = own.join('') + before.join('');
 }
 
-function describeFailure(c) {
+function describeFailure(sec, c) {
   const parts = [];
   const inside = c.inside || c.violations || [];
   for (const v of inside.slice(0, 3)) {
     const kind = KIND_LABEL[v.kind] || v.kind;
-    let s = `${kind} at ${fmt(v.start)}`;
+    let s = `${kind} at ${fmt(videoTimeAt(sec, v.start))}, ${intoSection(v.start)}`;
     if (v.kind === 'pattern') s += ` (${v.count.toFixed(1)}× the area limit)`;
     else if (v.kind !== 'extended' && v.count < 1.08) s += ` (only ${Math.round((v.count - 1) * 100)}% over the area threshold, just over the line)`;
     parts.push(s);
@@ -2549,7 +2590,7 @@ function renderViewerInfo() {
   if (e.extended) marks.push('held for 1 s');
   if ((sec.keep || []).includes(i)) marks.push('keep');
   if ((sec.blend || []).includes(i)) marks.push(`blended ${Math.round(blendStrength(sec) * 100)}% with the frames around it in the export (shown here as it is)`);
-  $('viewerInfo').textContent = `Section #${sec.id}, frame ${i} of ${sec.nFrames} · ${fmt(sec.start + sec.pts[i])} (${sec.pts[i].toFixed(3)} s in)${marks.length ? ' · ' + marks.join(' · ') : ''} · ${state.movie.width}×${state.movie.height}`;
+  $('viewerInfo').textContent = `Section #${sec.id}, frame ${i} of ${sec.nFrames} · ${fmt(frameVideoTime(sec, i))} in the video, ${(sec.pts[i] - sec.pts[0]).toFixed(3)} s into the section${marks.length ? ' · ' + marks.join(' · ') : ''} · ${state.movie.width}×${state.movie.height}`;
 }
 
 /**
@@ -2603,7 +2644,8 @@ function renderGrid(sec) {
     const tile = document.createElement('div');
     tile.className = 'frame';
     tile.dataset.i = i;
-    tile.title = `Frame ${i}: double-click (or select it and press Z) to see it at full size, decoded from the file, to read a subtitle, say`;
+    const at = fmt(frameVideoTime(sec, i));
+    tile.title = `Frame ${i}, at ${at} in the video, ${shown[i].toFixed(3)} s into the section: double-click (or select it and press Z) to see it at full size, decoded from the file, to read a subtitle, say`;
     const canvas = document.createElement('canvas');
     canvas.width = tw;
     canvas.height = th;
@@ -2612,6 +2654,11 @@ function renderGrid(sec) {
     no.className = 'fno';
     no.textContent = i;
     tile.appendChild(no);
+    // when it is in the whole video (as a verify of the export gives it), and into the section
+    const fv = document.createElement('span');
+    fv.className = 'fv';
+    fv.textContent = at;
+    tile.appendChild(fv);
     const ft = document.createElement('span');
     ft.className = 'ft';
     ft.textContent = shown[i].toFixed(3);
@@ -2629,6 +2676,17 @@ function renderGrid(sec) {
   }
   grid.appendChild(frag);
   renderGridMarks();
+  // opened from a verify: the frames on screen while the export flashed
+  const want = state.selectOnOpen;
+  if (want && want.id === sec.id) {
+    state.selectOnOpen = null;
+    const frames = [];
+    for (let i = 0; i < shown.length; i++) {
+      const next = i + 1 < sec.pts.length ? frameVideoTime(sec, i + 1) : Infinity;
+      if (frameVideoTime(sec, i) <= want.hi && next > want.lo) frames.push(i);
+    }
+    if (frames.length) selectFrames(sec, frames, `the frames at ${fmt(want.lo)}–${fmt(want.hi)} in the video, where the check of the export found ${KIND_LABEL[want.kind] ? `the ${KIND_LABEL[want.kind]}` : 'flashing'}`);
+  }
 }
 
 function onTileClick(i, e) {
@@ -3678,6 +3736,8 @@ function showExportResult(res, name, savedAs = null) {
     a.removeAttribute('href');
   }
   state.exportBlob = res.blob || null;
+  // (where its frames were held: its times run that much later than the video's)
+  state.exportHolds = res.holds || null;
   a.classList.toggle('hidden', !res.blob);
   $('btnVerifyExport').disabled = !res.blob;
   if (!res.blob) return;
@@ -3700,6 +3760,7 @@ function forgetExport(keep = null) {
   state.auto = null;
   renderAuto();
   state.exportBlob = null;
+  state.exportHolds = null;
   const a = $('exportDownload');
   if (a.getAttribute('href')) {
     URL.revokeObjectURL(a.href);
@@ -3718,6 +3779,7 @@ async function restoreExport(key, movie) {
   const found = await findPrivateExport(key);
   if (!found) return;
   state.exportBlob = found.file;
+  state.exportHolds = null;
   const a = $('exportDownload');
   a.href = URL.createObjectURL(found.file);
   a.download = chosenExportName();
@@ -3742,7 +3804,7 @@ async function verifySavedFile(file) {
 async function verifyExport() {
   if (!state.exportBlob) return;
   $('exportModal').classList.add('hidden');
-  const v = await verifyBlob(state.exportBlob);
+  const v = await verifyBlob(state.exportBlob, state.exportHolds);
   $('exportModal').classList.remove('hidden');
   if (!v) return;
   $('exportResult').innerHTML += `<p>${v.html}</p>`;
@@ -3752,7 +3814,7 @@ async function verifyExport() {
  * Re-scan an exported file with the current profile. Returns the scan, the
  * verdict as HTML for the dialog and as plain text, and the WCAG failures.
  */
-async function verifyBlob(blob) {
+async function verifyBlob(blob, holds = null) {
   const res = await runJob('Verifying the exported file', async (progress, cancelled) => {
     const m = await Movie.open(blob, wasm);
     const feeder = await makeFeeder(m.width, m.height);
@@ -3777,14 +3839,51 @@ async function verifyBlob(blob) {
   const wcagBad = v.filter((x) => x.kind === 'flash' || x.kind === 'red');
   const ext = v.filter((x) => x.kind === 'extended');
   const pat = v.filter((x) => x.kind === 'pattern');
-  let msg = wcagBad.length ? `<b>Fails WCAG:</b> ${wcagBad.length} violation${wcagBad.length === 1 ? '' : 's'}: ` + wcagBad.slice(0, 8).map((x) => `${x.kind} ${fmt(x.start)}–${fmt(x.end)}`).join(', ') : '<b>Passes WCAG.</b>';
-  if (ext.length && res.result.flag_extended) msg += ` ${ext.length} extended flash${ext.length === 1 ? '' : 'es'} remain${ext.length === 1 ? 's' : ''}: ` + ext.slice(0, 8).map((x) => `${fmt(x.start)}–${fmt(x.end)}`).join(', ');
-  if (res.result.flag_patterns) {
-    if (pat.length) msg += ` ${pat.length} hazardous stripe pattern${pat.length === 1 ? '' : 's'} remain${pat.length === 1 ? 's' : ''}: ` + pat.slice(0, 8).map((x) => `${fmt(x.start)}–${fmt(x.end)}`).join(', ');
-    else msg += ' No hazardous stripe patterns.';
-  }
-  const html = `${msg} (${res.frames} frames re-scanned in ${(res.elapsedMs / 1000).toFixed(1)} s)`;
-  return { res, wcagBad, html, text: html.replace(/<[^>]+>/g, '') };
+  // where each is in the video, and the section to fix it in: held frames
+  // push the file's times later than the video's (by the export's holds, or,
+  // for a file made elsewhere, the ones marked here)
+  const known = Array.isArray(holds);
+  const shifts = known ? holds : state.exportPlan ? state.exportPlan.holds : [];
+  const where = (x, html) => {
+    const w = exportToVideo(x.start, x.end, shifts);
+    const moved = Math.abs(w.lo - x.start) > 0.0005 || Math.abs(w.hi - x.end) > 0.0005;
+    const video = moved ? ` (${fmt(w.lo)}–${fmt(w.hi)} in the video${known ? '' : ', if it was exported with the frames held here'})` : '';
+    if (!w.sec) return `${video}, which no section covers`;
+    return `${video} in ${html ? `<button class="small" data-open-at="${w.sec.id}:${w.lo}:${w.hi}" data-kind="${x.kind}" title="Open the section with these frames selected">section #${w.sec.id}</button>` : `section #${w.sec.id}`}`;
+  };
+  const list = (xs, html, kind) => xs.slice(0, 8).map((x) => `${kind ? x.kind + ' ' : ''}${fmt(x.start)}–${fmt(x.end)}${where(x, html)}`).join(', ');
+  const describe = (html) => {
+    let msg = wcagBad.length ? `<b>Fails WCAG:</b> ${wcagBad.length} violation${wcagBad.length === 1 ? '' : 's'}: ` + list(wcagBad, html, true) : '<b>Passes WCAG.</b>';
+    if (ext.length && res.result.flag_extended) msg += ` ${ext.length} extended flash${ext.length === 1 ? '' : 'es'} remain${ext.length === 1 ? 's' : ''}: ` + list(ext, html);
+    if (res.result.flag_patterns) {
+      if (pat.length) msg += ` ${pat.length} hazardous stripe pattern${pat.length === 1 ? '' : 's'} remain${pat.length === 1 ? 's' : ''}: ` + list(pat, html);
+      else msg += ' No hazardous stripe patterns.';
+    }
+    return `${msg} (${res.frames} frames re-scanned in ${(res.elapsedMs / 1000).toFixed(1)} s)`;
+  };
+  return { res, wcagBad, html: describe(true), text: describe(false).replace(/<[^>]+>/g, '') };
+}
+
+/**
+ * Where a stretch of an exported file (`a`–`b`, seconds on its clock) is in
+ * the video: its times less the seconds that the frames held before them
+ * added (`holds`, sorted, on the video's clock), and the section over it.
+ */
+function exportToVideo(a, b, holds) {
+  const back = (t) => {
+    let shift = 0;
+    for (const h of holds) {
+      if (t < h.at + shift) break;
+      // (while a frame is held: that frame, the one just before h.at)
+      if (t < h.at + shift + h.seconds) return h.at - 0.001;
+      shift += h.seconds;
+    }
+    return t - shift;
+  };
+  const lo = back(a);
+  const hi = back(b);
+  const sec = state.project ? state.project.sectionsSorted().find((s) => s.start <= hi && s.end > lo) || null : null;
+  return { lo, hi, sec };
 }
 
 // ---- auto-fix: open a file, and the scan, the fixes, the export and its check follow -----
@@ -3997,7 +4096,7 @@ async function autopilot({ rescan = false } = {}) {
     // 4. verify
     if (halted()) return bail('verify', '');
     autoStep(auto, 'verify', 'running', 're-scanning the exported file');
-    const v = await verifyBlob(res.blob);
+    const v = await verifyBlob(res.blob, res.holds);
     if (!v || halted()) return bail('verify', 'The check of the exported file did not finish.');
     autoStep(auto, 'verify', v.wcagBad.length ? 'failed' : 'done', v.text);
     const ids = partial.map((s) => '#' + s.id).join(', ');
@@ -4117,6 +4216,7 @@ window.__unflash = {
     return state.changes;
   },
   debugReport: makeDebugReport,
+  exportToVideo,
   setPlayerSource,
   playSection,
   undo,

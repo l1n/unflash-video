@@ -14,6 +14,14 @@ it with node tests/e2e/whatsnew.mjs NAME (it is checked for flashing
 there, and tests/e2e/whatsnew-check.mjs holds every change to having
 one); tour:ID names a tour of it (web/tours.js). -->
 
+## 2026-09-30
+
+- <!-- 00:59 shot:frame-times --> **Frames show when they are in the whole video.** Each frame in the grid shows its time in the whole video (top right) as well as how far into the section it is (bottom right), and so does the frame at full size. The list under the verdict gives both for what still fails (*frames 43–123, 0:02.967 – 0:05.633 in the video, 0:01.433 – 0:04.100 into the section*), and so does the verdict.
+- <!-- 00:59 shot:verify-sections --> **The check of an export says which section each problem is in.** When *Verify* finds flashing left in an export, it names the section it is in, and a click on the section opens it with the frames that were on screen during the flashing selected. After a held frame an export runs later than the video, so the list then gives the video's times too.
+- <!-- 00:59 shot:fewest-verdict --> **After *Suggest: fewest removals*, the verdict is the check of what it marked.** Where none of the flashes it took out could be put back (each one tried failed the check), its message said the section passed, but the verdict showed the check of the last flash it tried to put back: *fails*, often only just over the line. The verdict is now the check of the frames it marked.
+- <!-- 00:59 shot:no-adapter --> **A plain message when the browser gives Unflash no graphics adapter.** Where the browser has WebGPU but hands the page no graphics adapter (graphics acceleration turned off, say), Unflash scans on the CPU instead, with the same results, more slowly. The message now says so in words, and in Chrome and Edge what to look at: *Use graphics acceleration when available* in Settings › System, and chrome://gpu. It used to be a line of errors from deep inside the GPU code (*vulkan support not compiled in* and so on); the debug report still has that.
+- <!-- 00:59 shot:quality-scale --> **The export quality says its scale** (*7 of 10*). And in Firefox, a reload no longer leaves the slider where it was with the number beside it back at 7 (the export went by the slider): both start at 7.
+
 ## 2026-09-29
 
 - <!-- 23:54 shot:dolby-sound --> **Dolby Digital sound plays.** A video whose sound is AC-3 or E-AC-3 (Dolby Digital, Dolby Digital Plus: TV recordings and films often have it), which no browser decodes for a web page, has its sound in the section player now: Unflash decodes it itself, mixed down to stereo. An export whose held frames need silence put into the sound re-encodes it the same way (in stereo), where before it could only leave the sound as it was, out of step after each held frame; an export without held frames still copies it as it is.

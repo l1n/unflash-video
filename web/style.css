@@ -214,6 +214,7 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 .frame-grid.dim .frame canvas { filter: brightness(.45); }
 .frame .fno { position: absolute; left: 3px; top: 3px; font-size: 10px; background: rgba(0, 0, 0, .75); padding: 0 4px; }
 .frame .ft { position: absolute; right: 3px; bottom: 3px; font-size: 10px; background: rgba(0, 0, 0, .75); padding: 0 4px; color: var(--fg2); }
+.frame .fv { position: absolute; right: 3px; top: 3px; font-size: 10px; background: rgba(0, 0, 0, .75); padding: 0 4px; color: var(--fg2); }
 .frame .fb { position: absolute; left: 3px; bottom: 3px; font-size: 10px; padding: 0 4px; background: var(--bad); color: var(--lit-fg); }
 .frame.flagged { box-shadow: inset 0 0 0 2px var(--flash); }
 .frame.flagged-red { box-shadow: inset 0 0 0 2px var(--red); }

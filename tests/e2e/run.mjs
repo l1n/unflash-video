@@ -174,6 +174,31 @@ try {
   results.verdictBefore = await page.textContent('#wsVerdict');
   results.frameCount = await page.textContent('#frameCount');
   console.log('prepared in', results.prepareMs, 'ms; verdict:', results.verdictBefore, results.frameCount);
+  // each frame says when it is in the whole video (as a verify of the export
+  // gives it) and how far into the section; so do the findings and the verdict
+  {
+    const t = await page.evaluate(() => {
+      const u = window.__unflash;
+      const fmt = (x) => u.state.env.wasm.format_time(x);
+      const sec = u.currentSection();
+      const tile = document.querySelectorAll('#frameGrid .frame')[10];
+      const v = sec.check.inside.find((x) => x.kind === 'flash');
+      return {
+        fv: tile.querySelector('.fv').textContent,
+        ft: tile.querySelector('.ft').textContent,
+        want: fmt(sec.start + sec.pts[10]),
+        rel: (sec.pts[10] - sec.pts[0]).toFixed(3),
+        title: tile.title,
+        verdict: document.querySelector('#wsVerdict').textContent,
+        flashAt: `flash at ${fmt(sec.start + sec.pts[0] + v.start)}, ${fmt(v.start)} into the section`,
+        findings: document.querySelector('#wsFindings').textContent,
+      };
+    });
+    console.log('frame 10:', t.fv, '/', t.ft, '| verdict:', t.verdict, '| findings:', t.findings.slice(0, 120));
+    assert(t.fv === t.want && t.ft === t.rel && t.title.includes(`at ${t.want} in the video, ${t.rel} s into the section`), 'a frame shows its time in the video and in the section: ' + JSON.stringify(t));
+    assert(t.verdict.includes(t.flashAt), `the verdict says when the flash is, in the video and in the section (${t.flashAt}): ${t.verdict}`);
+    assert(/Flash, frames \d+–\d+ \(\d+:\d\d\.\d{3} – \d+:\d\d\.\d{3} in the video, \d+:\d\d\.\d{3} – \d+:\d\d\.\d{3} into the section, [\d.]+ s\)/.test(t.findings), 'the findings say when, in the video and in the section: ' + t.findings);
+  }
   // a prepare cut into spans decoded side by side must give exactly what
   // one pass gives: the same pictures, times and pattern figures
   {
@@ -282,6 +307,30 @@ try {
   assert(results.fewest.removed > 0 && results.fewest.removed < results.marks, `fewest removals takes out fewer frames than keep dark (${results.fewest.removed} vs ${results.marks})`);
   // where the picture would freeze, frames come back at the safe rate
   assert(/came back into \d+ long stretch(es)? where the picture would have frozen, 3\.8 a second/.test(results.fewest.toast), 'the fewest removals let frames back into the long stretch: ' + results.fewest.toast);
+  // a suggestion's verdict is the check of the marks it hands back, not of the last marks it
+  // tried: the fewest removals hand back an earlier set when a flash put back fails (a
+  // suggester here that last tries no marks at all, which fail, then hands back ones that pass)
+  results.suggestVerdict = await page.evaluate(async () => {
+    const u = window.__unflash;
+    const { suggestEdits } = await import('./analysis.js');
+    const sec = u.currentSection();
+    const env = u.state.env;
+    const real = await suggestEdits(env, u.state.project, sec, 'fewest', null, { extS: 1.0 });
+    class Tried {
+      constructor() {
+        this.n = 0;
+      }
+      thin_long_gaps() {}
+      step() {
+        return JSON.stringify(this.n++ === 0 ? { simulate: {} } : { done: { ...real, verdict: undefined } });
+      }
+      free() {}
+    }
+    const wasm = new Proxy(env.wasm, { get: (t, k) => (k === 'Suggester' ? Tried : t[k]) });
+    const res = await suggestEdits({ ...env, wasm }, u.state.project, sec, 'fewest', null, { extS: 1.0 });
+    return { real: real.verdict.safe, handedBack: res.verdict.safe, note: res.note };
+  });
+  assert(results.suggestVerdict.real && results.suggestVerdict.handedBack, "a suggestion's verdict is the check of the marks it hands back, not of the last it tried: " + JSON.stringify(results.suggestVerdict));
 
   // --- reduce FPS from scratch ---------------------------------------------
   await page.click('#btnClearEdits');
@@ -522,6 +571,40 @@ try {
   }
   await page.screenshot({ path: path.join(OUT, '4-export.png') });
   await page.click('#btnCloseExport');
+  // a file whose check still finds flashing (the video itself here, as if its
+  // export had kept it): the verify says which section each problem is in,
+  // and the section opens with the frames on screen during it selected
+  {
+    await page.setInputFiles('#verifyFileInput', path.join(MEDIA, 'flash.mp4'));
+    await jobStarted(page);
+    await jobDone(page, 600000);
+    await page.waitForFunction(() => /flash\.mp4: .*re-scanned/.test(document.querySelector('#exportResult').textContent), null, { timeout: 30000 });
+    const found = await page.evaluate(() => ({
+      text: document.querySelector('#exportResult').textContent.split('flash.mp4: ').pop(),
+      buttons: [...document.querySelectorAll('#exportResult button[data-open-at]')].map((b) => b.textContent),
+    }));
+    console.log('verify of a file that still flashes:', found.text);
+    assert(/Fails WCAG/.test(found.text) && /flash \d+:\d\d\.\d{3}–\d+:\d\d\.\d{3} in section #1/.test(found.text) && found.buttons.includes('section #1'), 'the verify says which section the flash is in: ' + JSON.stringify(found));
+    await page.click('#exportResult button[data-open-at]');
+    await page.waitForFunction(() => document.querySelector('#exportModal').classList.contains('hidden') && window.__unflash.state.selection.size > 0, null, { timeout: 60000 });
+    const sel = await page.evaluate(() => {
+      const u = window.__unflash;
+      const sec = u.currentSection();
+      const s = [...u.state.selection].sort((a, b) => a - b);
+      return { n: s.length, first: sec.start + sec.pts[s[0]], last: sec.start + sec.pts[s[s.length - 1]], toast: document.querySelector('#toast').textContent };
+    });
+    console.log('opened from the verify:', JSON.stringify(sel));
+    // (the general flash is found at 3.9-5.5 s)
+    assert(sel.n > 20 && sel.first > 3.4 && sel.first < 4.6 && sel.last > 5.1 && sel.last < 5.8 && /where the check of the export found the flash/.test(sel.toast), 'the section opens with the flashing frames selected: ' + JSON.stringify(sel));
+    // a held frame puts off everything after it in an export: its times, taken back to the video's
+    const back = await page.evaluate(() => {
+      const f = window.__unflash.exportToVideo;
+      const holds = [{ at: 10, seconds: 1 }];
+      return [f(5, 6, holds), f(12, 12.5, holds), f(10.5, 10.6, holds)].map((w) => [+w.lo.toFixed(3), +w.hi.toFixed(3)]);
+    });
+    assert(JSON.stringify(back) === JSON.stringify([[5, 6], [11, 11.5], [9.999, 9.999]]), 'export times go back to the video by the holds before them: ' + JSON.stringify(back));
+    await page.keyboard.press('Escape');
+  }
 
   // --- the live monitor on the original -------------------------------------
   await page.selectOption('#playerSource', 'video');
@@ -562,6 +645,24 @@ try {
   scan = await scanCurrent();
   console.log('steady:', scan.toast);
   assert(scan.toast.includes('No flashing'), 'the steady file must be clean');
+
+  // --- bursts that each fail by themselves: the fewest removals try putting
+  // some back, which fails, and hand back the removal that took every one
+  // out; the verdict is the check of that, and passes (it was the check of
+  // the last try, which failed, under a message saying it passed)
+  await openFile('bursts.mp4');
+  scan = await scanCurrent();
+  await openSectionPrepared();
+  await verdictReady(page);
+  {
+    const before = await page.textContent('#toast');
+    await page.click('#btnSuggestFewest');
+    await toastChange(before);
+    await verdictReady(page);
+    results.bursts = { toast: await page.textContent('#toast'), verdict: await page.textContent('#wsVerdict') };
+    console.log('bursts, the fewest removals:', JSON.stringify(results.bursts));
+    assert(/every flash had to go \(putting any back failed the check\)/.test(results.bursts.toast) && /^passes/.test(results.bursts.verdict), 'every burst taken out: the verdict agrees with the message: ' + JSON.stringify(results.bursts));
+  }
 
   await openFile('extended.mp4');
   scan = await scanCurrent();
@@ -1168,6 +1269,33 @@ try {
   console.log('BGRX frames as they come:', JSON.stringify(results.packed));
   assert(results.packed.n === 20 && results.packed.same && results.packed.pics, 'BGRX frames copied as they are must match RGBA: ' + JSON.stringify(results.packed));
   assert(results.packed.route === 'rgba' && /BGRX as decoded/.test(results.packed.detail), 'the BGRX frames took the packed copy: ' + JSON.stringify(results.packed));
+
+  // ======== WebGPU that gives the page no adapter (graphics acceleration off, say)
+  // the CPU detector, and a banner that says so in words, with what to look
+  // at; the debug report keeps the browser's own error
+  {
+    const ctx = await browser.newContext({ viewport: { width: 1400, height: 1000 } });
+    await ctx.addInitScript(() => {
+      if (navigator.gpu) navigator.gpu.requestAdapter = async () => null;
+    });
+    const noGpu = await ctx.newPage();
+    await noGpu.goto(`http://127.0.0.1:${port}/?auto=0`);
+    await noGpu.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+    await noGpu.setInputFiles('#fileInput', path.join(MEDIA, 'flash.mp4'));
+    await noGpu.waitForFunction(() => /graphics adapter/.test(document.querySelector('#bannerText').textContent), null, { timeout: 60000 });
+    results.noAdapter = await noGpu.evaluate(() => ({
+      banner: document.querySelector('#bannerText').textContent,
+      info: document.querySelector('#banner').classList.contains('info'),
+      backend: window.__unflash.state.env.feeder.backend,
+      report: window.__unflash.debugReport(),
+    }));
+    await ctx.close();
+    console.log('no WebGPU adapter:', results.noAdapter.banner);
+    const b = results.noAdapter.banner;
+    assert(results.noAdapter.backend === 'cpu' && results.noAdapter.info, 'no adapter: the CPU detector, and an info banner: ' + JSON.stringify(results.noAdapter.backend));
+    assert(/the results are the same/.test(b) && /Use graphics acceleration when available/.test(b) && /chrome:\/\/gpu/.test(b) && !/compiled in/.test(b), 'no adapter: the banner says it in words, with what to look at: ' + b);
+    assert(/no WebGPU adapter/.test(results.noAdapter.report) && /WebGPU, but no adapter given to the page/.test(results.noAdapter.report), "no adapter: the debug report keeps the browser's own error: " + results.noAdapter.report);
+  }
 
   }
 

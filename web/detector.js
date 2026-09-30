@@ -12,7 +12,8 @@ import { profile } from './profile.js';
 export async function createDetector(wasm, configJson, width, height, { preferGpu = true, externalSources = null, route = null, batch = null } = {}) {
   let det = null;
   let backend = 'cpu';
-  let note = '';
+  let note = ''; // why the CPU detector, in words for the banner
+  let detail = ''; // and as the browser put it, for the debug report
   let probe = null;
   if (preferGpu && navigator.gpu) {
     try {
@@ -22,14 +23,17 @@ export async function createDetector(wasm, configJson, width, height, { preferGp
       backend = 'webgpu';
       probe = await SourceProbe.create(externalSources);
     } catch (e) {
-      note = `WebGPU unavailable (${e && e.message ? e.message : e}); using the CPU detector`;
-      console.warn(note);
+      const why = e && e.message ? e.message : String(e);
+      detail = `WebGPU unavailable (${why}); using the CPU detector`;
+      note = /no WebGPU adapter/.test(why) ? noAdapterNote() : `${ON_THE_CPU} WebGPU would not start (${why}).`;
+      console.warn(detail);
     }
   } else if (preferGpu) {
-    note = 'This browser has no WebGPU; using the CPU detector';
+    note = `${ON_THE_CPU} This browser has no WebGPU.`;
   }
   if (!det) det = new wasm.Detector(configJson, width, height);
   const feeder = new Feeder(wasm, det, backend, note, probe, route);
+  feeder.detail = detail || note;
   // can a decoded frame go to the GPU as it is? (a canvas-made frame asks
   // WebGPU the same question as a decoder's; null: not asked, another route
   // being forced)
@@ -49,6 +53,21 @@ export async function createDetector(wasm, configJson, width, height, { preferGp
     }
   }
   return feeder;
+}
+
+const ON_THE_CPU = 'Scans run on the CPU here, not on the graphics card: the results are the same, only a scan may take longer.';
+
+/**
+ * The banner's words when the browser has WebGPU but gives the page no
+ * graphics adapter (its error lists the backends of wgpu, the library the
+ * GPU detector is written with, that a web page never has: no help), with
+ * what to look at in Chrome and Edge.
+ */
+function noAdapterNote() {
+  const ua = navigator.userAgent;
+  const chromium = /Chrome\//.test(ua);
+  const gpuPage = /Edg\//.test(ua) ? 'edge://gpu' : 'chrome://gpu';
+  return `${ON_THE_CPU} This browser has WebGPU, but it gave the page no graphics adapter to use it with.${chromium ? ` That usually means graphics acceleration is off (Settings › System › "Use graphics acceleration when available": turn it on, then relaunch the browser), or that the browser has turned WebGPU off for this graphics card or its driver (${gpuPage} says which, under WebGPU).` : ''}`;
 }
 
 /**

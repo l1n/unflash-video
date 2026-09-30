@@ -15,11 +15,15 @@ export function builtInSound(codec) {
   return BUILT_IN_SOUND.test(codec || '');
 }
 
+/** Why the built-in decoder was not there, the last time it was wanted. */
+let missing = '';
+
 /**
  * A decoder for the sound configured by `cfg` ({ codec, sampleRate,
  * numberOfChannels, description }): `{ Decoder, builtIn }`, the class to
  * make it from (AudioDecoder, or BuiltInAudioDecoder, whose sound comes
- * mixed down to stereo), or null where neither can decode it.
+ * mixed down to stereo), or null where neither can decode it (and
+ * noSoundDecoder says why).
  */
 export async function soundDecoderFor(cfg) {
   if (typeof AudioDecoder !== 'undefined') {
@@ -29,7 +33,12 @@ export async function soundDecoderFor(cfg) {
       /* not this way */
     }
   }
-  if (builtInSound(cfg.codec) && typeof AudioData !== 'undefined' && typeof EncodedAudioChunk !== 'undefined') {
+  if (builtInSound(cfg.codec)) {
+    if (typeof AudioData === 'undefined' || typeof EncodedAudioChunk === 'undefined') {
+      missing = 'webcodecs';
+      return null;
+    }
+    missing = 'module';
     try {
       const mod = await loadDecoders();
       if (mod.Ac3Decoder) return { Decoder: BuiltInAudioDecoder, builtIn: true };
@@ -38,6 +47,19 @@ export async function soundDecoderFor(cfg) {
     }
   }
   return null;
+}
+
+/**
+ * Why soundDecoderFor found nothing for `codec`, in words, `what` naming the
+ * sound ("this video's sound (E-AC-3 …)"): the browser can't decode it; or,
+ * for a sound the app decodes itself, its decoder did not load (a page
+ * loaded before the decoder was added, holding on to the older decoders
+ * module) or the browser lacks the WebCodecs sound it hands its sound to.
+ */
+export function noSoundDecoder(codec, what) {
+  if (builtInSound(codec) && missing === 'module') return `the app's own decoder for ${what} did not load (reloading the page fetches it again)`;
+  if (builtInSound(codec) && missing === 'webcodecs') return `this browser lacks the WebCodecs sound support that the app's own decoder for ${what} needs`;
+  return `this browser can't decode ${what}`;
 }
 
 /**

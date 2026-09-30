@@ -3,8 +3,10 @@
 // most unlike the Chromium the other tests use: its WebGPU takes no
 // VideoFrame, so the pictures reach the detector through the decode
 // workers, copied out of its decoder; it has no long-task API; and it
-// offers to stop a page that keeps its thread for long. Here, in Firefox:
-// a scan on the GPU finds exactly what the CPU detector does; the page
+// offers to stop a page that keeps its thread for long; and it puts a
+// form's values back on a reload. Here, in Firefox: the export quality says
+// what the slider holds after a reload; a scan on the GPU finds exactly
+// what the CPU detector does; the page
 // answers all through a scan, and a second Scan click is turned away while
 // the first goes on; a section prepares, checks and is fixed by a Suggest
 // button; and in a scan in chunks, the built-in decoder takes over the
@@ -104,6 +106,25 @@ try {
   await cpu.close();
   const kinds = results.cpu.violations.map((v) => v.kind);
   assert(kinds.includes('flash') && kinds.includes('red'), 'the clip flashes, and red: ' + JSON.stringify(results.cpu.violations));
+
+  // --- the export quality after a reload: Firefox puts a form's values back
+  // on a reload, and put the slider back where it was (10, say) with the
+  // number beside it at the page's 7; the export went by the slider --------
+  {
+    const q = await newPage('cpu=1&auto=0');
+    const set = await q.evaluate(() => {
+      const s = document.querySelector('#exportQuality');
+      s.value = '10';
+      s.dispatchEvent(new Event('input', { bubbles: true }));
+      return document.querySelector('#exportQualityText').textContent;
+    });
+    await q.reload({ waitUntil: 'load' });
+    await q.waitForFunction(() => window.__unflash && window.__unflash.changes, { timeout: 60000 });
+    results.quality = { set, after: await q.evaluate(() => [document.querySelector('#exportQuality').value, document.querySelector('#exportQualityText').textContent]) };
+    await q.close();
+    console.log('export quality, set and after a reload:', JSON.stringify(results.quality));
+    assert(set === '10 of 10' && results.quality.after[0] === '7' && results.quality.after[1] === '7 of 10', 'the quality shows its scale, and says what the slider holds after a reload: ' + JSON.stringify(results.quality));
+  }
 
   // --- WebGPU, the pictures through the decode workers -----------------------
   const page = await newPage('auto=0&hybrid=0');

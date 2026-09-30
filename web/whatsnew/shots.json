@@ -192,6 +192,18 @@
    "violations": 0
   }
  },
+ "fewest-verdict": {
+  "w": 720,
+  "h": 450,
+  "seconds": 13.9,
+  "alt": "A section of bursts of quick flashes, each of which fails by itself: Suggest: fewest removals takes every burst out, and says the section passes, which the verdict now says too (it showed the check of the last burst tried back in, which fails).",
+  "sha256": "9963a6f37f6aea965dea26410eafc874727280fe2acd0a3b6f318ea139f3f00e",
+  "checked": {
+   "profile": "strict",
+   "frames": 419,
+   "violations": 0
+  }
+ },
  "films": {
   "w": 720,
   "h": 450,
@@ -249,6 +261,18 @@
   "checked": {
    "profile": "strict",
    "frames": 372,
+   "violations": 0
+  }
+ },
+ "frame-times": {
+  "w": 720,
+  "h": 450,
+  "seconds": 15.5,
+  "alt": "A section 50 seconds into a video: the verdict and the list under it say when the flash is in the whole video and how far into the section; then each frame in the grid shows its time in the whole video at the top right, and how far into the section it is at the bottom right.",
+  "sha256": "121d8e0c2fe59768253a54d4c017457bba57792e7744b3aaac31472aa92cd0ae",
+  "checked": {
+   "profile": "strict",
+   "frames": 466,
    "violations": 0
   }
  },
@@ -420,6 +444,18 @@
    "violations": 0
   }
  },
+ "no-adapter": {
+  "w": 720,
+  "h": 450,
+  "seconds": 12.5,
+  "alt": "A browser whose WebGPU gives the page no graphics adapter (hardware acceleration off, say): a video is opened, and the message says in words that the scans run on the CPU, with the same results, and what to look at in Chrome: Settings, System, Use graphics acceleration when available, and chrome://gpu. The debug report keeps the browser's own error.",
+  "sha256": "75170c821600335b5ec0943052d15808c36c2fde81ccbeed2d529599723f099a",
+  "checked": {
+   "profile": "strict",
+   "frames": 377,
+   "violations": 0
+  }
+ },
  "no-freeze": {
   "w": 720,
   "h": 450,
@@ -465,6 +501,18 @@
   "checked": {
    "profile": "strict",
    "frames": 341,
+   "violations": 0
+  }
+ },
+ "quality-scale": {
+  "w": 720,
+  "h": 450,
+  "seconds": 20.3,
+  "alt": "In Firefox, the export dialog's quality says 7 of 10; it is moved to 10 of 10 and the page reloaded; with the video open again, the dialog says 7 of 10, with the slider at 7 (Firefox used to put the slider back at 10 and leave the number at 7).",
+  "sha256": "4dc4f974bd4e807f5160472e37c711f56146d7558fb65f1bc45adc5b6e5eb179",
+  "checked": {
+   "profile": "strict",
+   "frames": 611,
    "violations": 0
   }
  },
@@ -730,6 +778,18 @@
   "checked": {
    "profile": "strict",
    "frames": 395,
+   "violations": 0
+  }
+ },
+ "verify-sections": {
+  "w": 720,
+  "h": 450,
+  "seconds": 12.6,
+  "alt": "An export whose check still finds flashing: Verify says which section each problem is in, and a click on section #1 opens it with the frames that were on screen during the flash selected.",
+  "sha256": "80d11763391907772c4157765b5e8021d6d7e649c66795cf6860e602ffd83f60",
+  "checked": {
+   "profile": "strict",
+   "frames": 378,
    "violations": 0
   }
  },

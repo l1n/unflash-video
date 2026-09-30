@@ -161,9 +161,10 @@ export function debugReport({ version, state, profile, gpu, segments, hybrid = n
     ])
   );
   const g = gpu && gpu.info;
+  const noAdapter = state.env && /no WebGPU adapter/.test(state.env.feeder.detail || '');
   lines.push(
     ...block('GPU', [
-      !navigator.gpu ? 'no WebGPU in this browser' : g ? [g.vendor, g.architecture, g.device, g.description].filter(Boolean).join(' · ') || 'WebGPU (the adapter gives no description)' : 'WebGPU (adapter not described)',
+      !navigator.gpu ? 'no WebGPU in this browser' : noAdapter ? 'WebGPU, but no adapter given to the page' : g ? [g.vendor, g.architecture, g.device, g.description].filter(Boolean).join(' · ') || 'WebGPU (the adapter gives no description)' : 'WebGPU (adapter not described)',
       gpu && gpu.fallback ? 'a fallback (software) adapter' : null,
     ])
   );
@@ -171,7 +172,7 @@ export function debugReport({ version, state, profile, gpu, segments, hybrid = n
   if (env) {
     const f = env.feeder;
     const det = [];
-    det.push(`${f.backend === 'webgpu' ? 'WebGPU' : 'CPU (WebAssembly)'} at ${f.aw}×${f.ah}${f.note ? ` (${f.note})` : ''}`);
+    det.push(`${f.backend === 'webgpu' ? 'WebGPU' : 'CPU (WebAssembly)'} at ${f.aw}×${f.ah}${f.detail || f.note ? ` (${f.detail || f.note})` : ''}`);
     det.push(`pictures reach it as: ${f.route || 'nothing yet'}${f.routeDetail ? ` (${f.routeDetail})` : ''}${f.takesFrames === false && f.backend === 'webgpu' ? ' · this WebGPU takes no decoded frame' : ''}`);
     const m = state.movie;
     const lanes = hybrid ? hybrid.hw : segments;

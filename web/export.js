@@ -13,7 +13,7 @@ import { decodeRange, ChunkReader, orTimeout } from './media.js';
 import { profile } from './profile.js';
 import { shownPts, softenPlan, blendMarks, blendStrength, blendSources, blendWeights } from './analysis.js';
 import { SoundRun, audioData } from './sound.js';
-import { soundDecoderFor } from './audiodec.js';
+import { noSoundDecoder, soundDecoderFor } from './audiodec.js';
 
 function avcLevel(w, h, fps) {
   const mbs = Math.ceil(w / 16) * Math.ceil(h / 16);
@@ -1040,7 +1040,7 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
   mx.free();
   const elapsedMs = performance.now() - started;
   profile.report(`export (${chosen.label}, ${plan.mode})`, encodedFrames, elapsedMs);
-  return { blob, warnings, frames: encodedFrames, copied: copiedFrames, spans: encodePieces.length, mode: plan.mode, parallel: K, softened, blended, elapsedMs, codec: codecString, encoderLabel: chosen.label };
+  return { blob, warnings, frames: encodedFrames, copied: copiedFrames, spans: encodePieces.length, mode: plan.mode, parallel: K, softened, blended, elapsedMs, codec: codecString, encoderLabel: chosen.label, holds: plan.holds };
 }
 
 /** Seconds as the export's notes say them: "1 s", "0.5 s". */
@@ -1072,7 +1072,7 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
   if (desc.length) dcfg.description = desc;
   // (WebCodecs', or the app's own for AC-3 and E-AC-3, whose sound comes mixed down to stereo)
   const found = await soundDecoderFor(dcfg);
-  if (!found) return { warning: `${why}, and this browser can't decode the audio (${name}) to re-encode it, ${without}.`, wrote: false };
+  if (!found) return { warning: `${why}, and ${noSoundDecoder(at.codec, `the audio (${name})`)}, ${without}.`, wrote: false };
   const channelsIn = found.builtIn ? 2 : at.channels;
   const pick = async (rate, channels) => {
     for (const c of [

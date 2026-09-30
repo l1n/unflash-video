@@ -1234,6 +1234,133 @@ export const SCENES = [
     },
   },
 
+  // ======== 2026-09-30 ==========================================================
+  {
+    name: 'frame-times',
+    alt: 'A section 50 seconds into a video: the verdict and the list under it say when the flash is in the whole video and how far into the section; then each frame in the grid shows its time in the whole video at the top right, and how far into the section it is at the bottom right.',
+    query: Q,
+    viewport: { width: 960, height: 700 },
+    async setup(d) {
+      await inSection(d, 'late-flash.mp4');
+      await toTop(d, '#wsTitle');
+    },
+    view: (d) => d.from('#wsVerdict', 16),
+    async play(d) {
+      await d.point('#wsVerdict', { dx: 0.2, ms: 600 });
+      await d.wait(2400);
+      await d.point('#wsFindings .finding b', { ms: 600 });
+      await d.wait(2600);
+      await d.scrollTo('#frameGrid', { ms: 900 });
+      await d.camera('#frameGrid .frame:nth-child(1)', { anchor: true, pad: 12, ms: 700 });
+      await d.point('#frameGrid .frame:nth-child(2) .fv', { ms: 700 });
+      await d.wait(2000);
+      await d.point('#frameGrid .frame:nth-child(2) .ft', { ms: 700 });
+      await d.wait(2000);
+    },
+  },
+
+  {
+    name: 'verify-sections',
+    alt: 'An export whose check still finds flashing: Verify says which section each problem is in, and a click on section #1 opens it with the frames that were on screen during the flash selected.',
+    query: Q,
+    async setup(d) {
+      await inSection(d);
+      await click(d, '#btnExport');
+      await d.until(() => !document.querySelector('#btnDoExport').disabled);
+      await click(d, '#btnDoExport');
+      await d.started();
+      await d.idle();
+      await d.until(() => !document.querySelector('#btnVerifyExport').disabled);
+    },
+    view: (d) => d.around('#exportModal .modal-box', 4),
+    async play(d) {
+      await d.click('#btnVerifyExport');
+      await d.started();
+      await d.faster(() => d.idle(), 4);
+      await d.until(() => /re-scanned/.test(document.querySelector('#exportResult').textContent));
+      await d.camera('#exportModal .modal-box', { pad: 6, ms: 500 });
+      await d.point('#exportResult button[data-open-at]', { ms: 700 });
+      await d.wait(2400);
+      await d.click('#exportResult button[data-open-at]', { after: 1200 });
+      await d.camera('#frameGrid .frame.selected', { anchor: true, pad: 40, ms: 900 });
+      await d.wait(3000);
+    },
+  },
+
+  {
+    name: 'fewest-verdict',
+    alt: 'A section of bursts of quick flashes, each of which fails by itself: Suggest: fewest removals takes every burst out, and says the section passes, which the verdict now says too (it showed the check of the last burst tried back in, which fails).',
+    query: Q,
+    setup: (d) => inSection(d, 'bursts.mp4'),
+    view: (d) => d.around(['#wsVerdict', '#btnSuggestFewest'], 10),
+    async play(d) {
+      await d.point('#wsVerdict', { ms: 600 });
+      await d.wait(1200);
+      await d.click('#btnSuggestFewest');
+      await d.started(5000);
+      await d.verdict(/^passes/);
+      await d.camera(await d.around(['#wsVerdict', '#btnSuggestFewest', '#toast'], 10), { ms: 800 });
+      await d.wait(3600);
+    },
+  },
+
+  {
+    name: 'no-adapter',
+    alt: "A browser whose WebGPU gives the page no graphics adapter (hardware acceleration off, say): a video is opened, and the message says in words that the scans run on the CPU, with the same results, and what to look at in Chrome: Settings, System, Use graphics acceleration when available, and chrome://gpu. The debug report keeps the browser's own error.",
+    // (the browser as it is with graphics acceleration off: WebGPU there, no adapter)
+    init: `if (navigator.gpu) navigator.gpu.requestAdapter = async () => null;`,
+    query: 'tour=0&auto=0',
+    viewport: { width: 960, height: 700 },
+    view: { x: 0, y: 0, width: 720, height: 450 },
+    async play(d) {
+      await d.pick('label.filebtn.primary', 'flash.mp4');
+      await d.until(() => /graphics adapter/.test(document.querySelector('#bannerText').textContent));
+      await d.camera('#banner', { pad: 8, ms: 900 });
+      await d.wait(4200);
+      await report(d, /^.*CPU \(WebAssembly\) at.*/);
+      await d.wait(2400);
+    },
+  },
+
+  {
+    name: 'quality-scale',
+    browser: 'firefox',
+    alt: "In Firefox, the export dialog's quality says 7 of 10; it is moved to 10 of 10 and the page reloaded; with the video open again, the dialog says 7 of 10, with the slider at 7 (Firefox used to put the slider back at 10 and leave the number at 7).",
+    query: FQ,
+    async setup(d) {
+      await d.open('flash.mp4');
+      await hideToast(d);
+      await click(d, '#btnExport');
+      await d.until(() => !document.querySelector('#btnDoExport').disabled);
+    },
+    view: (d) => d.around('#exportModal .modal-box', 4),
+    async play(d) {
+      await d.point('#exportQuality', { dx: 0.67, ms: 700 });
+      await d.wait(1400);
+      // (dragged to the top)
+      await d.point('#exportQuality', { dx: 0.98, ms: 700 });
+      await d.eval(() => {
+        const q = document.querySelector('#exportQuality');
+        q.value = '10';
+        q.dispatchEvent(new Event('input', { bubbles: true }));
+        q.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await d.wait(1800);
+      await d.reload();
+      await d.caption('the page, reloaded');
+      await d.wait(900);
+      await d.pick('label.filebtn.primary', 'flash.mp4');
+      await d.caption('');
+      await d.opened('flash.mp4');
+      await hideToast(d);
+      await d.click('#btnExport', { after: 400 });
+      await d.until(() => !document.querySelector('#btnDoExport').disabled);
+      await d.camera('#exportModal .modal-box', { pad: 6, ms: 700 });
+      await d.point('#exportQuality', { dx: 0.67, ms: 700 });
+      await d.wait(2600);
+    },
+  },
+
   // ======== What's new itself, films and all: filmed last ======================
   {
     name: 'films',

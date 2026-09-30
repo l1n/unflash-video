@@ -297,7 +297,14 @@ class ScreenshotFilm extends Film {
     this.loop = (async () => {
       while (this.running) {
         const a = Date.now();
-        const png = await this.page.screenshot({ type: 'png' });
+        let png;
+        try {
+          png = await this.page.screenshot({ type: 'png' });
+        } catch (e) {
+          // (a page halfway through a reload has nothing to take: the picture before it stays up)
+          await sleep(30);
+          continue;
+        }
         this.frames.push({ t: (a + Date.now()) / 2000, png: Buffer.from(png) });
       }
     })();
@@ -327,6 +334,10 @@ class FirefoxPage {
 
   goto(url) {
     return this.p.goto(url, { waitUntil: 'load' });
+  }
+
+  reload() {
+    return this.p.reload({ waitUntil: 'load' });
   }
 
   waitForFunction(fn, arg, opts = {}) {
@@ -391,6 +402,16 @@ export class Demo {
 
   async goto(query = '') {
     await this.page.goto(this.url(query));
+    await this.loaded();
+  }
+
+  /** Reload the page, as its reload button does (a browser may put back what its form fields held). */
+  async reload() {
+    await this.page.reload();
+    await this.loaded();
+  }
+
+  async loaded() {
     await this.page.waitForFunction(() => window.__unflash && window.__unflash.changes && window.__demo, null, { timeout: 60000 });
     await this.page.waitForFunction(() => /WebGPU|CPU/.test(document.querySelector('#support').textContent), null, { timeout: 60000 }).catch(() => {});
     this.x = this.y = null;

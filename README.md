@@ -116,7 +116,15 @@ player plays it. So is sound in AC-3 or E-AC-3 (Dolby Digital, Dolby
 Digital Plus: TV recordings, films), which no browser's WebCodecs
 decodes: the section player plays it, mixed down to stereo, and an
 export whose held frames need silence put into the sound re-encodes it
-(in stereo); an export without held frames copies it as it is.
+(in stereo); an export without held frames copies it as it is. (The
+whole-video player is the browser's own, and plays such a video without
+its sound.)
+
+Where a browser has WebGPU but gives the page no graphics adapter
+(graphics acceleration turned off in its settings, or WebGPU turned off
+for the graphics card or its driver: chrome://gpu says which), Unflash
+scans on the CPU instead: the same results, more slowly, and a note says
+what to look at.
 
 Files it reads:
 
@@ -151,7 +159,9 @@ Files it reads:
 2. **Open a section.** It prepares itself (its frames, plus a run-up and
    run-out, are decoded into memory at analysis resolution) and is checked.
    Under the verdict, whatever still fails is listed with its frames and
-   times; flashing that goes on from before the section, or past its end,
+   times, in the whole video and into the section (each frame's thumbnail
+   has both too: the video's time at the top right, the section's at the
+   bottom right); flashing that goes on from before the section, or past its end,
    says so and names the section it is in. Flashing from before the
    section that reaches it only as its first picture comes up is the
    section before's to fix, and is listed as such, outside this verdict.
@@ -247,7 +257,10 @@ frame.
    turning on *Always ask you where to save files* in its settings has
    *Download* ask for the folder (the dialog says so). **Verify** re-scans
    the exported file with the same detector; **verify a saved file…** does
-   the same for a file you saved earlier.
+   the same for a file you saved earlier. Anything still failing is listed
+   with the section it is in, and a click on the section opens it with the
+   frames on screen during it selected (after a held frame an export runs
+   later than the video, so the list gives the video's times too).
 
 **Auto-fix** (tick it in the header; off unless you do) does steps 2 to 7
 unattended: it softens stripes, tries the fewest removals (which end by

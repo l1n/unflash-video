@@ -6,7 +6,7 @@
 // sound on the edited timeline by that list; the export encodes what it
 // makes, and the section player plays it.
 
-import { soundDecoderFor } from './audiodec.js';
+import { noSoundDecoder, soundDecoderFor } from './audiodec.js';
 
 /**
  * The sound of the edited timeline as one unbroken run of samples, handed
@@ -422,7 +422,7 @@ export class SectionSound {
     if (desc.length) cfg.description = desc;
     // (WebCodecs', or the app's own for AC-3 and E-AC-3, which no browser's WebCodecs decodes)
     const found = await soundDecoderFor(cfg);
-    if (!found) throw new Error(`this browser can't decode this video's sound (${codecName(at.codec)})`);
+    if (!found) throw new Error(noSoundDecoder(at.codec, `this video's sound (${codecName(at.codec)})`));
     this.builtIn = found.builtIn;
     const reader = movie.reader ? movie.reader.fork() : null;
     const prefix = at.prefix && at.prefix.length ? Uint8Array.from(at.prefix) : null;
