@@ -1057,13 +1057,14 @@ const secs = (x) => `${Math.round(x * 100) / 100} s`;
  * each hold puts `seconds` of silence into the sound at `at`, the moment
  * the held frame's next frame would have come, so the sound waits exactly
  * where the picture does; or an MP4 can't hold the source's sound as it is
- * (Vorbis, PCM). Returns `{ warning, wrote }`: what was done, or why there
- * is no sound; `wrote` false means nothing went into the file.
+ * (Vorbis, PCM; DTS from an MKV or a transport stream). Returns
+ * `{ warning, wrote }`: what was done, or why there is no sound; `wrote`
+ * false means nothing went into the file.
  */
 async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [], onProgress = null } = {}) {
   const at = movie.audio;
   const a = movie.a;
-  const name = at.codec;
+  const name = soundName(at.codec); // (as people know it: DTS, not dtsc)
   const held = holds.length > 0;
   const lengths = [...new Set(holds.map((h) => h.seconds))];
   const silence = lengths.length === 1 ? `${secs(lengths[0])} of silence` : 'silence';
@@ -1072,7 +1073,7 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
   const without = held && at.copyable ? `so the sound was copied as it is and runs ahead of the picture after each held frame (by ${secs(holds.reduce((s, h) => s + h.seconds, 0))} at the end)` : 'so the export has no sound';
   if (typeof AudioEncoder === 'undefined') return { warning: `${why}, and this browser can't re-encode audio, ${without}.`, wrote: false };
   const dcfg = soundConfig(at, movie.dx.track_description(at.index));
-  // (WebCodecs', or the app's own for AC-3 and E-AC-3, whose sound comes mixed down to stereo, and PCM)
+  // (WebCodecs', or the app's own for AC-3, E-AC-3 and DTS, whose sound comes mixed down to stereo, and PCM)
   const found = await soundDecoderFor(dcfg);
   if (!found) return { warning: `${why}, and ${noSoundDecoder(at.codec, `the audio (${name})`)}, ${without}.`, wrote: false };
   const channelsIn = found.channels;

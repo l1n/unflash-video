@@ -144,6 +144,19 @@
    "violations": 0
   }
  },
+ "dts-sound": {
+  "w": 720,
+  "h": 450,
+  "seconds": 15.4,
+  "alt": "A video whose sound is DTS, which no browser decodes for a web page: sound off is clicked, and the section plays with its sound (a steady tone), decoded by Unflash itself, as the debug report then says. The film has its sound: turn it on with the film's own sound button.",
+  "sound": true,
+  "sha256": "e22936e0755af8e2bbbc5815d021ae2300c43e480fd591f6fd467fe23bb38a96",
+  "checked": {
+   "profile": "strict",
+   "frames": 464,
+   "violations": 0
+  }
+ },
  "exact-chunks": {
   "w": 720,
   "h": 450,

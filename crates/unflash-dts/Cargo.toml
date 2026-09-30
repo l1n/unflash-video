@@ -1,0 +1,8 @@
+[package]
+name = "unflash-dts"
+description = "A small DTS Coherent Acoustics core audio decoder for browsers without one"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+
+[dependencies]

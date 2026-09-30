@@ -229,7 +229,7 @@ export class SectionSound {
     this.clock = null; // the section moment the sound plays at a wall time, while it plays
     this.speed = 1;
     this.failed = null; // why there is no sound, once known
-    this.builtIn = ''; // the app's own decoder it is decoded by (AC-3, PCM), when not WebCodecs
+    this.builtIn = ''; // the app's own decoder it is decoded by (AC-3, DTS, PCM), when not WebCodecs
     this.heldBack = false; // the browser has not started the sound's output
     this.onFail = null;
     this.onChange = null; // the status changed
@@ -424,7 +424,7 @@ export class SectionSound {
     while (last < pts.length && pts[last] / 1e6 < to) last++;
     if (last <= first) return null;
     const cfg = soundConfig(at, movie.dx.track_description(at.index));
-    // (WebCodecs', or the app's own for AC-3 and E-AC-3, which no browser's WebCodecs decodes)
+    // (WebCodecs', or the app's own for AC-3, E-AC-3, DTS and PCM, which no browser's WebCodecs decodes)
     const found = await soundDecoderFor(cfg);
     if (!found) throw new Error(noSoundDecoder(at.codec, `this video's sound (${codecName(at.codec)})`));
     this.builtIn = found.builtIn ? found.name : '';

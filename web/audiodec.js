@@ -2,9 +2,10 @@
 // the codec; otherwise one built into the app, behind the same interface, so
 // that the section player's sound and the export's re-encode use either the
 // same way. The app's own: AC-3 and E-AC-3 (Dolby Digital, Dolby Digital
-// Plus), which no browser's WebCodecs decodes (crates/unflash-ac3, in the
-// decoders module; its sound comes mixed down to stereo), and PCM in every
-// form (big and little endian, 8 to 32 bits, float, G.711), read here.
+// Plus) and DTS, which no browser's WebCodecs decodes (crates/unflash-ac3
+// and crates/unflash-dts, in the decoders module; their sound comes mixed
+// down to stereo), and PCM in every form (big and little endian, 8 to 32
+// bits, float, G.711), read here.
 
 import { loadDecoders } from './codecs.js';
 
@@ -15,6 +16,8 @@ import { loadDecoders } from './codecs.js';
  */
 const BUILT_IN_SOUND = [
   { name: 'AC-3', test: /^(ac-3|ec-3|mp4a\.a5|mp4a\.a6)$/i, wasm: 'Ac3Decoder' },
+  // (DTS Express, dtse, and DTS-HD without a core are not: only the core is read)
+  { name: 'DTS', test: /^(dtsc|dtsh|dtsl)$/i, wasm: 'DtsDecoder' },
   { name: 'PCM', test: /^(pcm-(u8|s8|s16|s16be|s24|s24be|s32|s32be|f32|f32be|f64|f64be)|ulaw|alaw)$/, pcm: true },
 ];
 
@@ -59,7 +62,7 @@ let missing = '';
  * A decoder for the sound configured by `cfg` ({ codec, sampleRate,
  * numberOfChannels, description }): `{ Decoder, builtIn, name, channels }`,
  * the class to make it from (AudioDecoder, or BuiltInAudioDecoder), the
- * name of the app's own decoder when it is one ("AC-3", "PCM"), and
+ * name of the app's own decoder when it is one ("AC-3", "DTS", "PCM"), and
  * the channels its sound comes in (the source's; two where the app's own
  * mixes it down); or null where neither can decode it (and noSoundDecoder
  * says why).
@@ -185,12 +188,13 @@ export class PcmDecoder {
 }
 
 /**
- * A sound the app decodes itself (AC-3 and E-AC-3 through the decoders
- * module, PCM here), with as much of WebCodecs' AudioDecoder as
+ * A sound the app decodes itself (AC-3, E-AC-3 and DTS through the
+ * decoders module, PCM here), with as much of WebCodecs' AudioDecoder as
  * the app uses: configure, decode (EncodedAudioChunk; each a whole number
  * of frames, as an MP4 sample, a Matroska block or a transport stream's
  * packet is), flush, close, decodeQueueSize, and `output` given AudioData
- * (f32-planar, timed as the chunk was: Dolby mixed down to stereo). A chunk that won't decode at all goes to `error`; frames within
+ * (f32-planar, timed as the chunk was: Dolby and DTS mixed down to
+ * stereo). A chunk that won't decode at all goes to `error`; frames within
  * one that are damaged come out as silence.
  */
 export class BuiltInAudioDecoder {

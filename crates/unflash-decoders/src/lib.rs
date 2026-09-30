@@ -1,13 +1,13 @@
 //! The built-in decoders for the codecs a browser's WebCodecs may lack
 //! (HEVC, VP9, VP8 and AV1; H.264's is in the main module; and the sound
-//! decoder for AC-3 and E-AC-3, `Ac3Decoder`), as a WebAssembly module of
-//! their own: the page loads it only for a file that needs one,
-//! and each decode worker (`web/softworker.js`) runs one decoder over a
-//! group of pictures at a time. Every decoder gives 8-bit 4:2:0 pictures
-//! (deeper ones rounded), bit-exact with ffmpeg's for what it supports;
-//! here each is made the detector's size (`set_shrink`, from the decoder's
-//! own planes, as the GPU would convert and shrink it) or copied out as
-//! packed I420.
+//! decoders for AC-3 and E-AC-3, `Ac3Decoder`, and for DTS, `DtsDecoder`),
+//! as a WebAssembly module of their own: the page loads it only for a file
+//! that needs one, and each decode worker (`web/softworker.js`) runs one
+//! decoder over a group of pictures at a time. Every decoder gives 8-bit
+//! 4:2:0 pictures (deeper ones rounded), bit-exact with ffmpeg's for what it
+//! supports; here each is made the detector's size (`set_shrink`, from the
+//! decoder's own planes, as the GPU would convert and shrink it) or copied
+//! out as packed I420.
 
 use std::collections::VecDeque;
 
@@ -293,6 +293,72 @@ impl Ac3Decoder {
     }
 
     /// Forget the previous frame's overlap (after a seek).
+    pub fn reset(&mut self) {
+        self.dec.reset();
+    }
+}
+
+/// The DTS sound decoder (the core of DTS Coherent Acoustics, which every
+/// DTS, DTS-ES and DTS-HD stream with a core carries; DTS-HD's extensions
+/// are stepped over), for the sound no browser's WebCodecs decodes: the
+/// section player plays it and the export re-encodes it
+/// (`web/audiodec.js`). Each `decode` takes a whole number of frames (an
+/// MP4 sample, a Matroska block, a transport stream's PES payload) and
+/// gives their samples as f32 planes, one after the other, as an AudioData
+/// of format f32-planar takes them: 512 samples a frame, as a rule, in
+/// WAVE order (L R C LFE Ls Rs). A stream without a core (DTS-HD Master
+/// Audio or DTS Express without one) is an error that says so.
+#[wasm_bindgen]
+pub struct DtsDecoder {
+    dec: unflash_dts::Decoder,
+    out: Vec<Vec<f32>>,
+    last: unflash_dts::Decoded,
+    rate: u32,
+}
+
+#[wasm_bindgen]
+impl DtsDecoder {
+    /// A decoder; with `stereo`, every stream comes out mixed down to two
+    /// channels (Lo/Ro: with the stream's own coefficients when it has them).
+    #[wasm_bindgen(constructor)]
+    pub fn new(stereo: bool) -> DtsDecoder {
+        let output = if stereo { unflash_dts::Output::Stereo } else { unflash_dts::Output::Native };
+        DtsDecoder { dec: unflash_dts::Decoder::new(output), out: Vec::new(), last: unflash_dts::Decoded::default(), rate: 0 }
+    }
+
+    /// Decode `data`'s frames: every channel's samples, one plane after another.
+    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<f32>, JsValue> {
+        for plane in &mut self.out {
+            plane.clear();
+        }
+        self.last = self.dec.decode(data, &mut self.out).map_err(js_err)?;
+        if let Some(info) = self.dec.info() {
+            self.rate = info.sample_rate;
+        }
+        Ok(self.out.iter().flat_map(|p| p.iter().copied()).collect())
+    }
+
+    /// Samples each channel had in the last `decode`.
+    pub fn samples(&self) -> u32 {
+        self.last.samples as u32
+    }
+
+    /// Frames of the last `decode` that came out as silence (damaged).
+    pub fn damaged(&self) -> u32 {
+        self.last.damaged
+    }
+
+    /// Channels of the last `decode`'s output.
+    pub fn channels(&self) -> u32 {
+        self.out.len() as u32
+    }
+
+    /// The sample rate (Hz) of the last frame decoded.
+    pub fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// Forget the filter banks' and predictors' history (after a seek).
     pub fn reset(&mut self) {
         self.dec.reset();
     }

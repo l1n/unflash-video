@@ -1169,11 +1169,16 @@ dependencies = [
  "unflash-ac3",
  "unflash-av1",
  "unflash-core",
+ "unflash-dts",
  "unflash-hevc",
  "unflash-vp8",
  "unflash-vp9",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "unflash-dts"
+version = "0.1.0"
 
 [[package]]
 name = "unflash-gpu"

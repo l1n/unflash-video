@@ -112,18 +112,23 @@ Browser support:
 \* platform dependent. A file in any of those five codecs is decoded by
 Unflash itself when the browser cannot decode it; a file whose codec
 neither can decode can still be watched with the live monitor where the
-player plays it. So is sound in AC-3 or E-AC-3 (Dolby Digital, Dolby
-Digital Plus: TV recordings, films), which no browser's WebCodecs
-decodes: the section player plays it, mixed down to stereo, and an
-export whose held frames need silence put into the sound re-encodes it
-(in stereo); an export without held frames copies it as it is. (The
-whole-video player is the browser's own, and plays such a video without
-its sound.) Uncompressed sound (PCM) is read by Unflash itself, in every
-form (big and little endian, 8 to 32 bits, float, G.711): WebCodecs has
-no name for some, and Chromium's decoder of 24-bit PCM crashes the page
-when its sound is copied out. Of several sound tracks, the first that
-can be played here is used (the file's default track first); the video's
-line and the debug report say which, and the export keeps that one.
+player plays it. So is sound in AC-3, E-AC-3 or DTS (Dolby Digital,
+Dolby Digital Plus, DTS: TV recordings, films, Blu-ray rips), which no
+browser's WebCodecs decodes: the section player plays it, mixed down to
+stereo, and an export whose held frames need silence put into the sound
+re-encodes it (in stereo); an export without held frames copies it as it
+is (DTS only from an MP4: from an MKV or a transport stream it is
+re-encoded). DTS is read as its core, which most DTS-HD streams carry
+too: their extensions are passed over, so a 6.1, 7.1, 96 kHz or lossless
+track plays as its core (5.1 at 48 kHz at most), and DTS Express or
+DTS-HD without a core can't be played. (The whole-video player is the
+browser's own, and plays such a video without its sound.) Uncompressed
+sound (PCM) is read by Unflash itself, in every form (big and little
+endian, 8 to 32 bits, float, G.711): WebCodecs has no name for some, and
+Chromium's decoder of 24-bit PCM crashes the page when its sound is
+copied out. Of several sound tracks, the first that can be played here
+is used (the file's default track first); the video's line and the debug
+report say which, and the export keeps that one.
 
 Where a browser has WebGPU but gives the page no graphics adapter
 (graphics acceleration turned off in its settings, or WebGPU turned off
@@ -143,23 +148,22 @@ Files it reads:
   the frames' contents are skipped over, not decoded). Video: H.264, HEVC,
   VP9, AV1 and VP8, as the browser decodes them. Audio goes into the MP4
   export as it is when an MP4 can carry it (AAC, MP3, Opus, FLAC, AC-3,
-  E-AC-3) and is re-encoded with the browser's own encoder (AAC, else
-  Opus) when it can't (Vorbis, PCM). Subtitle tracks are left out of the
+  E-AC-3) and is re-encoded with the browser's own encoder (AAC, else Opus)
+  when it can't (Vorbis, PCM, DTS). Subtitle tracks are left out of the
   export, as the original tool leaves them out, and of several audio tracks
-  the one in use is kept (see above); the export says so. Live
-  recordings (clusters of unknown size), laced audio and header stripping
-  are handled, and a damaged stretch is skipped to the next cluster. A
-  browser whose `<video>` won't play the MKV (Chrome and Firefox play WebM,
-  and often MKV offered as WebM, which Unflash tries) still scans, edits,
-  plays sections and exports; only the whole-video view says it can't.
+  the one in use is kept (see above); the export says so. Live recordings
+  (clusters of unknown size), laced audio and header stripping are handled,
+  and a damaged stretch is skipped to the next cluster. A browser whose
+  `<video>` won't play the MKV (Chrome and Firefox play WebM, and often MKV
+  offered as WebM, which Unflash tries) still scans, edits, plays sections
+  and exports; only the whole-video view says it can't.
 - **MPEG transport streams**: .ts (TV recordings, OBS and ffmpeg
   recordings), .m2ts (Blu-ray) and .mts (AVCHD camcorders). A transport
   stream keeps no index either, so it is read through once when it opens,
   following each stream's packets. Video: H.264 (field pairs as one
   picture, as an MP4 holds them) and HEVC, their decoder setup built from
   the parameter sets in the stream. Sound: AAC (ADTS), AC-3, E-AC-3, MPEG
-  audio and Blu-ray's LPCM (and DTS, which is read but not yet played).
-  A recording that starts mid-GOP starts at
+  audio, DTS and Blu-ray's LPCM. A recording that starts mid-GOP starts at
   its first keyframe, the 33-bit clock is followed across its wrap, and a
   jump of the clock (a recording across a discontinuity) is closed up.
   MPEG-2 video (most TV recordings in standard definition, and DVDs), VC-1,
@@ -834,7 +838,8 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 | `crates/unflash-vp9` | the built-in VP9 decoder (profiles 0 and 2) |
 | `crates/unflash-vp8` | the built-in VP8 decoder |
 | `crates/unflash-ac3` | the built-in AC-3 and E-AC-3 sound decoder (Dolby Digital, Dolby Digital Plus), written to ATSC A/52 |
-| `crates/unflash-decoders` | the `wasm-bindgen` API of the built-in HEVC, VP9, VP8 and AV1 decoders and of the AC-3 / E-AC-3 sound decoder: a module of its own, loaded when a file needs one |
+| `crates/unflash-dts` | the built-in DTS sound decoder (the core of DTS Coherent Acoustics, which DTS-HD streams carry too), written to ETSI TS 102 114 |
+| `crates/unflash-decoders` | the `wasm-bindgen` API of the built-in HEVC, VP9, VP8 and AV1 decoders and of the AC-3 / E-AC-3 and DTS sound decoders: a module of its own, loaded when a file needs one |
 | `crates/unflash-av1` | AV1 decoding (8- and 10-bit, film grain applied) into 8-bit 4:2:0 pictures: a small wrapper over rav1d, bit-exact with ffmpeg's libdav1d |
 | `third_party/rav1d` | rav1d 1.1.0, the Rust port of dav1d (BSD-2-Clause), without its assembly and patched to build for wasm32 (see its `UNFLASH.md`) |
 | `crates/unflash-wasm` | the `wasm-bindgen` API |
@@ -884,11 +889,13 @@ bash tests/media/vp8/gen.sh               # VP8 decoder test streams and ffmpeg'
 cargo run --release -p unflash-vp8 --example conformance -- dir    # the libvpx VP8 test vectors
 bash tests/media/av1/gen.sh               # AV1 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libaom, libsvtav1, librav1e, libdav1d)
 cargo run --release -p unflash-av1 --example compare -- file.mkv   # decode an AV1 track, diff every picture against ffmpeg's libdav1d, time it
+bash tests/media/dts/gen.sh               # DTS decoder test streams, from ffmpeg's encoder (the tests compare with ffmpeg's decoder when it is installed)
+cargo run --release -p unflash-dts --example fate -- dir   # DTS and DTS-HD files (ffmpeg's FATE samples) against ffmpeg's decode of their core
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
 node tests/e2e/tour.mjs                   # the guided tour, on a first visit and after an update
 node tests/e2e/busy.mjs                   # the page while a job runs: a second start turned away, never a long freeze
-node tests/e2e/streams.mjs                # transport streams read as ffmpeg reads them, scanned and exported; PCM sound; the sound track that plays
+node tests/e2e/streams.mjs                # transport streams read as ffmpeg reads them, scanned and exported; PCM and DTS sound; the sound track that plays
 FIREFOX=/path/to/firefox node tests/e2e/firefox.mjs   # the app in headless Firefox, WebGPU on lavapipe (needs puppeteer-core)
 node tests/e2e/screenshots.mjs            # the screenshots above, made again from the test clips (not a test)
 FIREFOX=/path/to/firefox node tests/e2e/whatsnew.mjs [NAME...]   # What's new's films, made again and scanned for flashing (not a test)

@@ -137,7 +137,7 @@ jobs:
         if: matrix.part != 'formats' && matrix.part != 'firefox'
         run: node tests/e2e/run.mjs --part=${{ matrix.part }}
       # (beside the shortest part)
-      - name: Transport streams, PCM sound and the choice of sound track (headless Chromium)
+      - name: Transport streams, PCM and DTS sound, and the choice of sound track (headless Chromium)
         if: matrix.part == 'files'
         run: node tests/e2e/streams.mjs
       - name: Smart-cut splice, MKV and WebM, the sound of held frames, project files, the guided tour, the page while a job runs, the built-in HEVC, VP9, VP8 and AV1 decoders (headless Chromium), the shrink in WebAssembly, What's new's films, the site as published

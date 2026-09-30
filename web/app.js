@@ -10,7 +10,7 @@ import { scanMovie, scanChunks, CHUNK_S, prepareSection, checkSection, suggestEd
 import { Project, projectKey, dropCaches, lastSavedAt, projectFileText, readProjectFile, matchVideo } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, findPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
-import { SectionSound } from './sound.js';
+import { SectionSound, soundName } from './sound.js';
 import { FrameViewer } from './viewer.js';
 import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notifyState, systemNotify, titleProgress, titleMark } from './alerts.js';
 import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay, wireShots, escapeHtml } from './changes.js';
@@ -1093,7 +1093,7 @@ function describePlan(plan, movie, softened, blended = []) {
       ? `; the sound is re-encoded (AAC, or Opus) to put silence under the ${held === 1 ? 'held frame' : `${held} held frames`} (E marks), where the picture waits.`
       : movie.audio.copyable
         ? '; audio is copied without re-encoding.'
-        : `; the audio (${movie.audio.codec}) can't go into an MP4 as it is, so it is re-encoded (AAC, or Opus) where this browser can.`;
+        : `; the audio (${soundName(movie.audio.codec)}) can't go into an MP4 as it is, so it is re-encoded (AAC, or Opus) where this browser can.`;
   if (softened.length) text += ` Section${softened.length === 1 ? '' : 's'} ${softened.map((s) => '#' + s.id).join(', ')} ${softened.length === 1 ? 'is' : 'are'} softened (blurred) where stripes were found.`;
   if (blended.length) text += ` In section${blended.length === 1 ? '' : 's'} ${blended.map((s) => '#' + s.id).join(', ')} the frames marked B are blended with the frames around them.`;
   return text;

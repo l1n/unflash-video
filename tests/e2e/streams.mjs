@@ -7,8 +7,9 @@
 // same time and key frame flag; opened as the user opens them, they scan
 // to the flashing the MP4 has, and the .m2ts's sound plays through the
 // app's own AC-3 decoder. A MOV whose sound is 24-bit PCM, and an MKV
-// whose sound is DTS: the sound decodes (the browser's decoder, or the
-// app's own) to the whole ten seconds of tone, and an export re-encodes it.
+// whose sound is DTS: the sound decodes, by the app's own decoder, to the
+// whole ten seconds of tone, and an export re-encodes it, saying why by
+// the sound's name (PCM, DTS).
 // An MKV with two sound tracks, the first ALAC (which no browser plays),
 // takes the second, and the export says which it kept and why.
 //   node tests/e2e/streams.mjs
@@ -228,7 +229,18 @@ try {
   assert(results.pcmSound.builtIn === 'PCM' && Math.abs(results.pcmSound.seconds - 10) < 0.05 && results.pcmSound.peak > 0.1 && results.pcmSound.rate === 48000, `the PCM decodes, by the app's own reading of it, to ten seconds of tone: ${JSON.stringify(results.pcmSound)}`);
   results.pcmExport = await exportAsItIs();
   console.log('flash_pcm.mov export:', JSON.stringify(results.pcmExport));
-  assert(/can't go into an MP4 as it is/.test(results.pcmExport.plan) && /re-encoded to (Opus|AAC)/.test(results.pcmExport.result) && /^(opus|mp4a\.40\.2)$/.test(results.pcmExport.exported.audio) && Math.abs(results.pcmExport.exported.seconds - 10) < 0.2, `the export re-encodes the PCM: ${JSON.stringify(results.pcmExport)}`);
+  assert(/the audio \(PCM\) can't go into an MP4 as it is/.test(results.pcmExport.plan) && /The audio \(PCM\) can't go into an MP4 as it is, so it was re-encoded to (Opus|AAC)/.test(results.pcmExport.result) && /^(opus|mp4a\.40\.2)$/.test(results.pcmExport.exported.audio) && Math.abs(results.pcmExport.exported.seconds - 10) < 0.2, `the export re-encodes the PCM: ${JSON.stringify(results.pcmExport)}`);
+
+  // --- DTS in an MKV: the app's own decoder, re-encoded on export -----------------
+  results.dts = await open('flash_dts.mkv');
+  console.log('flash_dts.mkv', JSON.stringify(results.dts));
+  assert(results.dts.audio === 'dtsc' && results.dts.copyable === false, `flash_dts.mkv: DTS, not copied: ${JSON.stringify(results.dts)}`);
+  results.dtsSound = await decodedSound();
+  console.log('flash_dts.mkv sound:', JSON.stringify(results.dtsSound));
+  assert(results.dtsSound.builtIn === 'DTS' && Math.abs(results.dtsSound.seconds - 10) < 0.1 && results.dtsSound.peak > 0.1, `the DTS sound decodes, by the app's own decoder, to ten seconds of tone: ${JSON.stringify(results.dtsSound)}`);
+  results.dtsExport = await exportAsItIs();
+  console.log('flash_dts.mkv export:', JSON.stringify(results.dtsExport));
+  assert(/the audio \(DTS\) can't go into an MP4 as it is/.test(results.dtsExport.plan) && /The audio \(DTS\) can't go into an MP4 as it is, so it was re-encoded to (Opus|AAC)/.test(results.dtsExport.result) && /^(opus|mp4a\.40\.2)$/.test(results.dtsExport.exported.audio) && Math.abs(results.dtsExport.exported.seconds - 10) < 0.2, `the export re-encodes the DTS sound: ${JSON.stringify(results.dtsExport)}`);
 
   // --- two sound tracks, the first one no browser plays ---------------------------
   results.two = await open('flash_2audio.mkv');
