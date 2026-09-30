@@ -886,9 +886,9 @@ async function setProfile(name) {
   state.config = profileConfig(name);
   await withFeeder(() => createFeeders());
   for (const s of state.project.sections) if (s.check) s.check.stale = true;
-  await state.project.save();
   renderAll();
   updateStatus();
+  await state.project.save();
   toast('Profile changed. Sections need re-checking (they are re-checked when opened).');
   if (!state.decode.supported) return;
   if (autoEnabled()) autopilot({ rescan: true });
@@ -1194,9 +1194,12 @@ async function scan() {
   }
   state.scanTrace = project.scan.trace;
   state.traceNorm = null;
-  await project.save();
+  // drawn before the save, in the same turn as the job's end: nothing (a
+  // click on the list, say) can come between the job ending and its
+  // sections being on the page, where the list said "No sections yet"
   renderAll();
   updateStatus();
+  await project.save();
   const fps = (res.frames / (res.elapsedMs / 1000)).toFixed(0);
   toast(
     n
@@ -2072,8 +2075,8 @@ async function checkAll() {
     const c = await runJob(`Checking section #${s.id}`, async () => checkSection(state.env, state.project, s, null, { extS: EXT_S }));
     if (c) s.check = c;
   }
-  await state.project.save();
   renderAll();
+  await state.project.save();
 }
 
 // ---- workspace ----------------------------------------------------------------------
@@ -3022,12 +3025,12 @@ async function runCheck(announce) {
   } finally {
     state.checkRunning = false;
   }
-  await state.project.save();
   renderVerdict(sec);
   renderGridMarks();
   renderSectionList();
   drawTimeline();
   drawChart();
+  await state.project.save();
   if (state.checkAgain) {
     state.checkAgain = false;
     scheduleCheck(0);
@@ -3056,9 +3059,9 @@ async function doPrepare(sec) {
     return false;
   }
   sec.check = null;
-  await state.project.save();
   renderAll();
   updateStatus();
+  await state.project.save();
   if (state.current === sec.id) {
     scheduleCheck(0);
     if (state.player.mode !== 'video' && !sectionPlayer.active) posterSection();
@@ -3088,8 +3091,8 @@ async function doSuggest(prefer) {
   const res = await runJob(`Suggesting (${what})`, async (progress) => suggestEdits(state.env, state.project, sec, prefer, only, { extS: EXT_S, onProgress: (r) => progress(Math.min(0.95, 0.1 + r * 0.08), `check ${r + 1}`) }));
   if (!res) return;
   applySuggestion(sec, res, only);
-  await state.project.save();
   renderAll();
+  await state.project.save();
   toast(res.note, 6000);
 }
 
@@ -3107,8 +3110,8 @@ async function doSuggestBlend() {
   sec.check = res.verdict || null;
   state.project.invalidateNeighbours(sec, wasm.context_seconds(state.config));
   if (sec.id === state.current && state.player.mode === 'edited' && sectionPlayer && sectionPlayer.active && !sectionPlayer.paused) playSection(Math.max(0, sectionPlayer.slot));
-  await state.project.save();
   renderAll();
+  await state.project.save();
   toast(res.note, 8000);
 }
 
@@ -3124,8 +3127,8 @@ async function doSuggestFps() {
   applySuggestion(sec, res, only);
   sec.fpsFound = res.fps;
   $('fpsInput').value = String(res.fps);
-  await state.project.save();
   renderAll();
+  await state.project.save();
   toast(res.note, 9000);
 }
 
@@ -3140,8 +3143,8 @@ async function doSuggestFpsExact() {
   if (!res) return;
   applySuggestion(sec, res, only);
   sec.fpsFound = res.fps;
-  await state.project.save();
   renderAll();
+  await state.project.save();
   toast(res.note, 7000);
 }
 
