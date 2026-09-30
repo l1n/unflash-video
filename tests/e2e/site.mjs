@@ -49,7 +49,9 @@ assert(index.includes('src="v/bbbb/app.js"') && index.includes('href="v/bbbb/sty
 const bench = fs.readFileSync(path.join(B, 'bench.html'), 'utf8');
 assert(bench.includes("'./v/bbbb/pkg/unflash.js'") && bench.includes("'./v/bbbb/media.js'"), 'bench.html too');
 for (const b of vB.builds) for (const [rel, sha] of Object.entries(b.files)) assert(fs.existsSync(path.join(B, b.dir + rel)), `${b.id}: ${b.dir + rel} is there`);
-assert(fs.existsSync(path.join(B, 'clips/flash.mp4')) && fs.existsSync(path.join(B, 'whatsnew/shots.json')) && fs.existsSync(path.join(B, 'CHANGELOG.md')), 'the data stay at the top');
+// (the test clips are in web/clips where a test run or the Pages build put them)
+const clip = fs.existsSync(path.join(ROOT, 'web/clips/flash.mp4'));
+assert(fs.existsSync(path.join(B, 'whatsnew/shots.json')) && fs.existsSync(path.join(B, 'CHANGELOG.md')) && fs.existsSync(path.join(B, 'screenshots/scan.png')) && (!clip || fs.existsSync(path.join(B, 'clips/flash.mp4'))), 'the data stay at the top');
 // the page as a browser had it from build aaaa, and from before the layout
 fs.copyFileSync(path.join(A, 'index.html'), path.join(B, 'index-aaaa.html'));
 fs.copyFileSync(path.join(ROOT, 'web/index.html'), path.join(B, 'index-unversioned.html'));
