@@ -17,6 +17,14 @@ import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, change
 import { TourGuide, TOURS, PARTS } from './tours.js';
 import { watchPage, noteError, noteJob, noteFileName, debugReport } from './debug.js';
 
+/**
+ * The build this page runs. The published site keeps each build's code in
+ * a folder of its own, v/<build>/ (site.mjs), which this module was loaded
+ * from; where the code is served as it stands (a copy of the repository,
+ * the tests) there is none, unless ?build= names one to act as.
+ */
+const BUILD = (new URL(import.meta.url).pathname.match(/\/v\/([^/]+)\/[^/]+$/) || [])[1] || new URLSearchParams(location.search).get('build') || null;
+
 const $ = (id) => document.getElementById(id);
 const EXT_S = 1.0;
 
@@ -509,7 +517,40 @@ function closeChanges() {
 // ---- debug info --------------------------------------------------------------------
 
 function makeDebugReport() {
-  return debugReport({ version: wasm.version(), state, profile, gpu: gpuAdapter, segments: scanSegments(), hybrid: state.env ? hybridPlan(state.movie, state.env.feeder) : null, sound: { status: soundStatus(), failed: sectionSound.failed, output: sectionSound.ctx ? sectionSound.ctx.state : null, builtIn: sectionSound.builtIn } });
+  return debugReport({ version: wasm.version(), build: BUILD, state, profile, gpu: gpuAdapter, segments: scanSegments(), hybrid: state.env ? hybridPlan(state.movie, state.env.feeder) : null, sound: { status: soundStatus(), failed: sectionSound.failed, output: sectionSound.ctx ? sectionSound.ctx.state : null, builtIn: sectionSound.builtIn } });
+}
+
+// ---- a newer build published -------------------------------------------------------
+
+/** How often, at most, the page asks whether a newer build is out. */
+const UPDATE_EVERY_MS = 10 * 60 * 1000;
+const update = { checkedAt: 0, said: null };
+
+/**
+ * Whether the site has a newer build than the one this page runs (its
+ * versions.json names the current build), asked at most every 10 minutes
+ * (`force`: now). The page goes on with its own build's files until it is
+ * reloaded, so it says a newer one is out: a note once for each (not over
+ * a message about something that went wrong: then at the next asking),
+ * and a button in the header that stays, to reload with.
+ */
+async function checkForUpdate(force = false) {
+  if (!BUILD || (!force && Date.now() - update.checkedAt < UPDATE_EVERY_MS)) return;
+  update.checkedAt = Date.now();
+  let current = null;
+  try {
+    const r = await fetch('versions.json', { cache: 'no-cache' });
+    if (r.ok) current = (await r.json()).current || null;
+  } catch (e) {
+    return; // (offline, say: nothing to go on)
+  }
+  if (!current || current === BUILD) return;
+  $('btnUpdate').classList.remove('hidden');
+  if (update.said === current) return;
+  const b = $('banner');
+  if (!b.classList.contains('hidden') && !b.classList.contains('info')) return;
+  update.said = current;
+  banner("A newer version of Unflash is out: reload the page to use it, when you're ready (What's new says what changed). Until then this page carries on as it is; your sections and marks come back when you open the video again.", 'info');
 }
 
 /** The report in a dialog, copied to the clipboard at once where the browser lets it. */
@@ -551,7 +592,7 @@ async function boot() {
   await init();
   const hasGpu = !!navigator.gpu;
   const hasCodecs = typeof VideoDecoder !== 'undefined';
-  $('support').textContent = `Unflash ${wasm.version()} · WebGPU: ${hasGpu ? 'available' : 'not available (CPU detector will be used)'} · WebCodecs: ${hasCodecs ? 'available' : 'not available (only the live monitor will work)'}`;
+  $('support').textContent = `Unflash ${wasm.version()}${BUILD ? `, build ${BUILD}` : ''} · WebGPU: ${hasGpu ? 'available' : 'not available (CPU detector will be used)'} · WebCodecs: ${hasCodecs ? 'available' : 'not available (only the live monitor will work)'}`;
   setStatus([`ready · WebGPU ${hasGpu ? 'yes' : 'no'} · WebCodecs ${hasCodecs ? 'yes' : 'no'}`]);
   $('fileInput').addEventListener('change', (e) => {
     const f = e.target.files && e.target.files[0];
@@ -594,6 +635,15 @@ async function boot() {
     if (e.target === $('debugModal')) closeDebug();
   });
   initChanges();
+  // a newer build published while the page is open: asked now, and when the tab comes back into view
+  $('btnUpdate').addEventListener('click', () => {
+    if (state.job && !confirm(`${state.job.name} is running, and reloading the page stops it. Reload now?`)) return;
+    location.reload();
+  });
+  checkForUpdate(true);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') checkForUpdate();
+  });
   $('btnCloseBanner').addEventListener('click', () => $('banner').classList.add('hidden'));
   $('btnCancelJob').addEventListener('click', () => {
     if (state.job) state.job.cancelled = true;
@@ -4217,6 +4267,8 @@ window.__unflash = {
   },
   debugReport: makeDebugReport,
   exportToVideo,
+  checkForUpdate,
+  build: BUILD,
   setPlayerSource,
   playSection,
   undo,

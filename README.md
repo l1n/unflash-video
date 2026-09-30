@@ -814,16 +814,32 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 | `crates/unflash-av1` | AV1 decoding (8- and 10-bit, film grain applied) into 8-bit 4:2:0 pictures: a small wrapper over rav1d, bit-exact with ffmpeg's libdav1d |
 | `third_party/rav1d` | rav1d 1.1.0, the Rust port of dav1d (BSD-2-Clause), without its assembly and patched to build for wasm32 (see its `UNFLASH.md`) |
 | `crates/unflash-wasm` | the `wasm-bindgen` API |
-| `web/` | the app (plain ES modules, no build step beyond the WASM) |
+| `web/` | the app (plain ES modules, no build step beyond the WASM); `site.mjs` makes the published site from it |
 | `unflash/` | the Python reference implementation |
 
 ## Deploying
 
 `.github/workflows/pages.yml` builds the WASM on every push to `main` and
-publishes `web/` to GitHub Pages; it can also be run by hand from any branch
-(Actions → Pages → Run workflow). The first run enables Pages with the
-"GitHub Actions" source; if the repository refuses that, enable it once under
-Settings → Pages → Build and deployment → Source: GitHub Actions.
+publishes the site made from `web/` to GitHub Pages; it can also be run by
+hand from any branch (Actions → Pages → Run workflow). The first run enables
+Pages with the "GitHub Actions" source; if the repository refuses that,
+enable it once under Settings → Pages → Build and deployment → Source:
+GitHub Actions.
+
+[`site.mjs`](site.mjs) makes the site: each build's code (the modules, the
+style sheet, the WebAssembly) goes in a folder of its own, `v/<build>/`,
+which `index.html` loads, and the data (test clips, What's new's films, the
+changelog) stay beside `index.html`. So a page only ever loads the files of
+the build it started with: nothing of one build in the browser's cache can
+meet another build's files, and a page left open over an update goes on
+loading its own build's files when it next needs one (a decoder, a worker).
+The builds replaced in the last three days stay published beside the new
+one, for the pages still open on them: the workflow copies them from the
+site as it stands, which lists its builds and their files' hashes in
+`versions.json`. That file also names the current build, and a page on an
+older one says so and offers *new version: reload* in the header; the debug
+report names the build. `node site.mjs OUT --build ID [--keep-from URL|DIR]`
+makes one by hand (after `./build.sh`); `tests/e2e/site.mjs` tests it.
 `.github/workflows/ci.yml` runs the Rust tests (on lavapipe), builds the
 WASM and runs the browser test on every push.
 
@@ -852,6 +868,7 @@ FIREFOX=/path/to/firefox node tests/e2e/firefox.mjs   # the app in headless Fire
 node tests/e2e/screenshots.mjs            # the screenshots above, made again from the test clips (not a test)
 FIREFOX=/path/to/firefox node tests/e2e/whatsnew.mjs [NAME...]   # What's new's films, made again and scanned for flashing (not a test)
 node tests/e2e/whatsnew-check.mjs         # every change has its film, and each is the file that was scanned
+node tests/e2e/site.mjs                   # the site as published: each build's code in its own folder, old builds kept for open pages
 ```
 
 `crates/unflash-core/tests/reference_fixtures.rs` regenerates the frames the

@@ -1361,6 +1361,29 @@ export const SCENES = [
     },
   },
 
+  {
+    name: 'new-version',
+    alt: "A page open while a newer version of Unflash is published: it says so, once, and new version: reload stays in the header until the page is reloaded; until then the page carries on as it is, on its own version's files.",
+    // (acting as an earlier build; versions.json, as the site has it once a newer one is out, is given in the film)
+    query: Q + '&build=earlier',
+    viewport: { width: 960, height: 700 },
+    setup: (d) => inSection(d),
+    view: { x: 0, y: 0, width: 720, height: 450 },
+    async play(d) {
+      await d.wait(1200);
+      await d.caption('meanwhile, a newer version is published');
+      await d.page.route('**/versions.json', (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify({ current: 'later', builds: [] }) }));
+      await d.wait(1600);
+      await d.eval(() => window.__unflash.checkForUpdate(true));
+      await d.until(() => !document.querySelector('#btnUpdate').classList.contains('hidden'));
+      await d.caption('');
+      await d.camera(await d.around(['#banner', '#btnUpdate'], 10), { ms: 800 });
+      await d.wait(3000);
+      await d.point('#btnUpdate', { ms: 700 });
+      await d.wait(2400);
+    },
+  },
+
   // ======== What's new itself, films and all: filmed last ======================
   {
     name: 'films',

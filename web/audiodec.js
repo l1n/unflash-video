@@ -52,9 +52,9 @@ export async function soundDecoderFor(cfg) {
 /**
  * Why soundDecoderFor found nothing for `codec`, in words, `what` naming the
  * sound ("this video's sound (E-AC-3 …)"): the browser can't decode it; or,
- * for a sound the app decodes itself, its decoder did not load (a page
- * loaded before the decoder was added, holding on to the older decoders
- * module) or the browser lacks the WebCodecs sound it hands its sound to.
+ * for a sound the app decodes itself, its decoder did not load (every build
+ * has it, so its download failed) or the browser lacks the WebCodecs sound
+ * it hands its sound to.
  */
 export function noSoundDecoder(codec, what) {
   if (builtInSound(codec) && missing === 'module') return `the app's own decoder for ${what} did not load (reloading the page fetches it again)`;

@@ -444,6 +444,18 @@
    "violations": 0
   }
  },
+ "new-version": {
+  "w": 720,
+  "h": 450,
+  "seconds": 11.8,
+  "alt": "A page open while a newer version of Unflash is published: it says so, once, and new version: reload stays in the header until the page is reloaded; until then the page carries on as it is, on its own version's files.",
+  "sha256": "94626281234bbdee451ed1d5652f998105bfe7ae3842837ae73cbaa518e4e5e5",
+  "checked": {
+   "profile": "strict",
+   "frames": 355,
+   "violations": 0
+  }
+ },
  "no-adapter": {
   "w": 720,
   "h": 450,

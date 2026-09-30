@@ -1,4 +1,5 @@
-# Build the WebAssembly module and publish web/ to GitHub Pages.
+# Build the WebAssembly modules and publish the site made from web/ to GitHub
+# Pages (site.mjs: each build's code in a folder of its own).
 #
 # Runs on every push to main and on demand (Actions tab -> Pages -> Run
 # workflow, from any branch). The first run enables Pages for the repository
@@ -32,6 +33,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -72,9 +76,15 @@ jobs:
         run: |
           echo "::error::GitHub Pages is not enabled for this repository and the workflow token may not enable it."
           echo "::error::Enable it once: Settings -> Pages -> Build and deployment -> Source: 'GitHub Actions', then re-run this workflow."
+      # each build's code in a folder of its own (v/<build>/), so that a page
+      # only ever loads its own build's files; the builds replaced in the last
+      # three days stay, copied from the site as it is, for the pages still
+      # open on them (site.mjs)
+      - name: The site
+        run: node site.mjs _site --keep-from "${{ steps.pages.outputs.base_url }}/"
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: web/
+          path: _site/
   deploy:
     needs: build
     runs-on: ubuntu-latest

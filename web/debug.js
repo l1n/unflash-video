@@ -145,13 +145,14 @@ function scanLines(s, fps0) {
 }
 
 /**
- * The report, from the page's `state` and `profile`, the app's `version`,
- * the WebGPU adapter's description of itself (`gpu`), the number of
+ * The report, from the page's `state` and `profile`, the app's `version`
+ * and `build` (the published site's name for this build of its code), the
+ * WebGPU adapter's description of itself (`gpu`), the number of
  * segments a scan would use and the hybrid plan it would follow (if any).
  */
-export function debugReport({ version, state, profile, gpu, segments, hybrid = null, sound = null }) {
+export function debugReport({ version, build = null, state, profile, gpu, segments, hybrid = null, sound = null }) {
   const lines = [`Unflash debug info · ${new Date().toISOString().slice(0, 19).replace('T', ' ')} UTC`];
-  lines.push(...block('App', [`${version} · ${location.origin}${location.pathname}${location.search ? ` · options ${location.search}` : ''}`]));
+  lines.push(...block('App', [`${version}${build ? `, build ${build}` : ''} · ${location.origin}${location.pathname}${location.search ? ` · options ${location.search}` : ''}`]));
   const nav = navigator;
   const ua = nav.userAgentData;
   lines.push(
