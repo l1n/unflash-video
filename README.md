@@ -889,6 +889,8 @@ bash tests/media/vp8/gen.sh               # VP8 decoder test streams and ffmpeg'
 cargo run --release -p unflash-vp8 --example conformance -- dir    # the libvpx VP8 test vectors
 bash tests/media/av1/gen.sh               # AV1 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libaom, libsvtav1, librav1e, libdav1d)
 cargo run --release -p unflash-av1 --example compare -- file.mkv   # decode an AV1 track, diff every picture against ffmpeg's libdav1d, time it
+bash tests/media/ac3/gen.sh               # AC-3 / E-AC-3 decoder test streams, from ffmpeg's encoders (the tests compare with ffmpeg's decoder when it is installed)
+cargo run --release -p unflash-ac3 --example fate -- dir   # AC-3 and E-AC-3 files (ffmpeg's FATE samples) against ffmpeg's decode
 bash tests/media/dts/gen.sh               # DTS decoder test streams, from ffmpeg's encoder (the tests compare with ffmpeg's decoder when it is installed)
 cargo run --release -p unflash-dts --example fate -- dir   # DTS and DTS-HD files (ffmpeg's FATE samples) against ffmpeg's decode of their core
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)

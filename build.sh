@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build the WebAssembly modules and their JS glue: the app's (web/pkg) and
-# the built-in HEVC, VP9, VP8 and AV1 decoders' (web/pkg-dec, loaded only
-# for a file that needs one), and put the changelog next to the page.
+# the built-in decoders' (web/pkg-dec: HEVC, VP9, VP8 and AV1, and the
+# AC-3 / E-AC-3 and DTS sound decoders, loaded only for a file that needs
+# one), and put the changelog next to the page.
 set -euo pipefail
 cd "$(dirname "$0")"
 PROFILE="${1:-release}"
