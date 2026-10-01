@@ -13,6 +13,7 @@ pub mod annexb;
 pub mod codec;
 pub mod demux;
 pub mod entry;
+pub mod ivf;
 pub mod mkv;
 pub mod mux;
 mod reader;

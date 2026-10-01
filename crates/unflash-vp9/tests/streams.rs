@@ -4,40 +4,24 @@
 
 use std::path::PathBuf;
 
-use unflash_vp9::{Decoder, Frame};
+use unflash_vp9::Decoder;
+
+mod common;
+use common::frame_md5;
 
 fn media(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/vp9").join(name)
 }
 
-/// The samples of an IVF file (a 32-byte header, then frames with 12-byte
-/// headers: size and timestamp, little-endian), or of a WebM / MP4 file
-/// through the demuxer.
+/// The samples of an IVF file, or of a WebM / MP4 file through the
+/// demuxer.
 fn samples(data: &[u8]) -> Vec<(&[u8], f64)> {
-    if data.starts_with(b"DKIF") {
-        let mut p = u16::from_le_bytes([data[6], data[7]]) as usize;
-        let mut out = Vec::new();
-        while p + 12 <= data.len() {
-            let size = u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize;
-            let pts = u64::from_le_bytes(data[p + 4..p + 12].try_into().unwrap());
-            out.push((&data[p + 12..p + 12 + size], pts as f64));
-            p += 12 + size;
-        }
-        return out;
+    if let Some(frames) = unflash_mp4::ivf::frames(data) {
+        return frames.into_iter().map(|(ts, f)| (f, ts as f64)).collect();
     }
     let movie = unflash_mp4::demux::parse_bytes(data).unwrap();
     let track = movie.video().unwrap();
     track.samples.iter().map(|s| (&data[s.offset as usize..(s.offset + s.size as u64) as usize], s.pts as f64)).collect()
-}
-
-/// The MD5 of a frame as ffmpeg's framemd5 computes it: the planes packed
-/// one after the other, 16-bit samples little-endian.
-fn frame_md5(f: &Frame) -> String {
-    let bytes = match (&f.y16, &f.u16, &f.v16) {
-        (Some(y), Some(u), Some(v)) => y.iter().chain(u).chain(v).flat_map(|s| s.to_le_bytes()).collect(),
-        _ => [&f.y[..], &f.u[..], &f.v[..]].concat(),
-    };
-    format!("{:x}", md5::compute(bytes))
 }
 
 fn check(file: &str) {

@@ -899,7 +899,6 @@ pub const DEFAULT_COEF_PROBS: CoefProbs = [
 
 // ---- block sizes (section 10.2) ----------------------------------------------
 
-pub const BLOCK_4X4: usize = 0;
 pub const BLOCK_8X8: usize = 3;
 pub const BLOCK_64X64: usize = 12;
 pub const BLOCK_INVALID: u8 = 13;
@@ -971,9 +970,6 @@ pub const COEFBAND_8X8PLUS: [u8; 1024] = {
     }
     t
 };
-
-/// The context contribution of each token (TokenCache values).
-pub const ENERGY_CLASS: [u8; 11] = [0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 5];
 
 /// The transform type of an intra mode (DCT_DCT for inter modes).
 pub const MODE2TXFM: [u8; 14] = [0, 1, 2, 0, 3, 1, 2, 2, 1, 3, 0, 0, 0, 0];

@@ -19,7 +19,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use unflash_hevc::{Decoder, Error, Frame};
+use unflash_hevc::{Decoder, Error};
+
+#[path = "../tests/common/mod.rs"]
+mod common;
+use common::{framemd5, md5};
 
 /// Streams in which the standard's output process (C.5.2.2) discards
 /// pictures still waiting for output at an IRAP picture, as ffmpeg does.
@@ -57,28 +61,8 @@ fn expected(path: &Path, bit_depth: u8) -> Option<Vec<String>> {
             return None;
         }
     }
-    let text = std::fs::read_to_string(&file).ok()?;
-    let md5s: Vec<String> = text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).map(|l| l.rsplit(',').next().unwrap_or("").trim().to_string()).collect();
+    let md5s = framemd5(&std::fs::read_to_string(&file).ok()?);
     (!md5s.is_empty()).then_some(md5s)
-}
-
-/// The MD5 of a picture in ffmpeg's native layout for it.
-fn md5(f: &Frame) -> String {
-    let mut ctx = md5::Context::new();
-    match (&f.y16, &f.u16, &f.v16) {
-        (Some(y), Some(u), Some(v)) => {
-            for p in [y, u, v] {
-                let bytes: Vec<u8> = p.iter().flat_map(|s| s.to_le_bytes()).collect();
-                ctx.consume(&bytes);
-            }
-        }
-        _ => {
-            ctx.consume(&f.y);
-            ctx.consume(&f.u);
-            ctx.consume(&f.v);
-        }
-    }
-    format!("{:x}", ctx.compute())
 }
 
 /// How many suffix SEI NAL units open with a decoded picture hash message.

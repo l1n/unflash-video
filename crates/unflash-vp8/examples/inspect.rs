@@ -13,16 +13,8 @@ use unflash_vp8::Decoder;
 
 /// The frames of an IVF file, or of the video track of a WebM file.
 fn frames(data: &[u8]) -> Vec<&[u8]> {
-    if data.len() >= 32 && &data[..4] == b"DKIF" {
-        let mut out = Vec::new();
-        let mut p = u16::from_le_bytes([data[6], data[7]]) as usize;
-        while p + 12 <= data.len() {
-            let size = u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize;
-            p += 12;
-            out.push(&data[p..(p + size).min(data.len())]);
-            p += size;
-        }
-        return out;
+    if let Some(frames) = unflash_mp4::ivf::frames(data) {
+        return frames.into_iter().map(|(_, f)| f).collect();
     }
     let movie = unflash_mp4::demux::parse_bytes(data).expect("an IVF or WebM file");
     let track = movie.video().expect("a video track");

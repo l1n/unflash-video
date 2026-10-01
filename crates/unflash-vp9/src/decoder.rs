@@ -171,8 +171,10 @@ impl Decoder {
         for frame in split_superframe(sample) {
             let mut data = frame;
             // a frame that only shows another one may be followed by more
-            // frames without a superframe index (libvpx decodes those too)
-            while !data.is_empty() {
+            // frames without a superframe index (libvpx decodes those too);
+            // a sample shows no more frames than a superframe can hold (each
+            // a copy of a whole frame, from as little as one byte)
+            while !data.is_empty() && out.len() < 8 {
                 let used = self.decode_frame(data, pts, &mut out)?;
                 data = &data[used.min(data.len())..];
                 while let Some((&0, rest)) = data.split_first() {
@@ -228,12 +230,16 @@ impl Decoder {
         let size_changed = self.last_size != Some((w, h));
         let use_prev_mvs = !size_changed && self.last_show_frame && !fh.error_resilient_mode && !fh.is_intra();
         let n_mi = mi_cols * mi_rows;
-        if size_changed || fh.reset_past {
+        // (the map can have another size even when the last decoded frame
+        // had this one: a frame of another size that then failed in its
+        // compressed header resized it)
+        if size_changed || fh.reset_past || self.prev_segment_ids.len() != n_mi {
             self.prev_segment_ids.clear();
             self.prev_segment_ids.resize(n_mi, 0);
         }
-        // every block writes all the cells it covers before any are read, so
-        // the array is not cleared between frames
+        // every block writes all the cells it covers before any are read
+        // (except in a tile that could not be decoded, which keeps the last
+        // frame's records), so the array is not cleared between frames
         self.mi.resize(n_mi, MiInfo::default());
 
         let mut fc = self.state.contexts[fh.frame_context_idx].clone();
@@ -323,7 +329,7 @@ impl Decoder {
                 for (i, r) in ref_frames.iter().enumerate() {
                     td.refs[i] = r.as_ref().map(|r| RefFrame { ..*r });
                 }
-                td.decode()?;
+                td.decode();
                 damaged |= td.damaged;
             }
         }
@@ -439,7 +445,7 @@ fn split_superframe(data: &[u8]) -> Vec<&[u8]> {
             if data.len() >= index && data[data.len() - index] == marker {
                 let mut sizes = &data[data.len() - index + 1..];
                 let mut out = Vec::with_capacity(frames);
-                let mut start = 0;
+                let mut start = 0usize;
                 let limit = data.len() - index;
                 for _ in 0..frames {
                     let mut size = 0usize;
@@ -447,7 +453,8 @@ fn split_superframe(data: &[u8]) -> Vec<&[u8]> {
                         size |= (b as usize) << (8 * j);
                     }
                     sizes = &sizes[mag..];
-                    let end = (start + size).min(limit);
+                    // (saturating: on 32-bit targets the sum can wrap)
+                    let end = start.saturating_add(size).min(limit);
                     if end > start {
                         out.push(&data[start..end]);
                     }
@@ -569,6 +576,11 @@ mod tests {
         // a marker without its twin at the start of the index: one frame
         let data = [1, 2, 3, 0xc1];
         assert_eq!(split_superframe(&data), vec![&data[..]]);
+        // four-byte sizes (marker 0b110_11_001), the second 2^32 - 1: cut
+        // to the data (on 32-bit targets the end wrapped around and the
+        // frame was lost, or a debug build panicked; not so on 64-bit ones)
+        let data = [1, 2, 3, 0xd9, 1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xd9];
+        assert_eq!(split_superframe(&data), vec![&[1u8][..], &[2, 3][..]]);
     }
 
     #[test]

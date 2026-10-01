@@ -12,19 +12,8 @@ use unflash_vp9::{Decoder, Frame};
 /// The samples of a file: (data, pts), from IVF or through the MP4 /
 /// Matroska demuxer.
 fn samples(data: &[u8]) -> Vec<(Vec<u8>, f64)> {
-    if data.starts_with(b"DKIF") {
-        let header = u16::from_le_bytes([data[6], data[7]]) as usize;
-        let mut p = header;
-        let mut out = Vec::new();
-        while p + 12 <= data.len() {
-            let size = u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize;
-            let pts = u64::from_le_bytes(data[p + 4..p + 12].try_into().unwrap());
-            p += 12;
-            let end = (p + size).min(data.len());
-            out.push((data[p..end].to_vec(), pts as f64));
-            p = end;
-        }
-        return out;
+    if let Some(frames) = unflash_mp4::ivf::frames(data) {
+        return frames.into_iter().map(|(ts, f)| (f.to_vec(), ts as f64)).collect();
     }
     let movie = unflash_mp4::demux::parse_bytes(data).expect("demux");
     let track = movie.video().expect("video track");

@@ -8,7 +8,11 @@
 
 use std::path::{Path, PathBuf};
 
-use unflash_vp9::{Decoder, Error, Frame};
+use unflash_vp9::{Decoder, Error};
+
+#[path = "../tests/common/mod.rs"]
+mod common;
+use common::frame_md5;
 
 fn vectors(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -26,28 +30,12 @@ fn vectors(dir: &Path) -> Vec<PathBuf> {
 
 /// The samples of an IVF file, or of a WebM file through the demuxer.
 fn samples(data: &[u8]) -> Option<Vec<&[u8]>> {
-    if data.starts_with(b"DKIF") {
-        let mut p = u16::from_le_bytes([data[6], data[7]]) as usize;
-        let mut out = Vec::new();
-        while p + 12 <= data.len() {
-            let size = u32::from_le_bytes(data[p..p + 4].try_into().ok()?) as usize;
-            let end = (p + 12).saturating_add(size).min(data.len());
-            out.push(&data[p + 12..end]);
-            p = end;
-        }
-        return Some(out);
+    if let Some(frames) = unflash_mp4::ivf::frames(data) {
+        return Some(frames.into_iter().map(|(_, f)| f).collect());
     }
     let movie = unflash_mp4::demux::parse_bytes(data).ok()?;
     let track = movie.video()?;
     Some(track.samples.iter().map(|s| &data[s.offset as usize..(s.offset as usize + s.size as usize).min(data.len())]).collect())
-}
-
-fn frame_md5(f: &Frame) -> String {
-    let bytes = match (&f.y16, &f.u16, &f.v16) {
-        (Some(y), Some(u), Some(v)) => y.iter().chain(u).chain(v).flat_map(|s| s.to_le_bytes()).collect(),
-        _ => [&f.y[..], &f.u[..], &f.v[..]].concat(),
-    };
-    format!("{:x}", md5::compute(bytes))
 }
 
 struct Decoded {

@@ -87,6 +87,9 @@ impl<P: Sample> Core<P> {
             }
         }
         self.pool.retain(|p| p.fits(width, height, chroma));
+        // (a few: when references are missing, their stand-ins leave the
+        // buffer too, and the spares would grow by one a picture)
+        self.pool.truncate(4);
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         match self.pool.pop() {
@@ -301,11 +304,7 @@ fn to_frame<P: Sample>(pic: &Picture<P>, sps: &Sps, pts: f64, damaged: bool) -> 
         })
     });
     let vui = sps.vui.as_ref();
-    let bt709 = match vui.map(|v| v.matrix_coeffs) {
-        Some(1) => true,
-        Some(5) | Some(6) => false,
-        _ => h >= 720,
-    };
+    let bt709 = is_bt709(vui.map(|v| v.matrix_coeffs), h);
     let [y, u, v] = planes8;
     let (y16, u16, v16) = match planes16 {
         Some([y, u, v]) => (Some(y), Some(u), Some(v)),
@@ -325,6 +324,17 @@ fn to_frame<P: Sample>(pic: &Picture<P>, sps: &Sps, pts: f64, damaged: bool) -> 
         damaged,
         bt709,
         full_range: vui.is_some_and(|v| v.video_full_range),
+    }
+}
+
+/// Whether a picture's colour matrix is BT.709: from the VUI's
+/// matrix_coeffs (BT.2020's taken as BT.709), else above 576 lines, as
+/// players guess (the rule of the other decoders and of web/media.js).
+fn is_bt709(matrix_coeffs: Option<u8>, height: usize) -> bool {
+    match matrix_coeffs {
+        Some(1) | Some(9) => true,
+        Some(5) | Some(6) => false,
+        _ => height > 576,
     }
 }
 
@@ -475,7 +485,8 @@ impl Decoder {
             if len == 0 {
                 continue;
             }
-            if p + len > sample.len() {
+            // (not p + len, which can wrap around on 32-bit targets)
+            if len > sample.len() - p {
                 result = Err(Error::Bitstream("NAL unit runs past the end of the sample"));
                 break;
             }
@@ -602,6 +613,13 @@ impl Decoder {
         if self.skipping {
             return Ok(());
         }
+        // the slices of a picture are decoded with its parameter sets, so
+        // one that refers to others (or to its ids, sent again changed) is
+        // refused
+        if !hdr.first_slice_segment_in_pic && !self.same_sets(&hdr) {
+            self.mark_damaged();
+            return Err(Error::Bitstream("parameter sets change within a picture"));
+        }
         if !hdr.dependent {
             self.prev_hdr = Some(hdr.clone());
         }
@@ -610,6 +628,15 @@ impl Decoder {
 
     fn mark_damaged(&mut self) {
         with_core!(&mut self.core, c => if let Some(cur) = c.cur.as_mut() { cur.damaged = true }, ());
+    }
+
+    /// Whether a slice refers to the parameter sets of the picture in
+    /// progress (the same ones, or the same sent again).
+    fn same_sets(&self, hdr: &SliceHeader) -> bool {
+        let Some((sps, pps, _)) = &self.layout else { return false };
+        let Some(p) = &self.ppss[hdr.pps_id as usize] else { return false };
+        let s = &self.spss[p.sps_id as usize];
+        (Rc::ptr_eq(p, pps) || **p == **pps) && s.as_ref().is_some_and(|s| Rc::ptr_eq(s, sps) || **s == **sps)
     }
 
     /// Begin a new picture with its first slice segment's header.
@@ -666,8 +693,48 @@ impl Decoder {
             self.prev_tid0_poc = poc;
         }
         let output = hdr.pic_output;
-        let flush_refs = irap && no_rasl_output;
+        // (a stream changes its sequence parameter set only at an IRAP
+        // picture that starts afresh; at any other picture the old
+        // sequence's references, maybe of another size or format, are
+        // dropped all the same)
+        let flush_refs = sps_changed || (irap && no_rasl_output);
         with_core!(&mut self.core, c => c.start_picture(sps, pps, layout, hdr, poc, pts, output, flush_refs), ());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Streams that leave the colour matrix unspecified are taken as
+    /// BT.709 above 576 lines, as the other decoders and web/media.js take
+    /// them, and BT.2020's matrix as BT.709.
+    #[test]
+    fn colour_matrix() {
+        assert!(is_bt709(None, 640));
+        assert!(is_bt709(Some(2), 577));
+        assert!(!is_bt709(None, 576));
+        assert!(is_bt709(Some(9), 480));
+        assert!(!is_bt709(Some(6), 1080));
+    }
+
+    /// The spare picture buffers stay few when references are missing:
+    /// p_frames' pictures each predict from the one before, so with every
+    /// other one dropped each but the first names a missing picture, whose
+    /// mid-grey stand-in joins the spares later (they grew by one for
+    /// every picture).
+    #[test]
+    fn spare_pictures_stay_few() {
+        let data = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/media/hevc/p_frames.mp4")).unwrap();
+        let movie = unflash_mp4::demux::parse_bytes(&data).unwrap();
+        let track = movie.video().unwrap();
+        let mut dec = Decoder::new(track.description.as_deref().unwrap()).unwrap();
+        for s in track.samples.iter().step_by(2) {
+            let frames = dec.decode(&data[s.offset as usize..(s.offset + s.size as u64) as usize], s.pts as f64).unwrap();
+            assert!(frames.iter().all(|f| f.damaged == (s.pts > 0)));
+        }
+        let Cores::Eight(core) = &dec.core else { panic!("an 8-bit stream") };
+        assert!(core.pool.len() <= 4, "{} spare pictures", core.pool.len());
     }
 }

@@ -70,8 +70,6 @@ pub const BMODE_TREE: [i8; 18] = [
 ];
 /// 9.3: segment id tree.
 pub const SEGMENT_TREE: [i8; 6] = [2, 4, 0, -1, -2, -3];
-/// 16.3: inter mode tree, read with probabilities from [`MODE_CONTEXTS`].
-pub const MV_REF_TREE: [i8; 8] = [-(ZEROMV as i8), 2, -(NEARESTMV as i8), 4, -(NEARMV as i8), 6, -(NEWMV as i8), -(SPLITMV as i8)];
 /// 16.4: split partitioning tree.
 pub const SPLIT_MV_TREE: [i8; 6] = [-(SPLIT_4X4 as i8), 2, -(SPLIT_8X8 as i8), 4, -(SPLIT_16X8 as i8), -(SPLIT_8X16 as i8)];
 /// 16.4: subblock motion vector reference tree.

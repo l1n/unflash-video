@@ -136,20 +136,6 @@ impl<'a> BitReader<'a> {
         Ok(v)
     }
 
-    /// Whether syntax follows before the `rbsp_trailing_bits`.
-    pub fn more_rbsp_data(&self) -> bool {
-        let mut last = self.data.len();
-        while last > 0 && self.data[last - 1] == 0 {
-            last -= 1;
-        }
-        if last == 0 {
-            return false;
-        }
-        let b = self.data[last - 1];
-        let stop_bit_pos = (last - 1) * 8 + (7 - b.trailing_zeros() as usize);
-        self.pos < stop_bit_pos
-    }
-
     /// Skip to the next byte boundary.
     pub fn byte_align(&mut self) {
         self.pos = (self.pos + 7) & !7;
@@ -195,15 +181,5 @@ mod tests {
         assert_eq!(out, vec![0, 0, 1, 0, 0, 0, 0]);
         unescape(&[0, 0, 4], &mut out);
         assert_eq!(out, vec![0, 0, 4]);
-    }
-
-    #[test]
-    fn trailing_bits() {
-        let bits = [0b1100_0000];
-        let r = BitReader::new(&bits);
-        assert!(r.more_rbsp_data());
-        let mut r = BitReader::new(&bits);
-        r.skip(1).unwrap();
-        assert!(!r.more_rbsp_data());
     }
 }

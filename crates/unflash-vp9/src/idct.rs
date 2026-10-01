@@ -148,7 +148,9 @@ fn iwht4(t: &mut [i32; 4], shift: u32) {
 
 // The 1-D inverse transforms of 8.7.1, unrolled from the specification's
 // butterfly networks (generated; the permutations are resolved into the
-// variable names). `L` is one value, or several processed side by side.
+// variable names). A DCT passes its even-numbered inputs through the DCT
+// of half its size, as the network does, and numbers the rest as in the
+// whole network. `L` is one value, or several processed side by side.
 
 /// The 4-point inverse DCT.
 #[inline(always)]
@@ -169,14 +171,9 @@ pub fn idct4<L: Lane>(t: &mut [L; 4]) {
 #[inline(always)]
 pub fn idct8<L: Lane>(t: &mut [L; 8]) {
     let [i0, i1, i2, i3, i4, i5, i6, i7] = *t;
-    let x1 = i0.sub(i4).mul(11585).r14();
-    let x2 = i0.add(i4).mul(11585).r14();
-    let x3 = i2.mul(6270).sub(i6.mul(15137)).r14();
-    let x4 = i2.mul(15137).add(i6.mul(6270)).r14();
-    let x5 = x2.add(x4);
-    let x6 = x2.sub(x4);
-    let x7 = x1.add(x3);
-    let x8 = x1.sub(x3);
+    let mut even = [i0, i2, i4, i6];
+    idct4(&mut even);
+    let [x5, x7, x8, x6] = even;
     let x9 = i1.mul(3196).sub(i7.mul(16069)).r14();
     let x10 = i1.mul(16069).add(i7.mul(3196)).r14();
     let x11 = i5.mul(13623).sub(i3.mul(9102)).r14();
@@ -202,32 +199,9 @@ pub fn idct8<L: Lane>(t: &mut [L; 8]) {
 #[inline(always)]
 pub fn idct16<L: Lane>(t: &mut [L; 16]) {
     let [i0, i1, i2, i3, i4, i5, i6, i7, i8, i9, i10, i11, i12, i13, i14, i15] = *t;
-    let x1 = i0.sub(i8).mul(11585).r14();
-    let x2 = i0.add(i8).mul(11585).r14();
-    let x3 = i4.mul(6270).sub(i12.mul(15137)).r14();
-    let x4 = i4.mul(15137).add(i12.mul(6270)).r14();
-    let x5 = x2.add(x4);
-    let x6 = x2.sub(x4);
-    let x7 = x1.add(x3);
-    let x8 = x1.sub(x3);
-    let x9 = i2.mul(3196).sub(i14.mul(16069)).r14();
-    let x10 = i2.mul(16069).add(i14.mul(3196)).r14();
-    let x11 = i10.mul(13623).sub(i6.mul(9102)).r14();
-    let x12 = i10.mul(9102).add(i6.mul(13623)).r14();
-    let x13 = x9.add(x11);
-    let x14 = x9.sub(x11);
-    let x15 = x10.add(x12);
-    let x16 = x10.sub(x12);
-    let x17 = x16.sub(x14).mul(11585).r14();
-    let x18 = x16.add(x14).mul(11585).r14();
-    let x19 = x5.add(x15);
-    let x20 = x5.sub(x15);
-    let x21 = x7.add(x18);
-    let x22 = x7.sub(x18);
-    let x23 = x8.add(x17);
-    let x24 = x8.sub(x17);
-    let x25 = x6.add(x13);
-    let x26 = x6.sub(x13);
+    let mut even = [i0, i2, i4, i6, i8, i10, i12, i14];
+    idct8(&mut even);
+    let [x19, x21, x23, x25, x26, x24, x22, x20] = even;
     let x27 = i1.mul(1606).sub(i15.mul(16305)).r14();
     let x28 = i1.mul(16305).add(i15.mul(1606)).r14();
     let x29 = i9.mul(12665).sub(i7.mul(10394)).r14();
@@ -283,80 +257,9 @@ pub fn idct16<L: Lane>(t: &mut [L; 16]) {
 #[inline(always)]
 pub fn idct32<L: Lane>(t: &mut [L; 32]) {
     let [i0, i1, i2, i3, i4, i5, i6, i7, i8, i9, i10, i11, i12, i13, i14, i15, i16, i17, i18, i19, i20, i21, i22, i23, i24, i25, i26, i27, i28, i29, i30, i31] = *t;
-    let x1 = i0.sub(i16).mul(11585).r14();
-    let x2 = i0.add(i16).mul(11585).r14();
-    let x3 = i8.mul(6270).sub(i24.mul(15137)).r14();
-    let x4 = i8.mul(15137).add(i24.mul(6270)).r14();
-    let x5 = x2.add(x4);
-    let x6 = x2.sub(x4);
-    let x7 = x1.add(x3);
-    let x8 = x1.sub(x3);
-    let x9 = i4.mul(3196).sub(i28.mul(16069)).r14();
-    let x10 = i4.mul(16069).add(i28.mul(3196)).r14();
-    let x11 = i20.mul(13623).sub(i12.mul(9102)).r14();
-    let x12 = i20.mul(9102).add(i12.mul(13623)).r14();
-    let x13 = x9.add(x11);
-    let x14 = x9.sub(x11);
-    let x15 = x10.add(x12);
-    let x16 = x10.sub(x12);
-    let x17 = x16.sub(x14).mul(11585).r14();
-    let x18 = x16.add(x14).mul(11585).r14();
-    let x19 = x5.add(x15);
-    let x20 = x5.sub(x15);
-    let x21 = x7.add(x18);
-    let x22 = x7.sub(x18);
-    let x23 = x8.add(x17);
-    let x24 = x8.sub(x17);
-    let x25 = x6.add(x13);
-    let x26 = x6.sub(x13);
-    let x27 = i2.mul(1606).sub(i30.mul(16305)).r14();
-    let x28 = i2.mul(16305).add(i30.mul(1606)).r14();
-    let x29 = i18.mul(12665).sub(i14.mul(10394)).r14();
-    let x30 = i18.mul(10394).add(i14.mul(12665)).r14();
-    let x31 = i10.mul(7723).sub(i22.mul(14449)).r14();
-    let x32 = i10.mul(14449).add(i22.mul(7723)).r14();
-    let x33 = i26.mul(15679).sub(i6.mul(4756)).r14();
-    let x34 = i26.mul(4756).add(i6.mul(15679)).r14();
-    let x35 = x27.add(x29);
-    let x36 = x27.sub(x29);
-    let x37 = x33.add(x31);
-    let x38 = x33.sub(x31);
-    let x39 = x34.add(x32);
-    let x40 = x34.sub(x32);
-    let x41 = x28.add(x30);
-    let x42 = x28.sub(x30);
-    let x43 = x42.mul(6270).sub(x36.mul(15137)).r14();
-    let x44 = x42.mul(15137).add(x36.mul(6270)).r14();
-    let x45 = x38.mul(-15137).add(x40.mul(6270)).r14();
-    let x46 = x38.mul(-6270).sub(x40.mul(15137)).r14();
-    let x47 = x35.add(x37);
-    let x48 = x35.sub(x37);
-    let x49 = x41.add(x39);
-    let x50 = x41.sub(x39);
-    let x51 = x43.add(x46);
-    let x52 = x43.sub(x46);
-    let x53 = x44.add(x45);
-    let x54 = x44.sub(x45);
-    let x55 = x54.sub(x52).mul(11585).r14();
-    let x56 = x54.add(x52).mul(11585).r14();
-    let x57 = x50.sub(x48).mul(11585).r14();
-    let x58 = x50.add(x48).mul(11585).r14();
-    let x59 = x19.add(x49);
-    let x60 = x19.sub(x49);
-    let x61 = x21.add(x53);
-    let x62 = x21.sub(x53);
-    let x63 = x23.add(x56);
-    let x64 = x23.sub(x56);
-    let x65 = x25.add(x58);
-    let x66 = x25.sub(x58);
-    let x67 = x26.add(x57);
-    let x68 = x26.sub(x57);
-    let x69 = x24.add(x55);
-    let x70 = x24.sub(x55);
-    let x71 = x22.add(x51);
-    let x72 = x22.sub(x51);
-    let x73 = x20.add(x47);
-    let x74 = x20.sub(x47);
+    let mut even = [i0, i2, i4, i6, i8, i10, i12, i14, i16, i18, i20, i22, i24, i26, i28, i30];
+    idct16(&mut even);
+    let [x59, x61, x63, x65, x67, x69, x71, x73, x74, x72, x70, x68, x66, x64, x62, x60] = even;
     let x75 = i1.mul(804).sub(i31.mul(16364)).r14();
     let x76 = i1.mul(16364).add(i31.mul(804)).r14();
     let x77 = i17.mul(12140).sub(i15.mul(11003)).r14();

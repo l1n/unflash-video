@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use unflash_hevc::{Decoder, Error, Frame};
 use unflash_mp4::demux::parse_bytes;
 
+mod common;
+use common::{framemd5, md5};
+
 fn media(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/hevc").join(name)
 }
@@ -18,26 +21,6 @@ fn samples(name: &str) -> (Vec<u8>, Vec<(Vec<u8>, f64)>) {
     let track = movie.video().unwrap();
     let samples = track.samples.iter().map(|s| (data[s.offset as usize..(s.offset + s.size as u64) as usize].to_vec(), s.pts as f64)).collect();
     (track.description.clone().unwrap(), samples)
-}
-
-/// The MD5 of a picture as ffmpeg's framemd5 hashes it: the 8-bit planes,
-/// or the 16-bit little-endian ones above 8 bits.
-fn md5(f: &Frame) -> String {
-    let mut ctx = md5::Context::new();
-    match (&f.y16, &f.u16, &f.v16) {
-        (Some(y), Some(u), Some(v)) => {
-            for p in [y, u, v] {
-                let bytes: Vec<u8> = p.iter().flat_map(|s| s.to_le_bytes()).collect();
-                ctx.consume(&bytes);
-            }
-        }
-        _ => {
-            ctx.consume(&f.y);
-            ctx.consume(&f.u);
-            ctx.consume(&f.v);
-        }
-    }
-    format!("{:x}", ctx.compute())
 }
 
 /// Decode a file; every picture in presentation order.
@@ -57,8 +40,7 @@ fn decode(name: &str, fast: bool) -> Result<Vec<Frame>, Error> {
 }
 
 fn expected(name: &str) -> Vec<String> {
-    let text = std::fs::read_to_string(media(&format!("{name}.framemd5"))).unwrap();
-    text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).map(|l| l.rsplit(',').next().unwrap().trim().to_string()).collect()
+    framemd5(&std::fs::read_to_string(media(&format!("{name}.framemd5"))).unwrap())
 }
 
 fn check(name: &str) {
@@ -285,4 +267,70 @@ fn damaged_configuration_and_annexb_do_not_panic() {
         let _ = dec.decode_annexb(&a[cut..], 1.0);
         let _ = dec.flush();
     }
+}
+
+/// The NAL units of a sample (these files have four-byte lengths).
+fn nal_units(sample: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 4 <= sample.len() {
+        let n = u32::from_be_bytes([sample[i], sample[i + 1], sample[i + 2], sample[i + 3]]) as usize;
+        out.push(&sample[i + 4..i + 4 + n]);
+        i += 4 + n;
+    }
+    out
+}
+
+/// A sample of the given NAL units.
+fn sample_of(nal_units: &[&[u8]]) -> Vec<u8> {
+    nal_units.iter().flat_map(|n| (n.len() as u32).to_be_bytes().into_iter().chain(n.iter().copied())).collect()
+}
+
+/// A NAL unit length near 2^32 is an error. (On 32-bit targets, wasm32
+/// among them, the bounds check wrapped around and the slicing panicked;
+/// on 64-bit ones the sum cannot overflow, so only a 32-bit target can
+/// fail this test.)
+#[test]
+fn nal_length_near_four_gigabytes() {
+    let mut dec = Decoder::new(&[]).unwrap();
+    assert!(dec.decode(&[0xff; 8], 0.0).is_err());
+}
+
+/// A slice that refers to other parameter sets than its picture's is
+/// refused rather than decoded with the picture's: here slices.mp4's
+/// parameter sets and the second slice of its first picture (160x96, at
+/// CTB 3) follow the first slice of cip's first picture (96x64, two CTBs),
+/// with whose parameter sets it was decoded, from past the picture's end
+/// (a panic).
+#[test]
+fn slice_with_other_parameter_sets_is_refused() {
+    let (config, cip) = samples("cip");
+    let (other_config, other) = samples("slices");
+    let other_sets = config_nal_units(&other_config);
+    let mut nals = nal_units(&cip[0].0);
+    nals.extend(other_sets.iter().map(|n| &n[..]));
+    nals.push(nal_units(&other[0].0).into_iter().filter(|n| (n[0] >> 1) & 0x3f < 32).nth(1).unwrap());
+    let mut dec = Decoder::new(&config).unwrap();
+    assert!(dec.decode(&sample_of(&nals), 0.0).is_err());
+}
+
+/// A new sequence parameter set at a picture that is not a random access
+/// point (a bad splice) starts without the old sequence's pictures: here
+/// b_pyramid's parameter sets and its tenth picture, which predicts from
+/// order counts 8, 7, 5 and 3, follow mono's last picture (with mono's
+/// 4:0:0 pictures of order counts 5 to 9 as references, which 4:2:0
+/// chroma prediction panicked on).
+#[test]
+fn new_sequence_without_a_random_access_point() {
+    let (mono_config, mono) = samples("mono");
+    let (config, b_pyramid) = samples("b_pyramid");
+    let mut dec = Decoder::new(&mono_config).unwrap();
+    for (bytes, pts) in &mono {
+        dec.decode(bytes, *pts).unwrap();
+    }
+    let sets = config_nal_units(&config);
+    let mut nals: Vec<&[u8]> = sets.iter().map(|n| &n[..]).collect();
+    nals.extend(nal_units(&b_pyramid[9].0));
+    let frames = dec.decode(&sample_of(&nals), 0.0).unwrap();
+    assert!(frames.len() == 1 && frames[0].damaged && (frames[0].width, frames[0].height) == (128, 96));
 }

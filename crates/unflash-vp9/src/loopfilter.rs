@@ -77,7 +77,10 @@ impl Levels {
     }
 }
 
-/// Filter the whole frame.
+/// Filter the whole frame. (Kept out of line, as it runs once a frame:
+/// inlined into the frame's decoding, it compiled to code that ran 0.5 to
+/// 1.4% more instructions over the test streams.)
+#[inline(never)]
 pub fn filter_frame<T: Pixel>(frame: &mut FrameBuf<T>, mi: &[MiInfo], mi_rows: usize, mi_cols: usize, levels: &Levels) {
     let bd = frame.bit_depth as u32;
     for row in (0..mi_rows).step_by(8) {

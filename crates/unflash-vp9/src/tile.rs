@@ -9,7 +9,6 @@ use crate::frame::{FrameBuf, Pixel, PAD};
 use crate::header::*;
 use crate::probs::*;
 use crate::tables::*;
-use crate::Result;
 
 pub const DC_PRED: u8 = 0;
 pub const TM_PRED: u8 = 9;
@@ -185,17 +184,16 @@ pub struct TileDecoder<'a, 'd, T: Pixel> {
 
 impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
     /// decode_tile (6.4.2).
-    pub fn decode(&mut self) -> Result<()> {
+    pub fn decode(&mut self) {
         for r in (self.mi_row_start..self.mi_row_end).step_by(8) {
             self.left = LeftCtx::default();
             for c in (self.mi_col_start..self.mi_col_end).step_by(8) {
-                self.decode_partition(r, c, BLOCK_64X64)?;
+                self.decode_partition(r, c, BLOCK_64X64);
             }
         }
         if self.bd.overran() {
             self.damaged = true;
         }
-        Ok(())
     }
 
     #[inline]
@@ -203,9 +201,9 @@ impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
         &self.mi[r * self.mi_cols + c]
     }
 
-    fn decode_partition(&mut self, r: usize, c: usize, bsize: usize) -> Result<()> {
+    fn decode_partition(&mut self, r: usize, c: usize, bsize: usize) {
         if r >= self.mi_rows || c >= self.mi_cols {
-            return Ok(());
+            return;
         }
         let num8x8 = NUM_8X8_WIDE[bsize] as usize;
         let half = num8x8 >> 1;
@@ -214,22 +212,22 @@ impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
         let partition = self.read_partition(r, c, bsize, num8x8, has_rows, has_cols);
         let subsize = SUBSIZE_LOOKUP[partition][bsize] as usize;
         if subsize < BLOCK_8X8 || partition == PARTITION_NONE {
-            self.decode_block(r, c, subsize)?;
+            self.decode_block(r, c, subsize);
         } else if partition == PARTITION_HORZ {
-            self.decode_block(r, c, subsize)?;
+            self.decode_block(r, c, subsize);
             if has_rows {
-                self.decode_block(r + half, c, subsize)?;
+                self.decode_block(r + half, c, subsize);
             }
         } else if partition == PARTITION_VERT {
-            self.decode_block(r, c, subsize)?;
+            self.decode_block(r, c, subsize);
             if has_cols {
-                self.decode_block(r, c + half, subsize)?;
+                self.decode_block(r, c + half, subsize);
             }
         } else {
-            self.decode_partition(r, c, subsize)?;
-            self.decode_partition(r, c + half, subsize)?;
-            self.decode_partition(r + half, c, subsize)?;
-            self.decode_partition(r + half, c + half, subsize)?;
+            self.decode_partition(r, c, subsize);
+            self.decode_partition(r, c + half, subsize);
+            self.decode_partition(r + half, c, subsize);
+            self.decode_partition(r + half, c + half, subsize);
         }
         if bsize == BLOCK_8X8 || partition != PARTITION_SPLIT {
             let above = 15 >> B_WIDTH_LOG2[subsize];
@@ -239,7 +237,6 @@ impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
                 self.left.partition[(r + i) & 7] = left;
             }
         }
-        Ok(())
     }
 
     fn read_partition(&mut self, r: usize, c: usize, bsize: usize, num8x8: usize, has_rows: bool, has_cols: bool) -> usize {
@@ -278,7 +275,7 @@ impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
         p
     }
 
-    fn decode_block(&mut self, r: usize, c: usize, bsize: usize) -> Result<()> {
+    fn decode_block(&mut self, r: usize, c: usize, bsize: usize) {
         let mut b = Block { row: r, col: c, size: bsize, avail_u: r > 0, avail_l: c > self.mi_col_start, ..Default::default() };
         if self.fh.is_intra() {
             self.intra_frame_mode_info(&mut b);
@@ -306,7 +303,6 @@ impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
             let row = (r + y) * self.mi_cols + c;
             self.mi[row..row + w].fill(info);
         }
-        Ok(())
     }
 
     // ---- intra frames ----------------------------------------------------------
@@ -448,15 +444,14 @@ impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
             b.segment_id = 0;
             return;
         }
-        let predicted = self.predicted_segment_id(b);
         if !seg.update_map {
-            b.segment_id = predicted;
+            b.segment_id = self.predicted_segment_id(b);
             return;
         }
         if seg.temporal_update {
             let ctx = (self.left.seg_pred[b.row & 7] + self.above.seg_pred[b.col]) as usize;
             let pred = self.bd.read(seg.pred_probs[ctx]);
-            b.segment_id = if pred { predicted } else { self.bd.read_tree(&SEGMENT_TREE, &seg.tree_probs) as u8 };
+            b.segment_id = if pred { self.predicted_segment_id(b) } else { self.bd.read_tree(&SEGMENT_TREE, &seg.tree_probs) as u8 };
             for i in 0..NUM_8X8_WIDE[b.size] as usize {
                 self.above.seg_pred[b.col + i] = pred as u8;
             }

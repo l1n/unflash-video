@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use unflash_vp9::header::{parse_uncompressed_header, StreamState};
 use unflash_vp9::Decoder;
 
 fn media(name: &str) -> PathBuf {
@@ -15,14 +16,7 @@ fn media(name: &str) -> PathBuf {
 }
 
 fn ivf_samples(data: &[u8]) -> Vec<Vec<u8>> {
-    let mut p = u16::from_le_bytes([data[6], data[7]]) as usize;
-    let mut out = Vec::new();
-    while p + 12 <= data.len() {
-        let size = u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize;
-        out.push(data[p + 12..p + 12 + size].to_vec());
-        p += 12 + size;
-    }
-    out
+    unflash_mp4::ivf::frames(data).expect("an IVF file").into_iter().map(|(_, f)| f.to_vec()).collect()
 }
 
 /// xorshift64*: deterministic, so a failure can be replayed.
@@ -116,4 +110,37 @@ fn corrupt_streams_do_not_panic() {
             assert!(frames <= s.len() * 8, "{name} round {round}: too many frames");
         }
     }
+}
+
+/// A frame of another size that fails in its compressed header leaves the
+/// decoder at the old size, and the next frame's segment map prediction
+/// must still find a map of that size: here aq_cyclic's 176x144 frames
+/// (which predict their maps temporally) around odd_small's 33x17 key
+/// frame, whose compressed header no longer starts with its zero marker
+/// (the map was left at the key frame's size, and read past its end).
+#[test]
+fn failed_size_change_keeps_the_segment_map_whole() {
+    let cyclic = ivf_samples(&std::fs::read(media("aq_cyclic.ivf")).expect("run tests/media/vp9/gen.sh"));
+    let mut key = ivf_samples(&std::fs::read(media("odd_small.ivf")).expect("run tests/media/vp9/gen.sh")).swap_remove(0);
+    let fh = parse_uncompressed_header(&key, &mut StreamState::default(), &[None; 8]).unwrap();
+    key[fh.uncompressed_size] = 0xff;
+    let mut dec = Decoder::new(&[]).unwrap();
+    for s in &cyclic[..6] {
+        dec.decode(s, 0.0).unwrap();
+    }
+    assert!(dec.decode(&key, 0.0).is_err());
+    assert!(dec.decode(&cyclic[6], 0.0).is_ok());
+}
+
+/// Every byte of a sample can be a frame that shows a reference frame
+/// again (show_existing_frame), each shown frame a full copy: a sample
+/// shows at most eight, as many as a superframe can hold.
+#[test]
+fn shown_frames_per_sample_are_bounded() {
+    let key = ivf_samples(&std::fs::read(media("odd_small.ivf")).expect("run tests/media/vp9/gen.sh")).swap_remove(0);
+    let mut dec = Decoder::new(&[]).unwrap();
+    assert_eq!(dec.decode(&key, 0.0).unwrap().len(), 1);
+    // (0x88: show_existing_frame of slot 0, in one byte)
+    let shown = dec.decode(&[0x88; 300], 0.0).unwrap().len();
+    assert!((1..=8).contains(&shown), "{shown} frames from one sample");
 }

@@ -15,17 +15,8 @@ fn media(name: &str) -> PathBuf {
 /// of an IVF file, or the video samples of a WebM file.
 fn samples(file: &str) -> Vec<(f64, Vec<u8>)> {
     let data = std::fs::read(media(file)).expect("run tests/media/vp8/gen.sh");
-    if file.ends_with(".ivf") {
-        let mut out = Vec::new();
-        let mut p = u16::from_le_bytes([data[6], data[7]]) as usize;
-        while p + 12 <= data.len() {
-            let size = u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize;
-            let ts = u64::from_le_bytes(data[p + 4..p + 12].try_into().unwrap());
-            p += 12;
-            out.push((ts as f64, data[p..p + size].to_vec()));
-            p += size;
-        }
-        return out;
+    if let Some(frames) = unflash_mp4::ivf::frames(&data) {
+        return frames.into_iter().map(|(ts, f)| (ts as f64, f.to_vec())).collect();
     }
     let movie = parse_bytes(&data).unwrap();
     let track = movie.video().unwrap();

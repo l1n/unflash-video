@@ -37,7 +37,6 @@ pub const SEG_LVL_SKIP: usize = 3;
 pub const CS_UNKNOWN: u8 = 0;
 pub const CS_BT_601: u8 = 1;
 pub const CS_BT_709: u8 = 2;
-pub const CS_SMPTE_170: u8 = 3;
 pub const CS_SMPTE_240: u8 = 4;
 pub const CS_BT_2020: u8 = 5;
 pub const CS_RGB: u8 = 7;
@@ -180,10 +179,6 @@ impl FrameHeader {
 
     pub fn sb64_cols(&self) -> usize {
         (self.mi_cols() + 7) >> 3
-    }
-
-    pub fn sb64_rows(&self) -> usize {
-        (self.mi_rows() + 7) >> 3
     }
 }
 

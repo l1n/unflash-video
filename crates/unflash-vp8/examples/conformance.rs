@@ -21,27 +21,6 @@ fn vectors(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// The frames of an IVF file: a 32-byte file header, then per frame a
-/// 4-byte size, an 8-byte timestamp and the data.
-fn ivf_frames(data: &[u8]) -> Vec<(u64, &[u8])> {
-    let mut frames = Vec::new();
-    if data.len() < 32 || &data[..4] != b"DKIF" {
-        return frames;
-    }
-    let mut p = u16::from_le_bytes([data[6], data[7]]) as usize;
-    while p + 12 <= data.len() {
-        let size = u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize;
-        let ts = u64::from_le_bytes(data[p + 4..p + 12].try_into().unwrap());
-        p += 12;
-        if p + size > data.len() {
-            break;
-        }
-        frames.push((ts, &data[p..p + size]));
-        p += size;
-    }
-    frames
-}
-
 /// The reference MD5s: libvpx's `.md5` ("md5  name" per frame) or ffmpeg's
 /// `.framemd5` (the last comma-separated field).
 fn expected(path: &Path) -> Option<(Vec<String>, &'static str)> {
@@ -58,7 +37,7 @@ fn decode(path: &Path) -> Result<(Vec<String>, usize), Error> {
     let data = std::fs::read(path).expect("read");
     let mut dec = Decoder::new(&[])?;
     let (mut md5s, mut damaged) = (Vec::new(), 0);
-    for (ts, frame) in ivf_frames(&data) {
+    for (ts, frame) in unflash_mp4::ivf::frames(&data).unwrap_or_default() {
         for f in dec.decode(frame, ts as f64)? {
             let mut ctx = md5::Context::new();
             ctx.consume(&f.y);
