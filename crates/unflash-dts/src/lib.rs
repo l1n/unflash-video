@@ -98,7 +98,7 @@ mod qmf;
 mod tables;
 mod vq;
 
-pub use decoder::{probe, Decoder};
+pub use decoder::Decoder;
 pub use frame::Features;
 
 /// The standard's tables and CRC, for tests that build frames.
@@ -106,7 +106,7 @@ pub use frame::Features;
 pub mod testing {
     pub use crate::header::crc16;
     pub use crate::huffman::{Book, AUDIO, BIT_ALLOC, SCALES, TMODE};
-    pub use crate::tables::{AMODE_CHANNELS, DMIX_TABLE, JOINT_SCALES, RMS6, RMS7, SAMPLE_RATES};
+    pub use crate::tables::{AMODE_CHANNELS, RMS6};
 }
 
 /// How the decoder arranges its output channels.
@@ -156,8 +156,6 @@ pub enum Error {
     /// Only DTS-HD extension substreams, no core frame: DTS-HD Master
     /// Audio or DTS Express without a core.
     NoCore,
-    /// The stream uses something this decoder does not implement.
-    Unsupported(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -165,7 +163,6 @@ impl std::fmt::Display for Error {
         match self {
             Error::NoSync => write!(f, "no DTS frame found"),
             Error::NoCore => write!(f, "a DTS-HD stream without a core (DTS-HD Master Audio or DTS Express without one), which this decoder cannot play"),
-            Error::Unsupported(s) => write!(f, "unsupported DTS stream: {s}"),
         }
     }
 }

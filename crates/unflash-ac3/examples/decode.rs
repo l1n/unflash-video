@@ -17,10 +17,8 @@ fn main() {
     let data = std::fs::read(&args[1]).expect("read input");
     let stereo = args.iter().any(|a| a == "stereo");
     let quiet = args.iter().any(|a| a == "quiet");
-    let trace = args.iter().position(|a| a == "trace").and_then(|i| args.get(i + 1)).cloned();
     let mut dec = Decoder::new(if stereo { Output::Stereo } else { Output::Native });
     dec.set_noise(!quiet);
-    dec.set_trace(trace.is_some());
     let mut out = Vec::new();
     let t0 = std::time::Instant::now();
     let r = dec.decode(&data, &mut out);
@@ -47,14 +45,4 @@ fn main() {
         }
     }
     std::fs::write(&args[2], bytes).expect("write output");
-    if let Some(path) = trace {
-        // per block, per channel: blksw, then the four noisy-bin words
-        let mut t = String::new();
-        for b in dec.take_trace() {
-            let row: Vec<String> = b.channels.iter().map(|c| format!("{} {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x}", c.blksw as u8, c.noisy[0], c.noisy[1], c.noisy[2], c.noisy[3], c.hebap4[0], c.hebap4[1], c.hebap4[2], c.hebap4[3], c.spx[0], c.spx[1], c.spx[2], c.spx[3])).collect();
-            t.push_str(&row.join(" | "));
-            t.push('\n');
-        }
-        std::fs::write(path, t).expect("write trace");
-    }
 }

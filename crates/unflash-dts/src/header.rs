@@ -46,10 +46,6 @@ pub fn any_sync(data: &[u8], pos: usize) -> bool {
 /// full; a byte-swapped frame of an odd length ends with a whole word).
 pub fn to_be16(raw: &[u8], packing: Packing, out: &mut Vec<u8>) {
     out.clear();
-    if packing == Packing::Be16 {
-        out.extend_from_slice(raw);
-        return;
-    }
     let word = |i: usize| -> u16 {
         let (a, b) = (raw[2 * i], raw[2 * i + 1]);
         match packing {
@@ -59,7 +55,7 @@ pub fn to_be16(raw: &[u8], packing: Packing, out: &mut Vec<u8>) {
     };
     let words = raw.len() / 2;
     match packing {
-        Packing::Be16 => unreachable!(),
+        Packing::Be16 => out.extend_from_slice(raw),
         Packing::Le16 => {
             for i in 0..words {
                 out.extend_from_slice(&word(i).to_be_bytes());

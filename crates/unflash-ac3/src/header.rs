@@ -63,7 +63,6 @@ pub struct Header {
     /// E-AC-3 stream type (0 independent, 1 dependent, 2 converted from
     /// AC-3); 0 for AC-3.
     pub strmtyp: u8,
-    pub substreamid: u8,
     pub bytes: usize,
     pub sample_rate: u32,
     /// The sample rate code that chooses the hearing threshold table:
@@ -79,8 +78,6 @@ pub struct Header {
     /// Annex D §3.1.2, Annex E's mixing metadata).
     pub clev: f32,
     pub slev: f32,
-    /// E-AC-3 frames of more than one block that carry `convsync`.
-    pub frmsizecod: u8,
     /// Where the audio frame (E-AC-3) or the first audio block (AC-3)
     /// starts, in bits from the start of the frame.
     pub bsi_end: usize,
@@ -95,7 +92,7 @@ pub fn parse(data: &[u8]) -> Result<Header, &'static str> {
     if !s.eac3 {
         b.skip(16); // crc1
         h.fscod = b.read(2) as u8;
-        h.frmsizecod = b.read(6) as u8;
+        b.skip(6); // frmsizecod
         h.sample_rate = tables::SAMPLE_RATES[h.fscod as usize];
         b.skip(5); // bsid
         b.skip(3); // bsmod
@@ -171,7 +168,7 @@ pub fn parse(data: &[u8]) -> Result<Header, &'static str> {
         }
     } else {
         h.strmtyp = b.read(2) as u8;
-        h.substreamid = b.read(3) as u8;
+        b.skip(3); // substreamid
         b.skip(11); // frmsiz
         let fscod = b.read(2) as u8;
         if fscod == 3 {
@@ -298,7 +295,7 @@ pub fn parse(data: &[u8]) -> Result<Header, &'static str> {
         if h.strmtyp == 2 {
             let blkid = if h.numblkscod == 3 { true } else { b.flag() };
             if blkid {
-                h.frmsizecod = b.read(6) as u8;
+                b.skip(6); // frmsizecod
             }
         }
         if b.flag() {

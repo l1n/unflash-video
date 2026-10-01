@@ -10,6 +10,7 @@ mod common;
 use std::path::PathBuf;
 
 use common::{fix_crcs, frames};
+use unflash_ac3::testing::frame_bytes;
 use unflash_ac3::{Decoded, Decoder, Error, Output};
 
 fn media(name: &str) -> PathBuf {
@@ -126,7 +127,8 @@ fn nothing_to_decode() {
 
 /// Mutations of frames whose CRCs are then made to check again, so that
 /// the parser sees the damage: no panics, and a frame either decodes or
-/// is silence of its length.
+/// is silence of its length. The frame after the mutated one is decoded
+/// too: what a damaged frame leaves behind must not break the next one.
 #[test]
 fn mutated_frames_do_not_panic() {
     let mut rng = Lcg(1);
@@ -184,11 +186,16 @@ fn mutated_frames_do_not_panic() {
                 }
             }
             // keep the frame's length as its header now says
-            if let Some(size) = common::frame_size(&piece[f0..]) {
+            if let Some(size) = frame_bytes(&piece[f0..]) {
                 if f0 + size <= piece.len() && size >= 8 {
                     piece.truncate(f0 + size);
                     fix_crcs(&mut piece[f0..]);
                 }
+            }
+            // and the frame after it, as it was, which may reuse what the
+            // mutated frame left behind
+            if let Some(next) = fr.get(k + 1) {
+                piece.extend_from_slice(&data[next.clone()]);
             }
             for noise in [true, false] {
                 for output in [Output::Native, Output::Stereo] {
@@ -379,7 +386,6 @@ fn reduced_sample_rates() {
         let r = dec.decode(&half, &mut out).unwrap();
         assert_eq!(r, full.unwrap(), "{name}");
         assert_eq!(dec.info().unwrap().sample_rate, rate);
-        assert_eq!(unflash_ac3::probe(&half).unwrap().sample_rate, rate);
         assert_eq!(out, full_out, "{name}");
     }
 }
@@ -436,7 +442,6 @@ fn rms(v: &[f32]) -> f64 {
 #[test]
 fn dual_mono() {
     let data = common::dual_mono_frames(20, 10, 0x40);
-    assert_eq!(unflash_ac3::probe(&data).unwrap(), unflash_ac3::StreamInfo { sample_rate: 48000, channels: 2, eac3: false, acmod: 0, lfe: false });
     let (r, out) = decode(&data, true);
     let r = r.unwrap();
     assert_eq!((r.samples, r.damaged), (20 * 1536, 0));
@@ -449,16 +454,14 @@ fn dual_mono() {
     let mut stereo = Vec::new();
     dec.decode(&data, &mut stereo).unwrap();
     assert_eq!(stereo, out);
+    assert_eq!(dec.info(), Some(unflash_ac3::StreamInfo { sample_rate: 48000, channels: 2, eac3: false, acmod: 0, lfe: false }));
     let mut dec = Decoder::new(Output::Native);
     dec.set_noise(false);
     let mut quiet = Vec::new();
     dec.decode(&data, &mut quiet).unwrap();
     assert!(quiet.iter().flatten().all(|&v| v == 0.0));
     if common::ffmpeg_available() {
-        let path = std::env::temp_dir().join(format!("unflash-ac3-dual-{}.ac3", std::process::id()));
-        std::fs::write(&path, &data).unwrap();
-        let reference = common::ffmpeg_decode(&path, &[]).expect("ffmpeg decodes dual mono");
-        let _ = std::fs::remove_file(&path);
+        let reference = common::ffmpeg_decode_bytes(&data, "dual.ac3", &[]).expect("ffmpeg decodes dual mono");
         assert_eq!(reference.len(), 2);
         assert_eq!(reference[0].len(), out[0].len());
         assert!(reference[1].iter().all(|&v| v == 0.0), "ffmpeg's Ch2");
@@ -480,10 +483,7 @@ fn eac3_frames_of_one_two_and_three_blocks() {
         let level = rms(&out[0]);
         assert!(level > 1e-5, "{blocks} blocks: dithered");
         if common::ffmpeg_available() {
-            let path = std::env::temp_dir().join(format!("unflash-ac3-{blocks}-{}.eac3", std::process::id()));
-            std::fs::write(&path, &data).unwrap();
-            let reference = common::ffmpeg_decode(&path, &[]).expect("ffmpeg decodes it");
-            let _ = std::fs::remove_file(&path);
+            let reference = common::ffmpeg_decode_bytes(&data, &format!("{blocks}-blocks.eac3"), &[]).expect("ffmpeg decodes it");
             assert_eq!(reference[0].len(), out[0].len(), "{blocks} blocks");
             for c in 0..2 {
                 let ratio = rms(&reference[c]) / rms(&out[c]);

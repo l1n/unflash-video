@@ -88,8 +88,21 @@ mod imdct;
 mod tables;
 mod vq;
 
-pub use decoder::{block_ends, probe, Decoder};
+pub use decoder::{block_ends, Decoder};
 pub use frame::{BlockTrace, ChannelTrace, Features};
+
+/// The standard's tables and CRC, for tests that build frames.
+#[doc(hidden)]
+pub mod testing {
+    pub use crate::crc::crc16;
+    pub use crate::tables::{DEFAULT_CPL_BNDSTRC, DEFAULT_SPX_BNDSTRC, FRMEXPSTR, NFCHANS};
+
+    /// A sync frame's length in bytes, from its first six (`None` where
+    /// they cannot start a frame).
+    pub fn frame_bytes(f: &[u8]) -> Option<usize> {
+        crate::header::sync(f).map(|s| s.bytes)
+    }
+}
 
 /// How the decoder arranges its output channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,15 +146,12 @@ pub struct Decoded {
 pub enum Error {
     /// Not one sync frame of independent substream 0 was found.
     NoSync,
-    /// The stream uses something this decoder does not implement.
-    Unsupported(&'static str),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::NoSync => write!(f, "no AC-3 or E-AC-3 sync frame found"),
-            Error::Unsupported(s) => write!(f, "unsupported AC-3 / E-AC-3 stream: {s}"),
         }
     }
 }

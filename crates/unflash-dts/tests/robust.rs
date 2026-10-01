@@ -149,7 +149,6 @@ fn nothing_to_decode() {
         data.extend(substream(&mut rng, 300));
     }
     assert_eq!(decode(&data).0, Err(Error::NoCore));
-    assert_eq!(unflash_dts::probe(&data), Err(Error::NoCore));
     assert!(Error::NoCore.to_string().contains("without a core"));
 }
 
@@ -203,7 +202,9 @@ fn substreams_are_stepped_over() {
 }
 
 /// Mutations of frames: no panics, every channel as long as the others,
-/// every sample finite; a frame either decodes or is silence.
+/// every sample finite; a frame either decodes or is silence. The frame
+/// after the mutated one is decoded too: what a damaged frame leaves
+/// behind must not break the next one.
 #[test]
 fn mutated_frames_do_not_panic() {
     let mut rng = Lcg(1);
@@ -260,6 +261,11 @@ fn mutated_frames_do_not_panic() {
                         }
                     }
                 }
+            }
+            // and the frame after it, as it was, which goes on from what
+            // the mutated frame left behind
+            if let Some(next) = fr.get(k + 1) {
+                piece.extend_from_slice(&data[next.clone()]);
             }
             for output in [Output::Native, Output::Stereo] {
                 for drc in [false, true] {
@@ -479,7 +485,6 @@ fn what_the_standard_mutes_is_silence() {
         let r = r.unwrap();
         assert_eq!((r.samples, r.damaged), (3 * 512, 3), "AMODE {amode} VERNUM {vernum}");
         assert!(out.iter().flatten().all(|&v| v == 0.0));
-        assert!(matches!(unflash_dts::probe(&data), Err(Error::Unsupported(_))));
     }
 }
 

@@ -15,6 +15,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use unflash_ac3::testing::{crc16, frame_bytes};
 use unflash_ac3::{BlockTrace, Decoded, Decoder, Features, Output, StreamInfo};
 
 /// How far apart two float decoders' coefficients may be.
@@ -50,6 +51,15 @@ pub fn ffmpeg_decode(path: &Path, extra: &[&str]) -> Option<Vec<Vec<f32>>> {
     let samples: Vec<f32> = out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
     let n = samples.len() / channels;
     Some((0..channels).map(|c| (0..n).map(|i| samples[i * channels + c]).collect()).collect())
+}
+
+/// ffmpeg's decode of `data` written to a temporary file named `name`.
+pub fn ffmpeg_decode_bytes(data: &[u8], name: &str, extra: &[&str]) -> Option<Vec<Vec<f32>>> {
+    let path = std::env::temp_dir().join(format!("unflash-ac3-{}-{name}", std::process::id()));
+    std::fs::write(&path, data).ok()?;
+    let r = ffmpeg_decode(&path, extra);
+    let _ = std::fs::remove_file(&path);
+    r
 }
 
 /// One run of our decoder over a whole stream.
@@ -421,7 +431,7 @@ pub fn frames(data: &[u8]) -> Vec<std::ops::Range<usize>> {
     let mut v = Vec::new();
     let mut pos = 0;
     while pos + 6 <= data.len() {
-        let size = frame_size(&data[pos..]).unwrap_or_else(|| panic!("no frame at byte {pos}"));
+        let size = frame_bytes(&data[pos..]).unwrap_or_else(|| panic!("no frame at byte {pos}"));
         if pos + size > data.len() {
             break;
         }
@@ -429,41 +439,6 @@ pub fn frames(data: &[u8]) -> Vec<std::ops::Range<usize>> {
         pos += size;
     }
     v
-}
-
-/// A frame's size from its first bytes (Table 5.18, Annex E frmsiz).
-pub fn frame_size(f: &[u8]) -> Option<usize> {
-    if f.len() < 6 || f[0] != 0x0b || f[1] != 0x77 {
-        return None;
-    }
-    if f[5] >> 3 > 10 {
-        return Some(((((f[2] as usize) & 7) << 8 | f[3] as usize) + 1) * 2);
-    }
-    const RATES: [usize; 19] = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640];
-    let kbps = *RATES.get((f[4] & 0x3f) as usize / 2)?;
-    let words = match f[4] >> 6 {
-        0 => kbps * 2,
-        1 => kbps * 15360 / 7056 + (f[4] & 1) as usize,
-        2 => kbps * 3,
-        _ => return None,
-    };
-    Some(words * 2)
-}
-
-/// CRC-16 of A/52 §7.10.1 (x^16 + x^15 + x^2 + 1, zero start), bit by
-/// bit.
-pub fn crc16(data: &[u8]) -> u16 {
-    let mut r = 0u16;
-    for &b in data {
-        for k in (0..8).rev() {
-            let top = (r >> 15) as u8 & 1;
-            r <<= 1;
-            if top ^ ((b >> k) & 1) != 0 {
-                r ^= 0x8005;
-            }
-        }
-    }
-    r
 }
 
 /// Make a frame's CRC words check again after an edit: E-AC-3's crc2 over
@@ -546,7 +521,6 @@ impl BitWriter {
     }
 
     /// Overwrite the `n` bits at bit position `pos` (already written).
-    #[allow(dead_code)]
     pub fn set(&mut self, pos: usize, n: u32, v: u32) {
         for k in 0..n as usize {
             let bit = pos + k;

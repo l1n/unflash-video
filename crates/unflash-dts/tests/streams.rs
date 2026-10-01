@@ -3,15 +3,15 @@
 //! every channel must agree to 1e-4 of full scale (they agree to about
 //! 1e-6: ffmpeg's decoder works in fixed point before its filter bank).
 //! Without ffmpeg the comparisons are skipped, with a message. Also: what
-//! `probe` and `info` say, the stereo downmix, the other packings of the
-//! same frames, and a transport stream's packets.
+//! `info` says, the stereo downmix, the other packings of the same
+//! frames, and a transport stream's packets.
 
 mod common;
 
 use std::path::PathBuf;
 
 use common::{compare, describe, ffmpeg_available, ffmpeg_decode, ffmpeg_decode_bytes, frames, TOLERANCE};
-use unflash_dts::{probe, Decoder, Output, StreamInfo};
+use unflash_dts::{Decoder, Output, StreamInfo};
 
 fn media(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/dts").join(name)
@@ -142,13 +142,12 @@ fn streams_cover_the_encoders_tools() {
     );
 }
 
-/// What `probe` and `info` say of each stream.
+/// What `info` says of each stream.
 #[test]
-fn probe_and_info() {
+fn stream_info() {
     let expect = |name: &str, sample_rate: u32, channels: usize, amode: u8, lfe: bool| {
         let data = read(name);
         let want = StreamInfo { sample_rate, channels, amode, lfe, frame_samples: 512 };
-        assert_eq!(probe(&data), Ok(want), "{name}");
         let mut dec = Decoder::new(Output::Native);
         let mut out = Vec::new();
         let d = dec.decode(&data, &mut out).unwrap();
@@ -164,12 +163,11 @@ fn probe_and_info() {
     expect("dts_quad_48k_640k.dts", 48000, 4, 8, false);
     expect("dts_5.0_44k_768k.dts", 44100, 5, 9, false);
     expect("dts_5.1_48k_768k.dts", 48000, 6, 9, true);
-    assert_eq!(probe(&[0u8; 100]), Err(unflash_dts::Error::NoSync));
 }
 
-/// Each output's (Native channel, gain) pairs.
 /// Gains of (channel, gain) into one output.
 type Taps = Vec<(usize, f32)>;
+/// Each output's (Native channel, gain) pairs.
 type Gains = [Taps; 2];
 
 /// The default Lo/Ro, written out again here (the decoder has its own
@@ -277,7 +275,7 @@ fn other_packings_decode_alike() {
             let got = common::decode(&packed, Output::Native);
             assert_eq!(got.decoded, want.decoded, "{name} 14-bit {fourteen} little endian {little}");
             assert_eq!(got.out, want.out, "{name} 14-bit {fourteen} little endian {little}");
-            assert_eq!(probe(&packed), probe(&data));
+            assert_eq!(got.info, want.info, "{name} 14-bit {fourteen} little endian {little}");
             if !skip("other_packings_decode_alike against ffmpeg") {
                 let reference = ffmpeg_decode_bytes(&packed, &format!("packed-{fourteen}-{little}.dts"), &["-f", "dts"], &[]).expect("ffmpeg decodes it");
                 let map: Vec<Option<usize>> = (0..reference.len()).map(Some).collect();

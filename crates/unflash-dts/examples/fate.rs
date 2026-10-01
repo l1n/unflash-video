@@ -25,15 +25,12 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::{compare, describe, dtshd_stream, ffmpeg_available, ffmpeg_decode, ts_audio, ChannelStats, TOLERANCE};
+use common::{compare, describe, dtshd_stream, ffmpeg_available, ffmpeg_decode, planar, ts_audio, ChannelStats, TOLERANCE};
 use unflash_dts::{Decoder, Error, Features, Output, StreamInfo};
 
 /// Interleaved float samples (a FATE reference) as channels.
 fn read_f32(path: &Path, channels: usize) -> Option<Vec<Vec<f32>>> {
-    let bytes = std::fs::read(path).ok()?;
-    let v: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-    let n = v.len() / channels;
-    Some((0..channels).map(|c| (0..n).map(|i| v[i * channels + c]).collect()).collect())
+    Some(planar(&std::fs::read(path).ok()?, channels))
 }
 
 /// One decode of a file's chunks.

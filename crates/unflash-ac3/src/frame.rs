@@ -499,7 +499,7 @@ impl FrameDecoder {
 
         // spectral extension strategy and coordinates (E-AC-3)
         if eac3 {
-            self.parse_spx(b, h, af, blk)?;
+            self.parse_spx(b, h, blk)?;
         } else {
             self.spxinu = false;
             for f in self.fbw.iter_mut() {
@@ -532,18 +532,22 @@ impl FrameDecoder {
                     }
                 }
                 self.phsflginu = if acmod == 2 { b.flag() } else { false };
-                self.cplbegf = b.read(4) as usize;
-                self.cplendf = if !eac3 || !self.spxinu {
+                // (kept only once checked: when this frame fails, the next
+                // AC-3 frame's first block may still reuse coupling, and
+                // this range with it)
+                let cplbegf = b.read(4) as usize;
+                let cplendf = if !eac3 || !self.spxinu {
                     b.read(4) as i32
                 } else if self.spxbegf < 6 {
                     self.spxbegf as i32 - 2
                 } else {
                     self.spxbegf as i32 * 2 - 7
                 };
-                let ncplsubnd = 3 + self.cplendf - self.cplbegf as i32;
+                let ncplsubnd = 3 + cplendf - cplbegf as i32;
                 if ncplsubnd < 1 {
                     return Err(bad("coupling ends before it begins"));
                 }
+                (self.cplbegf, self.cplendf) = (cplbegf, cplendf);
                 if !eac3 || b.flag() {
                     for sb in 1..ncplsubnd as usize {
                         self.cplbndstrc[self.cplbegf + sb] = b.flag();
@@ -869,7 +873,7 @@ impl FrameDecoder {
         Ok(())
     }
 
-    fn parse_spx(&mut self, b: &mut Bits, h: &Header, af: &AudFrm, blk: usize) -> Result<()> {
+    fn parse_spx(&mut self, b: &mut Bits, h: &Header, blk: usize) -> Result<()> {
         let nfch = h.nfchans;
         let spxstre = if blk == 0 { true } else { b.flag() };
         if spxstre {
@@ -940,7 +944,6 @@ impl FrameDecoder {
                 }
             }
         }
-        let _ = af;
         Ok(())
     }
 
@@ -1765,5 +1768,32 @@ mod tests {
         // the spectral extension noise: unit variance
         let var: f64 = (0..n).map(|_| ((rng.uniform() * SPX_NOISE_SCALE) as f64).powi(2)).sum::<f64>() / n as f64;
         assert!((var - 1.0).abs() < 0.02, "{var}");
+    }
+
+    /// A coupling range that ends before it begins fails the frame and is
+    /// not kept: an AC-3 frame's first block may reuse coupling, and its
+    /// range, from the frame before (with the reversed range, the count of
+    /// coupling exponent groups went below zero, wrapped, and indexed past
+    /// the groups: a panic, which aborts the WebAssembly instance).
+    #[test]
+    fn a_reversed_coupling_range_is_not_kept() {
+        let h = Header { acmod: 2, nfchans: 2, blocks: 6, bytes: 64, bsi_end: 0, ..Default::default() };
+        let frame = |start: [u8; 2]| {
+            let mut f = [0u8; 64];
+            f[..2].copy_from_slice(&start);
+            f
+        };
+        let mut pcm = vec![vec![0f32; 6 * 256]; 2];
+        let mut dec = FrameDecoder::new();
+        // coupling in use from the frame before, sub-bands 2 to 7
+        (dec.cplinu, dec.cplbegf, dec.cplendf) = (true, 2, 5);
+        // block 0: cplstre and cplinu, both channels coupled, no phase
+        // flags, cplbegf 15, cplendf 0
+        assert_eq!(dec.decode(&frame([0x07, 0xbc]), &h, &mut pcm), Err(bad("coupling ends before it begins")));
+        assert_eq!((dec.cplbegf, dec.cplendf), (2, 5));
+        // the next frame's block 0 reuses coupling (cplstre 0) with new
+        // exponents over the range kept (cplexpstr 1, then zeros: they
+        // fall below 0, which fails the frame)
+        assert_eq!(dec.decode(&frame([0x00, 0x20]), &h, &mut pcm), Err(bad("exponent out of range")));
     }
 }

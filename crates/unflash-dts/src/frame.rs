@@ -99,14 +99,10 @@ pub struct Features {
     pub core_extension: bool,
 }
 
-/// What a frame carries besides its samples.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Extras {
-    /// The embedded downmix (5.8.2): its type (Table 5-32) and its
-    /// coefficients, one row per downmix channel, one column per coded
-    /// channel (coded order, LFE last).
-    pub downmix: Option<(u8, Vec<Vec<f32>>)>,
-}
+/// An embedded downmix (5.8.2): its type (Table 5-32) and its
+/// coefficients, one row per downmix channel, one column per coded
+/// channel (coded order, LFE last).
+pub type Downmix = (u8, Vec<Vec<f32>>);
 
 /// The primary audio coding header (Table 5-21).
 #[derive(Clone, Copy)]
@@ -203,8 +199,9 @@ impl FrameDecoder {
 
     /// Decode `frame` (the 16-bit big endian form, its header `h`) into
     /// `pcm`: one buffer per coded channel, the LFE channel last, each
-    /// `h.samples()` long.
-    pub fn decode(&mut self, frame: &[u8], h: &Header, pcm: &mut [Vec<f32>]) -> Result<Extras, FrameError> {
+    /// `h.samples()` long. Gives the frame's embedded downmix, if it
+    /// carries one.
+    pub fn decode(&mut self, frame: &[u8], h: &Header, pcm: &mut [Vec<f32>]) -> Result<Option<Downmix>, FrameError> {
         if h.vernum > 7 {
             // Table 5-16: a decoder not made for such a revision mutes
             return Err(Unsupported("encoder revision (VERNUM) above 7"));
@@ -242,7 +239,7 @@ impl FrameDecoder {
         if h.time_stamp {
             b.skip(32);
         }
-        let mut extras = Extras::default();
+        let mut downmix = None;
         if h.aux {
             let count = b.read(6) as usize;
             b.align(32);
@@ -250,13 +247,13 @@ impl FrameDecoder {
             if b.overrun() || start + count > h.bytes.min(frame.len()) {
                 return Err(Invalid("auxiliary data past the end of the frame"));
             }
-            extras.downmix = aux_downmix(&frame[start..start + count], c.channels + (h.lff > 0) as usize);
-            self.features.embedded_downmix |= extras.downmix.is_some();
+            downmix = aux_downmix(&frame[start..start + count], c.channels + (h.lff > 0) as usize);
+            self.features.embedded_downmix |= downmix.is_some();
         }
         if b.overrun() || b.position() > h.bytes * 8 {
             return Err(Invalid("the audio data runs past the end of the frame"));
         }
-        Ok(extras)
+        Ok(downmix)
     }
 
     /// The primary audio coding header (Table 5-21).
@@ -700,7 +697,7 @@ fn sum_difference(synth: &mut [[[f64; 32]; 32]; MAX_CHANNELS], l: usize, r: usiz
 
 /// The embedded downmix of the auxiliary data (5.8.2), if `aux` holds
 /// one whose sync word and CRC check: its type and coefficients.
-fn aux_downmix(aux: &[u8], channels: usize) -> Option<(u8, Vec<Vec<f32>>)> {
+fn aux_downmix(aux: &[u8], channels: usize) -> Option<Downmix> {
     if aux.len() < 8 || aux[..4] != [0x9a, 0x11, 0x05, 0xa0] {
         return None;
     }

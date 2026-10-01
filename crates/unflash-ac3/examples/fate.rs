@@ -204,11 +204,10 @@ fn main() {
         let stats = compare(&quiet.out, &noisy.out, &noisy.trace, &reference, &map);
         let mut ok = true;
         for (c, s) in stats.iter().enumerate() {
-            let Some(r) = map[c] else {
+            if map[c].is_none() {
                 println!("  {:>3}: not compared: {}", ours[c], if replaced.contains(&ours[c]) { "ffmpeg plays the dependent substream's channel here" } else { "ffmpeg has no such channel" });
                 continue;
-            };
-            let _ = r;
+            }
             let mut notes = Vec::new();
             if s.over > 0 {
                 ok = false;

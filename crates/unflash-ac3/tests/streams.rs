@@ -9,7 +9,7 @@ mod common;
 use std::path::PathBuf;
 
 use common::{compare, describe, ffmpeg_available, ffmpeg_decode};
-use unflash_ac3::{probe, Decoder, Output, StreamInfo};
+use unflash_ac3::{Decoder, Output, StreamInfo};
 
 fn media(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/ac3").join(name)
@@ -178,13 +178,12 @@ fn streams_cover_the_encoders_tools() {
     assert!(f.coupling && f.rematrixing && f.dither && f.lfe, "{f:?}");
 }
 
-/// What `probe` and `info` say of each stream.
+/// What `info` says of each stream.
 #[test]
-fn probe_and_info() {
+fn stream_info() {
     let expect = |name: &str, sample_rate: u32, channels: usize, eac3: bool, acmod: u8, lfe: bool| {
         let data = read(name);
         let want = StreamInfo { sample_rate, channels, eac3, acmod, lfe };
-        assert_eq!(probe(&data), Ok(want), "{name}");
         let mut dec = Decoder::new(Output::Native);
         let mut out = Vec::new();
         let d = dec.decode(&data, &mut out).unwrap();
@@ -203,7 +202,6 @@ fn probe_and_info() {
     expect("ac3_1f_lfe_32k.ac3", 32000, 2, false, 1, true);
     expect("eac3_stereo_48k.eac3", 48000, 2, true, 2, false);
     expect("eac3_3f2r_lfe_48k.eac3", 48000, 6, true, 7, true);
-    assert_eq!(probe(&[0u8; 100]), Err(unflash_ac3::Error::NoSync));
 }
 
 /// Each output's (input channel, gain) pairs.

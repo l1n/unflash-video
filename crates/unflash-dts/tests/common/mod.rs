@@ -38,15 +38,12 @@ pub fn ffprobe_channels(path: &Path, input: &[&str]) -> Option<usize> {
     String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse().ok()
 }
 
-/// The channel layout name ffprobe gives the first audio stream.
-pub fn ffprobe_layout(path: &Path, input: &[&str]) -> String {
-    let out = Command::new("ffprobe")
-        .args(["-v", "error"])
-        .args(format_options(input))
-        .args(["-select_streams", "a:0", "-show_entries", "stream=channel_layout", "-of", "csv=p=0"])
-        .arg(path)
-        .output();
-    out.map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").trim().to_string()).unwrap_or_default()
+/// Interleaved little endian float samples (ffmpeg's output, a FATE
+/// reference) as one vector per channel.
+pub fn planar(bytes: &[u8], channels: usize) -> Vec<Vec<f32>> {
+    let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let n = samples.len() / channels;
+    (0..channels).map(|c| (0..n).map(|i| samples[i * channels + c]).collect()).collect()
 }
 
 /// ffmpeg's float decode of `path` (with `input` options before `-i`,
@@ -72,9 +69,7 @@ pub fn ffmpeg_decode(path: &Path, input: &[&str], output: &[&str]) -> Option<Vec
     if !out.status.success() && out.stdout.is_empty() {
         return None;
     }
-    let samples: Vec<f32> = out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-    let n = samples.len() / channels;
-    Some((0..channels).map(|c| (0..n).map(|i| samples[i * channels + c]).collect()).collect())
+    Some(planar(&out.stdout, channels))
 }
 
 /// ffmpeg's decode of `data` written to a temporary file named `name`.
@@ -457,7 +452,7 @@ pub fn write_frame(f: &Frame) -> Vec<u8> {
         w.put(32, t);
     }
     if let Some(aux) = &f.aux {
-        let bytes = aux_bytes(aux, nch + (f.lff > 0) as usize);
+        let bytes = aux_bytes(aux);
         w.put(6, bytes.len() as u32);
         w.align(32);
         for b in bytes {
@@ -622,7 +617,7 @@ fn write_subframe(w: &mut BitWriter, f: &Frame, s: &Subframe) {
 }
 
 /// The bytes of the auxiliary data (5.8.2), sync word to CRC.
-pub fn aux_bytes(aux: &Aux, _channels: usize) -> Vec<u8> {
+pub fn aux_bytes(aux: &Aux) -> Vec<u8> {
     let mut w = BitWriter::default();
     w.put(32, 0x9a1105a0);
     w.put(1, aux.time_stamp.is_some() as u32);

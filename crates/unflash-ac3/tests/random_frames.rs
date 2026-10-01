@@ -36,7 +36,8 @@
 
 mod common;
 
-use common::{compare_with, describe, ffmpeg_available, fix_crcs, BitWriter};
+use common::{compare_with, describe, ffmpeg_available, ffmpeg_decode_bytes, fix_crcs, BitWriter};
+use unflash_ac3::testing::{DEFAULT_CPL_BNDSTRC, DEFAULT_SPX_BNDSTRC, FRMEXPSTR, NFCHANS};
 
 /// Frames built at random reach coefficient values that no encoder would
 /// send; there ffmpeg 6.1's arithmetic is off by up to about 1e-5 of full
@@ -58,8 +59,6 @@ impl Lcg {
         self.below(100) < percent
     }
 }
-
-const NFCHANS: [usize; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
 
 /// A frame's fixed choices.
 struct Plan {
@@ -463,10 +462,7 @@ fn random_ac3_frames_decode_as_ffmpeg_decodes_them() {
             let noisy = common::decode(&data, Output::Native, true);
             let quiet = common::decode(&data, Output::Native, false);
             assert_eq!(noisy.decoded.damaged, 0, "acmod {acmod} lfe {lfeon}");
-            let path = std::env::temp_dir().join(format!("unflash-ac3-random-{}-{acmod}-{lfeon}.ac3", std::process::id()));
-            std::fs::write(&path, &data).unwrap();
-            let reference = common::ffmpeg_decode(&path, &[]).expect("ffmpeg decodes the frames");
-            let _ = std::fs::remove_file(&path);
+            let reference = ffmpeg_decode_bytes(&data, &format!("random-{acmod}-{lfeon}.ac3"), &[]).expect("ffmpeg decodes the frames");
             assert_eq!(reference.len(), noisy.out.len(), "acmod {acmod} lfe {lfeon}: channels");
             assert_eq!(reference[0].len(), noisy.out[0].len(), "acmod {acmod} lfe {lfeon}: samples");
             let map: Vec<Option<usize>> = (0..reference.len()).map(Some).collect();
@@ -494,48 +490,6 @@ fn random_ac3_frames_decode_as_ffmpeg_decodes_them() {
 }
 
 // E-AC-3 ------------------------------------------------------------------
-
-/// Table E2.14: the exponent strategy of each block for each frame
-/// exponent strategy code (0 reuse, 1 D15, 2 D25, 3 D45).
-const FRMEXPSTR: [[u32; 6]; 32] = [
-    [1, 0, 0, 0, 0, 0],
-    [1, 0, 0, 0, 0, 3],
-    [1, 0, 0, 0, 2, 0],
-    [1, 0, 0, 0, 3, 3],
-    [2, 0, 0, 2, 0, 0],
-    [2, 0, 0, 2, 0, 3],
-    [2, 0, 0, 3, 2, 0],
-    [2, 0, 0, 3, 3, 3],
-    [2, 0, 1, 0, 0, 0],
-    [2, 0, 2, 0, 0, 3],
-    [2, 0, 2, 0, 2, 0],
-    [2, 0, 2, 0, 3, 3],
-    [2, 0, 3, 2, 0, 0],
-    [2, 0, 3, 2, 0, 3],
-    [2, 0, 3, 3, 2, 0],
-    [2, 0, 3, 3, 3, 3],
-    [3, 1, 0, 0, 0, 0],
-    [3, 1, 0, 0, 0, 3],
-    [3, 2, 0, 0, 2, 0],
-    [3, 2, 0, 0, 3, 3],
-    [3, 2, 0, 2, 0, 0],
-    [3, 2, 0, 2, 0, 3],
-    [3, 2, 0, 3, 2, 0],
-    [3, 2, 0, 3, 3, 3],
-    [3, 3, 1, 0, 0, 0],
-    [3, 3, 2, 0, 0, 3],
-    [3, 3, 2, 0, 2, 0],
-    [3, 3, 2, 0, 3, 3],
-    [3, 3, 3, 2, 0, 0],
-    [3, 3, 3, 2, 0, 3],
-    [3, 3, 3, 3, 2, 0],
-    [3, 3, 3, 3, 3, 3],
-];
-
-/// Tables E2.11 and E2.12: the default band structures (true: the
-/// sub-band continues the band before it).
-const DEFAULT_SPX_BNDSTRC: [bool; 17] = [false, false, false, false, false, false, false, false, true, false, true, false, true, false, true, false, true];
-const DEFAULT_CPL_BNDSTRC: [bool; 18] = [false, false, false, false, false, false, false, false, true, false, true, true, false, true, true, true, true, true];
 
 /// An E-AC-3 frame's choices made in its audio frame element (Annex E
 /// §2.3.2): the strategies of every block.
@@ -613,7 +567,7 @@ impl EPlan {
             } else {
                 let code = if once { 0 } else { rng.below(32) };
                 p.frmchexpstr[ch] = code;
-                p.chexpstr.iter_mut().enumerate().for_each(|(blk, s)| s[ch] = FRMEXPSTR[code as usize][blk]);
+                p.chexpstr.iter_mut().enumerate().for_each(|(blk, s)| s[ch] = u32::from(FRMEXPSTR[code as usize][blk]));
             }
         }
         if lfeon {
@@ -662,7 +616,7 @@ impl EPlan {
             let codes: Vec<usize> = (0..32).filter(|&c| (0..6).all(|blk| !must(&p, blk) || FRMEXPSTR[c][blk] != 0)).collect();
             let code = codes[rng.below(codes.len() as u32) as usize];
             p.frmcplexpstr = code as u32;
-            p.cplexpstr = FRMEXPSTR[code];
+            p.cplexpstr = FRMEXPSTR[code].map(u32::from);
         }
         p
     }
@@ -1338,10 +1292,7 @@ fn random_eac3_frames_decode_as_ffmpeg_decodes_them() {
         let noisy = common::decode(&data, Output::Native, true);
         let quiet = common::decode(&data, Output::Native, false);
         assert_eq!(noisy.decoded.damaged, 0, "{what}");
-        let path = std::env::temp_dir().join(format!("unflash-ac3-random-{}-{acmod}-{lfeon}-{blocks}.eac3", std::process::id()));
-        std::fs::write(&path, &data).unwrap();
-        let reference = common::ffmpeg_decode(&path, &[]).expect("ffmpeg decodes the frames");
-        let _ = std::fs::remove_file(&path);
+        let reference = ffmpeg_decode_bytes(&data, &format!("random-{acmod}-{lfeon}-{blocks}.eac3"), &[]).expect("ffmpeg decodes the frames");
         assert_eq!(reference.len(), noisy.out.len(), "{what}: channels");
         assert_eq!(reference[0].len(), noisy.out[0].len(), "{what}: samples");
         let map: Vec<Option<usize>> = (0..reference.len()).map(Some).collect();

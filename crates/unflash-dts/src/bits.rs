@@ -8,13 +8,11 @@ pub struct Bits<'a> {
     data: &'a [u8],
     /// Position in bits from the start of `data`.
     pos: usize,
-    /// End of the readable data in bits.
-    end: usize,
 }
 
 impl<'a> Bits<'a> {
     pub fn new(data: &'a [u8]) -> Bits<'a> {
-        Bits { data, pos: 0, end: data.len() * 8 }
+        Bits { data, pos: 0 }
     }
 
     /// Read `n` bits (0 to 32) as an unsigned number.
@@ -73,7 +71,7 @@ impl<'a> Bits<'a> {
 
     /// Whether a read went past the end of the data.
     pub fn overrun(&self) -> bool {
-        self.pos > self.end
+        self.pos > self.data.len() * 8
     }
 }
 

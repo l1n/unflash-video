@@ -1,7 +1,7 @@
 //! The public decoder: finding core frames and stepping over extension
 //! substreams, and arranging or downmixing the channels.
 
-use crate::frame::{Features, FrameDecoder, FrameError, MAX_CHANNELS};
+use crate::frame::{Downmix, Features, FrameDecoder, FrameError, MAX_CHANNELS};
 use crate::header::{self, Header};
 use crate::tables::AMODE_CHANNELS;
 use crate::{Decoded, Error, Output, StreamInfo};
@@ -11,14 +11,12 @@ pub struct Decoder {
     output: Output,
     frame: FrameDecoder,
     info: Option<StreamInfo>,
-    /// The layout of the last frame decoded (AMODE, LFF, sample rate).
-    layout: Option<(u8, u8, u32)>,
     /// One buffer per coded channel (LFE last) for the frame being decoded.
     pcm: Vec<Vec<f32>>,
     /// The frame being decoded in the standard's packing.
     frame_bytes: Vec<u8>,
-    /// The last embedded downmix (type and coefficients) of this layout.
-    downmix: Option<(u8, Vec<Vec<f32>>)>,
+    /// The last embedded downmix of this layout.
+    downmix: Option<Downmix>,
     /// Extension substream frames stepped over so far.
     skipped: u64,
 }
@@ -120,7 +118,7 @@ fn followed(data: &[u8], end: usize) -> bool {
 
 impl Decoder {
     pub fn new(output: Output) -> Decoder {
-        Decoder { output, frame: FrameDecoder::new(), info: None, layout: None, pcm: Vec::new(), frame_bytes: Vec::new(), downmix: None, skipped: 0 }
+        Decoder { output, frame: FrameDecoder::new(), info: None, pcm: Vec::new(), frame_bytes: Vec::new(), downmix: None, skipped: 0 }
     }
 
     /// Decode every core frame in `data` (a whole number of frames: a
@@ -257,13 +255,12 @@ impl Decoder {
     }
 
     fn decode_frame(&mut self, h: &Header, out: &mut Vec<Vec<f32>>, sized: &mut bool) -> Result<(), FrameError> {
-        let layout = (h.amode, h.lff, h.sample_rate);
-        if self.layout.is_some_and(|l| l != layout) {
-            // the old history belongs to other channels
+        let lfe = h.lff > 0;
+        // a layout change: the old history belongs to other channels
+        if self.info.is_some_and(|i| (i.amode, i.lfe, i.sample_rate) != (h.amode, lfe, h.sample_rate)) {
             self.frame.reset();
             self.downmix = None;
         }
-        let lfe = h.lff > 0;
         let coded = AMODE_CHANNELS[(h.amode as usize).min(12)] + lfe as usize;
         let samples = h.samples();
         self.pcm.resize(MAX_CHANNELS + 1, Vec::new());
@@ -271,10 +268,8 @@ impl Decoder {
             c.clear();
             c.resize(samples, 0.0);
         }
-        let extras = self.frame.decode(&self.frame_bytes, h, &mut self.pcm[..coded])?;
-        self.layout = Some(layout);
-        if extras.downmix.is_some() {
-            self.downmix = extras.downmix;
+        if let Some(d) = self.frame.decode(&self.frame_bytes, h, &mut self.pcm[..coded])? {
+            self.downmix = Some(d);
         }
         let info = info_of(h);
         self.info = Some(info);
@@ -307,42 +302,6 @@ impl Decoder {
             }
         }
         Ok(())
-    }
-}
-
-/// The first core frame's description, without decoding. A frame that
-/// the next frame (or the end of the data) follows is preferred; failing
-/// that, the first one whose header reads.
-pub fn probe(data: &[u8]) -> Result<StreamInfo, Error> {
-    let mut first: Option<StreamInfo> = None;
-    let (mut unsupported, mut substreams) = (false, false);
-    let mut scratch = Vec::new();
-    let mut pos = 0;
-    while pos + 6 <= data.len() {
-        if data[pos..pos + 4] == header::SUBSTREAM_SYNC {
-            if let Some(size) = header::substream_size(&data[pos..]) {
-                substreams = true;
-                pos += size;
-                continue;
-            }
-        }
-        if let Some((h, _, raw)) = core_header(data, pos, &mut scratch) {
-            if h.amode >= 13 || h.vernum > 7 {
-                unsupported = true;
-            } else {
-                if pos + raw <= data.len() && followed(data, pos + raw) {
-                    return Ok(info_of(&h));
-                }
-                first.get_or_insert(info_of(&h));
-            }
-        }
-        pos += 1;
-    }
-    match first {
-        Some(i) => Ok(i),
-        None if unsupported => Err(Error::Unsupported("more than six channels, a user defined arrangement or an encoder revision above 7")),
-        None if substreams => Err(Error::NoCore),
-        None => Err(Error::NoSync),
     }
 }
 

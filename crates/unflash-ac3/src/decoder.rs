@@ -354,48 +354,6 @@ pub fn block_ends(frame: &[u8]) -> (Vec<usize>, Vec<(usize, u32, u32)>) {
     (f.block_ends, f.bad_codes)
 }
 
-/// The first sync frame's description (independent substream 0), without
-/// decoding. A frame whose CRC checks is preferred; failing that, the
-/// first one whose header reads.
-pub fn probe(data: &[u8]) -> Result<StreamInfo, Error> {
-    let mut first: Option<StreamInfo> = None;
-    let mut unsupported = false;
-    let mut pos = 0;
-    while pos + 6 <= data.len() {
-        if !is_sync(data, pos) {
-            pos += 1;
-            continue;
-        }
-        let Some(s) = header::sync(&data[pos..]) else {
-            pos += 1;
-            continue;
-        };
-        let end = (pos + s.bytes).min(data.len());
-        if !s.main {
-            pos = end.max(pos + 1);
-            continue;
-        }
-        let frame = &data[pos..end];
-        if let Ok(h) = header::parse(frame) {
-            if h.bsid == 9 || h.bsid == 10 {
-                unsupported = true;
-            } else {
-                let complete = pos + s.bytes <= data.len();
-                if complete && crc_ok(frame, &s) {
-                    return Ok(info_of(&h));
-                }
-                first.get_or_insert(info_of(&h));
-            }
-        }
-        pos += 1;
-    }
-    match first {
-        Some(i) => Ok(i),
-        None if unsupported => Err(Error::Unsupported("bsid 9 or 10 (a decoder of A/52 mutes these)")),
-        None => Err(Error::NoSync),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
