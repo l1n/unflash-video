@@ -42,8 +42,3 @@ pub mod yuv;
 
 #[cfg(feature = "simd")]
 pub mod pixel_simd;
-
-pub use config::{DetectorConfig, ExtendedMode, Profile};
-pub use detector::{CpuDetector, Detector, PixelStage};
-pub use grid::{FrameInput, GridCell, GridGeometry, GridStats};
-pub use temporal::{AnalysisResult, FrameRecord, TransitionEvent, Violation, ViolationKind};

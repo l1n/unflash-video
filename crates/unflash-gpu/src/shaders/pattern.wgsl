@@ -3,9 +3,10 @@
 // state machine of unflash_core::pattern (the same fixed-point positions,
 // tests and order), ORs the orientation's bit into the mask of every pixel a
 // qualifying stretch crosses, and adds its spacing statistics to the
-// globals. Runs after ingest (which clears the mask) and before rows (which
-// counts the marked pixels). ORs and integer adds commute, so the result is
-// the CPU's exactly, whatever the thread order.
+// globals. Runs after the mask is cleared (a buffer clear before each
+// frame's passes in its batch) and before rows (which counts the marked
+// pixels). ORs and integer adds commute, so the result is the CPU's
+// exactly, whatever the thread order.
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> geo: array<u32>;

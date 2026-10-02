@@ -11,10 +11,10 @@ use crate::temporal::{AnalysisResult, EventKind, Violation, ViolationKind};
 /// Extra span asked of every flash window on top of the second the detector
 /// measures against, so a rate-reduced section keeps its margin through the
 /// render (a picture can land up to a whole grid slot early).
-pub const RATE_SAFETY_MARGIN: f64 = 0.05;
+const RATE_SAFETY_MARGIN: f64 = 0.05;
 
 /// Ceiling on a hand-typed target rate for "reduce FPS".
-pub const MAX_TARGET_FPS: f64 = 1000.0;
+pub(crate) const MAX_TARGET_FPS: f64 = 1000.0;
 
 /// How much of the run-up a detector has to have seen before its verdict at
 /// a given moment matches the verdict a pass over the whole video gives at
@@ -30,36 +30,37 @@ pub fn context_seconds(cfg: &DetectorConfig) -> f64 {
 
 /// How many frame intervals a burst of flashing needs to trip `cfg`.
 /// Returns 0 when no frame rate can be safe.
-pub fn flash_window_frames(cfg: &DetectorConfig) -> u32 {
+fn flash_window_frames(cfg: &DetectorConfig) -> u32 {
     let k_fail = cfg.k_fail() as i64;
     let mut m = 2 * (k_fail - 1);
     if cfg.flag_extended() {
-        let k_ext = (cfg.flash_limit.ceil() as i64).clamp(1, k_fail);
+        let k_ext = cfg.ext_rate() as i64;
         m = m.min(2 * (k_ext - 1));
     }
     m.max(0) as u32
 }
 
 /// (pictures per second, seconds between them) that `cfg` cannot fail,
-/// rounded *down* to two decimals. `(0.0, inf)` when no rate can satisfy it.
-pub fn safe_picture_rate(cfg: &DetectorConfig, margin: f64) -> (f64, f64) {
+/// with `RATE_SAFETY_MARGIN` to spare, rounded *down* to two decimals.
+/// `(0.0, inf)` when no rate can satisfy it.
+pub fn safe_picture_rate(cfg: &DetectorConfig) -> (f64, f64) {
     let m = flash_window_frames(cfg);
     if m < 1 {
         return (0.0, f64::INFINITY);
     }
-    let fps = (m as f64 / (1.0 + margin) * 100.0).floor() / 100.0;
+    let fps = (m as f64 / (1.0 + RATE_SAFETY_MARGIN) * 100.0).floor() / 100.0;
     (fps, 1.0 / fps)
 }
 
 /// Is thinning to `fps` pictures a second safe by arithmetic alone?
 pub fn rate_is_guaranteed(cfg: &DetectorConfig, fps: f64) -> bool {
-    let (safe, _) = safe_picture_rate(cfg, RATE_SAFETY_MARGIN);
+    let (safe, _) = safe_picture_rate(cfg);
     safe > 0.0 && fps <= safe + 1e-9
 }
 
 /// Snap [start, end] outward to keyframes, clamped into the video's real
 /// timeline bounds.
-pub fn snap_to_keyframes(keyframes: &[f64], start: f64, end: f64, bounds: (f64, f64)) -> (f64, f64) {
+fn snap_to_keyframes(keyframes: &[f64], start: f64, end: f64, bounds: (f64, f64)) -> (f64, f64) {
     let (ts_min, ts_max) = bounds;
     let clamp = |x: f64| x.min(ts_max).max(ts_min);
     let mut start = clamp(start);
@@ -229,9 +230,9 @@ mod tests {
         assert_eq!(flash_window_frames(&ext), 4);
         assert_eq!(flash_window_frames(&wcag), 6);
         assert_eq!(flash_window_frames(&strict), 4);
-        assert_eq!(safe_picture_rate(&ext, RATE_SAFETY_MARGIN).0, 3.80);
-        assert_eq!(safe_picture_rate(&wcag, RATE_SAFETY_MARGIN).0, 5.71);
-        assert_eq!(safe_picture_rate(&strict, RATE_SAFETY_MARGIN).0, 3.80);
+        assert_eq!(safe_picture_rate(&ext).0, 3.80);
+        assert_eq!(safe_picture_rate(&wcag).0, 5.71);
+        assert_eq!(safe_picture_rate(&strict).0, 3.80);
         assert!(rate_is_guaranteed(&ext, 3.8));
         assert!(!rate_is_guaranteed(&ext, 3.81));
         assert_eq!(context_seconds(&ext), 6.5);

@@ -186,8 +186,6 @@ impl Profile {
 }
 
 impl DetectorConfig {
-    pub const DEFAULT_PROFILE: Profile = Profile::WcagExt;
-
     /// Extended flashes count as violations and get their own sections.
     pub fn flag_extended(&self) -> bool {
         self.extended_mode == ExtendedMode::Section
@@ -247,21 +245,6 @@ impl DetectorConfig {
     /// Flashes per second that count as an extended flash (at the limit).
     pub fn ext_rate(&self) -> u32 {
         (self.flash_limit.ceil() as i64).max(1) as u32
-    }
-}
-
-/// Render / cache settings that affect editing (port of `RenderConfig`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RenderConfig {
-    /// How long an "E" mark holds a frame on screen, seconds.
-    pub extension_seconds: f64,
-    pub thumb_width: u32,
-}
-
-impl Default for RenderConfig {
-    fn default() -> Self {
-        RenderConfig { extension_seconds: 1.0, thumb_width: 160 }
     }
 }
 

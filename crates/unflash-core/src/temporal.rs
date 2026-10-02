@@ -34,15 +34,6 @@ impl ViolationKind {
     pub fn is_wcag(self) -> bool {
         matches!(self, ViolationKind::Flash | ViolationKind::Red)
     }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            ViolationKind::Extended => "extended",
-            ViolationKind::Flash => "flash",
-            ViolationKind::Pattern => "pattern",
-            ViolationKind::Red => "red",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -60,7 +51,6 @@ pub struct TransitionEvent {
     pub t: f64,
     /// Internal monotonic clock.
     pub tc: f64,
-    pub polarity: i8,
     pub kind: EventKind,
     /// Qualifying pixels in the best window.
     pub area: u32,
@@ -252,7 +242,7 @@ pub fn merge_segments(cfg: &DetectorConfig, geom: &GridGeometry, segments: &[Seg
         anomalies += seg.result.anomalies;
         last = Some((s.t[n - 1], s.tc[n - 1] + shift));
     }
-    Temporal::with_outcome(cfg.clone(), geom.clone(), stats, events, held, anomalies).finish()
+    Temporal::with_outcome(cfg.clone(), geom.clone(), stats, events, held, anomalies).finish(true)
 }
 
 /// The internal monotonic clock that bridges source timestamp
@@ -278,31 +268,34 @@ impl Clock {
         self.anomalies = 0;
     }
 
-    pub fn advance(&mut self, t: f64) -> f64 {
-        match self.last_native {
-            None => self.clock = 0.0,
-            Some(last) => {
-                let mut dt = t - last;
-                if dt <= 0.0 || dt > self.max_gap {
-                    dt = median(self.recent.iter().copied()).unwrap_or(1.0 / 30.0);
-                    self.anomalies += 1;
-                } else {
-                    self.recent.push_back(dt);
-                    if self.recent.len() > 120 {
-                        self.recent.pop_front();
-                    }
-                }
-                self.clock += dt;
-            }
+    /// The step from the last frame to one stamped `t` (0 for the first):
+    /// the timestamps' own difference or, where they go backwards or jump
+    /// by more than `max_gap` (an anomaly), the median of the last 120 good
+    /// steps ([`DEFAULT_STEP`] before there is one).
+    pub fn step(&mut self, t: f64) -> f64 {
+        let Some(last) = self.last_native.replace(t) else { return 0.0 };
+        let dt = t - last;
+        if dt <= 0.0 || dt > self.max_gap {
+            self.anomalies += 1;
+            return median(self.recent.iter().copied()).unwrap_or(DEFAULT_STEP);
         }
-        self.last_native = Some(t);
-        self.clock
+        self.recent.push_back(dt);
+        if self.recent.len() > 120 {
+            self.recent.pop_front();
+        }
+        dt
     }
 
-    pub fn now(&self) -> f64 {
+    /// The clock at the frame stamped `t`: 0 at the first, then each
+    /// [`step`](Self::step) on.
+    pub fn advance(&mut self, t: f64) -> f64 {
+        self.clock += self.step(t);
         self.clock
     }
 }
+
+/// The frame interval taken where none has been measured.
+pub const DEFAULT_STEP: f64 = 1.0 / 30.0;
 
 /// numpy-style median (mean of the two middle values for even counts).
 pub fn median(vals: impl IntoIterator<Item = f64>) -> Option<f64> {
@@ -316,7 +309,7 @@ pub fn median(vals: impl IntoIterator<Item = f64>) -> Option<f64> {
 }
 
 /// numpy.interp with clamping at both ends; `xp` ascending.
-pub fn interp(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
+fn interp(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
     if xp.is_empty() {
         return 0.0;
     }
@@ -578,22 +571,6 @@ impl Temporal {
         self.held = 0;
     }
 
-    pub fn config(&self) -> &DetectorConfig {
-        &self.cfg
-    }
-    pub fn geometry(&self) -> &GridGeometry {
-        &self.geom
-    }
-    pub fn frames(&self) -> usize {
-        self.n
-    }
-    pub fn stats(&self) -> &FrameStats {
-        &self.stats
-    }
-    pub fn events(&self) -> &[TransitionEvent] {
-        &self.events
-    }
-
     fn record(&self, i: usize) -> FrameRecord {
         let s = &self.stats;
         FrameRecord {
@@ -707,7 +684,7 @@ impl Temporal {
                     best_onset = (tc - onset_age as f64 * 1e-6) - cfg.area_accum_window;
                 }
                 if !self.above[ki] || tc - self.last_event_tc[ki] >= 0.25 {
-                    self.events.push(TransitionEvent { t, tc, polarity: 0, kind, area: best, bbox });
+                    self.events.push(TransitionEvent { t, tc, kind, area: best, bbox });
                     self.last_event_tc[ki] = tc;
                 }
             }
@@ -775,7 +752,12 @@ impl Temporal {
         t
     }
 
-    pub fn finish(&self) -> AnalysisResult {
+    /// The verdict over the frames fed so far. `with_stats` adds a copy of
+    /// every frame's statistics (for the chart, and for [`merge_segments`]
+    /// to join); without them a verdict costs little more than finding its
+    /// violations, which the page does after every chunk of a scan and the
+    /// live monitor several times a second.
+    pub fn finish(&self, with_stats: bool) -> AnalysisResult {
         let cfg = &self.cfg;
         let mut res = AnalysisResult {
             events: self.events.clone(),
@@ -783,7 +765,7 @@ impl Temporal {
             duration: if self.n > 0 { self.stats.tc[self.n - 1] - self.stats.tc[0] } else { 0.0 },
             anomalies: self.clock.anomalies,
             held: self.held,
-            frame_stats: self.stats.clone(),
+            frame_stats: if with_stats { self.stats.clone() } else { FrameStats::default() },
             flag_extended: cfg.flag_extended(),
             flag_patterns: cfg.flag_patterns(),
             area_thresh: self.geom.area_thresh,
@@ -838,7 +820,6 @@ impl Temporal {
         }
         let thresh = self.pattern_thresh();
         let s = &self.stats;
-        let dt = median(s.tc.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0.0)).unwrap_or(1.0 / 30.0);
         let mut out: Vec<(usize, usize, usize)> = Vec::new(); // first, last, peak frame
         for i in 0..self.n {
             if s.pattern[i] < thresh {
@@ -854,6 +835,12 @@ impl Temporal {
                 _ => out.push((i, i, i)),
             }
         }
+        if out.is_empty() {
+            return vec![];
+        }
+        // (a run's last frame stays up for a frame interval; sorting every
+        // interval for it is worth it only once there is a run)
+        let dt = crate::timeline::median_dt(&s.tc);
         out.into_iter()
             .filter(|&(a, b, _)| s.tc[b] - s.tc[a] + dt >= cfg.pattern_min_seconds)
             .map(|(a, b, p)| Violation {
@@ -987,7 +974,7 @@ fn round2(x: f64) -> f64 {
 
 /// Spans clipped to [lo, hi] and merged where they touch or overlap,
 /// returned sorted and disjoint.
-pub fn merge_spans(spans: impl IntoIterator<Item = (f64, f64)>, lo: f64, hi: f64) -> Vec<(f64, f64)> {
+fn merge_spans(spans: impl IntoIterator<Item = (f64, f64)>, lo: f64, hi: f64) -> Vec<(f64, f64)> {
     let mut v: Vec<(f64, f64)> = spans.into_iter().collect();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mut out: Vec<(f64, f64)> = Vec::new();
@@ -1005,14 +992,14 @@ pub fn merge_spans(spans: impl IntoIterator<Item = (f64, f64)>, lo: f64, hi: f64
 }
 
 /// How many seconds of a set of disjoint spans fall inside a window.
-pub struct Coverage {
+struct Coverage {
     a: Vec<f64>,
     b: Vec<f64>,
     cum: Vec<f64>,
 }
 
 impl Coverage {
-    pub fn new(starts: &[f64], ends: &[f64]) -> Self {
+    fn new(starts: &[f64], ends: &[f64]) -> Self {
         let mut cum = vec![0.0];
         for (s, e) in starts.iter().zip(ends) {
             let last = *cum.last().unwrap();
@@ -1022,14 +1009,14 @@ impl Coverage {
     }
 
     /// Covered seconds before `y`.
-    pub fn upto(&self, y: f64) -> f64 {
+    fn upto(&self, y: f64) -> f64 {
         let k = self.b.partition_point(|&b| b <= y);
         let part = if k < self.a.len() { (y - self.a[k]).clamp(0.0, self.b[k] - self.a[k]) } else { 0.0 };
         self.cum[k] + part
     }
 
     /// Covered seconds in [x, x + width].
-    pub fn inside(&self, x: f64, width: f64) -> f64 {
+    fn inside(&self, x: f64, width: f64) -> f64 {
         self.upto(x + width) - self.upto(x)
     }
 }

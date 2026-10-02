@@ -23,7 +23,7 @@ use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 use rav1d::include::dav1d::data::Dav1dData;
-use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dLogger, Dav1dSettings, DAV1D_INLOOPFILTER_ALL, DAV1D_INLOOPFILTER_NONE};
+use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dLogger, Dav1dSettings, DAV1D_INLOOPFILTER_ALL};
 use rav1d::include::dav1d::headers::{
     DAV1D_FRAME_TYPE_KEY, DAV1D_MC_BT2020_CL, DAV1D_MC_BT2020_NCL, DAV1D_MC_BT470BG, DAV1D_MC_BT601, DAV1D_MC_BT709, DAV1D_MC_FCC, DAV1D_MC_SMPTE240, DAV1D_PIXEL_LAYOUT_I400, DAV1D_PIXEL_LAYOUT_I420, DAV1D_PIXEL_LAYOUT_I422,
 };
@@ -110,8 +110,6 @@ pub struct Decoder {
     /// The configuration record's OBUs (a sequence header), fed again after
     /// every restart: Matroska files may carry it nowhere else.
     config_obus: Vec<u8>,
-    /// The in-loop filters are off (see [`Decoder::set_fast`]).
-    fast: bool,
     /// A sample failed since the last key frame: later pictures may predict
     /// from what was lost.
     damaged: bool,
@@ -127,28 +125,9 @@ impl Decoder {
     /// then configure the decoder.
     pub fn new(config: &[u8]) -> Result<Decoder> {
         let obus = config_obus(config)?;
-        let mut d = Decoder { ctx: open(false)?, config_obus: obus.to_vec(), fast: false, damaged: false, last: None };
+        let mut d = Decoder { ctx: open()?, config_obus: obus.to_vec(), damaged: false, last: None };
         d.send_config();
         Ok(d)
-    }
-
-    /// Leave out the in-loop filters (deblocking, CDEF, loop restoration),
-    /// for statistics only: the pictures are no longer exact, and errors
-    /// build up over a GOP (later pictures predict from unfiltered ones).
-    /// Call it before decoding: changing it restarts the decoder, which then
-    /// needs a key frame.
-    pub fn set_fast(&mut self, fast: bool) {
-        if fast == self.fast {
-            return;
-        }
-        // (on failure, out of memory, the decoder carries on as it was)
-        if let Ok(ctx) = open(fast) {
-            self.last = None;
-            close(std::mem::replace(&mut self.ctx, ctx));
-            self.fast = fast;
-            self.damaged = false;
-            self.send_config();
-        }
     }
 
     /// Decode one container sample (a temporal unit): the pictures it makes
@@ -291,9 +270,9 @@ impl Drop for Decoder {
 }
 
 /// A dav1d context: one thread, pictures out as soon as they are decoded,
-/// film grain applied, the highest spatial layer only (as ffmpeg and the
-/// browsers), no logging.
-fn open(fast: bool) -> Result<Dav1dContext> {
+/// every in-loop filter and film grain applied, the highest spatial layer
+/// only (as ffmpeg and the browsers), no logging.
+fn open() -> Result<Dav1dContext> {
     let mut s = MaybeUninit::<Dav1dSettings>::uninit();
     // SAFETY: `dav1d_default_settings` writes a whole `Dav1dSettings` to the
     // (possibly uninitialised) memory it is given.
@@ -305,7 +284,7 @@ fn open(fast: bool) -> Result<Dav1dContext> {
     s.max_frame_delay = 1;
     s.apply_grain = 1;
     s.all_layers = 0;
-    s.inloop_filters = if fast { DAV1D_INLOOPFILTER_NONE } else { DAV1D_INLOOPFILTER_ALL };
+    s.inloop_filters = DAV1D_INLOOPFILTER_ALL;
     // SAFETY: a logger without a callback is never called.
     s.logger = unsafe { Dav1dLogger::new(None, None) };
     let mut ctx: Option<Dav1dContext> = None;
@@ -521,8 +500,6 @@ mod tests {
         let mut d = Decoder::new(&[]).unwrap();
         assert!(d.decode(&[], 0.0).unwrap().is_empty());
         assert!(d.flush().unwrap().is_empty());
-        d.set_fast(true);
-        assert!(d.decode(&[], 0.0).unwrap().is_empty());
     }
 
     #[test]

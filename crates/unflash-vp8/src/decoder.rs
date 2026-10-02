@@ -53,8 +53,6 @@ pub struct Decoder {
     /// Coefficient contexts along the bottom of the macroblock row above.
     above_nz: Vec<NonZero>,
     coeffs: Box<Coeffs>,
-    /// Leave the loop filter out (see `set_fast`).
-    fast: bool,
 }
 
 /// The references of a frame by `MbInfo::ref_frame` (none for intra).
@@ -80,18 +78,7 @@ impl Decoder {
             filters: Vec::new(),
             above_nz: Vec::new(),
             coeffs: Box::default(),
-            fast: false,
         })
-    }
-
-    /// Leave the loop filter out, for pictures used only for statistics:
-    /// a tenth to a quarter of the decoding time. The pictures are no longer
-    /// bit-exact (block edges keep their coding artefacts, and later frames
-    /// predicted from them drift slightly), which is fine for flash
-    /// detection but not for pictures that are shown or re-encoded. With
-    /// `fast` false (the default) the output is bit-exact.
-    pub fn set_fast(&mut self, fast: bool) {
-        self.fast = fast;
     }
 
     /// Decode one container sample (one VP8 frame). Returns the frame when
@@ -214,7 +201,7 @@ impl Decoder {
         // chroma vectors
         let filter = if h.tag.version == 0 { Filter::SixTap } else { Filter::Bilinear };
         let full_pixel = h.tag.version == 3;
-        let loop_filter = h.filter_level > 0 && !self.fast;
+        let loop_filter = h.filter_level > 0;
         let refs: Refs = [None, self.last.map(|i| &self.pics[i]), self.golden.map(|i| &self.pics[i]), self.altref.map(|i| &self.pics[i])];
         let mut parts: [BoolDecoder; MAX_PARTITIONS] = std::array::from_fn(|i| BoolDecoder::new(p.partitions[i]));
         self.above_nz.fill([0; 9]);

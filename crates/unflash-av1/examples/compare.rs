@@ -1,6 +1,6 @@
 //! Decode the AV1 track of an MP4 / Matroska / WebM file, compare every
 //! picture with ffmpeg's libdav1d decoding (when ffmpeg is installed), then
-//! time the decoder on one thread with and without the in-loop filters.
+//! time the decoder on one thread.
 //!
 //!     cargo run --release -p unflash-av1 --example compare -- file.mkv [max_frames]
 //!
@@ -74,16 +74,13 @@ fn main() {
         println!("(ffmpeg with libdav1d not found: no comparison)");
     }
 
-    for fast in [false, true] {
-        let mut dec = Decoder::new(&config).unwrap();
-        dec.set_fast(fast);
-        let t0 = Instant::now();
-        let mut n = 0;
-        for (bytes, pts) in &samples {
-            n += dec.decode(bytes, *pts).map(|f| f.len()).unwrap_or(0);
-        }
-        n += dec.flush().unwrap().len();
-        let s = t0.elapsed().as_secs_f64();
-        println!("{}: {n} pictures in {s:.2} s, {:.1} fps", if fast { "fast (no in-loop filters)" } else { "exact" }, n as f64 / s);
+    let mut dec = Decoder::new(&config).unwrap();
+    let t0 = Instant::now();
+    let mut n = 0;
+    for (bytes, pts) in &samples {
+        n += dec.decode(bytes, *pts).map(|f| f.len()).unwrap_or(0);
     }
+    n += dec.flush().unwrap().len();
+    let s = t0.elapsed().as_secs_f64();
+    println!("{n} pictures in {s:.2} s, {:.1} fps", n as f64 / s);
 }

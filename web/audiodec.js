@@ -10,14 +10,14 @@
 import { loadDecoders } from './codecs.js';
 
 /**
- * The sounds the app decodes itself: `wasm` names the decoders module's
- * class (whose sound comes mixed down to stereo); PCM is read in JS, every
- * channel kept.
+ * The sounds the app decodes itself: `wasm` names the codec of the decoders
+ * module's SoundDecoder (whose sound comes mixed down to stereo); PCM is
+ * read in JS, every channel kept.
  */
 const BUILT_IN_SOUND = [
-  { name: 'AC-3', test: /^(ac-3|ec-3|mp4a\.a5|mp4a\.a6)$/i, wasm: 'Ac3Decoder' },
+  { name: 'AC-3', test: /^(ac-3|ec-3|mp4a\.a5|mp4a\.a6)$/i, wasm: 'ac3' },
   // (DTS Express, dtse, and DTS-HD without a core are not: only the core is read)
-  { name: 'DTS', test: /^(dtsc|dtsh|dtsl)$/i, wasm: 'DtsDecoder' },
+  { name: 'DTS', test: /^(dtsc|dtsh|dtsl)$/i, wasm: 'dts' },
   { name: 'PCM', test: /^(pcm-(u8|s8|s16|s16be|s24|s24be|s32|s32be|f32|f32be|f64|f64be)|ulaw|alaw)$/, pcm: true },
 ];
 
@@ -88,7 +88,7 @@ export async function soundDecoderFor(cfg) {
     missing = 'module';
     try {
       const mod = await loadDecoders();
-      if (mod[kind.wasm]) return { Decoder: BuiltInAudioDecoder, builtIn: true, name: kind.name, channels: 2 };
+      if (mod.SoundDecoder) return { Decoder: BuiltInAudioDecoder, builtIn: true, name: kind.name, channels: 2 };
     } catch (e) {
       /* the module did not load */
     }
@@ -147,8 +147,8 @@ const PCM_FORMATS = {
 };
 
 /**
- * Interleaved PCM read into planes, with the decoders module's decoders'
- * interface (decode, samples, channels, sample_rate, damaged, free): a
+ * Interleaved PCM read into planes, with the decoders module's sound
+ * decoder's interface (decode, samples, channels, sample_rate, free): a
  * chunk is any whole number of sample frames (a part frame at its end is
  * dropped).
  */
@@ -181,9 +181,6 @@ export class PcmDecoder {
   sample_rate() {
     return this.rate;
   }
-  damaged() {
-    return 0;
-  }
   free() {}
 }
 
@@ -208,21 +205,24 @@ export class BuiltInAudioDecoder {
     this.running = false;
     this.closed = false;
     this.idle = []; // flush() waiting for the queue to empty
-    this.damaged = 0;
     this.name = '';
+    this.rate = 0;
   }
 
   configure(cfg) {
     const kind = builtInKind(cfg.codec);
     if (!kind) throw new Error(`the app has no decoder of its own for ${cfg.codec}`);
     this.name = kind.name;
+    // the track's rate, for sound before the decoder has read one (a chunk
+    // whose frames all came out as silence)
+    this.rate = cfg.sampleRate;
     if (kind.pcm) {
       this.dec = new PcmDecoder(cfg.codec, cfg.numberOfChannels, cfg.sampleRate);
       this.ready = Promise.resolve();
       return;
     }
     this.ready = loadDecoders().then((mod) => {
-      if (!this.closed) this.dec = new mod[kind.wasm](true);
+      if (!this.closed) this.dec = new mod.SoundDecoder(kind.wasm);
     });
   }
 
@@ -250,14 +250,17 @@ export class BuiltInAudioDecoder {
           this.error(new Error(`the built-in ${this.name} decoder: ${e && e.message ? e.message : e}`));
           continue;
         }
-        this.damaged += this.dec.damaged();
         const n = this.dec.samples();
         if (!n) continue;
-        this.output(new AudioData({ format: 'f32-planar', sampleRate: this.dec.sample_rate(), numberOfFrames: n, numberOfChannels: this.dec.channels(), timestamp: c.timestamp, data: planes }));
+        this.output(new AudioData({ format: 'f32-planar', sampleRate: this.dec.sample_rate() || this.rate, numberOfFrames: n, numberOfChannels: this.dec.channels(), timestamp: c.timestamp, data: planes }));
         // (a long run of chunks lets the page breathe between them)
         if (this.queue.length && this.queue.length % 64 === 0) await new Promise((r) => setTimeout(r, 0));
       }
     } catch (e) {
+      // the chunks still queued go too, as on close(): until another
+      // decode() nothing would run them, and a flush() would wait for ever
+      this.queue.length = 0;
+      this.decodeQueueSize = 0;
       this.error(e);
     } finally {
       this.running = false;

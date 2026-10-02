@@ -201,11 +201,6 @@ impl Decoder {
         Ok(result)
     }
 
-    /// Forget the filter banks' and predictors' history (after a seek).
-    pub fn reset(&mut self) {
-        self.frame.reset();
-    }
-
     /// The stream as its last decoded frame described it.
     pub fn info(&self) -> Option<StreamInfo> {
         self.info

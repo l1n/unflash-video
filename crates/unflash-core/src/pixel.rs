@@ -17,7 +17,7 @@ use crate::grid::{
     GridGeometry, MASK_EXT_GEN, MASK_EXT_RED, MASK_POOL_GEN_DN, MASK_POOL_GEN_UP,
     MASK_POOL_RED_DN, MASK_POOL_RED_UP, MASK_STROBE_GEN, MASK_STROBE_RED,
 };
-use crate::lut::{lut, pixel_values, red_transition, red_values};
+use crate::lut::{luminance, lut, red_transition, red_values};
 use crate::time::{age, dur_to_us, never, saturate};
 
 /// How long a pixel may go on accumulating one monotonic run before the run
@@ -116,7 +116,7 @@ impl KernelParams {
             fresh: dur_to_us(cfg.area_accum_window),
             pool: dur_to_us(cfg.area_accum_window),
             k_fail: cfg.k_fail(),
-            k_ext: cfg.ext_rate().clamp(1, cfg.k_fail()),
+            k_ext: cfg.ext_rate(),
             held_delta: geom.held_delta,
             held_bar: geom.held_bar_int(),
             height: geom.ah,
@@ -354,12 +354,11 @@ impl FramePlanes {
         for i in 0..n {
             let p = &data[i * bpp..i * bpp + 3];
             let (r, g, b) = (t[p[0] as usize], t[p[1] as usize], t[p[2] as usize]);
-            self.l[i] = 0.2126f32 * r + 0.7152f32 * g + 0.0722f32 * b;
+            self.l[i] = luminance(r, g, b);
             let (s, c) = red_values(r, g, b, red_saturation, red_flare);
             self.v[i] = s;
             self.c[i] = c;
         }
-        let _ = pixel_values; // same arithmetic, kept as the documented form
     }
 }
 
@@ -760,6 +759,7 @@ pub(crate) fn run_range_scalar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lut::pixel_values;
 
     fn params(now_us: u32, mode: u32) -> KernelParams {
         let cfg = DetectorConfig::default();

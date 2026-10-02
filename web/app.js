@@ -803,7 +803,7 @@ async function openFile(file) {
     if (!state.decode.supported) banner(`This browser cannot decode ${movie.video.codec} with WebCodecs (${state.decode.reason}). The live monitor still works while the player plays; scanning and section editing need a decodable file (H.264 in most browsers).`, 'info');
     else if (state.decode.software) {
       const info = movie.softwareInfo || {};
-      const about = movie.builtIn.id === 'h264' ? ` (profile ${info.profile_idc}, level ${info.level_idc})` : info.summary ? ` (${info.summary})` : '';
+      const about = movie.builtIn.id === 'h264' ? ` (profile ${info.profile_idc}, level ${info.level_idc})` : '';
       const why = movie.forceBuiltIn ? 'You asked for the built-in decoder' : `This browser cannot decode ${movie.video.codec} with WebCodecs`;
       banner(`${why}, so Unflash uses its built-in ${movie.builtIn.name} decoder${about} for scanning, sections and export, decoding in ${defaultWorkerCount()} parallel workers.${movie.forceBuiltIn ? '' : ' The player cannot play this file here, so the live monitor is off.'}`, 'info');
     }

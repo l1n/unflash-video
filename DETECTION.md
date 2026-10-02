@@ -586,8 +586,10 @@ hazard areas, held frames, events, violations and verdicts.
 filter; the GPU ingest pass computes the same thing with fractional overlap
 weights in sRGB code space, rounding back to 8 bits before linearising
 through the same 256-entry table the CPU uses. The CPU path in the browser
-takes WebCodecs' RGBA copy of the frame through the identical box filter in
-WASM. The colour conversion from the codec's YUV is the browser's; scans on
+makes the frame small with the box filter the decode workers use (`Shrink`:
+exact integer sums, halves rounded to even), from WebCodecs' RGBA copy of it
+(the browser's colour conversion) or from the codec's YUV planes (converted
+in 16.16 fixed point, as the GPU's conversion pass does in floats); scans on
 the two paths agree to the frame.
 
 **Chart areas are grid-only.** The pooled transition areas drawn in the

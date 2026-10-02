@@ -27,8 +27,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         out[0] = bitcast<u32>(s);
         out[1] = atomicLoad(&globals[0]);
         atomicStore(&globals[0], 0u);
-        out[2] = params.now;
-        out[3] = params.mode;
         out[4] = pc;
         out[5] = atomicLoad(&globals[1]);
         out[6] = atomicLoad(&globals[2]);

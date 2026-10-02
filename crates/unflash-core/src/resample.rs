@@ -1,54 +1,7 @@
-//! Area-average downsampling of 8-bit sRGB pictures, the same box filter
-//! the GPU ingest pass applies (fractional overlap weights in code space,
-//! rounded back to 8 bits), for the CPU path.
-
-/// Downsample an RGBA8 (or RGB8 with `bpp = 3`) picture of `sw`×`sh` to
-/// `aw`×`ah` RGBA8. Alpha is set to 255.
-pub fn area_downsample(src: &[u8], bpp: usize, sw: u32, sh: u32, aw: u32, ah: u32) -> Vec<u8> {
-    let (sw, sh, aw, ah) = (sw as usize, sh as usize, aw as usize, ah as usize);
-    assert!(src.len() >= sw * sh * bpp, "source too short");
-    let mut out = vec![255u8; aw * ah * 4];
-    if sw == aw && sh == ah {
-        for i in 0..aw * ah {
-            out[i * 4..i * 4 + 3].copy_from_slice(&src[i * bpp..i * bpp + 3]);
-        }
-        return out;
-    }
-    let fx = sw as f32 / aw as f32;
-    let fy = sh as f32 / ah as f32;
-    for y in 0..ah {
-        let fy0 = y as f32 * fy;
-        let fy1 = (y + 1) as f32 * fy;
-        let iy0 = fy0.floor() as usize;
-        let iy1 = (fy1.ceil() as usize).min(sh);
-        for x in 0..aw {
-            let fx0 = x as f32 * fx;
-            let fx1 = (x + 1) as f32 * fx;
-            let ix0 = fx0.floor() as usize;
-            let ix1 = (fx1.ceil() as usize).min(sw);
-            let mut acc = [0f32; 3];
-            let mut wsum = 0f32;
-            for sy in iy0..iy1 {
-                let wy = fy1.min((sy + 1) as f32) - fy0.max(sy as f32);
-                for sx in ix0..ix1 {
-                    let wx = fx1.min((sx + 1) as f32) - fx0.max(sx as f32);
-                    let w = wx * wy;
-                    let p = &src[(sy * sw + sx) * bpp..];
-                    acc[0] += p[0] as f32 / 255.0 * w;
-                    acc[1] += p[1] as f32 / 255.0 * w;
-                    acc[2] += p[2] as f32 / 255.0 * w;
-                    wsum += w;
-                }
-            }
-            let o = (y * aw + x) * 4;
-            let inv = 1.0 / wsum.max(1e-9);
-            for c in 0..3 {
-                out[o + c] = (acc[c] * inv * 255.0).round().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-    out
-}
+//! Area-average downsampling of 8-bit pictures to the analysis size
+//! ([`Shrink`]): the boxes the GPU ingest pass averages (fractional overlap
+//! weights in code space, rounded back to 8 bits), summed exactly, for
+//! every picture made small off the GPU; and the blur that softens stripes.
 
 /// One axis of an area-average: for each output sample, the first source
 /// sample its box covers and the integer weights of the samples it covers
@@ -83,11 +36,12 @@ impl Axis {
 /// Area-average downsampling to the analysis size in exact integer
 /// arithmetic, for pictures made small before they reach the detector (in
 /// the browser's decode workers, so the page never handles the full-size
-/// picture): the boxes of [`area_downsample`] and the GPU ingest pass, whose
-/// float sums can land either side of an exact half, so a code can differ
-/// by one there; here the exact average is rounded half to even, as WGSL
-/// rounds. Rows are summed first (a straight run over each row, which the
-/// compiler vectorises), then columns, on one output row's sums at a time.
+/// picture, and in the built-in decoders) and for the CPU detector's own:
+/// the boxes of the GPU ingest pass, whose float sums can land either side
+/// of an exact half, so a code can differ by one there; here the exact
+/// average is rounded half to even, as WGSL rounds. Rows are summed first
+/// (a straight run over each row, which the compiler vectorises), then
+/// columns, on one output row's sums at a time.
 ///
 /// A 4:2:0 picture is converted a row at a time into three planes (R, G, B)
 /// with each chroma sample's terms worked out once per chroma row, so that
@@ -111,7 +65,11 @@ pub struct Shrink {
 }
 
 impl Shrink {
+    /// For pictures of `sw`×`sh` to `aw`×`ah`. A picture of no width or
+    /// height has nothing to average (its boxes would be endless), so
+    /// callers turn one away before it gets here.
     pub fn new(sw: u32, sh: u32, aw: u32, ah: u32) -> Shrink {
+        assert!(sw > 0 && sh > 0, "a {sw}×{sh} picture has nothing to shrink");
         let (sw, sh, aw, ah) = (sw as usize, sh as usize, aw.max(1) as usize, ah.max(1) as usize);
         Shrink { sw, sh, aw, ah, cols: Axis::new(sw, aw), rows: Axis::new(sh, ah), acc: Vec::new(), acc16: Vec::new(), planes: Vec::new(), terms: Vec::new() }
     }
@@ -126,6 +84,15 @@ impl Shrink {
         (self.sw, self.sh, self.aw, self.ah) == (sw as usize, sh as usize, aw as usize, ah as usize)
     }
 
+    /// The shrink in `slot` if it was made for these sizes, else a new one
+    /// put there (a source's pictures change size seldom, if ever).
+    pub fn reuse(slot: &mut Option<Shrink>, sw: u32, sh: u32, aw: u32, ah: u32) -> &mut Shrink {
+        if !slot.as_ref().is_some_and(|k| k.fits(sw, sh, aw, ah)) {
+            *slot = Some(Shrink::new(sw, sh, aw, ah));
+        }
+        slot.as_mut().unwrap()
+    }
+
     /// A picture of four bytes a pixel (R, G, B and one ignored, or B, G, R
     /// and one ignored with `bgr`), its first row at `offset` and each
     /// `stride` bytes after the one before, to RGBA8 at the analysis size.
@@ -135,8 +102,9 @@ impl Shrink {
         self.shrink_rows(&mut Packed { src, offset, stride, len }, bgr, out);
     }
 
-    /// A 4:2:0 picture: each row converted to RGB pixel by pixel as the GPU
-    /// converts it (the arithmetic of [`crate::yuv::to_rgba`]), then summed.
+    /// A 4:2:0 picture: each row converted to RGB in 16.16 fixed point (the
+    /// GPU converts with the same coefficients in f32; the two agree but for
+    /// rounding at exact halves), then summed.
     pub fn yuv420(&mut self, data: &[u8], l: &crate::yuv::YuvLayout, out: &mut Vec<u8>) {
         assert!(l.fits(data.len(), self.sw, self.sh), "picture data too short for its layout");
         let planes = Planes { y: &data[l.y_off..], y_stride: l.y_stride, u: &data[l.u_off..], u_stride: l.u_stride, v: &data[l.v_off.min(data.len())..], v_stride: l.v_stride, nv12: l.nv12 };
@@ -165,7 +133,7 @@ impl Shrink {
         let mut terms = std::mem::take(&mut self.terms);
         terms.resize(3 * cw, 0);
         let (mut last_row, mut last_crow) = (usize::MAX, usize::MAX);
-        // row `y` as R, G, B planes, exactly as `crate::yuv::to_rgba` converts each pixel
+        // row `y` as R, G, B planes, each pixel converted as `convert_row` says
         let mut convert = |y: usize, rgb: &mut [u8], terms: &mut [i32]| {
             if y == last_row {
                 return;
@@ -337,8 +305,8 @@ struct Planes<'a> {
 }
 
 /// A row of luma samples and its chroma terms (`t`: R, G and B, `cw`
-/// apart, one per chroma sample) converted to R, G and B planes, each
-/// sample as `crate::yuv::to_rgba` converts it: `(yy + term) >> 16`,
+/// apart, one per chroma sample, each with the half that rounds the sum to
+/// nearest) converted to R, G and B planes, each sample `(yy + term) >> 16`
 /// clamped to 0..=255.
 fn convert_row(yrow: &[u8], t: &[i32], cw: usize, ky: i32, yoff: i32, out: [&mut [u8]; 3]) {
     let w = yrow.len();
@@ -438,6 +406,55 @@ impl Divider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The float area average the GPU ingest pass computes, the reference
+    /// [`Shrink`] is held to: an RGBA8 (or RGB8 with `bpp = 3`) picture of
+    /// `sw`×`sh` to `aw`×`ah` RGBA8, alpha 255.
+    fn area_downsample(src: &[u8], bpp: usize, sw: u32, sh: u32, aw: u32, ah: u32) -> Vec<u8> {
+        let (sw, sh, aw, ah) = (sw as usize, sh as usize, aw as usize, ah as usize);
+        assert!(src.len() >= sw * sh * bpp, "source too short");
+        let mut out = vec![255u8; aw * ah * 4];
+        if sw == aw && sh == ah {
+            for i in 0..aw * ah {
+                out[i * 4..i * 4 + 3].copy_from_slice(&src[i * bpp..i * bpp + 3]);
+            }
+            return out;
+        }
+        let fx = sw as f32 / aw as f32;
+        let fy = sh as f32 / ah as f32;
+        for y in 0..ah {
+            let fy0 = y as f32 * fy;
+            let fy1 = (y + 1) as f32 * fy;
+            let iy0 = fy0.floor() as usize;
+            let iy1 = (fy1.ceil() as usize).min(sh);
+            for x in 0..aw {
+                let fx0 = x as f32 * fx;
+                let fx1 = (x + 1) as f32 * fx;
+                let ix0 = fx0.floor() as usize;
+                let ix1 = (fx1.ceil() as usize).min(sw);
+                let mut acc = [0f32; 3];
+                let mut wsum = 0f32;
+                for sy in iy0..iy1 {
+                    let wy = fy1.min((sy + 1) as f32) - fy0.max(sy as f32);
+                    for sx in ix0..ix1 {
+                        let wx = fx1.min((sx + 1) as f32) - fx0.max(sx as f32);
+                        let w = wx * wy;
+                        let p = &src[(sy * sw + sx) * bpp..];
+                        acc[0] += p[0] as f32 / 255.0 * w;
+                        acc[1] += p[1] as f32 / 255.0 * w;
+                        acc[2] += p[2] as f32 / 255.0 * w;
+                        wsum += w;
+                    }
+                }
+                let o = (y * aw + x) * 4;
+                let inv = 1.0 / wsum.max(1e-9);
+                for c in 0..3 {
+                    out[o + c] = (acc[c] * inv * 255.0).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        out
+    }
 
     #[test]
     fn identity_and_halving() {
@@ -584,22 +601,39 @@ mod tests {
         assert_eq!(round_div(8, 3), 3);
         assert_eq!(round_div(700, 1), 255);
     }
+
+    /// A picture of no width or height is turned away with a message. (A
+    /// size-0 axis put each box's last sample at 0 - 1, which wraps in a
+    /// release build, and making the shrink then asked for more memory than
+    /// there is.)
+    #[test]
+    #[should_panic(expected = "has nothing to shrink")]
+    fn zero_sizes_are_turned_away() {
+        Shrink::new(0, 360, 256, 144);
+    }
+
+    #[test]
+    fn reuse_keeps_a_shrink_that_fits() {
+        let mut slot = None;
+        let (src, mut out) = (picture(64, 36, 3), Vec::new());
+        Shrink::reuse(&mut slot, 64, 36, 16, 9).packed(&src, 0, 64 * 4, false, &mut out);
+        // the same sizes: the same shrink, its row sums' room still there
+        assert!(!Shrink::reuse(&mut slot, 64, 36, 16, 9).acc16.is_empty());
+        // other sizes: a new one
+        let k = Shrink::reuse(&mut slot, 64, 36, 16, 8);
+        assert!(k.fits(64, 36, 16, 8) && k.acc16.is_empty());
+    }
 }
 
-/// Three-pass box blur of an RGBA8 picture (close to a Gaussian of
+/// Three-pass box blur of an RGB8 picture (close to a Gaussian of
 /// σ ≈ 0.9·radius, edges replicated), for softening a regular pattern.
 /// `radius` 0 copies. The output is written to `dst`.
-pub fn blur_rgba(src: &[u8], w: u32, h: u32, radius: u32, dst: &mut Vec<u8>) {
-    blur_px::<4>(src, w, h, radius, dst)
-}
-
-/// The same blur of an RGB8 picture (three bytes per pixel).
 pub fn blur_rgb(src: &[u8], w: u32, h: u32, radius: u32, dst: &mut Vec<u8>) {
     blur_px::<3>(src, w, h, radius, dst)
 }
 
 /// The blur over `C` interleaved 8-bit channels.
-pub fn blur_px<const C: usize>(src: &[u8], w: u32, h: u32, radius: u32, dst: &mut Vec<u8>) {
+fn blur_px<const C: usize>(src: &[u8], w: u32, h: u32, radius: u32, dst: &mut Vec<u8>) {
     let (w, h) = (w as usize, h as usize);
     let n = w * h * C;
     dst.clear();
@@ -669,7 +703,7 @@ mod blur_tests {
         let (w, h) = (32u32, 8u32);
         let flat = vec![100u8; (w * h * 4) as usize];
         let mut out = Vec::new();
-        blur_rgba(&flat, w, h, 3, &mut out);
+        blur_px::<4>(&flat, w, h, 3, &mut out);
         assert_eq!(out, flat);
         let mut stripes = vec![255u8; (w * h * 4) as usize];
         for y in 0..h {
@@ -681,12 +715,12 @@ mod blur_tests {
                 stripes[k + 2] = v;
             }
         }
-        blur_rgba(&stripes, w, h, 3, &mut out);
+        blur_px::<4>(&stripes, w, h, 3, &mut out);
         let row: Vec<u8> = (0..w).map(|x| out[(x * 4) as usize]).collect();
         let (lo, hi) = (row[4..28].iter().min().unwrap(), row[4..28].iter().max().unwrap());
         assert!(hi - lo < 20, "stripes should flatten: {row:?}");
         assert!(out.iter().skip(3).step_by(4).all(|&a| a == 255), "alpha is untouched");
-        blur_rgba(&stripes, w, h, 0, &mut out);
+        blur_px::<4>(&stripes, w, h, 0, &mut out);
         assert_eq!(out, stripes);
     }
 }

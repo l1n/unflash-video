@@ -110,8 +110,6 @@ impl Depth for u16 {
 pub struct Decoder {
     state: StreamState,
     slots: [Option<Stored>; 8],
-    /// Leave out the loop filter.
-    fast: bool,
     /// The mode info of the frame being decoded.
     mi: Vec<MiInfo>,
     /// The motion of the previous decoded frame (for UsePrevFrameMvs).
@@ -139,7 +137,6 @@ impl Decoder {
         Ok(Decoder {
             state: StreamState::default(),
             slots: Default::default(),
-            fast: false,
             mi: Vec::new(),
             prev_mvs: Vec::new(),
             prev_segment_ids: Vec::new(),
@@ -152,14 +149,6 @@ impl Decoder {
             last_size: None,
             last_show_frame: false,
         })
-    }
-
-    /// Leave out the loop filter for pictures used only for statistics: about
-    /// a fifth of the decoding time. With `fast` false (the default) the
-    /// output is bit-exact; with it set, block edges keep their artefacts and
-    /// later frames predicted from them drift slightly.
-    pub fn set_fast(&mut self, fast: bool) {
-        self.fast = fast;
     }
 
     /// Decode one container sample (a frame, or a superframe holding several
@@ -335,7 +324,7 @@ impl Decoder {
         }
         cur.damaged |= damaged;
 
-        if fh.lf.level != 0 && !self.fast {
+        if fh.lf.level != 0 {
             filter_frame(&mut cur, &self.mi, mi_rows, mi_cols, &Levels::new(&fh));
         }
 

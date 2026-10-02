@@ -1,51 +1,38 @@
 //! Frame-time helpers shared by sectioning, editing and export (port of the
 //! timeline parts of `ffio.py` / `editing.py`).
 
-use crate::temporal::median;
+use serde::Serialize;
+
+use crate::temporal::{median, Clock, DEFAULT_STEP};
 
 /// Make a frame-time list strictly sane: non-positive deltas and deltas
 /// beyond `max_gap` (source timestamp discontinuities) are replaced with the
-/// running median delta. Returns (new_times, n_fixed).
+/// running median delta, as the detector's clock bridges them. Returns
+/// (new_times, n_fixed).
 ///
 /// Deltas are measured input-to-input, so every frame after a bridged
 /// anomaly does not itself look like another jump.
-pub fn sanitize_deltas(times: &[f64], max_gap: f64, fallback: f64) -> (Vec<f64>, usize) {
-    if times.is_empty() {
-        return (vec![], 0);
-    }
-    let mut out = Vec::with_capacity(times.len());
-    out.push(times[0]);
-    let mut prev_in = times[0];
-    let mut recent: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
-    let mut fixed = 0;
-    for &t in &times[1..] {
-        let mut d = t - prev_in;
-        prev_in = t;
-        if d <= 0.0 || d > max_gap {
-            d = median(recent.iter().copied()).unwrap_or(fallback);
-            fixed += 1;
-        } else {
-            recent.push_back(d);
-            if recent.len() > 120 {
-                recent.pop_front();
-            }
-        }
-        let last = *out.last().unwrap();
-        out.push(last + d);
-    }
-    (out, fixed)
+pub fn sanitize_deltas(times: &[f64], max_gap: f64) -> (Vec<f64>, usize) {
+    let mut clock = Clock::new(max_gap);
+    let mut at = times.first().copied().unwrap_or(0.0);
+    let out = times
+        .iter()
+        .map(|&t| {
+            at += clock.step(t);
+            at
+        })
+        .collect();
+    (out, clock.anomalies)
 }
 
-/// Median positive frame interval, or `fallback`.
-pub fn median_dt(pts: &[f64], fallback: f64) -> f64 {
-    if pts.len() < 2 {
-        return fallback;
-    }
-    median(pts.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0.0)).unwrap_or(fallback)
+/// Median positive frame interval ([`DEFAULT_STEP`] for fewer than two
+/// frames).
+pub fn median_dt(pts: &[f64]) -> f64 {
+    median(pts.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0.0)).unwrap_or(DEFAULT_STEP)
 }
 
 /// How a section maps onto the source.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SectionTimeline {
     /// Frame times rebased onto the section's first frame.
     pub rel: Vec<f64>,
@@ -64,9 +51,9 @@ pub struct SectionTimeline {
 pub fn section_timeline(pts: &[f64], start: f64, end: f64) -> SectionTimeline {
     let dur = end - start;
     if pts.is_empty() {
-        return SectionTimeline { rel: vec![], n_out: 0, total: dur, base: 0.0, med: 1.0 / 30.0 };
+        return SectionTimeline { rel: vec![], n_out: 0, total: dur, base: 0.0, med: DEFAULT_STEP };
     }
-    let med = median(pts.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 1e-9)).unwrap_or(1.0 / 30.0);
+    let med = median_dt(pts);
     // Frames at or past the section's end belong to the untouched span that
     // follows it.
     let mut n_out = pts.iter().filter(|&&t| t < dur - 1e-9).count();
@@ -97,7 +84,8 @@ pub fn parse_time(s: &str) -> Option<f64> {
         let v: f64 = part.trim().parse().ok()?;
         total = total * 60.0 + v;
     }
-    Some(total)
+    // (Rust reads "nan" and "inf" as numbers; no section starts there)
+    Some(total).filter(|t| t.is_finite())
 }
 
 /// Format seconds as m:ss.mmm (or h:mm:ss.mmm).
@@ -119,12 +107,19 @@ mod tests {
 
     #[test]
     fn sanitize_bridges_jumps() {
-        let (out, fixed) = sanitize_deltas(&[0.0, 0.04, 0.08, 0.02, 9.0, 9.04], 5.0, 1.0 / 30.0);
+        let (out, fixed) = sanitize_deltas(&[0.0, 0.04, 0.08, 0.02, 9.0, 9.04], 5.0);
         assert_eq!(fixed, 2);
         let want = [0.0, 0.04, 0.08, 0.12, 0.16, 0.20];
         for (a, b) in out.iter().zip(want) {
             assert!((a - b).abs() < 1e-9, "{a} vs {b}");
         }
+        // starting where the times start; a jump before any good step bridges by a 30th of a second
+        let (out, fixed) = sanitize_deltas(&[3.5, 1.0, 1.04], 5.0);
+        assert_eq!((out, fixed), (vec![3.5, 3.5 + DEFAULT_STEP, 3.5 + DEFAULT_STEP + (1.04 - 1.0)], 1));
+        assert_eq!(sanitize_deltas(&[], 5.0), (vec![], 0));
+        // (a repeated time is not an interval)
+        assert_eq!(median_dt(&[0.0, 0.25, 0.25, 0.5, 1.0]), 0.25);
+        assert_eq!(median_dt(&[2.0]), DEFAULT_STEP);
     }
 
     #[test]
@@ -142,6 +137,10 @@ mod tests {
         assert_eq!(parse_time("1:23.5"), Some(83.5));
         assert_eq!(parse_time("0:01:23.5"), Some(83.5));
         assert_eq!(parse_time("x"), None);
+        // numbers Rust reads but no time is
+        for s in ["nan", "NaN", "inf", "-inf", "infinity", "1:inf", "0:nan", "1e400"] {
+            assert_eq!(parse_time(s), None, "{s}");
+        }
         assert_eq!(format_time(83.5), "1:23.500");
         assert_eq!(format_time(3683.5), "1:01:23.500");
     }

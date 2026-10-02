@@ -1,14 +1,8 @@
 //! sRGB -> linear lookup and the per-pixel colour quantities.
 //!
 //! The table is computed in f64 and stored as f32, exactly as the reference
-//! does, so the CPU kernels and the GPU (which is handed this same table as
-//! a uniform) linearise identically.
-
-/// sRGB 8-bit code value -> linear light, f32.
-pub const fn srgb_lut() -> [f32; 256] {
-    // const fn cannot use powf; build at first use instead.
-    [0.0; 256]
-}
+//! does, so the CPU kernels and the GPU (which is handed this same table in
+//! a read-only storage buffer) linearise identically.
 
 static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
 
@@ -56,14 +50,20 @@ pub struct PixelValues {
     pub sat: bool,
 }
 
-/// Compute L and the red quantities from 8-bit sRGB. The arithmetic is f32
-/// in exactly the reference's order: numpy evaluates
-/// `0.2126*R + 0.7152*G + 0.0722*B` left to right in float32.
+/// The relative luminance of a linear colour, in f32 in exactly the
+/// reference's order: numpy evaluates `0.2126*R + 0.7152*G + 0.0722*B` left
+/// to right in float32 (and so does the GPU's ingest pass).
+#[inline(always)]
+pub fn luminance(r: f32, g: f32, b: f32) -> f32 {
+    0.2126f32 * r + 0.7152f32 * g + 0.0722f32 * b
+}
+
+/// Compute L and the red quantities from 8-bit sRGB.
 #[inline]
 pub fn pixel_values(r: u8, g: u8, b: u8, red_saturation: f32, flare: f32) -> PixelValues {
     let t = lut();
     let (r, g, b) = (t[r as usize], t[g as usize], t[b as usize]);
-    let l = 0.2126f32 * r + 0.7152f32 * g + 0.0722f32 * b;
+    let l = luminance(r, g, b);
     let (s, c) = red_values(r, g, b, red_saturation, flare);
     PixelValues { l, s, c, sat: c & SAT_BIT != 0 }
 }
@@ -83,7 +83,7 @@ pub fn red_values(r: f32, g: f32, b: f32, red_saturation: f32, flare: f32) -> (f
     let gf = g + flare;
     let bf = b + flare;
     let x = 0.4124f32 * rf + 0.3576f32 * gf + 0.1805f32 * bf;
-    let y = 0.2126f32 * rf + 0.7152f32 * gf + 0.0722f32 * bf;
+    let y = luminance(rf, gf, bf);
     let z = 0.0193f32 * rf + 0.1192f32 * gf + 0.9505f32 * bf;
     let d = x + 15.0f32 * y + 3.0f32 * z;
     let u = 4.0f32 * x / d;

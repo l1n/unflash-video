@@ -331,10 +331,9 @@ fn a_layout_change_resizes_the_output() {
     assert_eq!(&out[0][n - d.samples..], &out[1][n - d.samples..]);
 }
 
-/// Decoding frame by frame gives what decoding all at once gives, and
-/// `reset` starts the next frame from silence.
+/// Decoding frame by frame gives what decoding all at once gives.
 #[test]
-fn frame_by_frame_and_reset() {
+fn frame_by_frame() {
     for name in STREAMS {
         let data = read(name);
         let (_, all) = decode(&data, false);
@@ -346,17 +345,6 @@ fn frame_by_frame_and_reset() {
             dec.decode(&data[f.clone()], &mut out).unwrap();
         }
         assert_eq!(out, all, "{name}");
-        // after reset, frame k decodes as if it were the first
-        let k = fr.len() / 2;
-        let mut dec = Decoder::new(Output::Native);
-        dec.set_noise(false);
-        let mut before = Vec::new();
-        dec.decode(&data[fr[0].start..fr[k].start], &mut before).unwrap();
-        dec.reset();
-        let mut after = Vec::new();
-        dec.decode(&data[fr[k].clone()], &mut after).unwrap();
-        let (_, fresh) = decode(&data[fr[k].clone()], false);
-        assert_eq!(after, fresh, "{name}");
     }
 }
 

@@ -369,10 +369,9 @@ fn a_layout_change_resizes_the_output() {
 }
 
 /// Decoding frame by frame (as the blocks of a Matroska track or the
-/// samples of an MP4 one come) gives what decoding all at once gives, and
-/// after `reset` a frame decodes as if it were the first.
+/// samples of an MP4 one come) gives what decoding all at once gives.
 #[test]
-fn frame_by_frame_and_reset() {
+fn frame_by_frame() {
     for name in STREAMS {
         let data = read(name);
         let (_, all) = decode(&data);
@@ -383,15 +382,6 @@ fn frame_by_frame_and_reset() {
             dec.decode(&data[f.clone()], &mut out).unwrap();
         }
         assert_eq!(out, all, "{name}");
-        let k = fr.len() / 2;
-        let mut dec = Decoder::new(Output::Native);
-        let mut before = Vec::new();
-        dec.decode(&data[fr[0].start..fr[k].start], &mut before).unwrap();
-        dec.reset();
-        let mut after = Vec::new();
-        dec.decode(&data[fr[k].clone()], &mut after).unwrap();
-        let (_, fresh) = decode(&data[fr[k].clone()]);
-        assert_eq!(after, fresh, "{name}");
     }
 }
 

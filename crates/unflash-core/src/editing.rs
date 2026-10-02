@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::config::DetectorConfig;
-use crate::lut::lut;
-use crate::sections::{rate_is_guaranteed, safe_picture_rate, MAX_TARGET_FPS, RATE_SAFETY_MARGIN};
+use crate::lut::{lut, luminance};
+use crate::sections::{rate_is_guaranteed, safe_picture_rate, MAX_TARGET_FPS};
 use crate::temporal::{AnalysisResult, Violation, ViolationKind};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,19 +40,11 @@ impl FrameEdit {
     pub fn extended() -> Self {
         FrameEdit { removed: false, extended: true, fill: Fill::Prev }
     }
-    pub fn is_noop(&self) -> bool {
-        !self.removed && !self.extended
-    }
 }
 
 /// Marks by frame ordinal. JSON keys are strings ("12"), as in the
 /// reference's project files.
 pub type Edits = BTreeMap<usize, FrameEdit>;
-
-/// Marks without the no-ops.
-pub fn compact(edits: &Edits) -> Edits {
-    edits.iter().filter(|(_, e)| !e.is_noop()).map(|(k, e)| (*k, *e)).collect()
-}
 
 /// For each of a section's `n` frames, the ordinal whose picture it shows.
 ///
@@ -117,12 +109,6 @@ pub fn holds(rel_pts: &[f64], edits: &Edits, extension_seconds: f64, end: f64) -
         .collect()
 }
 
-/// How much later `holds` make a moment `t` of the source: the seconds of
-/// every hold at or before it.
-pub fn held_before(holds: &[Hold], t: f64) -> f64 {
-    holds.iter().take_while(|h| h.at <= t).map(|h| h.seconds).sum()
-}
-
 /// The section's edited timeline as (display_time, source_ordinal).
 /// Removed frames stand in for the survivor `replacement_map` picks; each
 /// frame comes as much later as the [`holds`] before it say.
@@ -162,7 +148,7 @@ pub fn picture_times(rel_pts: &[f64], edits: &Edits, extension_seconds: f64) -> 
 /// `gone` are slots already removed (they neither space nor consume the
 /// gap); `scope` restricts which slots may be removed (None = all). Frames
 /// outside the scope are kept and still set the pace.
-pub fn rate_limited_removals(
+fn rate_limited_removals(
     times: &[f64],
     min_gap: f64,
     scope: Option<&BTreeSet<usize>>,
@@ -202,7 +188,7 @@ pub fn flagged_frames(seq: &[(f64, usize)], violations: &[Violation]) -> Vec<usi
 }
 
 /// A context-aware simulation's violations split by where they land.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Classified {
     /// Overlapping the section: the ones its edits can act on.
     pub inside: Vec<Violation>,
@@ -247,16 +233,22 @@ pub fn classify(result: &AnalysisResult, end_disp: f64, next_at: Option<f64>, bo
     c
 }
 
+/// The flashing a check reports for the profile: every violation it
+/// reports but a pattern (not something removing frames can fix, so the
+/// suggesters leave patterns alone).
+fn flashing(result: &AnalysisResult) -> Vec<&Violation> {
+    result.violations.iter().filter(|v| v.kind != ViolationKind::Pattern && result.reports(v.kind)).collect()
+}
+
+/// Whether the stretch from `t0` to `t1` reaches a failing window (from a
+/// violation's onset to its end, a tenth of a second either side).
+fn reaches(failing: &[&Violation], t0: f64, t1: f64) -> bool {
+    failing.iter().any(|v| t1 >= v.onset.min(v.start) - 0.1 && t0 <= v.end + 0.1)
+}
+
 /// Time spans the suggester should work on, from each violation's onset.
-pub fn violation_spans(result: &AnalysisResult, pad: f64) -> Vec<(f64, f64)> {
-    // patterns are not something a frame removal can fix, so the suggesters
-    // leave them alone
-    let mut spans: Vec<(f64, f64)> = result
-        .violations
-        .iter()
-        .filter(|v| result.reports(v.kind) && v.kind != ViolationKind::Pattern)
-        .map(|v| (v.onset.min(v.start) - pad, v.end + pad))
-        .collect();
+fn violation_spans(result: &AnalysisResult, pad: f64) -> Vec<(f64, f64)> {
+    let mut spans: Vec<(f64, f64)> = flashing(result).into_iter().map(|v| (v.onset.min(v.start) - pad, v.end + pad)).collect();
     spans.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mut merged: Vec<(f64, f64)> = Vec::new();
     for (s, e) in spans {
@@ -269,7 +261,7 @@ pub fn violation_spans(result: &AnalysisResult, pad: f64) -> Vec<(f64, f64)> {
 }
 
 /// Union of the event windows inside a span (whole frame if none).
-pub fn span_bbox(result: &AnalysisResult, s: f64, e: f64, aw: u32, ah: u32) -> [u32; 4] {
+fn span_bbox(result: &AnalysisResult, s: f64, e: f64, aw: u32, ah: u32) -> [u32; 4] {
     let mut bb = [aw, ah, 0, 0];
     let mut found = false;
     for ev in &result.events {
@@ -298,7 +290,7 @@ pub trait FrameSource {
 }
 
 /// Mean relative luminance of the bbox region for each of the given frames.
-pub fn region_metric(frames: &dyn FrameSource, idxs: &[usize], bbox: [u32; 4]) -> Vec<f32> {
+fn region_metric(frames: &dyn FrameSource, idxs: &[usize], bbox: [u32; 4]) -> Vec<f32> {
     let t = lut();
     let w = frames.width() as usize;
     let bpp = frames.bpp();
@@ -311,7 +303,7 @@ pub fn region_metric(frames: &dyn FrameSource, idxs: &[usize], bbox: [u32; 4]) -
             for y in y0..y1 {
                 for x in x0..x1 {
                     let p = &f[(y * w + x) * bpp..];
-                    let l = 0.2126f32 * t[p[0] as usize] + 0.7152f32 * t[p[1] as usize] + 0.0722f32 * t[p[2] as usize];
+                    let l = luminance(t[p[0] as usize], t[p[1] as usize], t[p[2] as usize]);
                     sum += l as f64;
                 }
             }
@@ -321,7 +313,7 @@ pub fn region_metric(frames: &dyn FrameSource, idxs: &[usize], bbox: [u32; 4]) -
 }
 
 /// numpy.percentile with linear interpolation.
-pub fn percentile(vals: &[f32], p: f64) -> f32 {
+fn percentile(vals: &[f32], p: f64) -> f32 {
     if vals.is_empty() {
         return 0.0;
     }
@@ -394,6 +386,9 @@ struct Thin {
 /// removal it started from.
 const THIN_TRIES: usize = 3;
 
+/// Rounds of propose, simulate and escalate before the suggester gives up.
+const MAX_ROUNDS: usize = 5;
+
 /// What a suggester run produced.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Suggestion {
@@ -402,12 +397,6 @@ pub struct Suggestion {
     pub safe: bool,
     pub rounds: usize,
     pub note: String,
-    #[serde(default)]
-    pub fps: Option<f64>,
-    #[serde(default)]
-    pub safe_fps: Option<f64>,
-    #[serde(default)]
-    pub guaranteed: Option<bool>,
 }
 
 /// What the suggester wants next.
@@ -420,7 +409,7 @@ pub enum SuggestStep {
 }
 
 /// Keep-light / keep-dark: propose removals so the section passes.
-/// Iterates propose -> simulate -> escalate, up to 5 rounds.
+/// Iterates propose -> simulate -> escalate, up to `MAX_ROUNDS` rounds.
 pub struct Suggester {
     rel_pts: Vec<f64>,
     prefer: Prefer,
@@ -461,10 +450,6 @@ impl Suggester {
             attempt: 0,
             last_proposal: base_edits,
         }
-    }
-
-    pub fn max_rounds() -> usize {
-        5
     }
 
     /// For the fewest removals: once the removal passes, let frames back
@@ -635,7 +620,7 @@ impl Suggester {
     }
 
     fn step_restore(&mut self, result: &AnalysisResult) -> SuggestStep {
-        let failing: Vec<Violation> = result.violations.iter().filter(|v| v.kind != ViolationKind::Pattern && result.reports(v.kind)).cloned().collect();
+        let failing = flashing(result);
         let r = self.restore.as_ref().unwrap();
         let kept_side = if self.prefer == Prefer::Light { "light" } else { "dark" };
         if failing.is_empty() {
@@ -662,10 +647,7 @@ impl Suggester {
             let pulses = &r.pulses;
             let rel = &self.rel_pts;
             let before = r.restored.len();
-            r.restored.retain(|&k| {
-                let (t0, t1) = (rel[pulses[k][0]], rel[*pulses[k].last().unwrap()]);
-                !failing.iter().any(|v| t1 >= v.onset.min(v.start) - 0.1 && t0 <= v.end + 0.1)
-            });
+            r.restored.retain(|&k| !reaches(&failing, rel[pulses[k][0]], rel[*pulses[k].last().unwrap()]));
             if r.restored.len() == before {
                 // nothing to blame: fewer a second everywhere
                 r.fixed = false;
@@ -713,7 +695,12 @@ impl Suggester {
                 return SuggestStep::Simulate(self.last_proposal.clone());
             }
         }
-        SuggestStep::Done(Suggestion { edits: self.removals(), safe: true, rounds: self.attempt, note, fps: None, safe_fps: None, guaranteed: None })
+        self.done(true, note)
+    }
+
+    /// The suggestion: the removals so far, `safe` or not, and what to say.
+    fn done(&self, safe: bool, note: String) -> SuggestStep {
+        SuggestStep::Done(Suggestion { edits: self.removals(), safe, rounds: self.attempt, note })
     }
 
     /// The runs of removed frames with room for frames `gap` apart, and
@@ -763,9 +750,8 @@ impl Suggester {
     }
 
     fn step_thin(&mut self, result: &AnalysisResult) -> SuggestStep {
-        let failing: Vec<Violation> = result.violations.iter().filter(|v| v.kind != ViolationKind::Pattern && result.reports(v.kind)).cloned().collect();
+        let failing = flashing(result);
         let mut th = self.thin.take().unwrap();
-        let done = |s: &Self, note: String| SuggestStep::Done(Suggestion { edits: s.removals(), safe: true, rounds: s.attempt, note, fps: None, safe_fps: None, guaranteed: None });
         if failing.is_empty() {
             let runs = th.live.len();
             let back: usize = th.live.iter().map(|&k| th.runs[k].back.len()).sum();
@@ -779,19 +765,19 @@ impl Suggester {
                 self.removed.len()
             );
             self.thin = Some(th);
-            return done(self, note);
+            return self.done(true, note);
         }
         self.attempt += 1;
         th.tries += 1;
         let before = th.live.len();
         let runs = &th.runs;
-        th.live.retain(|&k| !failing.iter().any(|v| runs[k].t1 >= v.onset.min(v.start) - 0.1 && runs[k].t0 <= v.end + 0.1));
+        th.live.retain(|&k| !reaches(&failing, runs[k].t0, runs[k].t1));
         if th.live.len() == before || th.live.is_empty() || th.tries >= THIN_TRIES {
             // nothing to blame, nothing left, or enough tries: as it was
             self.removed = th.base.clone();
             let note = th.note.clone();
             self.thin = Some(th);
-            return done(self, note);
+            return self.done(true, note);
         }
         self.thin = Some(th);
         self.apply_thin();
@@ -826,7 +812,7 @@ impl Suggester {
         if self.restore.is_some() {
             return self.step_restore(result);
         }
-        let flashes_ok = result.violations.iter().all(|v| v.kind == ViolationKind::Pattern || !result.reports(v.kind));
+        let flashes_ok = flashing(result).is_empty();
         // the fewest removals: a passing removal first, then flashes put back
         if flashes_ok && self.fewest && self.attempt > 0 && !self.removed.is_empty() {
             return self.start_restore();
@@ -846,17 +832,10 @@ impl Suggester {
                 };
                 note.push_str(" A regular pattern (stripes) remains; removing frames cannot fix that. Turn on “soften stripes” for this section instead.");
             }
-            return SuggestStep::Done(Suggestion {
-                edits: if self.attempt == 0 { Edits::new() } else { self.removals() },
-                safe: true,
-                rounds: self.attempt,
-                note,
-                fps: None,
-                safe_fps: None,
-                guaranteed: None,
-            });
+            // (nothing is removed before the first round)
+            return self.done(true, note);
         }
-        if self.attempt >= Self::max_rounds() {
+        if self.attempt >= MAX_ROUNDS {
             let note = format!(
                 "Still failing after {} removals. {}",
                 self.removed.len(),
@@ -868,15 +847,7 @@ impl Suggester {
                     "Edit this one by hand."
                 }
             );
-            return SuggestStep::Done(Suggestion {
-                edits: self.removals(),
-                safe: false,
-                rounds: self.attempt,
-                note,
-                fps: None,
-                safe_fps: None,
-                guaranteed: None,
-            });
+            return self.done(false, note);
         }
         if self.fewest && self.attempt == 0 {
             self.prefer = self.pick_side(frames, result);
@@ -907,8 +878,10 @@ pub fn flash_frames(rel_pts: Vec<f64>, frames: &dyn FrameSource, result: &Analys
 }
 
 /// A "reduce FPS" proposal: removals that thin the section down to `fps`
-/// pictures a second, from timestamps alone.
-#[derive(Clone, Debug, PartialEq)]
+/// pictures a second, from timestamps alone. (Read back with every field
+/// optional, as the page hands it back to [`rate_note`].)
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RateProposal {
     /// Base edits (outside the scope) plus the thinning removals: what to
     /// simulate.
@@ -939,7 +912,7 @@ pub fn rate_proposal(
     if n == 0 {
         return Err("Section has no frames".into());
     }
-    let (safe_fps, safe_gap) = safe_picture_rate(cfg, RATE_SAFETY_MARGIN);
+    let (safe_fps, safe_gap) = safe_picture_rate(cfg);
     let (fps, min_gap) = match fps {
         None => {
             if safe_fps <= 0.0 {
@@ -1022,7 +995,7 @@ pub fn rate_note(p: &RateProposal, safe: bool) -> String {
 }
 
 /// Python's `{:g}`-ish formatting for rates.
-pub fn fmt_g(x: f64) -> String {
+fn fmt_g(x: f64) -> String {
     if (x - x.round()).abs() < 1e-9 {
         format!("{}", x.round() as i64)
     } else {
@@ -1077,15 +1050,17 @@ mod tests {
         let hs = holds(&pts, &e, 1.0, end);
         // frame 2 holds until frame 3's time, 9 until 10's, the last until the end; a removed frame holds nothing
         assert_eq!(hs, vec![Hold { at: pts[3], seconds: 1.0 }, Hold { at: pts[10], seconds: 1.0 }, Hold { at: end, seconds: 1.0 }]);
+        // how much later the holds make a moment of the source: every hold at or before it
+        let held_before = |t: f64| hs.iter().take_while(|h| h.at <= t).map(|h| h.seconds).sum::<f64>();
         let seq = edited_sequence(&pts, &e, 1.0);
         for (i, &(t, _)) in seq.iter().enumerate() {
-            assert_eq!(t, pts[i] + held_before(&hs, pts[i]), "frame {i}");
+            assert_eq!(t, pts[i] + held_before(pts[i]), "frame {i}");
         }
         assert_eq!(seq[3].0 - seq[2].0, 1.0 + 1.0 / 30.0);
         // the last frame's hold is counted: everything after the section comes three seconds late
         assert_eq!(hs.iter().map(|h| h.seconds).sum::<f64>(), 3.0);
-        assert_eq!(held_before(&hs, end), 3.0);
-        assert_eq!(held_before(&hs, pts[3] - 1e-9), 0.0);
+        assert_eq!(held_before(end), 3.0);
+        assert_eq!(held_before(pts[3] - 1e-9), 0.0);
     }
 
     #[test]

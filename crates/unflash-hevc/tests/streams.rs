@@ -24,10 +24,9 @@ fn samples(name: &str) -> (Vec<u8>, Vec<(Vec<u8>, f64)>) {
 }
 
 /// Decode a file; every picture in presentation order.
-fn decode(name: &str, fast: bool) -> Result<Vec<Frame>, Error> {
+fn decode(name: &str) -> Result<Vec<Frame>, Error> {
     let (config, samples) = samples(name);
     let mut dec = Decoder::new(&config)?;
-    dec.set_fast(fast);
     let mut frames = Vec::new();
     for (bytes, pts) in &samples {
         let got = dec.decode(bytes, *pts)?;
@@ -44,7 +43,7 @@ fn expected(name: &str) -> Vec<String> {
 }
 
 fn check(name: &str) {
-    let got = decode(name, false).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let got = decode(name).unwrap_or_else(|e| panic!("{name}: {e}"));
     let want = expected(name);
     assert_eq!(got.len(), want.len(), "{name}: frame count");
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -120,7 +119,7 @@ fn main10_weighted_lossless() {
 
 #[test]
 fn monochrome() {
-    let got = decode("mono", false).unwrap();
+    let got = decode("mono").unwrap();
     let want = expected("mono");
     assert_eq!(got.len(), want.len(), "mono: frame count");
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -133,21 +132,11 @@ fn monochrome() {
 
 #[test]
 fn ten_bit_frames_carry_rounded_eight_bit_planes() {
-    for f in decode("main10", false).unwrap() {
+    for f in decode("main10").unwrap() {
         assert_eq!(f.bit_depth, 10);
         let y16 = f.y16.as_ref().unwrap();
         assert_eq!(y16.len(), f.y.len());
         assert!(y16.iter().zip(&f.y).all(|(&h, &l)| ((h + 2) >> 2).min(255) as u8 == l));
-    }
-}
-
-#[test]
-fn fast_mode_decodes_every_picture() {
-    for name in ["b_pyramid", "slices", "main10"] {
-        let fast = decode(name, true).unwrap();
-        let exact = decode(name, false).unwrap();
-        assert_eq!(fast.len(), exact.len(), "{name}");
-        assert!(fast.iter().zip(&exact).all(|(a, b)| a.width == b.width && a.height == b.height && !a.damaged), "{name}");
     }
 }
 
@@ -170,9 +159,8 @@ fn damaged_streams_do_not_panic() {
     let mut rng = Lcg(1);
     for name in names {
         let (config, samples) = samples(name);
-        for round in 0..24 {
+        for _ in 0..24 {
             let mut dec = Decoder::new(&config).unwrap();
-            dec.set_fast(round % 5 == 4);
             for (i, (bytes, pts)) in samples.iter().enumerate() {
                 let mut b = bytes.clone();
                 match rng.next() % 8 {

@@ -659,11 +659,6 @@ export function annexbToLengthPrefixed(b) {
   return { bytes: out, sps, pps };
 }
 
-/** An avcC record (4-byte NAL lengths) for one SPS and one PPS. */
-export function avcRecordOf(sps, pps) {
-  return Uint8Array.from([1, sps[1], sps[2], sps[3], 0xff, 0xe1, sps.length >> 8, sps.length & 255, ...sps, 1, pps.length >> 8, pps.length & 255, ...pps]);
-}
-
 // ---- one re-encoded piece --------------------------------------------------------
 
 /**
@@ -709,12 +704,13 @@ class PieceEncoder {
         chunk.copyTo(buf);
         // H.264 with no avcC record is Annex B (the WebCodecs rule): MP4 wants
         // lengths in front of its NAL units, and a record, which the first
-        // keyframe's parameter sets make
+        // keyframe's parameter sets make (with a High profile's chroma format
+        // and bit depths after them)
         if (/^avc[13]/.test(this.codec) && !this.description && (this.annexb || startsWithStartCode(buf))) {
           this.annexb = true;
           const conv = annexbToLengthPrefixed(buf);
           buf = conv.bytes;
-          if (conv.sps && conv.pps && !this.madeDescription) this.madeDescription = avcRecordOf(conv.sps, conv.pps);
+          if (conv.sps && conv.pps && !this.madeDescription) this.madeDescription = movie.wasm.avcc_record(conv.sps, conv.pps) || null;
         }
         this.chunks.push({ pts: chunk.timestamp, sync: chunk.type === 'key', bytes: buf, desc: this.description || this.madeDescription || null, codec: this.codec });
       },

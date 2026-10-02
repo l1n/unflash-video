@@ -38,7 +38,6 @@ struct Params {
 };
 
 const MODE_FIRST: u32 = 1u;
-const MODE_HELD: u32 = 2u;
 const MODE_SATURATE: u32 = 4u;
 const AGE_MAX: u32 = 1073741824u;
 const K: u32 = {{K}};
@@ -54,7 +53,6 @@ const GEO_NGX: u32 = 6u;
 const GEO_NGY: u32 = 7u;
 const GEO_GXS: u32 = 8u;
 const GEO_GYS: u32 = 72u;
-const GEO_MAX_POS: u32 = 64u;
 // half-extent of the pattern pass's line family (core::pattern::line_radius)
 const GEO_PAT_R: u32 = 136u;
 
@@ -103,9 +101,9 @@ const DIR_MASK: u32 = 3u;
 const UP: u32 = 1u;
 const DN: u32 = 2u;
 
-// output buffer: header words (frame luminance, moved pixels, now, mode,
-// pattern pixels, pattern spacing sum, pattern spacing count) then 12 words
-// per grid cell
+// output buffer: header words (frame luminance, moved pixels, two unused,
+// pattern pixels, pattern spacing sum, pattern spacing count, one unused)
+// then 12 words per grid cell
 const OUT_HEADER: u32 = 8u;
 const CELL_WORDS: u32 = 12u;
 

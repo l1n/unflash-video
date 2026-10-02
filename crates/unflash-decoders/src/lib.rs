@@ -1,13 +1,13 @@
 //! The built-in decoders for the codecs a browser's WebCodecs may lack
 //! (HEVC, VP9, VP8 and AV1; H.264's is in the main module; and the sound
-//! decoders for AC-3 and E-AC-3, `Ac3Decoder`, and for DTS, `DtsDecoder`),
-//! as a WebAssembly module of their own: the page loads it only for a file
-//! that needs one, and each decode worker (`web/softworker.js`) runs one
-//! decoder over a group of pictures at a time. Every decoder gives 8-bit
-//! 4:2:0 pictures (deeper ones rounded), bit-exact with ffmpeg's for what it
-//! supports; here each is made the detector's size (`set_shrink`, from the
-//! decoder's own planes, as the GPU would convert and shrink it) or copied
-//! out as packed I420.
+//! decoders for AC-3, E-AC-3 and DTS, `SoundDecoder`), as a WebAssembly
+//! module of their own: the page loads it only for a file that needs one,
+//! and each decode worker (`web/softworker.js`) runs one decoder over a
+//! group of pictures at a time. Every decoder gives 8-bit 4:2:0 pictures
+//! (deeper ones rounded), bit-exact with ffmpeg's for what it supports; here
+//! each is made the detector's size (`set_shrink`, from the decoder's own
+//! planes, as a decode worker makes a browser decoder's picture small) or
+//! copied out as packed I420.
 
 use std::collections::VecDeque;
 
@@ -55,28 +55,12 @@ impl Inner {
     /// A decoder for `codec` (the app's name: hevc, vp9, vp8, av1) and the
     /// track's configuration record (hvcC, vpcC, av1C or Matroska's
     /// CodecPrivate; may be empty).
-    fn new(codec: &str, config: &[u8], fast: bool) -> Result<Inner, String> {
+    fn new(codec: &str, config: &[u8]) -> Result<Inner, String> {
         Ok(match codec {
-            "hevc" => {
-                let mut d = unflash_hevc::Decoder::new(config).map_err(|x| x.to_string())?;
-                d.set_fast(fast);
-                Inner::Hevc(d)
-            }
-            "vp9" => {
-                let mut d = unflash_vp9::Decoder::new(config).map_err(|x| x.to_string())?;
-                d.set_fast(fast);
-                Inner::Vp9(d)
-            }
-            "vp8" => {
-                let mut d = unflash_vp8::Decoder::new(config).map_err(|x| x.to_string())?;
-                d.set_fast(fast);
-                Inner::Vp8(d)
-            }
-            "av1" => {
-                let mut d = unflash_av1::Decoder::new(config).map_err(|x| x.to_string())?;
-                d.set_fast(fast);
-                Inner::Av1(d)
-            }
+            "hevc" => Inner::Hevc(unflash_hevc::Decoder::new(config).map_err(|x| x.to_string())?),
+            "vp9" => Inner::Vp9(unflash_vp9::Decoder::new(config).map_err(|x| x.to_string())?),
+            "vp8" => Inner::Vp8(unflash_vp8::Decoder::new(config).map_err(|x| x.to_string())?),
+            "av1" => Inner::Av1(unflash_av1::Decoder::new(config).map_err(|x| x.to_string())?),
             other => return Err(format!("there is no built-in decoder for {other}")),
         })
     }
@@ -134,11 +118,10 @@ pub struct SoftDecoder {
 #[wasm_bindgen]
 impl SoftDecoder {
     /// A decoder for `codec` (hevc, vp9, vp8 or av1) and the track's
-    /// configuration record (`config`). `fast` leaves the in-loop filters
-    /// out: pictures good for statistics, not for showing or re-encoding.
+    /// configuration record (`config`).
     #[wasm_bindgen(constructor)]
-    pub fn new(codec: &str, config: &[u8], fast: bool) -> Result<SoftDecoder, JsValue> {
-        Ok(SoftDecoder { inner: Inner::new(codec, config, fast).map_err(js_err)?, ready: VecDeque::new(), cur: None, frame: Vec::new(), shrink: None, shrinker: None, small: Vec::new() })
+    pub fn new(codec: &str, config: &[u8]) -> Result<SoftDecoder, JsValue> {
+        Ok(SoftDecoder { inner: Inner::new(codec, config).map_err(js_err)?, ready: VecDeque::new(), cur: None, frame: Vec::new(), shrink: None, shrinker: None, small: Vec::new() })
     }
 
     /// From now on make each picture `analysis_width`×`analysis_height`
@@ -177,10 +160,7 @@ impl SoftDecoder {
         let cw = w.div_ceil(2);
         match self.shrink {
             Some((aw, ah)) => {
-                if !self.shrinker.as_ref().is_some_and(|k| k.fits(p.width, p.height, aw, ah)) {
-                    self.shrinker = Some(Shrink::new(p.width, p.height, aw, ah));
-                }
-                let k = self.shrinker.as_mut().unwrap();
+                let k = Shrink::reuse(&mut self.shrinker, p.width, p.height, aw, ah);
                 k.yuv420_planes(&p.y, w, &p.u, cw, &p.v, cw, p.bt709, p.full_range, &mut self.small);
             }
             None => {
@@ -229,101 +209,50 @@ impl SoftDecoder {
 }
 
 /// Whether the built-in decoder for `codec` can take a track with this
-/// configuration record: JSON ({ codec, reorder }) or an error saying why
-/// not (an unsupported profile, say).
+/// configuration record: an empty JSON object (the page reads nothing from
+/// it), or an error saying why not (an unsupported profile, say).
 #[wasm_bindgen]
 pub fn probe(codec: &str, config: &[u8]) -> Result<String, JsValue> {
-    let d = Inner::new(codec, config, false).map_err(js_err)?;
-    Ok(serde_json::json!({ "codec": codec, "reorder": d.reorder_depth() }).to_string())
+    Inner::new(codec, config).map_err(js_err)?;
+    Ok("{}".into())
 }
 
-/// The AC-3 and E-AC-3 (Dolby Digital, Dolby Digital Plus) sound decoder,
-/// for the sound no browser's WebCodecs decodes: the section player plays
-/// it and the export re-encodes it (`web/audiodec.js`). Each `decode` takes
-/// a whole number of sync frames (an MP4 sample, a Matroska block) and
-/// gives their samples as f32 planes, one after the other, as an AudioData
-/// of format f32-planar takes them.
+/// The sound no browser's WebCodecs decodes, for the section player to play
+/// and the export to re-encode (`web/audiodec.js`): AC-3 and E-AC-3 (Dolby
+/// Digital, Dolby Digital Plus), and DTS (the core of DTS Coherent
+/// Acoustics, which every DTS, DTS-ES and DTS-HD stream with a core
+/// carries; DTS-HD's extensions are stepped over, and a stream without a
+/// core, DTS-HD Master Audio or DTS Express without one, is an error that
+/// says so). Each `decode` takes a whole number of frames (an MP4 sample, a
+/// Matroska block, a transport stream's PES payload) and gives their
+/// samples mixed down to stereo (DTS's Lo/Ro with the stream's own
+/// coefficients when it has them) as f32 planes, one after the other, as an
+/// AudioData of format f32-planar takes them.
 #[wasm_bindgen]
-pub struct Ac3Decoder {
-    dec: unflash_ac3::Decoder,
+pub struct SoundDecoder {
+    dec: Sound,
     out: Vec<Vec<f32>>,
-    last: unflash_ac3::Decoded,
+    samples: usize,
     rate: u32,
 }
 
-#[wasm_bindgen]
-impl Ac3Decoder {
-    /// A decoder; with `stereo`, every stream comes out mixed down to two channels.
-    #[wasm_bindgen(constructor)]
-    pub fn new(stereo: bool) -> Ac3Decoder {
-        let output = if stereo { unflash_ac3::Output::Stereo } else { unflash_ac3::Output::Native };
-        Ac3Decoder { dec: unflash_ac3::Decoder::new(output), out: Vec::new(), last: unflash_ac3::Decoded::default(), rate: 0 }
-    }
-
-    /// Decode `data`'s sync frames: every channel's samples, one plane after another.
-    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<f32>, JsValue> {
-        for plane in &mut self.out {
-            plane.clear();
-        }
-        self.last = self.dec.decode(data, &mut self.out).map_err(js_err)?;
-        if let Some(info) = self.dec.info() {
-            self.rate = info.sample_rate;
-        }
-        Ok(self.out.iter().flat_map(|p| p.iter().copied()).collect())
-    }
-
-    /// Samples each channel had in the last `decode`.
-    pub fn samples(&self) -> u32 {
-        self.last.samples as u32
-    }
-
-    /// Sync frames of the last `decode` that came out as silence (damaged).
-    pub fn damaged(&self) -> u32 {
-        self.last.damaged
-    }
-
-    /// Channels of the last `decode`'s output.
-    pub fn channels(&self) -> u32 {
-        self.out.len() as u32
-    }
-
-    /// The sample rate (Hz) of the last frame decoded.
-    pub fn sample_rate(&self) -> u32 {
-        self.rate
-    }
-
-    /// Forget the previous frame's overlap (after a seek).
-    pub fn reset(&mut self) {
-        self.dec.reset();
-    }
-}
-
-/// The DTS sound decoder (the core of DTS Coherent Acoustics, which every
-/// DTS, DTS-ES and DTS-HD stream with a core carries; DTS-HD's extensions
-/// are stepped over), for the sound no browser's WebCodecs decodes: the
-/// section player plays it and the export re-encodes it
-/// (`web/audiodec.js`). Each `decode` takes a whole number of frames (an
-/// MP4 sample, a Matroska block, a transport stream's PES payload) and
-/// gives their samples as f32 planes, one after the other, as an AudioData
-/// of format f32-planar takes them: 512 samples a frame, as a rule, in
-/// WAVE order (L R C LFE Ls Rs). A stream without a core (DTS-HD Master
-/// Audio or DTS Express without one) is an error that says so.
-#[wasm_bindgen]
-pub struct DtsDecoder {
-    dec: unflash_dts::Decoder,
-    out: Vec<Vec<f32>>,
-    last: unflash_dts::Decoded,
-    rate: u32,
+enum Sound {
+    // (boxed: the decoders' states differ in size, about 20 and 5 KB)
+    Ac3(Box<unflash_ac3::Decoder>),
+    Dts(Box<unflash_dts::Decoder>),
 }
 
 #[wasm_bindgen]
-impl DtsDecoder {
-    /// A decoder; with `stereo`, every stream comes out mixed down to two
-    /// channels (Lo/Ro: with the stream's own coefficients when it has them).
+impl SoundDecoder {
+    /// A decoder for `codec`: `ac3` (AC-3 and E-AC-3) or `dts`.
     #[wasm_bindgen(constructor)]
-    pub fn new(stereo: bool) -> DtsDecoder {
-        let output = if stereo { unflash_dts::Output::Stereo } else { unflash_dts::Output::Native };
-        DtsDecoder { dec: unflash_dts::Decoder::new(output), out: Vec::new(), last: unflash_dts::Decoded::default(), rate: 0 }
+    pub fn new(codec: &str) -> Result<SoundDecoder, JsValue> {
+        let dec = match codec {
+            "ac3" => Sound::Ac3(Box::new(unflash_ac3::Decoder::new(unflash_ac3::Output::Stereo))),
+            "dts" => Sound::Dts(Box::new(unflash_dts::Decoder::new(unflash_dts::Output::Stereo))),
+            other => return Err(js_err(format!("there is no built-in sound decoder for {other}"))),
+        };
+        Ok(SoundDecoder { dec, out: Vec::new(), samples: 0, rate: 0 })
     }
 
     /// Decode `data`'s frames: every channel's samples, one plane after another.
@@ -331,21 +260,20 @@ impl DtsDecoder {
         for plane in &mut self.out {
             plane.clear();
         }
-        self.last = self.dec.decode(data, &mut self.out).map_err(js_err)?;
-        if let Some(info) = self.dec.info() {
-            self.rate = info.sample_rate;
+        let (samples, rate) = match &mut self.dec {
+            Sound::Ac3(d) => (d.decode(data, &mut self.out).map_err(js_err)?.samples, d.info().map(|i| i.sample_rate)),
+            Sound::Dts(d) => (d.decode(data, &mut self.out).map_err(js_err)?.samples, d.info().map(|i| i.sample_rate)),
+        };
+        self.samples = samples;
+        if let Some(rate) = rate {
+            self.rate = rate;
         }
         Ok(self.out.iter().flat_map(|p| p.iter().copied()).collect())
     }
 
     /// Samples each channel had in the last `decode`.
     pub fn samples(&self) -> u32 {
-        self.last.samples as u32
-    }
-
-    /// Frames of the last `decode` that came out as silence (damaged).
-    pub fn damaged(&self) -> u32 {
-        self.last.damaged
+        self.samples as u32
     }
 
     /// Channels of the last `decode`'s output.
@@ -353,14 +281,10 @@ impl DtsDecoder {
         self.out.len() as u32
     }
 
-    /// The sample rate (Hz) of the last frame decoded.
+    /// The sample rate (Hz) of the last frame decoded (0 before a frame has
+    /// decoded: those before came out as silence).
     pub fn sample_rate(&self) -> u32 {
         self.rate
-    }
-
-    /// Forget the filter banks' and predictors' history (after a seek).
-    pub fn reset(&mut self) {
-        self.dec.reset();
     }
 }
 

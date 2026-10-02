@@ -10,7 +10,7 @@
 use std::time::Instant;
 
 use unflash_core::config::{DetectorConfig, Profile};
-use unflash_core::detector::{CpuStage, PixelStage};
+use unflash_core::detector::CpuStage;
 use unflash_core::grid::{FrameInput, GridGeometry};
 use unflash_core::pixel::MODE_FIRST;
 use unflash_core::time::secs_to_us;

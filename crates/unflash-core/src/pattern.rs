@@ -121,7 +121,8 @@ struct LineState {
     /// number of extrema pushed (the ring holds the last RING of them)
     n_ext: u32,
     marked_upto: i32,
-    /// the stretch currently being marked started at this extremum ordinal
+    /// a qualifying stretch is open (a run that keeps it going adds only
+    /// its own spacing to the statistics)
     in_stretch: bool,
     pub spacing_sum: u32,
     pub spacing_n: u32,

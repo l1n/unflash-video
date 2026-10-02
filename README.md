@@ -408,17 +408,19 @@ oldest transition still feeding a failure window. That is the whole
 bandwidth story: **one pass over the pixel state per frame**, no
 intermediate images, nothing per pixel read back.
 
-The GPU version runs four dispatches per frame — an ingest pass that area-
+The GPU version runs five dispatches per frame — an ingest pass that area-
 averages the source (any size, straight from a `VideoFrame`) into the
 analysis model and linearises it through the same sRGB table the CPU uses,
-the update pass, a row pass and a gather pass — and copies the few-kilobyte
-result into one of a ring of staging buffers, so several frames are in
-flight while the CPU handles the rest. The reduction passes use no
-workgroup barriers: on a real GPU they are latency-bound and take tens of
-microseconds; on a software implementation (SwiftShader, lavapipe) they are
-merely slow rather than pathological.
+a pass counting the pixels that moved since the last new picture, the
+update pass, a row pass and a gather pass, with one more converting a
+picture handed over as YUV planes to RGB first — and copies the
+few-kilobyte result into one of a ring of staging buffers, so several
+frames are in flight while the CPU handles the rest. The reduction passes
+use no workgroup barriers: on a real GPU they are latency-bound and take
+tens of microseconds; on a software implementation (SwiftShader, lavapipe)
+they are merely slow rather than pathological.
 
-The **pattern stage** (`crates/unflash-core/src/pattern.rs`, and a fifth
+The **pattern stage** (`crates/unflash-core/src/pattern.rs`, and a sixth
 dispatch on the GPU) looks for stationary hazards the flash detector cannot
 see: regular stripes and gratings. It walks the luminance plane along
 parallel lines in eight orientations with the same monotonic-run tracker,
@@ -623,16 +625,20 @@ decodes with WebCodecs, copies each picture out (its planes, or its RGB
 pixels) straight into the WebAssembly module's memory and makes it the
 detector's size there (`resample::Shrink`: the boxes of the GPU's ingest
 pass, summed exactly in integers, rows first so the sums vectorise, YUV
-converted a row at a time with the GPU's arithmetic), and the page gets
-128 KB a frame instead of the whole picture. The YUV conversion is written
-for the vector unit: each chroma sample's terms are worked out once for
-the two rows that share them, each row goes to three planes (R, G, B)
-sixteen samples at a time in WebAssembly SIMD (a shuffle spreads each
-chroma term over its two samples, and the saturating narrowing from 32 to
-8 bits is the clamp), and each average is divided by a multiply and a
-shift instead of a division (`Divider`). A 1920×960 picture takes 3.7 ms
-in WebAssembly, 10 before; `tests/e2e/shrink.mjs` holds the WebAssembly
-build to a plain JavaScript statement of the arithmetic, value for value. That upload was most of a
+converted a row at a time with the GPU's coefficients in 16.16 fixed
+point, which agree with its floating point but for rounding at exact
+halves), and the page gets 128 KB a frame instead of the whole picture.
+(The CPU detector makes a picture it is handed whole small the same way,
+so what it finds does not depend on where pictures were made small.) The
+YUV conversion is written for the vector unit: each chroma sample's terms
+are worked out once for the two rows that share them, each row goes to
+three planes (R, G, B) sixteen samples at a time in WebAssembly SIMD (a
+shuffle spreads each chroma term over its two samples, and the saturating
+narrowing from 32 to 8 bits is the clamp), and each average is divided by
+a multiply and a shift instead of a division (`Divider`). A 1920×960
+picture takes 3.7 ms in WebAssembly, 10 before; `tests/e2e/shrink.mjs`
+holds the WebAssembly build to a plain JavaScript statement of the
+arithmetic, value for value. That upload was most of a
 scan in Firefox, where it also crosses to a separate GPU process: an hour
 of 1920×960 took 172 s of a 269 s scan uploading 7 MB pictures. The
 browser test prepares a section both ways and requires the same cached

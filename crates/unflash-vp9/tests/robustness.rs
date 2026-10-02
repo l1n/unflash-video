@@ -100,7 +100,6 @@ fn corrupt_streams_do_not_panic() {
             let mut s = samples.clone();
             mutate(&mut rng, &mut s, &all);
             let mut dec = Decoder::new(&[]).unwrap();
-            dec.set_fast(round % 4 == 3);
             let mut frames = 0;
             for sample in &s {
                 if let Ok(f) = dec.decode(sample, 0.0) {

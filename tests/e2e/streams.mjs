@@ -118,9 +118,13 @@ function flashesAsInTheMp4(name, v) {
   assert(red && red.start > 7.5 && red.start < 8.6 && red.end > 8.2 && red.end < 8.8, `${name}: red flash at 7.9-8.5 s: ${JSON.stringify(red)}`);
 }
 
-/** The open video's sound, decoded as the section player and the export decode it: seconds of it, and its peak. */
-const decodedSound = () =>
-  page.evaluate(async () => {
+/**
+ * The open video's sound, decoded as the section player and the export
+ * decode it: seconds of it, and its peak; with `damageFirst`, a byte in the
+ * middle of its first chunk flipped (`first`: that chunk's sound).
+ */
+const decodedSound = (damageFirst = false) =>
+  page.evaluate(async (damageFirst) => {
     const { soundConfig, soundDecoderFor } = await import('./audiodec.js');
     const m = window.__unflash.state.movie;
     const at = m.audio;
@@ -132,11 +136,13 @@ const decodedSound = () =>
     let rate = 0;
     let channels = 0;
     let error = null;
+    let first = null;
     const dec = new found.Decoder({
       output: (d) => {
         const x = new Float32Array(d.numberOfFrames);
         d.copyTo(x, { planeIndex: 0, format: 'f32-planar' });
         for (const v of x) peak = Math.max(peak, Math.abs(v));
+        if (!first) first = { rate: d.sampleRate, frames: d.numberOfFrames, peak: x.reduce((p, v) => Math.max(p, Math.abs(v)), 0) };
         frames += d.numberOfFrames;
         rate = d.sampleRate;
         channels = d.numberOfChannels;
@@ -147,14 +153,15 @@ const decodedSound = () =>
     dec.configure(soundConfig(at, m.dx.track_description(at.index)));
     const reader = m.reader.fork();
     for (let i = 0; i < a.offset.length; i++) {
-      const bytes = await reader.read(a.offset[i], a.size[i]);
-      dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: a.pts[i], duration: a.dur[i], data: bytes.slice() }));
+      const bytes = (await reader.read(a.offset[i], a.size[i])).slice();
+      if (damageFirst && i === 0) bytes[bytes.length >> 1] ^= 0xff;
+      dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: a.pts[i], duration: a.dur[i], data: bytes }));
     }
     await dec.flush();
     dec.close();
     if (error) return { error: String(error.message || error) };
-    return { builtIn: found.builtIn ? found.name : '', seconds: frames / rate, peak, rate, channels };
-  });
+    return { builtIn: found.builtIn ? found.name : '', seconds: frames / rate, peak, rate, channels, first, firstChunk: a.size[0] };
+  }, damageFirst);
 
 /** Export the open video as it is (no sections: every frame copied); the export's notes and its sound. */
 async function exportAsItIs() {
@@ -215,6 +222,12 @@ try {
   results.m2tsSound = await decodedSound();
   console.log('flash_ac3.m2ts sound:', JSON.stringify(results.m2tsSound));
   assert(results.m2tsSound.builtIn === 'AC-3' && Math.abs(results.m2tsSound.seconds - 10) < 0.1 && results.m2tsSound.peak > 0.1, `the AC-3 sound decodes, by the app's own decoder, to ten seconds of tone: ${JSON.stringify(results.m2tsSound)}`);
+  // a first chunk whose one frame is damaged comes out as silence, at the
+  // track's rate: the decoder has read none yet (an AudioData at 0 Hz threw)
+  results.m2tsDamaged = await decodedSound(true);
+  console.log('flash_ac3.m2ts sound, its first frame damaged:', JSON.stringify(results.m2tsDamaged));
+  const df = results.m2tsDamaged.first;
+  assert(!results.m2tsDamaged.error && results.m2tsSound.first.peak > 0 && df && df.rate === 48000 && df.peak === 0 && df.frames === results.m2tsSound.first.frames && Math.abs(results.m2tsDamaged.seconds - 10) < 0.1, `a damaged first frame plays as silence at 48 kHz: ${JSON.stringify(results.m2tsDamaged)}`);
   results.m2tsExport = await exportAsItIs();
   console.log('flash_ac3.m2ts export:', JSON.stringify(results.m2tsExport));
   assert(/audio is copied/.test(results.m2tsExport.plan) && results.m2tsExport.exported.frames === 300 && results.m2tsExport.exported.audio === 'ac-3' && Math.abs(results.m2tsExport.exported.seconds - 10) < 0.1, `the export copies the pictures and the AC-3 sound: ${JSON.stringify(results.m2tsExport)}`);

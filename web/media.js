@@ -838,16 +838,7 @@ async function decodeRangeSoftware(movie, startSec, endSec, onFrame, { cancel, o
   const dec = new movie.wasm.H264Decoder(movie.dx.track_description(movie.video.index), fast);
   // pictures for the detector alone made small here, as the workers make them
   const small = smallSize(raw, shrink);
-  if (small) {
-    let colorSpace = null;
-    try {
-      colorSpace = JSON.parse(dec.color_json());
-    } catch (e) {
-      /* default colour space */
-    }
-    const words = yuvLayoutWords('I420', [{ offset: 0, stride: 0 }, { offset: 0, stride: 0 }, { offset: 0, stride: 0 }], colorSpace, dec.height());
-    dec.set_shrink(small.aw, small.ah, words[7] === 1, words[8] === 1);
-  }
+  if (small) dec.set_shrink(small.aw, small.ah);
   // presentation order of the samples this pass will decode
   const ptsSorted = [];
   for (let i = startIdx; i < n; i++) {

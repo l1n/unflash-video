@@ -4,7 +4,7 @@
 // `shrink`, made the detector's size here straight from the decoder's own
 // picture, so the full-size picture never leaves WebAssembly memory.
 import init, * as wasm from './pkg/unflash.js';
-import { ChunkReader, yuvLayoutWords } from './media.js';
+import { ChunkReader } from './media.js';
 
 const ready = init();
 let desc = null;
@@ -48,17 +48,8 @@ async function run(job) {
   let dec;
   try {
     dec = new wasm.H264Decoder(desc, !!fast);
-    if (shrink) {
-      // the colour conversion the page would pick for these pictures
-      let colorSpace = null;
-      try {
-        colorSpace = JSON.parse(dec.color_json());
-      } catch (e) {
-        /* default colour space */
-      }
-      const words = yuvLayoutWords('I420', [{ offset: 0, stride: 0 }, { offset: 0, stride: 0 }, { offset: 0, stride: 0 }], colorSpace, dec.height());
-      dec.set_shrink(shrink.aw, shrink.ah, words[7] === 1, words[8] === 1);
-    }
+    // (the decoder converts with the matrix and range the page would pick)
+    if (shrink) dec.set_shrink(shrink.aw, shrink.ah);
   } catch (e) {
     postMessage({ type: 'done', id, emitted: 0, damaged: pts.length, decodeMs: 0, decoded: 0, error: String(e && e.message ? e.message : e) });
     return;

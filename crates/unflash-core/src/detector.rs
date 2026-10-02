@@ -15,18 +15,9 @@ use crate::pixel::{
 use crate::temporal::{AnalysisResult, FrameRecord, Temporal};
 use crate::time::{age, secs_to_us, SATURATE_EVERY_FRAMES, SATURATE_EVERY_US};
 
-/// A synchronous pixel stage.
-pub trait PixelStage {
-    fn geometry(&self) -> &GridGeometry;
-    /// Reduce one frame under `params` (whose `mode` carries FIRST /
-    /// SATURATE; the stage decides HELD itself).
-    fn run(&mut self, params: KernelParams, frame: FrameInput<'_>) -> GridStats;
-}
-
 /// Clock, bookkeeping and the temporal stage; pixel-stage agnostic.
 #[derive(Clone, Debug)]
 pub struct Detector {
-    cfg: DetectorConfig,
     geom: GridGeometry,
     temporal: Temporal,
     template: KernelParams,
@@ -40,9 +31,8 @@ impl Detector {
     pub fn new(cfg: DetectorConfig, aw: u32, ah: u32) -> Self {
         let geom = GridGeometry::new(&cfg, aw, ah);
         let template = KernelParams::template(&cfg, &geom);
-        let temporal = Temporal::new(cfg.clone(), geom.clone());
+        let temporal = Temporal::new(cfg, geom.clone());
         Detector {
-            cfg,
             geom,
             temporal,
             template,
@@ -59,25 +49,11 @@ impl Detector {
         Self::new(cfg, aw, ah)
     }
 
-    pub fn config(&self) -> &DetectorConfig {
-        &self.cfg
-    }
     pub fn geometry(&self) -> &GridGeometry {
         &self.geom
     }
     pub fn temporal(&self) -> &Temporal {
         &self.temporal
-    }
-    pub fn params_template(&self) -> &KernelParams {
-        &self.template
-    }
-    /// Frames submitted so far (including ones not yet completed).
-    pub fn submitted(&self) -> u32 {
-        self.submitted
-    }
-    /// Frames completed so far.
-    pub fn frames(&self) -> usize {
-        self.temporal.frames()
     }
     pub fn pending(&self) -> usize {
         self.pending.len()
@@ -115,8 +91,10 @@ impl Detector {
         self.temporal.feed(t, tc, stats)
     }
 
-    pub fn finish(&self) -> AnalysisResult {
-        self.temporal.finish()
+    /// The verdict over the frames completed so far; `with_stats` adds the
+    /// per-frame statistics (see [`Temporal::finish`]).
+    pub fn finish(&self, with_stats: bool) -> AnalysisResult {
+        self.temporal.finish(with_stats)
     }
 
     pub fn reset(&mut self) {
@@ -221,14 +199,10 @@ impl CpuStage {
             pattern_spacing_n: pat.spacing_n,
         }
     }
-}
 
-impl PixelStage for CpuStage {
-    fn geometry(&self) -> &GridGeometry {
-        &self.geom
-    }
-
-    fn run(&mut self, params: KernelParams, frame: FrameInput<'_>) -> GridStats {
+    /// Reduce one frame under `params` (whose `mode` carries FIRST /
+    /// SATURATE; the stage decides HELD itself).
+    pub fn run(&mut self, params: KernelParams, frame: FrameInput<'_>) -> GridStats {
         self.planes.ingest(frame.data, frame.bpp, params.red_saturation, params.red_flare);
         self.run_planes(params)
     }
@@ -249,11 +223,6 @@ impl CpuDetector {
         CpuDetector { det, stage }
     }
 
-    pub fn for_source(cfg: DetectorConfig, width: u32, height: u32) -> Self {
-        let (aw, ah) = cfg.analysis_dims(width, height);
-        Self::new(cfg, aw, ah)
-    }
-
     pub fn geometry(&self) -> &GridGeometry {
         self.det.geometry()
     }
@@ -266,7 +235,7 @@ impl CpuDetector {
     }
 
     pub fn finish(&self) -> AnalysisResult {
-        self.det.finish()
+        self.det.finish(true)
     }
 
     pub fn reset(&mut self) {
@@ -527,6 +496,37 @@ mod tests {
             let s = stage.run(p, FrameInput::rgb(f));
             det.complete_frame(&s);
         }
-        assert_eq!(whole.finish(), det.finish());
+        assert_eq!(whole.finish(), det.finish(true));
+    }
+
+    /// A verdict without the per-frame statistics (what the page asks for
+    /// after every chunk of a scan, and the live monitor several times a
+    /// second) is the full verdict less them: the same violations and
+    /// events, and no copy of every frame's statistics.
+    #[test]
+    fn finish_without_stats_is_the_verdict_alone() {
+        let cfg = Profile::WcagExt.config();
+        let (aw, ah) = cfg.analysis_dims(640, 360);
+        let mut det = Detector::new(cfg.clone(), aw, ah);
+        let mut stage = CpuStage::new(&cfg, det.geometry().clone());
+        let a = frame(aw, ah, 0.5, 20);
+        let b = frame(aw, ah, 0.5, 200);
+        // stripes over the whole picture for the last second: a pattern too
+        let stripes: Vec<u8> = (0..(aw * ah) as usize).flat_map(|i| if ((i % aw as usize) / 4).is_multiple_of(2) { [20u8; 3] } else { [220u8; 3] }).collect();
+        for i in 0..150 {
+            let t = i as f64 / 30.0;
+            let f = if i >= 120 { &stripes } else if (i / 3) % 2 == 0 { &a } else { &b };
+            let p = det.begin_frame(t);
+            let s = stage.run(p, FrameInput::rgb(f));
+            det.complete_frame(&s);
+        }
+        let full = det.finish(true);
+        let lean = det.finish(false);
+        assert_eq!(full.frame_stats.len(), 150);
+        assert!(lean.frame_stats.is_empty() && lean.frame_stats == Default::default());
+        assert!(full.violations.iter().any(|v| v.kind == ViolationKind::Flash) && full.violations.iter().any(|v| v.kind == ViolationKind::Pattern), "{:?}", full.violations);
+        assert_eq!(lean.violations, full.violations);
+        assert_eq!(lean.events, full.events);
+        assert_eq!((lean.frames, lean.held, lean.duration, lean.anomalies), (full.frames, full.held, full.duration, full.anomalies));
     }
 }

@@ -5,7 +5,7 @@
 //! UNFLASH_REQUIRE_GPU is set.
 
 use unflash_core::config::{DetectorConfig, Profile};
-use unflash_core::detector::{CpuStage, PixelStage};
+use unflash_core::detector::CpuStage;
 use unflash_core::grid::{FrameInput, GridGeometry};
 use unflash_core::pixel::{KernelParams, MODE_FIRST, MODE_SATURATE};
 use unflash_core::time::secs_to_us;
@@ -193,7 +193,7 @@ fn compare(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframe
 fn compare_with(ctx: &GpuContext, cfg: DetectorConfig, src_w: u32, src_h: u32, nframes: usize, gen: &dyn Fn(usize, f64, usize, usize) -> Vec<u8>, expect: Expect) {
     let (aw, ah) = cfg.analysis_dims(src_w, src_h);
     let geom = GridGeometry::new(&cfg, aw, ah);
-    eprintln!("analysis {}x{} window {}x{} cells {} E={}", aw, ah, geom.ww, geom.wh, geom.ncells(), aw.div_ceil(256));
+    eprintln!("analysis {}x{} window {}x{} cells {}", aw, ah, geom.ww, geom.wh, geom.ncells());
     let mut gpu = GpuStage::new(ctx, &cfg, geom.clone()).expect("stage");
     let mut cpu = CpuStage::new(&cfg, geom.clone());
     cpu.use_simd = false;

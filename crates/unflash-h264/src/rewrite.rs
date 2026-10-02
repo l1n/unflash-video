@@ -574,14 +574,6 @@ impl AvcRegistry {
         write_avcc(&self.rec)
     }
 
-    pub fn sps_count(&self) -> usize {
-        self.rec.sps.len()
-    }
-
-    pub fn pps_count(&self) -> usize {
-        self.rec.pps.len()
-    }
-
     /// An id for a PPS the encoder numbered `old`: its own when free. A
     /// CAVLC slice's data is shifted by the change in the id's code length,
     /// and I_PCM samples in it are aligned to the NAL unit's bytes, so for

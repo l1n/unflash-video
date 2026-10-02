@@ -10,9 +10,9 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use unflash_core::config::Profile;
+use unflash_core::detector::CpuDetector;
 use unflash_core::grid::FrameInput;
 use unflash_core::temporal::{EventKind, ViolationKind};
-use unflash_core::CpuDetector;
 
 const W: usize = 128;
 const H: usize = 96;

@@ -1,7 +1,8 @@
 //! 8-bit 4:2:0 YCbCr pictures in the layouts WebCodecs' `VideoFrame.copyTo`
 //! and the built-in decoder deliver (I420: three planes; NV12: a luma plane
-//! and an interleaved CbCr plane), converted to RGBA for the CPU detector.
-//! The GPU stage converts the same way in a shader (`shaders/yuv.wgsl`).
+//! and an interleaved CbCr plane), and how their codes map to RGB: in 16.16
+//! fixed point where [`crate::resample::Shrink`] converts them, in f32 with
+//! the same coefficients in the GPU stage's shader (`shaders/yuv.wgsl`).
 
 /// Where the planes of a 4:2:0 picture sit in one buffer, and how its codes
 /// map to RGB.
@@ -73,8 +74,10 @@ impl YuvLayout {
 }
 
 /// Convert a picture to RGBA8 (alpha 255); each chroma sample covers its
-/// 2×2 luma block. `out` is resized to width × height × 4.
-pub fn to_rgba(data: &[u8], width: usize, height: usize, l: &YuvLayout, out: &mut Vec<u8>) {
+/// 2×2 luma block. `out` is resized to width × height × 4. (The plain
+/// statement of the conversion the shrink's faster one is tested against.)
+#[cfg(test)]
+pub(crate) fn to_rgba(data: &[u8], width: usize, height: usize, l: &YuvLayout, out: &mut Vec<u8>) {
     assert!(l.fits(data.len(), width, height), "picture data too short for its layout");
     let [ky, kr, kgu, kgv, kb, yoff] = l.coefficients();
     out.clear();

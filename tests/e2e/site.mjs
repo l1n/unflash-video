@@ -94,7 +94,7 @@ try {
     p.evaluate(async () => {
       const base = document.querySelector('script[type=module][src]').src;
       const { loadDecoders } = await import(new URL('codecs.js', base).href);
-      return typeof (await loadDecoders()).Ac3Decoder;
+      return typeof (await loadDecoders()).SoundDecoder;
     });
   const folders = (code) => [...new Set(code.map((u) => (u.match(/^\/v\/[^/]+\//) || ['(top)'])[0]))];
 

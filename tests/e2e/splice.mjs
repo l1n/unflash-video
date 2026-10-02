@@ -5,7 +5,8 @@
 // the built-in decoder (this Chromium has no H.264), shows splice_a's
 // pictures outside the spans and splice_b's inside them, from one track
 // whose record holds both streams' parameter sets. Also the full
-// re-encode, and two spans two at a time.
+// re-encode, two spans two at a time, and encoders that hand over Annex B
+// with no record (a High-profile one's record must carry the High fields).
 //   node tests/e2e/splice.mjs
 import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
@@ -133,6 +134,14 @@ const r = await page.evaluate(async () => {
     for (let i = 0; i < nsps; i++) p += 2 + ((desc[p] << 8) | desc[p + 1]);
     return [nsps, desc[p]];
   };
+  // what a record carries after its parameter sets (a High profile's chroma format and bit depths)
+  const recordTail = (desc) => {
+    let p = 6;
+    for (let i = 0; i < (desc[5] & 31); i++) p += 2 + ((desc[p] << 8) | desc[p + 1]);
+    const npps = desc[p++];
+    for (let i = 0; i < npps; i++) p += 2 + ((desc[p] << 8) | desc[p + 1]);
+    return Array.from(desc.subarray(p));
+  };
   const run = async (name, opts, expectB) => {
     encoded.length = 0;
     const plan = await exportPlan(env, a, project, { codec: candidate.config.codec, ...opts });
@@ -155,7 +164,8 @@ const r = await page.evaluate(async () => {
       if (m.v.ptsTicks[i] - m.video.edit_shift < m.v.dtsTicks[i] || (i > 0 && m.v.dtsTicks[i] <= m.v.dtsTicks[i - 1])) timing = false;
     }
     const timingInfo = { editShift: m.video.edit_shift, first: Array.from({ length: 6 }, (_, i) => [m.v.ptsTicks[i], m.v.dtsTicks[i]]) };
-    return { name, mode: res.mode, spans: res.spans, frames: res.frames, copied: res.copied, parallel: res.parallel, codec: res.codec, plan: plan.pieces.map((p) => `${p.kind} ${p.from}-${p.to}`), paramSets: paramSets(m.dx.track_description(m.video.index)), outFrames: ho.length, mismatches, timing, timingInfo, keyRequests: encoded.filter((e) => e.key).map((e) => e.t), size: res.blob.size, hasAudio: !!m.audio };
+    const record = m.dx.track_description(m.video.index);
+    return { name, mode: res.mode, spans: res.spans, frames: res.frames, copied: res.copied, parallel: res.parallel, codec: res.codec, plan: plan.pieces.map((p) => `${p.kind} ${p.from}-${p.to}`), paramSets: paramSets(record), tail: recordTail(record), outFrames: ho.length, mismatches, timing, timingInfo, keyRequests: encoded.filter((e) => e.key).map((e) => e.t), size: res.blob.size, hasAudio: !!m.audio };
   };
   const results = {};
   // one span in the middle: GOP 1 (frames 10..19, an IDR every 10 frames)
@@ -196,6 +206,47 @@ const r = await page.evaluate(async () => {
     return inner;
   };
   results.annexB = await run('annex-b encoder', { spans: [[0.4, 0.5]], parallel: 1, makeEncoder: annexB }, (k) => k >= 10 && k < 20);
+  // a High-profile encoder with B-frames that gives no record: splice_a's
+  // own samples as Annex B, its sets in front of each IDR picture, handed
+  // out in decode order once the pictures before them are in. The record
+  // made of its first keyframe's sets must carry, after them, the chroma
+  // format and bit depths ISO/IEC 14496-15 asks of a High profile's
+  const aSets = avccSets(a.dx.track_description(a.video.index));
+  const aOrder = [];
+  for (let i = 0; i < a.v.pts.length; i++) aOrder.push({ pts: a.v.pts[i], bytes: (await a.reader.read(a.v.offset[i], a.v.size[i])).slice(), sync: !!a.v.sync[i] });
+  const annexBHigh = (config, { output }) => {
+    let next = 0;
+    let latest = -Infinity;
+    const emit = (upTo) => {
+      for (; next < aOrder.length && aOrder[next].pts <= upTo; next++) {
+        const s = aOrder[next];
+        const out = [];
+        if (s.sync) for (const n of [...aSets.sps, ...aSets.pps]) out.push(0, 0, 0, 1, ...n);
+        for (let p = 0; p + 4 <= s.bytes.length; ) {
+          const len = (s.bytes[p] << 24) | (s.bytes[p + 1] << 16) | (s.bytes[p + 2] << 8) | s.bytes[p + 3];
+          out.push(0, 0, 0, 1, ...s.bytes.subarray(p + 4, p + 4 + len));
+          p += 4 + len;
+        }
+        const bytes = Uint8Array.from(out);
+        output({ byteLength: bytes.length, copyTo: (dst) => dst.set(bytes), timestamp: s.pts, type: s.sync ? 'key' : 'delta' }, next === 0 ? { decoderConfig: { codec: a.video.codec } } : {});
+      }
+    };
+    return {
+      encodeQueueSize: 0,
+      configure() {},
+      encode(frame, opts) {
+        encoded.push({ t: frame.timestamp, key: !!(opts && opts.keyFrame) });
+        latest = Math.max(latest, frame.timestamp);
+        emit(latest);
+      },
+      async flush() {
+        emit(Infinity);
+      },
+      close() {},
+    };
+  };
+  results.annexBHigh = await run('annex-b High-profile encoder', { smartCut: false, parallel: 1, makeEncoder: annexBHigh }, () => false);
+  results.sourceTail = recordTail(a.dx.track_description(a.video.index));
   return { software, frames: ha.length, results };
 });
 console.log(JSON.stringify(r, null, 1));
@@ -231,6 +282,11 @@ const ab = r.results.annexB;
 assert(ab.mode === 'smart' && ab.frames === 10 && ab.copied === 30, 'an Annex B encoder with no record: spliced all the same: ' + JSON.stringify(ab));
 assert(ab.outFrames === 40 && ab.mismatches.length === 0 && ab.timing, 'an Annex B encoder: every frame decodes as its source: ' + JSON.stringify(ab.mismatches));
 assert(ab.paramSets[0] === 2 && ab.paramSets[1] === 2, 'an Annex B encoder: its parameter sets join the source\'s: ' + ab.paramSets);
+const abh = r.results.annexBHigh;
+assert(abh.mode === 'full' && abh.frames === 40 && abh.copied === 0, 'a High-profile Annex B encoder: everything re-encoded: ' + JSON.stringify(abh));
+assert(abh.outFrames === 40 && abh.mismatches.length === 0 && abh.timing, 'a High-profile Annex B encoder: every frame decodes as its source: ' + JSON.stringify(abh.mismatches));
+// (4:2:0, 8-bit luma and chroma, no SPS extensions: what x264 wrote after splice_a's own sets)
+assert(JSON.stringify(r.results.sourceTail) === '[253,248,248,0]' && JSON.stringify(abh.tail) === JSON.stringify(r.results.sourceTail), 'a High-profile Annex B encoder: the record made for it carries the High profile\'s fields: ' + JSON.stringify([abh.tail, r.results.sourceTail]));
 console.log('SPLICE OK');
 await browser.close();
 srv.close();

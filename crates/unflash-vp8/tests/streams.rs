@@ -150,27 +150,6 @@ fn key_frames_start_afresh() {
     assert_eq!(got, all[5..]);
 }
 
-/// The fast mode leaves the loop filter out: the same frames, close to the
-/// exact ones.
-#[test]
-fn fast_mode_is_close() {
-    let mut exact = Decoder::new(&[]).unwrap();
-    let mut fast = Decoder::new(&[]).unwrap();
-    fast.set_fast(true);
-    let mut differs = false;
-    for (pts, s) in samples("highq.ivf") {
-        let a = exact.decode(&s, pts).unwrap();
-        let b = fast.decode(&s, pts).unwrap();
-        assert_eq!(a.len(), b.len());
-        for (a, b) in a.iter().zip(&b) {
-            let diff: u64 = a.y.iter().zip(&b.y).map(|(&x, &y)| (x as i32 - y as i32).unsigned_abs() as u64).sum();
-            assert!(diff as f64 / (a.y.len() as f64) < 4.0, "fast picture too far from the exact one");
-            differs |= diff > 0;
-        }
-    }
-    assert!(differs, "the loop filter should change something");
-}
-
 /// Truncated, corrupted and nonsensical samples give errors or damaged
 /// frames, never a panic, and the decoder recovers at the next key frame.
 #[test]

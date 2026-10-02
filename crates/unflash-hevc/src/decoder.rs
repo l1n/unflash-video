@@ -183,7 +183,7 @@ impl<P: Sample> Core<P> {
     /// Finish the current picture: conceal what no slice covered, run the
     /// in-loop filters, check it against its hash when asked to, keep it
     /// as a reference, and return it for output.
-    fn finish_picture(&mut self, fast: bool, check_hash: bool) -> Option<Finished<P>> {
+    fn finish_picture(&mut self, check_hash: bool) -> Option<Finished<P>> {
         let mut cur = self.cur.take()?;
         let layout = cur.layout.clone();
         let sps = cur.sps.clone();
@@ -191,16 +191,14 @@ impl<P: Sample> Core<P> {
             cur.damaged = true;
             self.conceal(&mut cur);
         }
-        if !fast {
-            if self.meta.slices.iter().any(|s| !s.deblocking_disabled) {
-                deblock(&mut cur.pic, &self.meta, &sps, &cur.pps, &layout);
-            }
-            if sps.sao_enabled {
-                sao(&mut cur.pic, &self.meta, &sps, &cur.pps, &layout, &mut self.sao_scratch);
-            }
-            if let Some(h) = cur.hash.as_ref().filter(|_| check_hash) {
-                cur.damaged |= !hash::matches(&cur.pic, sps.bit_depth, h);
-            }
+        if self.meta.slices.iter().any(|s| !s.deblocking_disabled) {
+            deblock(&mut cur.pic, &self.meta, &sps, &cur.pps, &layout);
+        }
+        if sps.sao_enabled {
+            sao(&mut cur.pic, &self.meta, &sps, &cur.pps, &layout, &mut self.sao_scratch);
+        }
+        if let Some(h) = cur.hash.as_ref().filter(|_| check_hash) {
+            cur.damaged |= !hash::matches(&cur.pic, sps.bit_depth, h);
         }
         self.compress_motion(&mut cur.pic, sps.log2_ctb as usize, layout.width_ctbs as usize);
         let pic = Rc::new(cur.pic);
@@ -367,7 +365,6 @@ pub struct Decoder {
     active_sps: Option<Rc<Sps>>,
     layout: Option<(Rc<Sps>, Rc<Pps>, Rc<Layout>)>,
     core: Cores,
-    fast: bool,
     check_hashes: bool,
     out: Vec<Frame>,
     rbsp: Vec<u8>,
@@ -396,7 +393,6 @@ impl Decoder {
             active_sps: None,
             layout: None,
             core: Cores::None,
-            fast: false,
             check_hashes: false,
             out: Vec::new(),
             rbsp: Vec::new(),
@@ -453,17 +449,10 @@ impl Decoder {
         seen.unwrap_or(15)
     }
 
-    /// Leave out in-loop filtering (deblocking and SAO) for pictures used
-    /// only for statistics. With fast = false (the default) output is
-    /// bit-exact.
-    pub fn set_fast(&mut self, fast: bool) {
-        self.fast = fast;
-    }
-
     /// Check every picture against the decoded picture hash SEI message
     /// the encoder sent with it, when there is one, and mark those that
-    /// differ as damaged: a self-test for conformance streams. Hashing
-    /// every picture costs time, and fast mode's pictures never match.
+    /// differ as damaged: a self-test for conformance streams (hashing
+    /// every picture costs time).
     pub fn set_check_hashes(&mut self, check: bool) {
         self.check_hashes = check;
     }
@@ -537,8 +526,8 @@ impl Decoder {
     }
 
     fn finish_picture(&mut self) {
-        let (fast, check) = (self.fast, self.check_hashes);
-        let frame = with_core!(&mut self.core, c => c.finish_picture(fast, check).map(|f| to_frame(&f.pic, &f.sps, f.pts, f.damaged)), None);
+        let check = self.check_hashes;
+        let frame = with_core!(&mut self.core, c => c.finish_picture(check).map(|f| to_frame(&f.pic, &f.sps, f.pts, f.damaged)), None);
         self.out.extend(frame);
     }
 

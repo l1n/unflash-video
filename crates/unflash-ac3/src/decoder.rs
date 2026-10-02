@@ -213,11 +213,6 @@ impl Decoder {
         Ok(result)
     }
 
-    /// Forget the previous frame's overlap (after a seek).
-    pub fn reset(&mut self) {
-        self.frame.reset_overlap();
-    }
-
     /// The stream as its last decoded frame described it.
     pub fn info(&self) -> Option<StreamInfo> {
         self.info

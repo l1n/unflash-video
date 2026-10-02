@@ -9,11 +9,12 @@ use std::rc::Rc;
 use serde::Serialize;
 use unflash_core::blend;
 use unflash_core::config::{DetectorConfig, Profile};
-use unflash_core::detector::{CpuStage, Detector as CoreDetector, PixelStage};
+use unflash_core::detector::{CpuStage, Detector as CoreDetector};
 use unflash_core::editing::{self, Edits, FrameSource, Prefer, SuggestStep};
-use unflash_core::grid::FrameInput;
-use unflash_core::pixel::MODE_FIRST;
+use unflash_core::grid::{FrameInput, GridGeometry};
+use unflash_core::resample::Shrink;
 use unflash_core::temporal::{AnalysisResult, FrameRecord, Violation};
+use unflash_core::yuv::YuvLayout;
 use unflash_core::{sections, timeline};
 use unflash_gpu::{FrameSource as GpuSource, GpuContext, GpuStage};
 use unflash_h264::yuv::to_i420;
@@ -76,12 +77,6 @@ pub fn version() -> String {
 // ---- configuration --------------------------------------------------------
 
 #[wasm_bindgen]
-pub fn profile_names() -> String {
-    let names: Vec<&str> = Profile::ALL.iter().map(|p| p.name()).collect();
-    serde_json::to_string(&names).unwrap()
-}
-
-#[wasm_bindgen]
 pub fn profile_config(name: &str) -> Result<String, JsValue> {
     let p = Profile::from_name(name).ok_or_else(|| js_err(format!("unknown profile {name}")))?;
     to_json(&p.config())
@@ -98,19 +93,13 @@ pub fn config_signature(config_json: &str) -> Result<String, JsValue> {
 }
 
 #[wasm_bindgen]
-pub fn analysis_dims(config_json: &str, width: u32, height: u32) -> Result<Vec<u32>, JsValue> {
-    let (aw, ah) = parse_cfg(config_json)?.analysis_dims(width, height);
-    Ok(vec![aw, ah])
-}
-
-#[wasm_bindgen]
 pub fn context_seconds(config_json: &str) -> Result<f64, JsValue> {
     Ok(sections::context_seconds(&parse_cfg(config_json)?))
 }
 
 #[wasm_bindgen]
 pub fn safe_picture_rate(config_json: &str) -> Result<f64, JsValue> {
-    Ok(sections::safe_picture_rate(&parse_cfg(config_json)?, sections::RATE_SAFETY_MARGIN).0)
+    Ok(sections::safe_picture_rate(&parse_cfg(config_json)?).0)
 }
 
 #[wasm_bindgen]
@@ -134,8 +123,8 @@ pub fn violations_to_sections(violations_json: &str, config_json: &str, ts_min: 
 pub fn merge_scan_segments(config_json: &str, src_width: u32, src_height: u32, segments_json: &str) -> Result<String, JsValue> {
     let cfg = parse_cfg(config_json)?;
     let segs: Vec<unflash_core::temporal::Segment> = serde_json::from_str(segments_json).map_err(|e| js_err(format!("bad segments: {e}")))?;
-    let det = CoreDetector::for_source(cfg.clone(), src_width, src_height);
-    to_json(&unflash_core::temporal::merge_segments(&cfg, det.geometry(), &segs))
+    let (aw, ah) = cfg.analysis_dims(src_width, src_height);
+    to_json(&unflash_core::temporal::merge_segments(&cfg, &GridGeometry::new(&cfg, aw, ah), &segs))
 }
 
 #[wasm_bindgen]
@@ -146,7 +135,7 @@ pub fn timeline_summary(result_json: &str, ts_min: f64, ts_max: f64, bin_seconds
 
 #[wasm_bindgen]
 pub fn sanitize_deltas(times: &[f64], max_gap: f64) -> String {
-    let (out, fixed) = timeline::sanitize_deltas(times, max_gap, 1.0 / 30.0);
+    let (out, fixed) = timeline::sanitize_deltas(times, max_gap);
     serde_json::json!({ "times": out, "fixed": fixed }).to_string()
 }
 
@@ -156,14 +145,13 @@ pub fn shown_pts(pts: &[f64], start: f64, end: f64) -> Vec<f64> {
 }
 
 #[wasm_bindgen]
-pub fn section_timeline(pts: &[f64], start: f64, end: f64) -> String {
-    let tl = timeline::section_timeline(pts, start, end);
-    serde_json::json!({ "rel": tl.rel, "n_out": tl.n_out, "total": tl.total, "base": tl.base, "med": tl.med }).to_string()
+pub fn section_timeline(pts: &[f64], start: f64, end: f64) -> Result<String, JsValue> {
+    to_json(&timeline::section_timeline(pts, start, end))
 }
 
 #[wasm_bindgen]
 pub fn median_dt(pts: &[f64]) -> f64 {
-    timeline::median_dt(pts, 1.0 / 30.0)
+    timeline::median_dt(pts)
 }
 
 #[wasm_bindgen]
@@ -203,12 +191,6 @@ pub fn section_holds(rel_pts: &[f64], edits_json: &str, extension_seconds: f64, 
 }
 
 #[wasm_bindgen]
-pub fn picture_times(rel_pts: &[f64], edits_json: &str, extension_seconds: f64) -> Result<Vec<f64>, JsValue> {
-    let e = parse_edits(edits_json)?;
-    Ok(editing::picture_times(rel_pts, &e, extension_seconds))
-}
-
-#[wasm_bindgen]
 pub fn flagged_frames(seq_times: &[f64], violations_json: &str) -> Result<Vec<u32>, JsValue> {
     let v = parse_violations(violations_json)?;
     let seq: Vec<(f64, usize)> = seq_times.iter().enumerate().map(|(i, &t)| (t, i)).collect();
@@ -220,8 +202,7 @@ pub fn flagged_frames(seq_times: &[f64], violations_json: &str) -> Result<Vec<u3
 pub fn classify(config_json: &str, result_json: &str, end_disp: f64, next_at: Option<f64>) -> Result<String, JsValue> {
     let cfg = parse_cfg(config_json)?;
     let r = parse_result(result_json)?;
-    let c = editing::classify(&r, end_disp, next_at, cfg.area_accum_window);
-    Ok(serde_json::json!({ "inside": c.inside, "after": c.after, "elsewhere": c.elsewhere, "before": c.before }).to_string())
+    to_json(&editing::classify(&r, end_disp, next_at, cfg.area_accum_window))
 }
 
 #[wasm_bindgen]
@@ -238,35 +219,13 @@ pub fn rate_proposal(
     let e = parse_edits(edits_json)?;
     let only = parse_only(only_json)?;
     let keep = parse_keep(keep_json)?;
-    let p = editing::rate_proposal(&cfg, rel_pts, &e, only.as_ref(), &keep, fps, extension_seconds).map_err(js_err)?;
-    Ok(serde_json::json!({
-        "edits": p.edits,
-        "removals": p.removals,
-        "fps": p.fps,
-        "safe_fps": p.safe_fps,
-        "guaranteed": p.guaranteed,
-        "pool": p.pool,
-        "n_removed": p.n_removed,
-        "only": p.only,
-        "kept": p.kept,
-    })
-    .to_string())
+    to_json(&editing::rate_proposal(&cfg, rel_pts, &e, only.as_ref(), &keep, fps, extension_seconds).map_err(js_err)?)
 }
 
+/// The note for a `rate_proposal` once its check is in.
 #[wasm_bindgen]
 pub fn rate_note(proposal_json: &str, safe: bool) -> Result<String, JsValue> {
-    let v: serde_json::Value = serde_json::from_str(proposal_json).map_err(js_err)?;
-    let p = editing::RateProposal {
-        edits: Edits::new(),
-        removals: Edits::new(),
-        fps: v["fps"].as_f64().unwrap_or(0.0),
-        safe_fps: v["safe_fps"].as_f64().unwrap_or(0.0),
-        guaranteed: v["guaranteed"].as_bool().unwrap_or(false),
-        pool: v["pool"].as_u64().unwrap_or(0) as usize,
-        n_removed: v["n_removed"].as_u64().unwrap_or(0) as usize,
-        only: v["only"].as_bool().unwrap_or(false),
-        kept: v["kept"].as_u64().unwrap_or(0) as usize,
-    };
+    let p: editing::RateProposal = serde_json::from_str(proposal_json).map_err(|e| js_err(format!("bad rate proposal: {e}")))?;
     Ok(editing::rate_note(&p, safe))
 }
 
@@ -281,14 +240,9 @@ pub fn apply_suggestion(existing_json: &str, suggested_json: &str, only_json: Op
     to_json(&editing::apply_suggestion(&ex, &su, only.as_ref(), &keep))
 }
 
-#[wasm_bindgen]
-pub fn area_downsample(rgba: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
-    unflash_core::resample::area_downsample(rgba, 4, src_w, src_h, dst_w, dst_h)
-}
-
 // ---- frame cache -----------------------------------------------------------
 
-/// Analysis-resolution RGBA frames of a section, in WASM memory.
+/// Analysis-resolution frames of a section (RGB8), in WASM memory.
 #[wasm_bindgen]
 pub struct FrameCache {
     width: u32,
@@ -348,23 +302,6 @@ impl FrameCache {
             out.push(255);
         }
         Ok(out)
-    }
-
-    /// Byte offset of frame `i` (RGB8) in WASM memory (for zero-copy views).
-    pub fn frame_ptr(&self, i: u32) -> Result<usize, JsValue> {
-        let f = self.frame_ref(i as usize).ok_or_else(|| js_err("no such frame"))?;
-        Ok(f.as_ptr() as usize)
-    }
-
-    pub fn clear(&mut self) {
-        self.data.clear();
-        self.n = 0;
-    }
-
-    pub fn truncate(&mut self, n: u32) {
-        let n = (n as usize).min(self.n);
-        self.data.truncate(n * (self.width * self.height * 3) as usize);
-        self.n = n;
     }
 
     /// Move every frame of `other` (same size) onto the end of this cache,
@@ -519,16 +456,20 @@ impl Suggester {
 /// shrink what is there to RGBA8 (see `unflash_core::resample::Shrink`).
 #[wasm_bindgen]
 pub struct Shrinker {
-    inner: unflash_core::resample::Shrink,
+    inner: Shrink,
     input: Vec<u8>,
     out: Vec<u8>,
 }
 
 #[wasm_bindgen]
 impl Shrinker {
+    /// For pictures of `width`×`height` (neither 0).
     #[wasm_bindgen(constructor)]
-    pub fn new(width: u32, height: u32, analysis_width: u32, analysis_height: u32) -> Shrinker {
-        Shrinker { inner: unflash_core::resample::Shrink::new(width, height, analysis_width, analysis_height), input: Vec::new(), out: Vec::new() }
+    pub fn new(width: u32, height: u32, analysis_width: u32, analysis_height: u32) -> Result<Shrinker, JsValue> {
+        if width == 0 || height == 0 {
+            return Err(js_err(format!("a {width}×{height} picture has nothing to make small")));
+        }
+        Ok(Shrinker { inner: Shrink::new(width, height, analysis_width, analysis_height), input: Vec::new(), out: Vec::new() })
     }
 
     /// Whether it was made for these sizes.
@@ -549,7 +490,7 @@ impl Shrinker {
     /// `bgr`), rows `stride` bytes apart from `offset`: RGBA8 at the analysis size.
     pub fn packed(&mut self, offset: usize, stride: usize, bgr: bool) -> Result<Vec<u8>, JsValue> {
         let (w, h) = self.inner.source_size();
-        if h == 0 || stride < w * 4 || self.input.len() < offset + (h - 1) * stride + w * 4 {
+        if stride < w * 4 || self.input.len() < offset + (h - 1) * stride + w * 4 {
             return Err(js_err("picture data too short for its size"));
         }
         self.inner.packed(&self.input, offset, stride, bgr, &mut self.out);
@@ -558,7 +499,7 @@ impl Shrinker {
 
     /// The 4:2:0 picture in the input (`layout`: the words Detector.feed_yuv takes).
     pub fn yuv(&mut self, layout: &[u32]) -> Result<Vec<u8>, JsValue> {
-        let layout = unflash_core::yuv::YuvLayout::from_words(layout).ok_or_else(|| js_err("bad picture layout"))?;
+        let layout = YuvLayout::from_words(layout).ok_or_else(|| js_err("bad picture layout"))?;
         let (w, h) = self.inner.source_size();
         if !layout.fits(self.input.len(), w, h) {
             return Err(js_err("picture data too short for its layout"));
@@ -599,7 +540,6 @@ struct TrackSummary {
     prefix: Vec<u8>,
     /// Whether an MP4 can carry the track as it is (its sample entry).
     copyable: bool,
-    name: String,
     language: String,
     /// Why the track cannot be used, when it cannot.
     note: String,
@@ -663,7 +603,6 @@ impl Demuxer {
                 frame_duration: t.frame_duration,
                 prefix: t.prefix.clone(),
                 copyable: t.copyable(),
-                name: t.name.clone(),
                 language: t.language.clone(),
                 note: t.note.clone(),
             })
@@ -812,8 +751,10 @@ pub struct Detector {
     captures: BTreeMap<usize, Vec<u8>>,
     /// capture flags of frames submitted to the GPU, in order
     pending_capture: std::collections::VecDeque<bool>,
-    /// RGBA conversion buffer of the CPU detector's YUV input
-    yuv_scratch: Vec<u8>,
+    /// The CPU detector's pictures made the analysis size, as the decode
+    /// workers make them, and the room for the last one.
+    shrink: Option<Shrink>,
+    small: Vec<u8>,
     /// The resolve function of the promise `gpu_wait` handed out last.
     waiter: Rc<RefCell<Option<js_sys::Function>>>,
 }
@@ -826,7 +767,7 @@ impl Detector {
         let cfg = parse_cfg(config_json)?;
         let det = CoreDetector::for_source(cfg.clone(), src_width, src_height);
         let stage = CpuStage::new(&cfg, det.geometry().clone());
-        Ok(Detector { det, stage: Stage::Cpu(stage), records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default(), yuv_scratch: Vec::new(), waiter: Default::default() })
+        Ok(Detector::with_stage(det, Stage::Cpu(stage), Default::default()))
     }
 
     /// WebGPU detector; resolves to a `Detector` or rejects when there is no
@@ -852,14 +793,10 @@ impl Detector {
                     }
                 })));
             }
-            let d = Detector { det, stage: Stage::Gpu(Box::new(stage)), records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default(), yuv_scratch: Vec::new(), waiter };
-            Ok(JsValue::from(d))
+            Ok(JsValue::from(Detector::with_stage(det, Stage::Gpu(Box::new(stage)), waiter)))
         })
     }
 
-    pub fn is_gpu(&self) -> bool {
-        matches!(self.stage, Stage::Gpu(_))
-    }
     pub fn analysis_width(&self) -> u32 {
         self.det.geometry().aw
     }
@@ -878,16 +815,6 @@ impl Detector {
     /// Pixels a regular pattern has to cover to count.
     pub fn pattern_thresh(&self) -> u32 {
         self.det.temporal().pattern_thresh()
-    }
-    pub fn config_json(&self) -> String {
-        serde_json::to_string(self.det.config()).unwrap()
-    }
-    /// Frames whose results have been processed.
-    pub fn frames(&self) -> u32 {
-        self.det.frames() as u32
-    }
-    pub fn submitted(&self) -> u32 {
-        self.det.submitted()
     }
     /// Frames submitted but not yet completed (GPU in flight).
     pub fn pending(&self) -> u32 {
@@ -920,12 +847,6 @@ impl Detector {
             }
         })
     }
-    pub fn capacity(&self) -> u32 {
-        match &self.stage {
-            Stage::Cpu(_) => 1,
-            Stage::Gpu(g) => g.capacity() as u32,
-        }
-    }
     /// Approximate bytes of GPU memory traffic per frame (bandwidth model).
     pub fn bytes_per_frame(&self) -> f64 {
         match &self.stage {
@@ -936,65 +857,39 @@ impl Detector {
 
     /// Feed an RGBA8 picture of any size, stamped `t` seconds (native pts).
     pub fn feed_rgba(&mut self, rgba: &[u8], width: u32, height: u32, t: f64, capture: bool) -> Result<(), JsValue> {
-        let (aw, ah) = (self.det.geometry().aw, self.det.geometry().ah);
+        if width == 0 || height == 0 {
+            return Err(js_err("empty picture"));
+        }
         if rgba.len() < (width * height * 4) as usize {
             return Err(js_err("frame data too short"));
         }
-        match &mut self.stage {
-            Stage::Cpu(stage) => {
-                let params = self.det.begin_frame(t);
-                let small;
-                let data: &[u8] = if (width, height) == (aw, ah) {
-                    rgba
-                } else {
-                    small = unflash_core::resample::area_downsample(rgba, 4, width, height, aw, ah);
-                    &small
-                };
-                let stats = stage.run(params, FrameInput::rgba(data));
-                let rec = self.det.complete_frame(&stats);
-                if capture {
-                    self.captures.insert(rec.index, data[..(aw * ah * 4) as usize].to_vec());
-                }
-                self.records.push(rec);
-                Ok(())
-            }
-            Stage::Gpu(stage) => {
-                if !stage.can_submit() {
-                    return Err(js_err("detector busy: poll() before submitting more frames"));
-                }
-                let params = self.det.begin_frame(t);
-                stage.submit(params, GpuSource::Rgba8 { data: rgba, width, height }, capture).map_err(js_err)?;
-                self.pending_capture.push_back(capture);
-                Ok(())
-            }
+        if !matches!(self.stage, Stage::Cpu(_)) {
+            return self.submit(GpuSource::Rgba8 { data: rgba, width, height }, t, capture);
         }
+        let g = self.det.geometry();
+        if (width, height) == (g.aw, g.ah) {
+            self.run_cpu(FrameInput::rgba(rgba), t, capture);
+        } else {
+            self.run_cpu_shrunk(width, height, t, capture, |k, out| k.packed(rgba, 0, width as usize * 4, false, out));
+        }
+        Ok(())
     }
 
     /// Feed a BGRX / BGRA picture (as some browsers' decoders give them) as
-    /// it came: the GPU swaps the channels while it reads them, the CPU
-    /// detector gets a swapped copy.
+    /// it came: the GPU swaps the channels while it reads them, and so does
+    /// the CPU detector's shrink.
     pub fn feed_bgra(&mut self, bgra: &[u8], width: u32, height: u32, t: f64, capture: bool) -> Result<(), JsValue> {
+        if width == 0 || height == 0 {
+            return Err(js_err("empty picture"));
+        }
         if bgra.len() < (width * height * 4) as usize {
             return Err(js_err("frame data too short"));
         }
-        if matches!(self.stage, Stage::Cpu(_)) {
-            let mut rgba = std::mem::take(&mut self.yuv_scratch);
-            rgba.clear();
-            rgba.extend_from_slice(&bgra[..(width * height * 4) as usize]);
-            for p in rgba.chunks_exact_mut(4) {
-                p.swap(0, 2);
-            }
-            let r = self.feed_rgba(&rgba, width, height, t, capture);
-            self.yuv_scratch = rgba;
-            return r;
+        if !matches!(self.stage, Stage::Cpu(_)) {
+            return self.submit(GpuSource::Bgra8 { data: bgra, width, height }, t, capture);
         }
-        let Stage::Gpu(stage) = &mut self.stage else { unreachable!() };
-        if !stage.can_submit() {
-            return Err(js_err("detector busy: poll() before submitting more frames"));
-        }
-        let params = self.det.begin_frame(t);
-        stage.submit(params, GpuSource::Bgra8 { data: bgra, width, height }, capture).map_err(js_err)?;
-        self.pending_capture.push_back(capture);
+        // (at the analysis size too: it copies, swapping the channels)
+        self.run_cpu_shrunk(width, height, t, capture, |k, out| k.packed(bgra, 0, width as usize * 4, true, out));
         Ok(())
     }
 
@@ -1002,26 +897,17 @@ impl Detector {
     /// `VideoFrame.copyTo` and the built-in decoder lay them out. `layout`
     /// is [format (0 I420, 1 NV12), y_off, y_stride, u_off, u_stride, v_off,
     /// v_stride, matrix (0 BT.601, 1 BT.709), full_range]. The GPU converts
-    /// to RGB in a shader; the CPU detector converts in WASM.
+    /// to RGB in a shader; the CPU detector converts and shrinks as the
+    /// decode workers do.
     pub fn feed_yuv(&mut self, data: &[u8], width: u32, height: u32, layout: &[u32], t: f64, capture: bool) -> Result<(), JsValue> {
-        let layout = unflash_core::yuv::YuvLayout::from_words(layout).ok_or_else(|| js_err("bad picture layout"))?;
+        let layout = YuvLayout::from_words(layout).ok_or_else(|| js_err("bad picture layout"))?;
         if width == 0 || height == 0 || !layout.fits(data.len(), width as usize, height as usize) {
             return Err(js_err("picture data too short for its layout"));
         }
-        if matches!(self.stage, Stage::Cpu(_)) {
-            let mut rgba = std::mem::take(&mut self.yuv_scratch);
-            unflash_core::yuv::to_rgba(data, width as usize, height as usize, &layout, &mut rgba);
-            let r = self.feed_rgba(&rgba, width, height, t, capture);
-            self.yuv_scratch = rgba;
-            return r;
+        if !matches!(self.stage, Stage::Cpu(_)) {
+            return self.submit(GpuSource::Yuv420 { data, width, height, layout }, t, capture);
         }
-        let Stage::Gpu(stage) = &mut self.stage else { unreachable!() };
-        if !stage.can_submit() {
-            return Err(js_err("detector busy: poll() before submitting more frames"));
-        }
-        let params = self.det.begin_frame(t);
-        stage.submit(params, GpuSource::Yuv420 { data, width, height, layout }, capture).map_err(js_err)?;
-        self.pending_capture.push_back(capture);
+        self.run_cpu_shrunk(width, height, t, capture, |k, out| k.yuv420(data, &layout, out));
         Ok(())
     }
 
@@ -1033,24 +919,11 @@ impl Detector {
         if (cache.width, cache.height) != (aw, ah) {
             return Err(js_err(format!("cache is {}x{} but the detector analyses at {aw}x{ah}", cache.width, cache.height)));
         }
-        match &mut self.stage {
-            Stage::Cpu(stage) => {
-                let params = self.det.begin_frame(t);
-                let stats = stage.run(params, FrameInput::rgb(f));
-                let rec = self.det.complete_frame(&stats);
-                self.records.push(rec);
-                Ok(())
-            }
-            Stage::Gpu(stage) => {
-                if !stage.can_submit() {
-                    return Err(js_err("detector busy: poll() before submitting more frames"));
-                }
-                let params = self.det.begin_frame(t);
-                stage.submit(params, GpuSource::Rgb8 { data: f, width: aw, height: ah }, false).map_err(js_err)?;
-                self.pending_capture.push_back(false);
-                Ok(())
-            }
+        if !matches!(self.stage, Stage::Cpu(_)) {
+            return self.submit(GpuSource::Rgb8 { data: f, width: aw, height: ah }, t, false);
         }
+        self.run_cpu(FrameInput::rgb(f), t, false);
+        Ok(())
     }
 
     /// Feed the current picture of a `<video>` element (GPU detector only).
@@ -1093,49 +966,6 @@ impl Detector {
         self.feed_external(unflash_gpu::wgpu::ExternalImageSource::OffscreenCanvas(canvas.clone()), w, h, t, capture)
     }
 
-    /// Feed an `ImageBitmap` (GPU detector only). The caller closes it afterwards.
-    #[cfg(target_arch = "wasm32")]
-    pub fn feed_image_bitmap(&mut self, bitmap: &web_sys::ImageBitmap, t: f64, capture: bool) -> Result<(), JsValue> {
-        let (w, h) = (bitmap.width(), bitmap.height());
-        if w == 0 || h == 0 {
-            return Err(js_err("empty image bitmap"));
-        }
-        self.feed_external(unflash_gpu::wgpu::ExternalImageSource::ImageBitmap(bitmap.clone()), w, h, t, capture)
-    }
-
-    /// Note: `wgpu` unwraps the result of `copyExternalImageToTexture`, so a
-    /// source the browser's WebGPU rejects (Firefox takes neither
-    /// `VideoFrame` nor `<video>`) would abort the whole WASM instance. The
-    /// JS side (`web/detector.js`) probes every kind of source on a throwaway
-    /// device before it lets one through here.
-    #[cfg(target_arch = "wasm32")]
-    fn feed_external(&mut self, source: unflash_gpu::wgpu::ExternalImageSource, w: u32, h: u32, t: f64, capture: bool) -> Result<(), JsValue> {
-        use unflash_gpu::wgpu;
-        let Stage::Gpu(stage) = &mut self.stage else {
-            return Err(js_err("external sources need the GPU detector; use feed_rgba"));
-        };
-        if !stage.can_submit() {
-            return Err(js_err("detector busy: poll() before submitting more frames"));
-        }
-        let tex = stage.source_texture(w, h).clone();
-        stage.queue().copy_external_image_to_texture(
-            &wgpu::CopyExternalImageSourceInfo { source, origin: wgpu::Origin2d::ZERO, flip_y: false },
-            wgpu::CopyExternalImageDestInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-                color_space: wgpu::PredefinedColorSpace::Srgb,
-                premultiplied_alpha: false,
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        let params = self.det.begin_frame(t);
-        stage.submit(params, GpuSource::SourceTexture, capture).map_err(js_err)?;
-        self.pending_capture.push_back(capture);
-        Ok(())
-    }
-
     /// Collect finished GPU frames. Returns how many completed.
     pub fn poll(&mut self) -> Result<u32, JsValue> {
         let Stage::Gpu(stage) = &mut self.stage else { return Ok(0) };
@@ -1167,22 +997,11 @@ impl Detector {
         self.captures.remove(&(index as usize))
     }
 
-    pub fn has_capture(&self, index: u32) -> bool {
-        self.captures.contains_key(&(index as usize))
-    }
-
-    /// Events (strobing moments) so far, as JSON.
-    pub fn events_json(&self) -> Result<String, JsValue> {
-        to_json(&self.det.temporal().events())
-    }
-
-    /// The verdict over everything fed so far.
+    /// The verdict over everything fed so far; `include_stats` adds every
+    /// frame's statistics (a partial verdict's violations need none, and
+    /// copying them each time costs more the longer a scan has run).
     pub fn finish(&self, include_stats: bool) -> Result<String, JsValue> {
-        let mut r = self.det.finish();
-        if !include_stats {
-            r.frame_stats = Default::default();
-        }
-        to_json(&r)
+        to_json(&self.det.finish(include_stats))
     }
 
     pub fn reset(&mut self) {
@@ -1204,17 +1023,79 @@ impl Detector {
             stage.flush();
         }
     }
+}
 
-    /// Frames of the batch being filled: fed, but not yet run.
-    pub fn queued(&self) -> u32 {
-        match &self.stage {
-            Stage::Gpu(stage) => stage.queued() as u32,
-            Stage::Cpu(_) => 0,
-        }
+impl Detector {
+    fn with_stage(det: CoreDetector, stage: Stage, waiter: Rc<RefCell<Option<js_sys::Function>>>) -> Detector {
+        Detector { det, stage, records: Vec::new(), captures: BTreeMap::new(), pending_capture: Default::default(), shrink: None, small: Vec::new(), waiter }
     }
 
-    pub fn is_first_pending(&self) -> bool {
-        self.det.submitted() == 0 || (self.det.params_template().mode & MODE_FIRST) != 0
+    /// Hand a picture to the GPU detector: it runs when its batch is full,
+    /// or on `flush`.
+    fn submit(&mut self, source: GpuSource<'_>, t: f64, capture: bool) -> Result<(), JsValue> {
+        let Stage::Gpu(stage) = &mut self.stage else { unreachable!("the GPU detector's pictures") };
+        if !stage.can_submit() {
+            return Err(js_err("detector busy: poll() before submitting more frames"));
+        }
+        let params = self.det.begin_frame(t);
+        stage.submit(params, source, capture).map_err(js_err)?;
+        self.pending_capture.push_back(capture);
+        Ok(())
+    }
+
+    /// Run the CPU detector over a picture at the analysis size (RGBA8
+    /// when it is to be captured).
+    fn run_cpu(&mut self, frame: FrameInput<'_>, t: f64, capture: bool) {
+        let Stage::Cpu(stage) = &mut self.stage else { unreachable!("the CPU detector's pictures") };
+        let params = self.det.begin_frame(t);
+        let stats = stage.run(params, frame);
+        let rec = self.det.complete_frame(&stats);
+        if capture {
+            self.captures.insert(rec.index, frame.data[..self.det.geometry().npix() * 4].to_vec());
+        }
+        self.records.push(rec);
+    }
+
+    /// Run the CPU detector over a `width`×`height` picture made the
+    /// analysis size by `shrink` (given the shrink for that size and room
+    /// for the result), as a decode worker makes it.
+    fn run_cpu_shrunk(&mut self, width: u32, height: u32, t: f64, capture: bool, shrink: impl FnOnce(&mut Shrink, &mut Vec<u8>)) {
+        let (aw, ah) = (self.det.geometry().aw, self.det.geometry().ah);
+        let mut small = std::mem::take(&mut self.small);
+        shrink(Shrink::reuse(&mut self.shrink, width, height, aw, ah), &mut small);
+        self.run_cpu(FrameInput::rgba(&small), t, capture);
+        self.small = small;
+    }
+
+    /// Note: `wgpu` unwraps the result of `copyExternalImageToTexture`, so a
+    /// source the browser's WebGPU rejects (Firefox takes neither
+    /// `VideoFrame` nor `<video>`) would abort the whole WASM instance. The
+    /// JS side (`web/detector.js`) probes every kind of source on a throwaway
+    /// device before it lets one through here.
+    #[cfg(target_arch = "wasm32")]
+    fn feed_external(&mut self, source: unflash_gpu::wgpu::ExternalImageSource, w: u32, h: u32, t: f64, capture: bool) -> Result<(), JsValue> {
+        use unflash_gpu::wgpu;
+        let Stage::Gpu(stage) = &mut self.stage else {
+            return Err(js_err("external sources need the GPU detector; use feed_rgba"));
+        };
+        // (before the copy, so that a frame turned away costs nothing)
+        if !stage.can_submit() {
+            return Err(js_err("detector busy: poll() before submitting more frames"));
+        }
+        let tex = stage.source_texture(w, h).clone();
+        stage.queue().copy_external_image_to_texture(
+            &wgpu::CopyExternalImageSourceInfo { source, origin: wgpu::Origin2d::ZERO, flip_y: false },
+            wgpu::CopyExternalImageDestInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+                color_space: wgpu::PredefinedColorSpace::Srgb,
+                premultiplied_alpha: false,
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.submit(GpuSource::SourceTexture, t, capture)
     }
 }
 
@@ -1234,7 +1115,6 @@ pub fn h264_probe(avcc: &[u8]) -> Result<String, JsValue> {
         "level_idc": sps.level_idc,
         "width": w,
         "height": h,
-        "cabac": true,
     })
     .to_string())
 }
@@ -1263,13 +1143,11 @@ pub struct H264Decoder {
     shrink: Option<SmallPictures>,
 }
 
-/// The analysis size and colour conversion pictures are made small to, and the last one.
+/// The analysis size pictures are made small to, and the last one.
 struct SmallPictures {
     aw: u32,
     ah: u32,
-    bt709: bool,
-    full_range: bool,
-    shrink: Option<unflash_core::resample::Shrink>,
+    shrink: Option<Shrink>,
     last: Vec<u8>,
 }
 
@@ -1290,10 +1168,11 @@ impl H264Decoder {
 
     /// From now on make each picture `analysis_width`×`analysis_height`
     /// RGBA8 here, straight from the decoder's own picture (converted with
-    /// the BT.709 or BT.601 matrix, full or limited range, as the page
-    /// would convert it), instead of copying it out whole: `small` has it.
-    pub fn set_shrink(&mut self, analysis_width: u32, analysis_height: u32, bt709: bool, full_range: bool) {
-        self.shrink = Some(SmallPictures { aw: analysis_width.max(1), ah: analysis_height.max(1), bt709, full_range, shrink: None, last: Vec::new() });
+    /// the matrix and range its sequence says, as the page would convert
+    /// it: see `conversion`), instead of copying it out whole: `small` has
+    /// it.
+    pub fn set_shrink(&mut self, analysis_width: u32, analysis_height: u32) {
+        self.shrink = Some(SmallPictures { aw: analysis_width.max(1), ah: analysis_height.max(1), shrink: None, last: Vec::new() });
     }
 
     /// The last picture made small (RGBA8 at the analysis size).
@@ -1326,13 +1205,11 @@ impl H264Decoder {
         let (w, h) = (w as u32, h as u32);
         match &mut self.shrink {
             Some(s) => {
-                if !s.shrink.as_ref().is_some_and(|k| k.fits(w, h, s.aw, s.ah)) {
-                    s.shrink = Some(unflash_core::resample::Shrink::new(w, h, s.aw, s.ah));
-                }
+                let (bt709, full_range) = conversion(sps);
                 let pic = &f.pic;
                 let (lw, cw) = (pic.width, pic.width / 2);
-                let k = s.shrink.as_mut().unwrap();
-                k.yuv420_planes(&pic.y[cy * lw + cx..], lw, &pic.u[cy / 2 * cw + cx / 2..], cw, &pic.v[cy / 2 * cw + cx / 2..], cw, s.bt709, s.full_range, &mut s.last);
+                let k = Shrink::reuse(&mut s.shrink, w, h, s.aw, s.ah);
+                k.yuv420_planes(&pic.y[cy * lw + cx..], lw, &pic.u[cy / 2 * cw + cx / 2..], cw, &pic.v[cy / 2 * cw + cx / 2..], cw, bt709, full_range, &mut s.last);
             }
             None => to_i420(&f.pic, f.crop, &mut self.frame),
         }
@@ -1365,10 +1242,6 @@ impl H264Decoder {
     }
     pub fn frame_len(&self) -> u32 {
         self.frame.len() as u32
-    }
-    /// A copy of the last picture (for callers that cannot read memory).
-    pub fn frame_i420(&self) -> Vec<u8> {
-        self.frame.clone()
     }
     pub fn frame_pts(&self) -> f64 {
         self.pts
@@ -1408,14 +1281,6 @@ impl AvcRegistry {
     pub fn record(&self) -> Vec<u8> {
         self.inner.record()
     }
-
-    pub fn sps_count(&self) -> u32 {
-        self.inner.sps_count() as u32
-    }
-
-    pub fn pps_count(&self) -> u32 {
-        self.inner.pps_count() as u32
-    }
 }
 
 /// Makes one encoder's samples fit the merged track (see `AvcRegistry`).
@@ -1448,6 +1313,36 @@ pub fn h264_first_vcl_nal_type(sample: &[u8], nal_length_size: u32) -> u32 {
 #[wasm_bindgen]
 pub fn avcc_nal_length_size(avcc: &[u8]) -> u32 {
     avcc.get(4).map(|b| (b & 3) as u32 + 1).unwrap_or(4)
+}
+
+/// An `avcC` record (4-byte NAL lengths) for one SPS and one PPS (NAL
+/// units, each with its header byte), with the chroma format and bit
+/// depths a High profile's record carries after the sets: for an encoder
+/// that gives its stream as Annex B and no record. Nothing when they are
+/// not an SPS and a PPS, or the SPS can't be read.
+#[wasm_bindgen]
+pub fn avcc_record(sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> {
+    unflash_mp4::avcc_record(sps, pps)
+}
+
+/// The colour conversion the page gives a picture of this sequence, as
+/// (BT.709, full range): `web/media.js`'s yuvLayoutWords reading the
+/// matrix of `color_space_json` and the picture's height. BT.709 for
+/// matrix 1 (or 9, BT.2020's), BT.601 for 5 or 6, otherwise by height
+/// (BT.709 above 576 lines); full range as the VUI says, else limited.
+fn conversion(sps: &unflash_h264::Sps) -> (bool, bool) {
+    let hd = sps.cropped_size().1 > 576;
+    match &sps.vui {
+        Some(v) => (
+            match v.matrix_coefficients {
+                1 | 9 => true,
+                5 | 6 => false,
+                _ => hd,
+            },
+            v.video_full_range,
+        ),
+        None => (hd, false),
+    }
 }
 
 /// The VideoColorSpace of a sequence, from its VUI or the usual defaults
@@ -1484,4 +1379,117 @@ fn color_space_json(sps: &unflash_h264::Sps) -> String {
         };
     }
     serde_json::json!({ "primaries": primaries, "transfer": transfer, "matrix": matrix, "fullRange": full }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A picture of `bpp` bytes a pixel, smooth in places and noisy in
+    /// others, with a light square over half of it on odd `i` (flashing).
+    fn picture(w: usize, h: usize, bpp: usize, i: usize) -> Vec<u8> {
+        let mut x = (i as u32 + 1).wrapping_mul(2654435761) | 1;
+        let mut out = vec![255u8; w * h * bpp];
+        for y in 0..h {
+            for c in 0..w {
+                let lit = i % 2 == 1 && c < w * 3 / 4 && y < h * 3 / 4;
+                for k in 0..bpp.min(3) {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    let v = if lit { 200 + x % 40 } else if y % 3 == 0 { (c * 255 / w) as u32 } else { 30 + x % 60 };
+                    out[(y * w + c) * bpp + k] = v as u8;
+                }
+            }
+        }
+        out
+    }
+
+    /// The CPU detector makes a picture the analysis size as a decode
+    /// worker's Shrinker does, whatever form it comes in, so a scan gives
+    /// the same records wherever its pictures were made small: full-size
+    /// RGBA, BGRA and I420 pictures give the records and captures of the
+    /// worker-made small ones. (2:1 boxes average exact halves, which the
+    /// float area average it used before rounded away from zero.)
+    #[test]
+    fn cpu_detector_shrinks_as_the_workers_do() {
+        let cfg = serde_json::to_string(&Profile::WcagExt.config()).unwrap();
+        let (w, h) = (512u32, 288u32);
+        let det = || Detector::new(&cfg, w, h).unwrap();
+        let (mut rgba, mut bgra, mut yuv, mut want_rgb, mut want_yuv) = (det(), det(), det(), det(), det());
+        let (aw, ah) = (want_rgb.analysis_width(), want_rgb.analysis_height());
+        assert_eq!((aw, ah), (w / 2, h / 2));
+        let mut k = Shrink::new(w, h, aw, ah);
+        let mut small = Vec::new();
+        let (ws, hs) = (w as usize, h as usize);
+        let l = YuvLayout::packed_i420(ws, hs, true, false);
+        let words = [0, l.y_off as u32, l.y_stride as u32, l.u_off as u32, l.u_stride as u32, l.v_off as u32, l.v_stride as u32, 1, 0];
+        for i in 0..36 {
+            let (t, capture) = (i as f64 / 24.0, i % 5 == 2);
+            let px = picture(ws, hs, 4, i / 3);
+            k.packed(&px, 0, ws * 4, false, &mut small);
+            want_rgb.feed_rgba(&small, aw, ah, t, capture).unwrap();
+            rgba.feed_rgba(&px, w, h, t, capture).unwrap();
+            let swapped: Vec<u8> = px.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], 7]).collect();
+            bgra.feed_bgra(&swapped, w, h, t, capture).unwrap();
+            let planes = picture(ws * 3 / 2, hs, 1, i / 3);
+            k.yuv420(&planes, &l, &mut small);
+            want_yuv.feed_rgba(&small, aw, ah, t, capture).unwrap();
+            yuv.feed_yuv(&planes, w, h, &words, t, capture).unwrap();
+        }
+        let want = want_rgb.drain_records().unwrap();
+        let records: Vec<FrameRecord> = serde_json::from_str(&want).unwrap();
+        assert!(records.len() == 36 && records.iter().any(|r| r.up_area > 0) && records.iter().any(|r| r.down_area > 0), "the pictures flash: {want}");
+        assert_eq!(rgba.drain_records().unwrap(), want, "RGBA");
+        assert_eq!(bgra.drain_records().unwrap(), want, "BGRA");
+        assert_eq!(yuv.drain_records().unwrap(), want_yuv.drain_records().unwrap(), "I420");
+        for i in (0..36).filter(|i| i % 5 == 2) {
+            let shot = want_rgb.take_capture(i).unwrap();
+            assert_eq!(rgba.take_capture(i).unwrap(), shot, "RGBA capture {i}");
+            assert_eq!(bgra.take_capture(i).unwrap(), shot, "BGRA capture {i}");
+            assert_eq!(yuv.take_capture(i), want_yuv.take_capture(i), "I420 capture {i}");
+        }
+        assert_eq!(rgba.finish(false).unwrap(), want_rgb.finish(false).unwrap());
+    }
+
+    /// `web/media.js`'s yuvLayoutWords: the matrix and range it gives a
+    /// picture of colour space `color` (a VideoColorSpaceInit) and height.
+    fn page_conversion(color: &str, height: u32) -> (bool, bool) {
+        let cs: serde_json::Value = serde_json::from_str(color).unwrap();
+        let bt709 = match cs["matrix"].as_str() {
+            Some("bt709" | "bt2020-ncl") => true,
+            Some("smpte170m" | "bt470bg" | "fcc") => false,
+            _ => height > 576,
+        };
+        (bt709, cs["fullRange"].as_bool().unwrap_or(false))
+    }
+
+    /// The H.264 decoder makes its pictures small with the conversion the
+    /// page would pick for them (which it used to be told), for every
+    /// matrix a VUI may name, both ranges, no VUI, and both sides of the
+    /// height rule.
+    #[test]
+    fn h264_shrink_converts_as_the_page_would() {
+        // splice_a.mp4's avcC: High profile, 64×48
+        let avcc = [
+            0x01, 0x64, 0x00, 0x0a, 0xff, 0xe1, 0x00, 0x1c, 0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x46, 0x26, 0xff, 0xc0, 0x05, 0x80, 0x06, 0xc4, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c,
+            0x48, 0x96, 0x58, 0x01, 0x00, 0x06, 0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0, 0xfd, 0xf8, 0xf8, 0x00,
+        ];
+        let mut d = unflash_h264::Decoder::new();
+        d.configure_avcc(&avcc).unwrap();
+        let base = d.first_sps().unwrap().clone();
+        let mut cases = 0;
+        for lines in [480u32, 576, 720, 1080] {
+            for vui in std::iter::once(None).chain((0..=12u8).flat_map(|m| [false, true].map(|full| Some(unflash_h264::ps::Vui { matrix_coefficients: m, video_full_range: full, ..Default::default() })))) {
+                let mut sps = base.clone();
+                sps.height_mbs = lines.div_ceil(16);
+                sps.crop = (0, 0, 0, sps.height_mbs * 16 - lines);
+                sps.vui = vui;
+                assert_eq!(sps.cropped_size().1, lines);
+                assert_eq!(conversion(&sps), page_conversion(&color_space_json(&sps), lines), "{lines} lines, {:?}", sps.vui);
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 4 * 27);
+    }
 }

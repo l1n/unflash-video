@@ -2,7 +2,7 @@
 //! tests/media/av1 matches the per-frame MD5 of ffmpeg's libdav1d decoding
 //! (`gen.sh` there), and so does tests/media/av1.mp4 when ffmpeg is here to
 //! decode it. Also: decoding from a key frame in the middle, pts, damaged
-//! samples, the formats turned down, and the fast mode.
+//! samples, and the formats turned down.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,9 +40,8 @@ fn load(path: &Path) -> Stream {
 }
 
 /// Every picture of samples `from..`, flushed at the end.
-fn decode_from(s: &Stream, from: usize, fast: bool) -> Vec<Frame> {
+fn decode_from(s: &Stream, from: usize) -> Vec<Frame> {
     let mut dec = Decoder::new(&s.config).unwrap();
-    dec.set_fast(fast);
     let mut out = Vec::new();
     for (bytes, pts, _) in &s.samples[from..] {
         out.extend(dec.decode(bytes, *pts).unwrap_or_else(|e| panic!("sample at {pts}: {e}")));
@@ -52,7 +51,7 @@ fn decode_from(s: &Stream, from: usize, fast: bool) -> Vec<Frame> {
 }
 
 fn decode(s: &Stream) -> Vec<Frame> {
-    decode_from(s, 0, false)
+    decode_from(s, 0)
 }
 
 fn decode_raw(s: &Stream) -> Vec<RawFrame> {
@@ -216,7 +215,7 @@ fn from_a_key_frame_in_the_middle() {
         let keys: Vec<usize> = (1..s.samples.len()).filter(|&i| s.samples[i].2).collect();
         assert!(!keys.is_empty(), "{name}: a key frame in the middle");
         for k in keys {
-            let part = decode_from(&s, k, false);
+            let part = decode_from(&s, k);
             let tail: Vec<&Frame> = all.iter().filter(|f| f.pts >= s.samples[k].1).collect();
             assert_eq!(part.len(), tail.len(), "{name} from sample {k}: picture count");
             for (a, b) in part.iter().zip(tail) {
@@ -311,29 +310,6 @@ fn flush_then_start_over() {
             again.extend(dec.decode(bytes, *pts).unwrap());
         }
         assert_eq!(again.as_slice(), &all[key..], "{name}: from sample {key} after a flush");
-    }
-}
-
-/// Without the in-loop filters the pictures are close, not exact.
-#[test]
-fn fast_mode_is_close() {
-    for name in ["aom_altref_tiles.mp4", "svt_grain.mp4", "aom_odd.mp4"] {
-        let s = load(&media(name));
-        let exact = decode(&s);
-        let fast = decode_from(&s, 0, true);
-        assert_eq!(fast.len(), exact.len(), "{name}");
-        let mut differ = 0;
-        let (mut sum, mut n) = (0u64, 0u64);
-        for (f, e) in fast.iter().zip(&exact) {
-            assert_eq!((f.width, f.height, f.pts), (e.width, e.height, e.pts));
-            differ += (f != e) as usize;
-            sum += f.y.iter().zip(&e.y).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as u64).sum::<u64>();
-            n += f.y.len() as u64;
-        }
-        let mad = sum as f64 / n as f64;
-        eprintln!("{name}: fast mode, mean absolute luma difference {mad:.3}, {differ} of {} pictures differ", fast.len());
-        assert!(differ > 0, "{name}: the filters were left out");
-        assert!(mad < 2.0, "{name}: mean absolute luma difference {mad}");
     }
 }
 

@@ -1,20 +1,27 @@
 //! WebGPU pixel stage for the Unflash detector, on wgpu (native backends and
 //! the browser's WebGPU alike).
 //!
-//! Each frame runs four compute passes, five with pattern detection on:
+//! Each frame runs five compute passes, six with pattern detection on,
+//! and one more before them for a YUV source (**yuv**: its planes converted
+//! into the RGBA source texture). As a picture arrives:
 //!
 //! 1. **ingest** — area-average the source texture to the analysis size,
-//!    linearise through the sRGB table, produce L / V / saturation planes and
-//!    count the pixels that moved since the last new picture;
-//! 2. **pattern** — the regular-pattern (stripe) detector
+//!    linearise through the sRGB table and produce the L / V / chromaticity
+//!    planes (the frame's input planes, kept until its batch runs).
+//!
+//! Then, frame by frame, when the batch runs:
+//!
+//! 2. **moved** — count the pixels that moved since the last new picture
+//!    (for the held-frame test; it needs the previous frame's update);
+//! 3. **pattern** — the regular-pattern (stripe) detector
 //!    (`unflash_core::pattern`, restated in WGSL), one thread per sampling
 //!    line, marking the patterned pixels;
-//! 3. **update** — the per-pixel state machine
+//! 4. **update** — the per-pixel state machine
 //!    (`unflash_core::pixel::run_frame_scalar`, restated in WGSL);
-//! 4. **rows** — per-row window sums and onset maxima, one thread per window
+//! 5. **rows** — per-row window sums and onset maxima, one thread per window
 //!    position (no workgroup barriers: cheap on real GPUs and not
 //!    pathological on software ones);
-//! 5. **gather** — one grid cell per window position.
+//! 6. **gather** — one grid cell per window position.
 //!
 //! The output is a few kilobytes per frame, copied into a staging buffer and
 //! mapped asynchronously; several frames can be in flight. Per-pixel state
@@ -168,20 +175,21 @@ pub struct GpuStage {
     queue: wgpu::Queue,
     cfg: DetectorConfig,
     geom: GridGeometry,
-    layout: StateLayout,
     // buffers
     params_buf: wgpu::Buffer,
     geo_buf: wgpu::Buffer,
     lut_buf: wgpu::Buffer,
     inputs_buf: wgpu::Buffer,
+    /// Read back only by the native debug helpers (the passes reach it
+    /// through their bind groups).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     state_buf: wgpu::Buffer,
     /// Read back only by the native debug helpers.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pixout_buf: wgpu::Buffer,
     rgba_buf: wgpu::Buffer,
-    // the per-frame globals regions are reached through the bind groups only
-    rowwin_buf: wgpu::Buffer,
-    rowtot_buf: wgpu::Buffer,
+    // the per-frame globals regions and the row sums are reached through
+    // the bind groups only
     /// Read back only by the native debug helpers (the per-row pattern
     /// counts live in the rows / gather bind groups alone).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -230,7 +238,6 @@ pub struct GpuStage {
     /// Told whenever a readback completes.
     notify: Option<Notify>,
     free: Vec<usize>,
-    frames_submitted: u64,
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -322,8 +329,11 @@ impl GpuStage {
         let batch = batch.max(1);
         let device = ctx.device.clone();
         let queue = ctx.queue.clone();
+        // (the analysis model's screen at full scale: its per-pixel state,
+        // about 100 MB at 1024×768, is near what one storage binding may
+        // hold by default, 128 MiB)
         if geom.aw > 1024 {
-            return Err(format!("analysis width {} exceeds the 1024 the row scan supports", geom.aw));
+            return Err(format!("analysis width {} is over 1024, the analysis model's at full scale", geom.aw));
         }
         if geom.gxs.len() > GEO_MAX_POS || geom.gys.len() > GEO_MAX_POS {
             return Err("too many window positions".into());
@@ -516,7 +526,6 @@ impl GpuStage {
             queue,
             cfg: cfg.clone(),
             geom,
-            layout,
             params_buf,
             geo_buf,
             lut_buf,
@@ -524,8 +533,6 @@ impl GpuStage {
             state_buf,
             pixout_buf,
             rgba_buf,
-            rowwin_buf,
-            rowtot_buf,
             patmask_buf,
             out_buf,
             out_words,
@@ -562,19 +569,9 @@ impl GpuStage {
             in_flight: VecDeque::new(),
             notify: None,
             free,
-            frames_submitted: 0,
         })
     }
 
-    pub fn geometry(&self) -> &GridGeometry {
-        &self.geom
-    }
-    pub fn config(&self) -> &DetectorConfig {
-        &self.cfg
-    }
-    pub fn device(&self) -> &wgpu::Device {
-        &self.device
-    }
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
@@ -603,14 +600,6 @@ impl GpuStage {
     /// slot is free to start one.
     pub fn can_submit(&self) -> bool {
         self.current.is_some() || !self.free.is_empty()
-    }
-    /// Frames per batch.
-    pub fn batch(&self) -> usize {
-        self.batch
-    }
-    /// Frames ingested into the batch being filled.
-    pub fn queued(&self) -> usize {
-        self.queued
     }
     /// Bytes of per-pixel state touched by one full-update frame: the record
     /// read plus the partial write plus the input planes (for bandwidth
@@ -698,9 +687,8 @@ impl GpuStage {
                 for i in 0..n {
                     self.rgba_scratch[i * 4..i * 4 + 3].copy_from_slice(&data[i * 3..i * 3 + 3]);
                 }
-                let tex = self.source_texture(width, height);
-                let tex = tex.clone();
-                self.write_source(&tex, &self.rgba_scratch.clone(), width, height);
+                let tex = self.source_texture(width, height).clone();
+                self.write_source(&tex, &self.rgba_scratch, width, height);
             }
             FrameSource::Rgba8 { data, width, height } | FrameSource::Bgra8 { data, width, height } => {
                 let n = (width * height) as usize;
@@ -778,7 +766,6 @@ impl GpuStage {
         self.frame_capture.push(capture);
         self.queued += 1;
         self.last_pos = k;
-        self.frames_submitted += 1;
         if self.queued >= self.batch {
             self.submit_batch();
         }
@@ -991,17 +978,14 @@ impl GpuStage {
             // unmaps, so the slot can be reused while its frames are handed out
             if self.slots[slot_idx].next == 0 && self.slots[slot_idx].words.is_empty() {
                 let slot = &mut self.slots[slot_idx];
-                match &r {
-                    Ok(()) => {
-                        let view = slot.staging.slice(..(n * out_region) as u64).get_mapped_range().expect("mapped range");
-                        slot.words = cast_slice::<u8, u32>(&view).to_vec();
-                        drop(view);
-                        if slot.captured {
-                            let rs = slot.rgba_staging.as_ref().unwrap();
-                            slot.rgba = rs.slice(..(n * rgba_region) as u64).get_mapped_range().expect("mapped rgba").to_vec();
-                        }
+                if r.is_ok() {
+                    let view = slot.staging.slice(..(n * out_region) as u64).get_mapped_range().expect("mapped range");
+                    slot.words = cast_slice::<u8, u32>(&view).to_vec();
+                    drop(view);
+                    if slot.captured {
+                        let rs = slot.rgba_staging.as_ref().unwrap();
+                        slot.rgba = rs.slice(..(n * rgba_region) as u64).get_mapped_range().expect("mapped rgba").to_vec();
                     }
-                    Err(_) => {}
                 }
                 slot.staging.unmap();
                 if slot.captured {
@@ -1125,16 +1109,5 @@ impl GpuStage {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn debug_patmask(&self) -> Vec<u32> {
         self.read_buffer_words(&self.patmask_buf)
-    }
-
-    pub fn state_layout(&self) -> StateLayout {
-        self.layout
-    }
-    /// Sizes of the intermediate buffers (bytes): (row windows, row totals).
-    pub fn intermediate_bytes(&self) -> (u64, u64) {
-        (self.rowwin_buf.size(), self.rowtot_buf.size())
-    }
-    pub fn frames_submitted(&self) -> u64 {
-        self.frames_submitted
     }
 }

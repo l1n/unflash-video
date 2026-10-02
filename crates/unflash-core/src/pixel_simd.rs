@@ -202,7 +202,6 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
     let main = n - n % LANES;
     let now = u32x8::splat(p.now);
     let zero = u32x8::splat(0);
-    let ones = !zero;
 
     if p.saturate() {
         let lim = u32x8::splat(AGE_MAX);
@@ -252,10 +251,8 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
             st_u(&mut out.onset_red, i, zero);
             i += LANES;
         }
-        // the tail: the scalar path also does saturation, which is done
-        // already for the head only, so give it a copy of the params
-        // without the saturate bit for the head's sake -- the tail range
-        // still needs both, which the scalar runner applies in order
+        // the tail: the scalar runner saturates and ages its own range
+        // only (the head's were done above), with the same params
         run_range_scalar(st, planes, p, out, main, n);
         return;
     }
@@ -371,7 +368,6 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
         st_u(&mut out.mask, i, mask);
         i += LANES;
     }
-    let _ = ones;
     // the tail: saturation for the head was done above, so hand the scalar
     // runner the tail only
     run_range_scalar(st, planes, p, out, main, n);
