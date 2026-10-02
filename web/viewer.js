@@ -9,7 +9,7 @@ import { decodeRange } from './media.js';
 /** Seconds decoded either side of the frame asked for, kept for stepping. */
 const WINDOW_S = 0.35;
 /** At most 2.5 new pictures a second: slower than any flash that counts. */
-const MIN_GAP_MS = 400;
+export const MIN_GAP_MS = 400;
 /** Pictures kept (as bitmaps at the viewer's size). */
 const KEEP = 48;
 

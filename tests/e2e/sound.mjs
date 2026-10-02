@@ -187,7 +187,7 @@ try {
     const { sectionRenderPlan } = await import('./export.js');
     const u = window.__unflash;
     const sec = u.currentSection();
-    const plan = sectionRenderPlan(u.state.env, u.state.movie, sec, 1.0);
+    const plan = sectionRenderPlan(u.state.env, u.state.movie, sec);
     // the held frame's own time, and the time its next frame had
     return { holds: plan.holds, extra: plan.extra };
   });
@@ -385,7 +385,7 @@ try {
   const dolbyHold = await dolby.evaluate(async () => {
     const { sectionRenderPlan } = await import('./export.js');
     const u = window.__unflash;
-    return sectionRenderPlan(u.state.env, u.state.movie, u.currentSection(), 1.0).holds[0];
+    return sectionRenderPlan(u.state.env, u.state.movie, u.currentSection()).holds[0];
   });
   await dolby.click('#btnExport');
   await dolby.waitForSelector('#exportModal', { state: 'visible' });

@@ -49,7 +49,7 @@ export class SectionPlayer {
    * `loop()` is asked at the end of each pass. With `once`, draw the first
    * picture and stop (a poster). Returns once playback has been set going.
    */
-  async play({ env, movie, sec, edited = true, extS = 1.0, fromSlot = 0, loop = () => false, once = false }) {
+  async play({ env, movie, sec, edited = true, fromSlot = 0, loop = () => false, once = false }) {
     // two calls close together: each waits out whatever pass is under way
     while (this.run && !this.run.done) await this.stop();
     const run = { cancelled: false, paused: false, wake: null, base: null, pausedAt: null, done: false, slot: -1, t: null, once };
@@ -59,7 +59,7 @@ export class SectionPlayer {
       let from = fromSlot;
       try {
         for (;;) {
-          await this._pass(run, { env, movie, sec, edited, extS, fromSlot: from });
+          await this._pass(run, { env, movie, sec, edited, fromSlot: from });
           if (run.cancelled || once || !loop()) break;
           from = 0;
           run.base = null; // the next pass sets the clock (and the sound) going at its first frame
@@ -163,8 +163,8 @@ export class SectionPlayer {
     }
   }
 
-  async _pass(run, { env, movie, sec, edited, extS, fromSlot }) {
-    const plan = sectionRenderPlan(env, movie, sec, extS, { edited });
+  async _pass(run, { env, movie, sec, edited, fromSlot }) {
+    const plan = sectionRenderPlan(env, movie, sec, { edited });
     const n = plan.seq.t.length;
     if (!n) return;
     const first = Math.max(0, Math.min(fromSlot, n - 1));

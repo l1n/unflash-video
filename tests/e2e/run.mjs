@@ -200,6 +200,20 @@ try {
   results.verdictBefore = await page.textContent('#wsVerdict');
   results.frameCount = await page.textContent('#frameCount');
   console.log('prepared in', results.prepareMs, 'ms; verdict:', results.verdictBefore, results.frameCount);
+  // the frame on the section's very end gives it its length but is not one of
+  // its own (the export shows it after the section): the grid stops before
+  // it, and so do the count over the grid, Ctrl+A and the arrow keys
+  {
+    await page.click('#frameGrid .frame:nth-child(1)');
+    await page.keyboard.press('Control+a');
+    const grid = await page.evaluate(() => ({ tiles: document.querySelectorAll('#frameGrid .frame').length, nFrames: window.__unflash.currentSection().nFrames, count: document.querySelector('#frameCount').textContent, all: window.__unflash.state.selection.size }));
+    await page.click('#frameGrid .frame:last-child');
+    await page.keyboard.press('ArrowRight');
+    grid.afterLast = await page.evaluate(() => [...window.__unflash.state.selection]);
+    await page.keyboard.press('Escape');
+    console.log('the grid:', JSON.stringify(grid));
+    assert(grid.nFrames === grid.tiles + 1 && grid.count === `(${grid.tiles})` && grid.all === grid.tiles && JSON.stringify(grid.afterLast) === `[${grid.tiles - 1}]`, 'the count, Ctrl+A and the arrows keep to the frames in the grid: ' + JSON.stringify(grid));
+  }
   // each frame says when it is in the whole video (as a verify of the export
   // gives it) and how far into the section; so do the findings and the verdict
   {
@@ -374,6 +388,63 @@ try {
   console.log('after 5 removals:', results.verdictAfterMarks, `(auto-check took ${results.checkMs.toFixed(0)} ms for ${nFrames} frames + context)`);
   assert(results.checkMs < 5000, 'the instant check must be quick');
 
+  // --- a frame marked while a check or a suggestion runs is not lost ----------
+  // (R pressed, or Check clicked, half way through the frames they feed the
+  // detector, after they have read the marks; auto-check off, so that
+  // nothing checks again by itself)
+  {
+    const during = (what) =>
+      page.evaluate((what) => {
+        const f = window.__unflash.state.env.feeder;
+        const cached = f.cached;
+        let n = 0;
+        window.__pressed = false;
+        f.cached = (...a) => {
+          if (++n === 200) {
+            delete f.cached;
+            window.__pressed = true;
+            if (what === 'check') document.querySelector('#btnCheck').click();
+            else document.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', bubbles: true }));
+          }
+          return cached.apply(f, a);
+        };
+      }, what);
+    const marked = f0 + 9;
+    const markOf = () => page.evaluate((i) => window.__unflash.currentSection().edits[i] || null, marked);
+    await page.uncheck('#autoCheck');
+    await page.click(`#frameGrid .frame:nth-child(${marked + 1})`);
+    // the check judged the marks before: its verdict says they need checking again
+    await during('r');
+    await page.click('#btnCheck');
+    await page.waitForFunction(() => window.__pressed && !window.__unflash.state.checkRunning, null, { timeout: 60000 });
+    const checked = { verdict: await page.textContent('#wsVerdict'), stale: await page.evaluate(() => !!window.__unflash.currentSection().check.stale), mark: await markOf() };
+    await page.keyboard.press('Control+z');
+    // the suggestion was made from the marks before: it is not applied over the frame marked
+    const edits = await page.evaluate(() => JSON.stringify(window.__unflash.currentSection().edits));
+    await during('r');
+    const toastNow = await page.textContent('#toast');
+    await page.click('#btnSuggestFewest');
+    await toastChange(toastNow);
+    const suggested = { toast: await page.textContent('#toast'), mark: await markOf() };
+    await page.keyboard.press('Control+z');
+    suggested.undone = (await page.evaluate(() => JSON.stringify(window.__unflash.currentSection().edits))) === edits;
+    // a check asked for as a suggestion runs checks the marks the suggestion
+    // hands back, once they are in (taken before, they made its verdict stale)
+    await during('check');
+    await page.click('#btnSuggestFewest');
+    await page.waitForFunction(() => window.__pressed && !window.__unflash.state.job && !window.__unflash.state.checkRunning, null, { timeout: 120000 });
+    const asked = { verdict: await page.textContent('#wsVerdict'), stale: await page.evaluate(() => !!window.__unflash.currentSection().check.stale) };
+    await page.keyboard.press('Control+z');
+    asked.undone = (await page.evaluate(() => JSON.stringify(window.__unflash.currentSection().edits))) === edits;
+    await page.check('#autoCheck');
+    await page.click('#btnCheck');
+    await verdictReady(page);
+    console.log('marked while a check ran:', JSON.stringify(checked), '| while a suggestion ran:', JSON.stringify(suggested), '| a check asked for as a suggestion ran:', JSON.stringify(asked));
+    assert(checked.mark && checked.mark.removed && checked.stale && checked.verdict === 'needs re-check', 'a check that ran as a frame was marked does not pass its verdict off as the marks\': ' + JSON.stringify(checked));
+    assert(suggested.mark && suggested.mark.removed && suggested.undone && /^Suggesting \(fewest removals\): the section's marks changed while it ran, so its suggestion was not applied/.test(suggested.toast), 'a suggestion that ran as a frame was marked is not applied over the mark: ' + JSON.stringify(suggested));
+    assert(!asked.stale && /^(passes|fails)/.test(asked.verdict) && asked.undone, "a check asked for as a suggestion ran judged the suggestion's marks: " + JSON.stringify(asked));
+  }
+
   // --- cancelled part way, a suggestion and a prepare change nothing -----------
   {
     const section = () =>
@@ -381,7 +452,7 @@ try {
         const u = window.__unflash;
         const s = u.currentSection();
         const { sectionRenderPlan } = await import('./export.js');
-        return JSON.stringify({ edits: s.edits, pts: s.pts.length, nFrames: s.nFrames, prepared: s.prepared, warnings: s.warnings, runOut: s.ctx && s.ctx.tailPts.length, shown: sectionRenderPlan(u.state.env, u.state.movie, s, 1.0).nOut });
+        return JSON.stringify({ edits: s.edits, pts: s.pts.length, nFrames: s.nFrames, prepared: s.prepared, warnings: s.warnings, runOut: s.ctx && s.ctx.tailPts.length, shown: sectionRenderPlan(u.state.env, u.state.movie, s).nOut });
       });
     const before = await section();
     // a suggestion stops at its next check, and none of it is applied
@@ -398,6 +469,47 @@ try {
     assert(afterSuggest.toast === `${suggesting}: cancelled` && afterSuggest.section === before, 'a cancelled suggestion is not applied: ' + JSON.stringify({ before, afterSuggest }));
     assert(afterPrepare.toast === `${preparing}: cancelled` && afterPrepare.section === before, 'a cancelled prepare leaves the section as it was: ' + JSON.stringify({ before, afterPrepare }));
     await noBanner(page);
+  }
+  // another video's open, cancelled part way (its index read, its project and
+  // detectors under way), leaves the page as it was: this video, its section
+  // and marks, and nothing of the other
+  {
+    const opened = () =>
+      page.evaluate(() => {
+        const u = window.__unflash;
+        return JSON.stringify({ video: document.querySelector('#videoInfo').textContent, movie: u.state.movie.name, current: u.state.current, edits: u.currentSection().edits, sections: u.state.project.sections.length, profile: document.querySelector('#profileSel').value });
+      });
+    const before = await opened();
+    await page.evaluate(() => {
+      const u = window.__unflash;
+      const watch = new MutationObserver(() => {
+        const job = u.state.job;
+        if (job && job.name === 'Opening video' && job.pct >= 36) {
+          watch.disconnect();
+          document.querySelector('#btnCancelJob').click();
+        }
+      });
+      watch.observe(document.querySelector('#jobBar'), { attributes: true, attributeFilter: ['style'] });
+    });
+    await page.setInputFiles('#fileInput', path.join(MEDIA, 'steady.mp4'));
+    await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Opening video: cancelled', null, { timeout: 60000 });
+    await jobDone(page);
+    const after = await opened();
+    console.log('an open cancelled:', after === before ? 'the page as it was' : after);
+    assert(after === before && !(await page.evaluate(() => window.__unflash.state.job)), 'an open cancelled part way leaves the video that was open: ' + JSON.stringify({ before, after }));
+    await noBanner(page);
+  }
+  // a re-scan cancelled part way leaves nothing of what it saw: the timeline,
+  // the chart and the monitor read the last whole scan's trace again
+  {
+    const scanning = await cancelledJob(page, '#btnScan', 30);
+    const trace = await page.evaluate(() => {
+      const u = window.__unflash;
+      const n = u.state.traceNorm;
+      return { toast: document.querySelector('#toast').textContent, frames: n ? n.t.length : 0, last: !!n && n.src === u.state.project.scan.trace };
+    });
+    console.log('a re-scan cancelled:', JSON.stringify(trace));
+    assert(trace.toast === `${scanning}: cancelled` && trace.frames === 300 && trace.last, "a cancelled re-scan leaves the last scan's trace drawn: " + JSON.stringify(trace));
   }
 
   // --- let the suggester fix it ---------------------------------------------
@@ -443,7 +555,7 @@ try {
     const { suggestEdits } = await import('./analysis.js');
     const sec = u.currentSection();
     const env = u.state.env;
-    const real = await suggestEdits(env, u.state.project, sec, 'fewest', null, { extS: 1.0 });
+    const real = await suggestEdits(env, u.state.project, sec, 'fewest', null);
     class Tried {
       constructor() {
         this.n = 0;
@@ -455,7 +567,7 @@ try {
       free() {}
     }
     const wasm = new Proxy(env.wasm, { get: (t, k) => (k === 'Suggester' ? Tried : t[k]) });
-    const res = await suggestEdits({ ...env, wasm }, u.state.project, sec, 'fewest', null, { extS: 1.0 });
+    const res = await suggestEdits({ ...env, wasm }, u.state.project, sec, 'fewest', null);
     return { real: real.verdict.safe, handedBack: res.verdict.safe, note: res.note };
   });
   assert(results.suggestVerdict.real && results.suggestVerdict.handedBack, "a suggestion's verdict is the check of the marks it hands back, not of the last it tried: " + JSON.stringify(results.suggestVerdict));
@@ -790,6 +902,45 @@ try {
   // a scan of this file exists, so the meter reads it instead of detecting again
   assert(/from the scan/.test(results.hud), 'after a scan the monitor reads the scan trace: ' + results.hud);
   await page.screenshot({ path: path.join(OUT, '5-live.png') });
+  // the monitor goes on across new detectors (the old ones freed under its
+  // loop): another video opened as this one plays (none of it scanned, so
+  // the monitor detects on it), and another profile chosen as that one plays
+  {
+    const play = () =>
+      page.evaluate(() => {
+        const v = document.querySelector('#player');
+        v.muted = true;
+        v.currentTime = 0;
+        return v.play();
+      });
+    // (what the monitor says as it detects, cleared first: a count from its loop now)
+    const watching = async () => {
+      await page.evaluate(() => (document.querySelector('#hudInfo').textContent = ''));
+      await page.waitForFunction(() => {
+        const m = /^(\d+) frames watched/.exec(document.querySelector('#hudInfo').textContent);
+        return m && +m[1] > 5;
+      }, null, { timeout: 30000 });
+    };
+    const profile = async (name) => {
+      await page.evaluate(() => (document.querySelector('#toast').textContent = ''));
+      await page.selectOption('#profileSel', name);
+      await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('Profile changed'), null, { timeout: 30000 });
+    };
+    await page.setInputFiles('#fileInput', path.join(MEDIA, 'steady.mp4'));
+    await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('steady.mp4'), null, { timeout: 60000 });
+    await jobDone(page);
+    await play();
+    await watching();
+    await profile('wcag');
+    await play();
+    await watching();
+    results.liveAcross = await page.textContent('#hudInfo');
+    console.log('the monitor after a new video and a new profile:', results.liveAcross);
+    // (back as it was: the default profile, and the first video open)
+    await profile('wcag_ext');
+    await openFile('flash.mp4');
+    await jobDone(page);
+  }
   await page.uncheck('#liveToggle');
   await page.evaluate(() => document.querySelector('#player').pause());
 
@@ -866,9 +1017,111 @@ try {
   assert(results.extendedHalfCleared.verdict === 'passes' && results.extendedHalfCleared.findings.length === 1 && results.extendedHalfCleared.findings[0].run && results.extendedHalfCleared.findings[0].text.includes(`up to its first picture, in section #${firstHalf}`), 'flashing that only reaches its first picture is the section before\'s: ' + JSON.stringify(results.extendedHalfCleared));
   await page.click(`#wsFindings button[data-open-section="${firstHalf}"]`);
   await page.waitForFunction((id) => window.__unflash.currentSection().id === id, firstHalf, { timeout: 5000 });
-  page.once('dialog', (d) => d.accept());
-  await page.click('#btnDeleteAll');
-  await page.waitForFunction(() => document.querySelectorAll('#sectionList .sec-item').length === 1);
+  const checked = () => page.waitForFunction(() => { const u = window.__unflash; const c = u.currentSection() && u.currentSection().check; return c && !c.stale && !u.state.checkRunning; }, null, { timeout: 120000 });
+  await checked();
+  const secondHalf = await page.evaluate((id) => window.__unflash.state.project.sections.find((s) => s.id !== id).id, firstHalf);
+  // a check that ends after another section was opened leaves that section's
+  // verdict and findings on the page (it used to draw its own there)
+  {
+    const area = () => page.evaluate(() => JSON.stringify({ verdict: document.querySelector('#wsVerdict').textContent, findings: document.querySelector('#wsFindings').textContent }));
+    const first = await area();
+    await page.evaluate((other) => {
+      const v = document.querySelector('#wsVerdict');
+      const watch = new MutationObserver(() => {
+        if (v.textContent !== 'checking…') return;
+        watch.disconnect();
+        // (the first half's check under way: the second half opened from the list)
+        [...document.querySelectorAll('#sectionList .sec-item')].find((el) => el.textContent.startsWith(`#${other} `)).click();
+        window.__opened = JSON.stringify({ verdict: v.textContent, findings: document.querySelector('#wsFindings').textContent });
+      });
+      watch.observe(v, { childList: true, characterData: true, subtree: true });
+      window.__opened = null;
+      document.querySelector('#btnCheck').click();
+    }, secondHalf);
+    await page.waitForFunction(() => window.__opened && !window.__unflash.state.checkRunning, null, { timeout: 60000 });
+    const opened = await page.evaluate(() => window.__opened);
+    const shown = await area();
+    console.log('a check that ended after another section was opened:', JSON.stringify({ first, opened, shown }));
+    assert(first !== opened && shown === opened, "the section open keeps its own verdict and findings when another's check ends: " + JSON.stringify({ first, opened, shown }));
+  }
+  // Check all and Prepare all end at a cancel: the sections after the one
+  // cancelled are left as they were
+  {
+    await page.evaluate(() => window.__unflash.state.project.sections.forEach((s) => (s.check.stale = true)));
+    // (a check job says nothing as it goes: the cancel comes with the click)
+    const checking = await page.evaluate(() => {
+      document.querySelector('#btnCheckAll').click();
+      const name = window.__unflash.state.job.name;
+      document.querySelector('#btnCancelJob').click();
+      return name;
+    });
+    await page.waitForFunction((name) => document.querySelector('#toast').textContent === `${name}: cancelled`, checking, { timeout: 60000 });
+    await jobDone(page);
+    const stale = await page.evaluate(() => window.__unflash.state.project.sections.map((s) => s.check.stale));
+    await page.evaluate(async () => {
+      const { dropCaches } = await import('./project.js');
+      window.__unflash.state.project.sections.forEach(dropCaches);
+    });
+    const preparing = await cancelledJob(page, '#btnPrepareAll', 10);
+    const prepared = await page.evaluate(() => window.__unflash.state.project.sections.map((s) => s.prepared));
+    console.log('Check all cancelled:', JSON.stringify(stale), '| Prepare all cancelled:', preparing, JSON.stringify(prepared));
+    assert(stale.length === 2 && stale.every((x) => x), 'Check all ends at a cancel: ' + JSON.stringify(stale));
+    assert(prepared.length === 2 && prepared.every((x) => !x), 'Prepare all ends at a cancel: ' + JSON.stringify(prepared));
+    // and goes through both, uncancelled
+    await page.click('#btnPrepareAll');
+    await page.waitForFunction(() => window.__unflash.state.project.sections.every((s) => s.prepared) && !window.__unflash.state.job, null, { timeout: 120000 });
+    await checked();
+  }
+  // another range is another section: what was made on its frames goes with
+  // them (its K marks and its undo history too), and the check of the
+  // section next to it, which read its edge, is stale (they all stayed)
+  {
+    const open = (id) => page.evaluate((id) => [...document.querySelectorAll('#sectionList .sec-item')].find((el) => el.textContent.startsWith(`#${id} `)).click(), id);
+    await open(firstHalf);
+    await checked();
+    await page.click('#frameGrid .frame:nth-child(1)');
+    await page.keyboard.press('k');
+    await page.click('#frameGrid .frame:nth-child(2)');
+    await page.keyboard.press('r');
+    await checked();
+    // (the second half checked after those marks: its check is not stale yet)
+    await open(secondHalf);
+    await checked();
+    await open(firstHalf);
+    await page.fill('#secEnd', '4.5');
+    await page.click('#btnApplyRange');
+    await page.waitForFunction(() => window.__unflash.currentSection().end === 4.5, null, { timeout: 30000 });
+    const ranged = await page.evaluate((other) => {
+      const u = window.__unflash;
+      const s = u.currentSection();
+      return { keep: s.keep, edits: s.edits, history: u.state.history.has(s.id), nextStale: !!u.state.project.sections.find((o) => o.id === other).check.stale };
+    }, secondHalf);
+    console.log('a section given another range:', JSON.stringify(ranged));
+    assert(!ranged.keep.length && !Object.keys(ranged.edits).length && !ranged.history && ranged.nextStale, "another range leaves none of the section's marks or history, and its neighbour's check stale: " + JSON.stringify(ranged));
+    // (the second half open and checked again, for what follows)
+    await open(secondHalf);
+    await checked();
+  }
+  // every section deleted while a check runs: their frames are freed once it
+  // is done (freed under it, they were "null pointer passed to rust")
+  {
+    await page.evaluate(() => {
+      const f = window.__unflash.state.env.feeder;
+      const cached = f.cached;
+      let n = 0;
+      f.cached = (...a) => {
+        if (++n === 100) {
+          delete f.cached;
+          document.querySelector('#btnDeleteAll').click();
+        }
+        return cached.apply(f, a);
+      };
+    });
+    page.once('dialog', (d) => d.accept());
+    await page.click('#btnCheck');
+    await page.waitForFunction(() => document.querySelectorAll('#sectionList .sec-item').length === 1 && !window.__unflash.state.checkRunning, null, { timeout: 60000 });
+    await noBanner(page);
+  }
   await page.selectOption('#profileSel', 'wcag');
   await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('Profile changed'), null, { timeout: 30000 });
   scan = await scanCurrent();
@@ -1619,6 +1872,72 @@ try {
   results.autoAgain = await autoDone();
   console.log('auto-fix flash.mp4 again:', JSON.stringify(results.autoAgain));
   assert(/last visit/.test(results.autoAgain.steps.scan.text) && /marks from before/.test(results.autoAgain.steps.fix.text) && results.autoAgain.steps.verify.status === 'done', 'the second visit reuses the scan and the marks: ' + JSON.stringify(results.autoAgain.steps));
+
+  // "stop" pressed as the run moves on to its export, between its jobs (none
+  // is under way to cancel), stops it there: no export starts
+  {
+    await page.evaluate(() => {
+      window.__jobs = [];
+      const name = document.querySelector('#jobName');
+      new MutationObserver(() => window.__jobs.push(name.textContent)).observe(name, { childList: true, characterData: true, subtree: true });
+      const steps = document.querySelector('#autoSteps');
+      const watch = new MutationObserver(() => {
+        const fix = steps.querySelector('[data-step="fix"]');
+        if (!fix || !fix.classList.contains('done')) return;
+        watch.disconnect();
+        document.querySelector('#btnAutoStop').click();
+      });
+      watch.observe(steps, { childList: true });
+    });
+    await page.click('#btnAutoRerun');
+    const run = await autoDone();
+    const jobs = await page.evaluate(() => window.__jobs);
+    console.log('auto-fix stopped as it moved on to its export:', JSON.stringify({ steps: run.steps, jobs }));
+    assert(run.steps.fix.status === 'done' && run.steps.export.status === 'stopped' && !run.steps.verify && !jobs.includes('Exporting') && /^Stopped/.test(run.summary), 'stopped between its jobs, the run starts no export: ' + JSON.stringify({ steps: run.steps, jobs }));
+  }
+  // "stop" during the run's scan cancels the scan, and the run ends there
+  {
+    await page.evaluate(() => {
+      const u = window.__unflash;
+      const watch = new MutationObserver(() => {
+        const job = u.state.job;
+        if (!job || job.name !== 'Scanning for flashes' || job.pct < 10) return;
+        watch.disconnect();
+        document.querySelector('#btnAutoStop').click();
+      });
+      watch.observe(document.querySelector('#jobBar'), { attributes: true, attributeFilter: ['style'] });
+    });
+    await page.click('#btnAutoRerun');
+    const run = await autoDone();
+    const toast = await page.textContent('#toast');
+    console.log('auto-fix stopped during its scan:', JSON.stringify(run.steps), '|', toast);
+    assert(run.steps.scan.status === 'stopped' && !run.steps.fix && toast === 'Scanning for flashes: cancelled' && /^Stopped/.test(run.summary), 'stopped during its scan, the run ends there: ' + JSON.stringify(run));
+  }
+  // a run whose export still fails WCAG ends with an alert that says so (it
+  // used to say nothing: no job had failed). The marks go here as the fixes
+  // finish, so that the export keeps the flashing
+  {
+    await page.evaluate(() => {
+      const u = window.__unflash;
+      u.setAlerts({ beep: false, after: 0, notify: false });
+      u.state.lastAlert = null;
+      const steps = document.querySelector('#autoSteps');
+      const watch = new MutationObserver(() => {
+        const fix = steps.querySelector('[data-step="fix"]');
+        if (!fix || !fix.classList.contains('done')) return;
+        watch.disconnect();
+        for (const s of u.state.project.sections) Object.assign(s, { edits: {}, blend: [], soften: false });
+      });
+      watch.observe(steps, { childList: true });
+    });
+    await page.click('#btnAutoRerun');
+    const run = await autoDone();
+    await page.waitForFunction(() => window.__unflash.lastAlert, null, { timeout: 30000 });
+    const alert = await page.evaluate(() => window.__unflash.lastAlert);
+    await page.evaluate(() => window.__unflash.setAlerts({ after: 60 }));
+    console.log('the alert of a run whose export still fails:', JSON.stringify(alert));
+    assert(run.steps.verify.status === 'failed' && !alert.ok && /failed$/.test(alert.title) && /^The exported file still fails WCAG/.test(alert.body), 'the alert of a run whose export still fails says so: ' + JSON.stringify({ steps: run.steps, alert }));
+  }
 
   // the switch in the header turns it off: the file is scanned and nothing more
   await page.uncheck('#autoToggle');

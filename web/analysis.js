@@ -1125,6 +1125,12 @@ async function prepareSpans(env, movie, sec, plan, feeders, { onProgress, cancel
   return parts;
 }
 
+/**
+ * Seconds a frame marked E is held for (as the export holds it): what
+ * edited_sequence, section_holds and rate_proposal are told.
+ */
+const EXT_S = 1.0;
+
 /** The times of the frames a prepared section shows (section_timeline's first n_out, rebased onto the first). */
 export function shownPts(wasm, sec) {
   return wasm.shown_pts(Float64Array.from(sec.pts), sec.start, sec.end);
@@ -1137,11 +1143,11 @@ export function shownPts(wasm, sec) {
  * each slot) and the holds, all in section time. The check, the export and
  * a neighbour's check of its edge all read it from here.
  */
-export function sectionSequence(wasm, sec, edits, extS) {
+export function sectionSequence(wasm, sec, edits) {
   const tl = JSON.parse(wasm.section_timeline(Float64Array.from(sec.pts), sec.start, sec.end));
   const shown = Float64Array.from(tl.rel.slice(0, tl.n_out));
   const marks = JSON.stringify(edits || {});
-  return { tl, shown, seq: JSON.parse(wasm.edited_sequence(shown, marks, extS)), holds: JSON.parse(wasm.section_holds(shown, marks, extS, tl.total)) };
+  return { tl, shown, seq: JSON.parse(wasm.edited_sequence(shown, marks, EXT_S)), holds: JSON.parse(wasm.section_holds(shown, marks, EXT_S, tl.total)) };
 }
 
 /** Blur strength that takes a stripe pattern under the detector's swing. */
@@ -1304,9 +1310,9 @@ function sectionsIn(project, sec, tLo, tHi) {
 }
 
 /** The last/first `seconds` of another section as the export will contain it. */
-function editedEdge(wasm, o, seconds, side, extS) {
+function editedEdge(wasm, o, seconds, side) {
   if (!o.prepared || !o.cache || !o.pts || !o.pts.length) return null;
-  const { seq } = sectionSequence(wasm, o, o.edits, extS);
+  const { seq } = sectionSequence(wasm, o, o.edits);
   if (!seq.t.length) return null;
   const cache = sectionFrames(o);
   const idx = [];
@@ -1319,7 +1325,7 @@ function editedEdge(wasm, o, seconds, side, extS) {
   return { frames: idx.map((k) => ({ cache, i: seq.src[k] })), times: idx.map((k) => seq.t[k]) };
 }
 
-function compose(wasm, project, sec, src, secStart, tLo, tHi, need, extS, side, notes) {
+function compose(wasm, project, sec, src, secStart, tLo, tHi, need, side, notes) {
   const others = sectionsIn(project, sec, tLo, tHi);
   const frames = src ? src.frames : [];
   const times = src ? src.times : [];
@@ -1339,7 +1345,7 @@ function compose(wasm, project, sec, src, secStart, tLo, tHi, need, extS, side, 
   let cursor = tLo;
   for (const o of others) {
     original(cursor, o.start);
-    const edge = editedEdge(wasm, o, need, side, extS);
+    const edge = editedEdge(wasm, o, need, side);
     if (edge) parts.push(edge);
     else {
       original(Math.max(cursor, o.start), Math.min(tHi, o.end));
@@ -1368,7 +1374,7 @@ function join(parts, dt) {
 }
 
 /** Run-up and run-out for a section's check, as the export will contain them. */
-function sectionContext(env, project, sec, extS) {
+function sectionContext(env, project, sec) {
   const { wasm, config } = env;
   const need = wasm.context_seconds(config);
   const notes = [];
@@ -1385,13 +1391,13 @@ function sectionContext(env, project, sec, extS) {
   }
   const dt = wasm.median_dt(Float64Array.from(sec.pts || []));
   const [tsMin, tsMax] = project.bounds;
-  const leadParts = compose(wasm, project, sec, leadSrc, sec.start, Math.max(tsMin, sec.start - need), sec.start, need, extS, 'lead', notes);
+  const leadParts = compose(wasm, project, sec, leadSrc, sec.start, Math.max(tsMin, sec.start - need), sec.start, need, 'lead', notes);
   const lead = join(leadParts, dt);
   if (lead.frames.length) {
     const shift = lead.times[lead.times.length - 1] + dt;
     lead.times = lead.times.map((t) => t - shift);
   }
-  const tailParts = compose(wasm, project, sec, tailSrc, sec.start, sec.end, Math.min(tsMax, sec.end + need), need, extS, 'tail', notes);
+  const tailParts = compose(wasm, project, sec, tailSrc, sec.start, sec.end, Math.min(tsMax, sec.end + need), need, 'tail', notes);
   const tail = join(tailParts, dt);
   tail.times = tail.times.map((t) => t + dt);
   const nxt = sectionsIn(project, sec, sec.end, sec.end + need);
@@ -1405,15 +1411,15 @@ function sectionContext(env, project, sec, extS) {
  * section left as it is). A cancel (`cancel()` true) makes it throw
  * 'cancelled' before it starts.
  */
-export async function checkSection(env, project, sec, edits, { extS = 1.0, onProgress, cancel = null, blend = null } = {}) {
+export async function checkSection(env, project, sec, edits, { onProgress, cancel = null, blend = null } = {}) {
   const { wasm, feeder } = env;
   // a turn for the page between checks (a suggestion runs dozens), never
   // during one: what a check reads stays put while it runs
   await breathe();
   if (cancel && cancel()) throw new Error('cancelled');
   if (!sec.prepared || !sec.cache) throw new Error('Section not prepared');
-  const ctx = sectionContext(env, project, sec, extS);
-  const { tl, seq, holds } = sectionSequence(wasm, sec, edits || sec.edits, extS);
+  const ctx = sectionContext(env, project, sec);
+  const { tl, seq, holds } = sectionSequence(wasm, sec, edits || sec.edits);
   // the frames after the section come after all of its holds, its last frame's too
   const total = tl.total;
   const lastHold = holds.filter((h) => h.at >= total - 1e-9).reduce((sum, h) => sum + h.seconds, 0);
@@ -1505,7 +1511,7 @@ export function keepJson(sec) {
  * A cancel (`cancel()` true) makes it, and the suggesters below, throw at
  * the next check.
  */
-export async function suggestEdits(env, project, sec, prefer, only, { extS = 1.0, onProgress, cancel = null } = {}) {
+export async function suggestEdits(env, project, sec, prefer, only, { onProgress, cancel = null } = {}) {
   const { wasm, config } = env;
   const sug = new wasm.Suggester(shownPts(wasm, sec), JSON.stringify(sec.edits || {}), prefer, only ? JSON.stringify(only) : undefined, keepJson(sec));
   let step;
@@ -1519,7 +1525,7 @@ export async function suggestEdits(env, project, sec, prefer, only, { extS = 1.0
     let round = 0;
     while (step.simulate) {
       if (onProgress) onProgress(round);
-      const tried = await checkSection(env, project, sec, step.simulate, { extS, cancel });
+      const tried = await checkSection(env, project, sec, step.simulate, { cancel });
       step = JSON.parse(sug.step(frames, JSON.stringify(tried.raw)));
       round++;
     }
@@ -1532,16 +1538,16 @@ export async function suggestEdits(env, project, sec, prefer, only, { extS = 1.0
   // then is an earlier set, whose check says nothing about the last
   const done = step.done;
   const marks = JSON.parse(wasm.apply_suggestion(JSON.stringify(sec.edits || {}), JSON.stringify(done.edits), only ? JSON.stringify(only) : undefined, keepJson(sec)));
-  const verdict = await checkSection(env, project, sec, marks, { extS, cancel });
+  const verdict = await checkSection(env, project, sec, marks, { cancel });
   const note = done.safe && !verdict.safe ? `${done.note} Checked again as applied, though, it does not pass: see the verdict.` : done.note;
   return { ...done, note, verdict };
 }
 
 /** "Reduce FPS": thin to a rate from timestamps alone, then check. */
-export async function suggestFrameRate(env, project, sec, only, fps, { extS = 1.0, cancel = null } = {}) {
+export async function suggestFrameRate(env, project, sec, only, fps, { cancel = null } = {}) {
   const { wasm, config } = env;
-  const p = JSON.parse(wasm.rate_proposal(config, shownPts(wasm, sec), JSON.stringify(sec.edits || {}), only ? JSON.stringify(only) : undefined, fps == null ? undefined : fps, extS, keepJson(sec)));
-  const verdict = await checkSection(env, project, sec, p.edits, { extS, cancel });
+  const p = JSON.parse(wasm.rate_proposal(config, shownPts(wasm, sec), JSON.stringify(sec.edits || {}), only ? JSON.stringify(only) : undefined, fps == null ? undefined : fps, EXT_S, keepJson(sec)));
+  const verdict = await checkSection(env, project, sec, p.edits, { cancel });
   const note = wasm.rate_note(JSON.stringify(p), verdict.safe);
   return { edits: p.removals, safe: verdict.safe, rounds: 1, fps: p.fps, safe_fps: p.safe_fps, guaranteed: p.guaranteed, note, verdict };
 }
@@ -1575,7 +1581,7 @@ export function rateLadder(safe, sourceFps) {
  * pictures as it can. Returns the first rate that passes (or the last tried)
  * with the rates that failed before it.
  */
-export async function searchFrameRate(env, project, sec, only, { extS = 1.0, sourceFps = 30, onProgress, cancel = null } = {}) {
+export async function searchFrameRate(env, project, sec, only, { sourceFps = 30, onProgress, cancel = null } = {}) {
   const { wasm, config } = env;
   const safe = wasm.safe_picture_rate(config);
   const ladder = rateLadder(safe, sourceFps);
@@ -1583,7 +1589,7 @@ export async function searchFrameRate(env, project, sec, only, { extS = 1.0, sou
   let res = null;
   for (let i = 0; i < ladder.length; i++) {
     if (onProgress) onProgress(i / ladder.length, ladder[i]);
-    res = await suggestFrameRate(env, project, sec, only, ladder[i], { extS, cancel });
+    res = await suggestFrameRate(env, project, sec, only, ladder[i], { cancel });
     if (res.safe) break;
     failed.push(ladder[i]);
   }
@@ -1611,7 +1617,7 @@ const BLEND_ROUNDS = 3;
  * `{ edits, blend, strength, least, safe, note, verdict }`; each check is
  * handed the blend it tries, and the section's own marks are left alone.
  */
-export async function suggestBlend(env, project, sec, only, { extS = 1.0, onProgress, cancel = null } = {}) {
+export async function suggestBlend(env, project, sec, only, { onProgress, cancel = null } = {}) {
   const { wasm } = env;
   const reach = only ? new Set(only) : null;
   const inReach = (i) => !reach || reach.has(i);
@@ -1622,7 +1628,7 @@ export async function suggestBlend(env, project, sec, only, { extS = 1.0, onProg
   let checks = 0;
   const check = (marks, strength) => {
     if (onProgress) onProgress(checks++);
-    return checkSection(env, project, sec, edits, { extS, cancel, blend: { marks, strength } });
+    return checkSection(env, project, sec, edits, { cancel, blend: { marks, strength } });
   };
   const candidates = (verdict) => JSON.parse(wasm.blend_candidates(shown, JSON.stringify(verdict.raw), sec.cache, only ? JSON.stringify(only) : undefined, keepJson(sec), false)).frames;
   const pct = (s) => `${Math.round(s * 100)}%`;

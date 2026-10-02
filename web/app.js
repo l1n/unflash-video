@@ -3,7 +3,7 @@
 import init, * as wasm from './pkg/unflash.js';
 import { defaultWorkerCount, SoftwarePool } from './h264pool.js';
 import { builtInFor } from './codecs.js';
-import { Movie, tick } from './media.js';
+import { Movie } from './media.js';
 import { createDetector, gpuAdapter } from './detector.js';
 import { profile } from './profile.js';
 import { scanMovie, scanChunks, CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, hasMarks, BLEND_DEFAULT } from './analysis.js';
@@ -11,11 +11,20 @@ import { Project, projectKey, dropCaches, lastSavedAt, projectFileText, readProj
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, findPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
 import { SectionSound, soundName } from './sound.js';
-import { FrameViewer } from './viewer.js';
+import { FrameViewer, MIN_GAP_MS } from './viewer.js';
 import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notifyState, systemNotify, titleProgress, titleMark } from './alerts.js';
 import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay, wireShots, escapeHtml } from './changes.js';
 import { TourGuide, TOURS, PARTS } from './tours.js';
 import { watchPage, noteError, noteJob, noteFileName, debugReport } from './debug.js';
+
+/** The page's query: settings for tests and for trying things out (`?cpu=1`, `?segments=3`). */
+const QUERY = new URLSearchParams(location.search);
+
+/** `?name=1` or `on`: true; `0` or `off`: false; anything else, or none: null. */
+function onOff(name) {
+  const v = QUERY.get(name);
+  return v === '1' || v === 'on' ? true : v === '0' || v === 'off' ? false : null;
+}
 
 /**
  * The build this page runs. The published site keeps each build's code in
@@ -23,10 +32,27 @@ import { watchPage, noteError, noteJob, noteFileName, debugReport } from './debu
  * from; where the code is served as it stands (a copy of the repository,
  * the tests) there is none, unless ?build= names one to act as.
  */
-const BUILD = (new URL(import.meta.url).pathname.match(/\/v\/([^/]+)\/[^/]+$/) || [])[1] || new URLSearchParams(location.search).get('build') || null;
+const BUILD = (new URL(import.meta.url).pathname.match(/\/v\/([^/]+)\/[^/]+$/) || [])[1] || QUERY.get('build') || null;
 
 const $ = (id) => document.getElementById(id);
-const EXT_S = 1.0;
+
+/** What this browser keeps under `key`, or null (nothing kept, or storage blocked). */
+function stored(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Keep `value` under `key` in this browser (with storage blocked, the choice lasts the visit). */
+function store(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (e) {
+    /* storage blocked */
+  }
+}
 
 /**
  * Bytes of decoded section frames kept in memory (older sections are dropped
@@ -52,13 +78,13 @@ const state = {
   movie: null,
   project: null,
   config: null,
-  env: null, // { wasm, config, feeder } for scans/checks
+  env: null, // { wasm, config, feeder, spares } for scans and checks (spares: spareFeeders')
   liveFeeder: null,
   current: null,
   selection: new Set(),
   anchor: null,
   job: null,
-  live: { on: false, fromScan: false, t: [], hazard: [], hazardRed: [], pattern: [], violations: 0, lastCheck: 0 },
+  live: { on: false, fromScan: false, t: [], hazard: [], hazardRed: [], lastCheck: 0 },
   decode: { supported: false, reason: '' },
   exportBlob: null,
   exportHolds: null, // the export's held frames ({ at, seconds } on the video's clock), when it was made here
@@ -66,9 +92,8 @@ const state = {
   checkTimer: null,
   checkRunning: false,
   checkAgain: false,
-  scanTrace: null,
   // a running scan's own: { violations: what it has found so far (chunked
-  // scans), partials: when }, else null
+  // scans), partials: when, trace: its per-frame trace so far }, else null
   scanning: null,
   traceNorm: null, // the scan trace as area fractions, for the timeline and the monitor
   auto: null, // the unattended scan -> fix -> export -> verify run (see autopilot)
@@ -119,7 +144,7 @@ function setStatus(parts) {
 // serialised here.
 let feederLock = Promise.resolve();
 function withFeeder(fn) {
-  const run = feederLock.then(fn, fn);
+  const run = feederLock.then(() => fn());
   feederLock = run.then(
     () => {},
     () => {}
@@ -144,6 +169,8 @@ async function runJob(name, fn) {
     return null;
   }
   const job = { name, cancelled: false, t0: performance.now(), pct: 0 };
+  // (settled once the job is over: what waits for it, afterJobs, waits on this)
+  job.ended = new Promise((r) => (job.end = r));
   state.job = job;
   const note = noteJob(name);
   chainStart(name);
@@ -173,7 +200,10 @@ async function runJob(name, fn) {
   let outcome = 'ok';
   let message = '';
   try {
-    return await withFeeder(() => fn(progress, () => job.cancelled));
+    const res = await withFeeder(() => fn(progress, () => job.cancelled));
+    // (a job that does not ask `cancelled` runs to its end: what it made after a cancel is not wanted)
+    if (job.cancelled) throw new Error('cancelled');
+    return res;
   } catch (e) {
     if (job.cancelled) {
       outcome = 'cancelled';
@@ -193,6 +223,7 @@ async function runJob(name, fn) {
     titleProgress('');
     note(job.cancelled ? 'cancelled' : outcome);
     chainEnd(job.cancelled ? 'cancelled' : outcome, message);
+    job.end();
   }
 }
 
@@ -242,7 +273,8 @@ async function finishChain() {
   const last = chain.names[chain.names.length - 1] || 'job';
   const autoSummary = state.auto && state.auto.summary;
   const title = chain.ok ? `Unflash: ${chain.names.length > 1 ? chain.names.join(', then ').toLowerCase() : last.toLowerCase()} done` : `Unflash: ${last.toLowerCase()} failed`;
-  const body = (chain.ok ? autoSummary || chain.toast || `Finished after ${fmtWait(secs)}.` : chain.error) + (chain.ok ? ` (${fmtWait(secs)})` : '');
+  // (an auto-fix run whose export still fails failed with no job failing: its summary says so)
+  const body = chain.ok ? `${autoSummary || chain.toast || `Finished after ${fmtWait(secs)}.`} (${fmtWait(secs)})` : chain.error || autoSummary || '';
   const alert = { title, body, secs, ok: chain.ok, beeped: false, notified: false };
   state.lastAlert = alert;
   titleMark(chain.ok);
@@ -269,10 +301,8 @@ function wireAlerts() {
   $('btnAlerts').addEventListener('click', (e) => {
     e.stopPropagation();
     renderAlertNote();
-    $('alertsMenu').classList.toggle('hidden');
+    toggleMenu('alertsMenu');
   });
-  $('alertsMenu').addEventListener('click', (e) => e.stopPropagation());
-  document.addEventListener('click', () => $('alertsMenu').classList.add('hidden'));
   $('alertBeep').addEventListener('change', () => {
     alertSettings.beep = $('alertBeep').checked;
     save();
@@ -296,11 +326,28 @@ function profileConfig(name) {
   return wasm.profile_config(name);
 }
 
-/** Whether the profile that produced `result` counts violation `v`. */
-function reported(result, v) {
-  if (v.kind === 'extended') return !!result.flag_extended;
-  if (v.kind === 'pattern') return !!result.flag_patterns;
+/**
+ * Whether the profile behind `r` (a scan, stored or just made, a check, the
+ * live monitor's result) counts violation `v`: profiles differ on extended
+ * flashes and stripe patterns (a scan stored before scans said which goes
+ * by its profile's name).
+ */
+function counts(r, v) {
+  if (v.kind === 'extended') return r.flag_extended !== undefined ? !!r.flag_extended : r.profile !== 'wcag';
+  if (v.kind === 'pattern') return !!r.flag_patterns;
   return true;
+}
+
+/** Close every menu (the project's, the alerts', the frame rate's). */
+function closeMenus() {
+  for (const m of document.querySelectorAll('.menu')) m.classList.add('hidden');
+}
+
+/** Open menu `id`, or close it when it is open: the others close either way. */
+function toggleMenu(id) {
+  const open = !$(id).classList.contains('hidden');
+  closeMenus();
+  $(id).classList.toggle('hidden', open);
 }
 
 const KIND_LABEL = { flash: 'flash', red: 'red flash', extended: 'extended flash', pattern: 'stripes' };
@@ -327,7 +374,7 @@ const kindInk = (kind) => ({ flash: ink.flash, red: ink.red, extended: ink.ext, 
 
 /** `?cpu=1` forces the WebAssembly detector (for comparison and tests). */
 function preferGpuSetting() {
-  return !new URLSearchParams(location.search).has('cpu');
+  return !QUERY.has('cpu');
 }
 
 /**
@@ -336,14 +383,14 @@ function preferGpuSetting() {
  * the routes other browsers need (Firefox: canvas only).
  */
 function externalSourcesSetting() {
-  const v = new URLSearchParams(location.search).get('extsrc');
+  const v = QUERY.get('extsrc');
   if (v === null) return null;
   return v === 'none' ? [] : v.split(',');
 }
 
 /** `?route=yuv` (videoframe, yuv, rgba, canvas or pixels) forces one way of feeding pictures to the detector. */
 function routeSetting() {
-  return new URLSearchParams(location.search).get('route');
+  return QUERY.get('route');
 }
 
 // ---- what's new ----------------------------------------------------------------
@@ -372,6 +419,7 @@ async function initChanges() {
   const newest = newestChange(log);
   if (!newest) return;
   let seen = changesSeen();
+  let firstVisit = false;
   if (seen === null) {
     let last = 0;
     try {
@@ -384,14 +432,14 @@ async function initChanges() {
     else {
       seen = newest;
       markChangesSeen(newest);
-      state.firstVisit = true;
+      firstVisit = true;
     }
   }
   state.changes = { log, newest, seen };
   renderChanges();
   // the tours: getting started on a first visit, the new things' own after an update
   const fresh = changesSince(log, seen).flatMap((d) => d.items.map((it) => it.tour).filter(Boolean));
-  tourGuide.plan({ firstVisit: !!state.firstVisit, tours: fresh });
+  tourGuide.plan({ firstVisit, tours: fresh });
 }
 
 // ---- the guided tour ------------------------------------------------------------
@@ -401,10 +449,8 @@ async function initChanges() {
 
 /** `?tour=0` never starts a tour by itself, `?tour=1` does even in an automated browser (tests). */
 function tourAutoSetting() {
-  const q = new URLSearchParams(location.search).get('tour');
-  if (q === '0' || q === 'off') return false;
-  if (q === '1' || q === 'on') return true;
-  return !navigator.webdriver;
+  const v = onOff('tour');
+  return v !== null ? v : !navigator.webdriver;
 }
 
 /** The last click, key or scroll (ms), and whether a button is down: a tour waits for a quiet moment. */
@@ -652,11 +698,7 @@ async function boot() {
   $('btnScan').addEventListener('click', scan);
   $('autoToggle').checked = initialAutoSetting();
   $('autoToggle').addEventListener('change', () => {
-    try {
-      localStorage.setItem('unflash:auto', $('autoToggle').checked ? '1' : '0');
-    } catch (e) {
-      /* storage blocked: the choice lasts the session */
-    }
+    store('unflash:auto', $('autoToggle').checked ? '1' : '0');
     // ticked with a file open: the run starts, once whatever job is under way (the scan, say) is done
     if ($('autoToggle').checked && state.movie && !(state.auto && state.auto.running)) {
       afterJobs().then(() => {
@@ -675,6 +717,9 @@ async function boot() {
   wirePlayer();
   $('btnExport').addEventListener('click', openExport);
   wireProjectMenu();
+  // a menu closes with a click anywhere else on the page
+  for (const m of document.querySelectorAll('.menu')) m.addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', closeMenus);
   $('btnCloseExport').addEventListener('click', () => $('exportModal').classList.add('hidden'));
   $('btnDoExport').addEventListener('click', doExport);
   $('exportName').addEventListener('input', () => onExportNameInput(false));
@@ -710,9 +755,12 @@ async function boot() {
   for (const b of document.querySelectorAll('[data-clip]')) b.addEventListener('click', () => openClip(b.dataset.clip));
   $('btnPrepareAll').addEventListener('click', prepareAll);
   $('btnCheckAll').addEventListener('click', checkAll);
-  $('btnDeleteAll').addEventListener('click', () => {
-    if (!state.project || !confirm('Delete every section, including its marks?')) return;
-    for (const s of [...state.project.sections]) state.project.deleteSection(s.id);
+  $('btnDeleteAll').addEventListener('click', async () => {
+    if (!state.project || busy('delete the sections') || !confirm('Delete every section, including its marks?')) return;
+    // (their frames are freed once no check reads them)
+    await withFeeder(() => {
+      for (const s of [...state.project.sections]) state.project.deleteSection(s.id);
+    });
     state.current = null;
     state.project.save();
     renderAll();
@@ -733,9 +781,8 @@ async function boot() {
     if (state.live.on && state.player.mode === 'video') startLiveLoop();
   });
   player.addEventListener('pause', flushVerdict);
+  // (a seek's timeupdate, which comes first, has drawn the timeline and the chart)
   player.addEventListener('seeked', () => {
-    drawTimeline();
-    if (chartMode() === 'video') drawChart();
     if (state.live.on && state.live.fromScan) monitorFromScan(player.currentTime);
   });
 }
@@ -750,42 +797,30 @@ async function openFile(file) {
   $('banner').classList.add('hidden');
   if (sectionPlayer) await sectionPlayer.stop();
   closeViewer();
-  const opened = await runJob('Opening video', async (progress) => {
-    progress(0.05, 'reading the index');
-    const movie = await Movie.open(file, wasm, {
-      // a Matroska file or a transport stream keeps no index: it is read through once
-      onProgress: (p, container) => progress(0.05 + 0.3 * p, container === 'matroska' || container === 'mpegts' ? `reading through the file for its frames (${container === 'mpegts' ? 'transport streams' : 'MKV / WebM'} keep no index): ${Math.round(p * 100)}%` : 'reading the index'),
-    });
-    // the last file, its unattended run and its export go only now that
-    // the new one has opened (an export of this same video, kept on disk,
-    // stays: it is offered again below)
+  const opened = await runJob('Opening video', async (progress, cancelled) => {
+    const { movie, key, decode, project, kept, made } = await readVideo(file, progress, cancelled);
+    // From here on nothing waits: the page goes over to the new video in one
+    // go. The last file, its unattended run and its export go (an export of
+    // this same video, kept on disk, stays: it is offered again)
     if (state.movie) state.movie.close();
-    const key = projectKey(file);
     forgetExport(exportOwner(key));
     // (a name typed for the last video's export is not this one's)
     state.exportFileName = null;
     if (state.project) for (const s of state.project.sections) dropCaches(s);
     state.lastScan = null;
     state.lastVerify = null;
-    state.scanTrace = null;
     state.traceNorm = null;
     state.movie = movie;
-    movie.forceBuiltIn = builtInSetting();
-    progress(0.36, 'asking the browser about its decoder');
-    state.decode = await movie.decoderSupport();
-    progress(0.38, 'loading the project kept for this video');
-    const project = await Project.load(key, movie.bounds, movie.keyframes);
-    progress(0.39, 'looking for an export of it');
-    await restoreExport(exportOwner(key), movie);
-    progress(0.4, 'starting the detector');
+    state.decode = decode;
     state.project = project;
-    if (project.scan && project.scan.trace) state.scanTrace = project.scan.trace;
+    state.config = made.config;
     $('profileSel').value = project.profile;
-    state.config = profileConfig(project.profile);
-    await createFeeders(progress);
-    movie.decodeInWorkers = decodeWorkersSetting(state.env.feeder);
-    movie.shrinkInWorkers = shrinkSetting();
+    if (kept) offerKeptExport(kept);
+    // (the player first: the live monitor, if it is on, starts afresh on it)
     loadPlayer(file, movie);
+    useDetectors(made);
+    movie.decodeInWorkers = decodeWorkersSetting(made.feeder);
+    movie.shrinkInWorkers = shrinkSetting();
     $('videoInfo').textContent = `${file.name} · ${movie.width}×${movie.height} · ${movie.fps.toFixed(2)} fps · ${fmt(movie.duration)} · ${movie.video.codec}${movie.audio ? ' + ' + movie.audio.codec : ''}${movie.audioTracks > 1 ? ` (sound ${movie.audioSkipped.length + 1} of ${movie.audioTracks})` : ''}`;
     sectionSound.failed = null;
     state.player.soundFailSaid = null;
@@ -827,9 +862,62 @@ async function openFile(file) {
   else if (autoScanEnabled()) autoScan();
 }
 
-/** Resolves when no job is running. */
+/**
+ * What opening `file` needs, read and made before anything on the page
+ * changes: the Movie, how it decodes here, its project, its export kept in
+ * private storage (or null) and its detectors. A cancel (`cancelled()`)
+ * makes it throw 'cancelled' at its next step, the read through a file
+ * that keeps no index included, having let go of what it had made.
+ */
+async function readVideo(file, progress, cancelled) {
+  const stop = () => {
+    if (cancelled()) throw new Error('cancelled');
+  };
+  progress(0.05, 'reading the index');
+  const movie = await Movie.open(file, wasm, {
+    // a Matroska file or a transport stream keeps no index: it is read through once
+    onProgress: (p, container) => {
+      stop();
+      progress(0.05 + 0.3 * p, container === 'matroska' || container === 'mpegts' ? `reading through the file for its frames (${container === 'mpegts' ? 'transport streams' : 'MKV / WebM'} keep no index): ${Math.round(p * 100)}%` : 'reading the index');
+    },
+  });
+  let made = null;
+  try {
+    // `?builtin=1`: the app's built-in decoder for the codec even where
+    // WebCodecs has one (tests; a browser whose decoder misbehaves)
+    movie.forceBuiltIn = onOff('builtin') === true;
+    progress(0.36, 'asking the browser about its decoder');
+    const decode = await movie.decoderSupport();
+    stop();
+    progress(0.38, 'loading the project kept for this video');
+    const key = projectKey(file);
+    const project = await Project.load(key, movie.bounds, movie.keyframes);
+    stop();
+    progress(0.39, 'looking for an export of it');
+    const kept = await findPrivateExport(exportOwner(key));
+    stop();
+    progress(0.4, 'starting the detector');
+    made = await makeDetectors(movie, profileConfig(project.profile), progress);
+    stop();
+    return { movie, key, decode, project, kept, made };
+  } catch (e) {
+    if (made) freeDetectors(made);
+    movie.close();
+    throw e;
+  }
+}
+
+/**
+ * Resolves once no job is running: at a job's end, after whoever started it
+ * has gone on (what it keeps, and a job it starts next, as the open starts
+ * the scan, are seen: that job is waited for too).
+ */
 async function afterJobs() {
-  while (state.job) await new Promise((r) => setTimeout(r, 100));
+  while (state.job) {
+    await state.job.ended;
+    // (the job's caller was handed its result as the job ended: it goes on first)
+    await null;
+  }
 }
 
 /** Scan a freshly opened file, unless a scan of it under this profile is stored from a previous visit. */
@@ -863,25 +951,65 @@ async function openClip(name) {
   }
 }
 
-async function createFeeders(progress) {
-  const movie = state.movie;
-  if (state.env && state.env.feeder) state.env.feeder.det.free();
-  if (state.env && state.env.spares) for (const f of state.env.spares) f.det.free();
-  if (state.liveFeeder) state.liveFeeder.det.free();
-  const preferGpu = preferGpuSetting();
-  const externalSources = externalSourcesSetting();
-  const route = routeSetting();
-  const feeder = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu, externalSources, route });
-  state.env = { wasm, config: state.config, feeder };
-  const live = await createDetector(wasm, state.config, movie.width, movie.height, { preferGpu, externalSources, route, batch: 1 });
-  state.liveFeeder = live;
-  if (feeder.note) banner(feeder.note, 'info');
-  if (progress) progress(0.8, `${feeder.backend} detector at ${feeder.aw}×${feeder.ah}`);
+/** How the page's detectors are made: the GPU unless `?cpu`, and the routes the query forces. */
+function detectorSettings() {
+  return { preferGpu: preferGpuSetting(), externalSources: externalSourcesSetting(), route: routeSetting() };
+}
+
+/**
+ * The two detectors a video needs, made for `movie` under `config` and not
+ * yet put to use (useDetectors does that): the main one, which scans,
+ * prepares and checks feed, and the live monitor's, a picture at a time.
+ */
+async function makeDetectors(movie, config, progress = null) {
+  const feeder = await createDetector(wasm, config, movie.width, movie.height, detectorSettings());
+  try {
+    if (progress) progress(0.8, `${feeder.backend} detector at ${feeder.aw}×${feeder.ah}`);
+    const live = await createDetector(wasm, config, movie.width, movie.height, { ...detectorSettings(), batch: 1 });
+    return { config, feeder, live };
+  } catch (e) {
+    feeder.det.free();
+    throw e;
+  }
+}
+
+/** Free detectors `made` (makeDetectors) that were never put to use. */
+function freeDetectors(made) {
+  made.feeder.det.free();
+  made.live.det.free();
+}
+
+/**
+ * Put detectors `made` (makeDetectors) to use, then free the ones they
+ * replace, the spares made for spans too: in one go, so that nothing that
+ * runs between frames (the live monitor, the timeline) finds its detector
+ * freed. The monitor, if it is on, starts afresh on its new detector.
+ */
+function useDetectors(made) {
+  const old = state.env ? [state.env.feeder, ...(state.env.spares || [])] : [];
+  if (state.liveFeeder) old.push(state.liveFeeder);
+  state.env = { wasm, config: made.config, feeder: made.feeder };
+  state.liveFeeder = made.live;
+  for (const f of old) f.det.free();
+  // (the trace's levels are shares of the detector's thresholds, which a profile sets)
+  state.traceNorm = null;
+  if (made.feeder.note) banner(made.feeder.note, 'info');
+  if (state.live.on) setLive(true);
+}
+
+/** New detectors for the open video under the current profile, in place of the ones it has (under the feeder lock). */
+async function createFeeders() {
+  useDetectors(await makeDetectors(state.movie, state.config));
 }
 
 async function setProfile(name) {
   if (!state.project) return;
   await stopAuto();
+  // (a job under way runs on the detector it started with: what it found would be kept as the new profile's)
+  if (busy('change the profile')) {
+    $('profileSel').value = state.project.profile;
+    return;
+  }
   state.project.profile = name;
   state.config = profileConfig(name);
   await withFeeder(() => createFeeders());
@@ -915,6 +1043,9 @@ function updateStatus() {
 
 // ---- scanning -------------------------------------------------------------------
 
+/** `?segments=N`: the count scanSegments gives, whatever the machine (0: none forced). */
+const SEGMENTS = parseInt(QUERY.get('segments') || '', 10) || 0;
+
 /**
  * Spans a scan is cut into and scanned at once: one per two logical cores,
  * at most four, on the GPU detector with the browser's own decoder (the
@@ -922,13 +1053,8 @@ function updateStatus() {
  * one thread); decoding in workers, all but two cores, at most six.
  * `?segments=N` forces a count.
  */
-function segmentsForced() {
-  return parseInt(new URLSearchParams(location.search).get('segments') || '', 10) > 0;
-}
-
 function scanSegments() {
-  const forced = parseInt(new URLSearchParams(location.search).get('segments') || '', 10);
-  if (forced > 0) return forced;
+  if (SEGMENTS > 0) return SEGMENTS;
   if (!state.env || state.env.feeder.backend !== 'webgpu' || state.decode.software) return 1;
   const cores = navigator.hardwareConcurrency || 4;
   // decoding in workers, each segment's pictures are copied and made small
@@ -953,9 +1079,8 @@ function scanSegments() {
  * browser's decoder and S workers for the built-in one (0: none).
  */
 function hybridPlan(movie, feeder) {
-  const q = new URLSearchParams(location.search);
-  let h = q.get('hybrid');
-  if (h === '0' || h === 'off') return null;
+  if (onOff('hybrid') === false) return null;
+  let h = QUERY.get('hybrid');
   // tests: `?hybrid=sim:H,S` runs the browser's lanes on the built-in
   // decoder (the test browser has no H.264 in WebCodecs), `?hybridfail=1`
   // fails the built-in decoder's first run
@@ -989,7 +1114,7 @@ function hybridPlan(movie, feeder) {
     }
   }
   // a lane of the browser's decoder that the scan sets aside, as slower than the rest, gives its core to the built-in decoder
-  return { hw, sw, poolMax: sw > 0 ? Math.min(16, sw + hw) : 0, sim, failBuiltIn: q.get('hybridfail') === '1' };
+  return { hw, sw, poolMax: sw > 0 ? Math.min(16, sw + hw) : 0, sim, failBuiltIn: QUERY.get('hybridfail') === '1' };
 }
 
 /**
@@ -1008,11 +1133,10 @@ function hybridPlan(movie, feeder) {
  * picture of the browser's lanes. `opts` as scanMovie's.
  */
 async function scanWithPlan(env, movie, opts) {
-  const q = new URLSearchParams(location.search);
-  const chunk = parseFloat(q.get('chunk') || '');
+  const chunk = parseFloat(QUERY.get('chunk') || '');
   const chunkS = chunk > 0 ? chunk : CHUNK_S;
-  const hold = parseFloat(q.get('hold') || '');
-  if (q.get('chunked') === '0' || scanChunks(movie, chunkS).length < 2) return scanMovie(env, movie, opts);
+  const hold = parseFloat(QUERY.get('hold') || '');
+  if (QUERY.get('chunked') === '0' || scanChunks(movie, chunkS).length < 2) return scanMovie(env, movie, opts);
   const plan = hybridPlan(movie, env.feeder);
   let pool = null;
   if (plan && plan.sw > 0) {
@@ -1024,12 +1148,12 @@ async function scanWithPlan(env, movie, opts) {
       noteError(`hybrid scan without the built-in decoder: ${why}`);
     }
   }
-  const order = q.get('order') === 'file' ? 'file' : 'triage';
+  const order = QUERY.get('order') === 'file' ? 'file' : 'triage';
   try {
     return await scanMovie(env, movie, {
       ...opts,
       // (a plan that leans on the built-in decoder, without it, goes back to the browser's lanes)
-      chunked: { hw: plan && (pool || !plan.sw || plan.sim) ? plan.hw : scanSegments(), pool, poolMax: plan ? plan.poolMax : 0, chunkS, order, budget: hold > 0 ? hold * 1024 * 1024 : null, sim: !!(plan && plan.sim), failBuiltIn: !!(plan && plan.failBuiltIn), slow: parseFloat(q.get('slowlanes') || '') || 0, steal: q.get('steal') !== '0', rebalance: q.get('rebalance') !== '0' },
+      chunked: { hw: plan && (pool || !plan.sw || plan.sim) ? plan.hw : scanSegments(), pool, poolMax: plan ? plan.poolMax : 0, chunkS, order, budget: hold > 0 ? hold * 1024 * 1024 : null, sim: !!(plan && plan.sim), failBuiltIn: !!(plan && plan.failBuiltIn), slow: parseFloat(QUERY.get('slowlanes') || '') || 0, steal: QUERY.get('steal') !== '0', rebalance: QUERY.get('rebalance') !== '0' },
     });
   } finally {
     if (pool) pool.close();
@@ -1043,35 +1167,26 @@ async function scanWithPlan(env, movie, opts) {
  * once. `?decodeworkers=1` / `=0` forces it.
  */
 function decodeWorkersSetting(feeder) {
-  const q = new URLSearchParams(location.search).get('decodeworkers');
-  if (q === '1' || q === 'on') return true;
-  if (q === '0' || q === 'off') return false;
+  const forced = onOff('decodeworkers');
+  if (forced !== null) return forced;
   // a forced picture route is one taken on the page
   if (routeSetting()) return false;
   return !feeder.takesFrames;
 }
 
-/** `?builtin=1`: decode with the app's built-in decoder for the codec even where WebCodecs has one (tests; a browser whose decoder misbehaves). */
-function builtInSetting() {
-  const q = new URLSearchParams(location.search).get('builtin');
-  return q === '1' || q === 'on';
-}
-
 /** `?shrink=0`: pictures decoded in workers reach the page at full size (the detector shrinks them) rather than at its size. */
 function shrinkSetting() {
-  const q = new URLSearchParams(location.search).get('shrink');
-  return !(q === '0' || q === 'off');
+  return onOff('shrink') !== false;
 }
 
 /** `?smartcut=0`: an export re-encodes the whole video instead of copying the GOPs no section touches. */
 function smartCutSetting() {
-  const q = new URLSearchParams(location.search).get('smartcut');
-  return !(q === '0' || q === 'off');
+  return onOff('smartcut') !== false;
 }
 
 /** `?parallel=N`: how many spans an export re-encodes at once (0: by the machine). */
 function parallelSetting() {
-  return Math.max(0, parseInt(new URLSearchParams(location.search).get('parallel') || '0', 10) || 0);
+  return Math.max(0, parseInt(QUERY.get('parallel') || '0', 10) || 0);
 }
 
 /** The export dialog's line about what an export does with this plan. */
@@ -1101,7 +1216,7 @@ function describePlan(plan, movie, softened, blended = []) {
 
 /** Another detector like the current one, for a scan segment (or a verify). */
 function makeFeeder(width, height) {
-  return createDetector(wasm, state.config, width, height, { preferGpu: preferGpuSetting(), externalSources: externalSourcesSetting(), route: routeSetting() });
+  return createDetector(wasm, state.config, width, height, detectorSettings());
 }
 
 /**
@@ -1119,35 +1234,39 @@ async function spareFeeders(n) {
 async function scan() {
   if (!state.movie || !state.env || busy('scan')) return null;
   const t0 = performance.now();
-  // what this scan has found so far, until the whole result is in: its own,
-  // made and dropped inside its job, so nothing outside it can clear it
-  // under a running scan
-  const found = { violations: [], partials: [] };
+  // (the profile the scan runs under, which it is kept as)
+  const profileName = state.project.profile;
+  const sig = wasm.config_signature(state.config);
+  // what this scan has found so far, and its trace, until the whole result
+  // is in: its own, made and dropped inside its job, so nothing outside it
+  // can clear it under a running scan (nor keep it after one that stopped)
+  const found = { violations: [], partials: [], trace: null };
+  // when the timeline was last drawn (0: draw it at the next report)
+  let drawnAt = 0;
   const res = await runJob('Scanning for flashes', async (progress, cancelled) => {
     setLive(false);
-    $('liveToggle').checked = false;
     state.scanning = found;
     state.partials = found.partials;
     try {
       const r = await scanWithPlan(state.env, state.movie, {
         cancel: cancelled,
         segments: scanSegments(),
-        forceSegments: segmentsForced(),
+        forceSegments: SEGMENTS > 0,
         moreFeeders: spareFeeders,
         // exactly what the scan has found up to where it has got, and what its early looks found after that
         onPartial: (part) => {
           found.violations = part.violations;
           found.partials.push({ ms: performance.now() - t0, until: part.until, found: part.violations.length, early: !!part.early });
-          state.timelineDrawnAt = 0;
+          drawnAt = 0;
         },
         onProgress: (p, trace, count, ms) => {
-          state.scanTrace = trace;
+          found.trace = trace;
           const n = found.violations.length;
           progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps${n ? ` · ${n} violation${n === 1 ? '' : 's'} found so far` : ''}`);
           // the timeline twice a second, not per so many frames
           const now = performance.now();
-          if (!(now - (state.timelineDrawnAt || 0) < 500)) {
-            state.timelineDrawnAt = now;
+          if (!(now - drawnAt < 500)) {
+            drawnAt = now;
             drawTimeline();
             if (chartMode() === 'video') drawChart();
           }
@@ -1160,12 +1279,15 @@ async function scan() {
     }
   });
   if (!res) {
+    // (what it saw goes with it: the last finished scan is drawn again)
+    renderSectionList();
     drawTimeline();
+    if (chartMode() === 'video') drawChart();
     return null;
   }
   state.lastScan = res;
   const project = state.project;
-  const counted = res.result.violations.filter((v) => reported(res.result, v));
+  const counted = res.result.violations.filter((v) => counts(res.result, v));
   const n = counted.length;
   const np = counted.filter((v) => v.kind === 'pattern').length;
   project.scan = {
@@ -1173,8 +1295,8 @@ async function scan() {
     summary: res.summary,
     frames: res.frames,
     elapsedMs: res.elapsedMs,
-    profile: project.profile,
-    sig: wasm.config_signature(state.config),
+    profile: profileName,
+    sig,
     safe: n === 0,
     counted: n,
     patterns: np,
@@ -1192,7 +1314,6 @@ async function scan() {
     project.addSection(s.start, s.end, s.kinds, false);
     added++;
   }
-  state.scanTrace = project.scan.trace;
   state.traceNorm = null;
   // drawn before the save, in the same turn as the job's end: nothing (a
   // click on the list, say) can come between the job ending and its
@@ -1214,6 +1335,7 @@ async function scan() {
 
 function setLive(on) {
   state.live.on = on;
+  $('liveToggle').checked = on;
   $('hud').classList.toggle('hidden', !on);
   if (!on) {
     setVerdict('live-verdict idle', 'monitor off', true);
@@ -1241,8 +1363,6 @@ function setLive(on) {
   state.live.t = [];
   state.live.hazard = [];
   state.live.hazardRed = [];
-  state.live.pattern = [];
-  state.live.violations = 0;
   setVerdict('live-verdict ok', 'watching', true);
   startLiveLoop();
 }
@@ -1252,9 +1372,10 @@ function startLiveLoop() {
   const player = $('player');
   if (liveLoopActive || !state.live.on) return;
   liveLoopActive = true;
-  const feeder = state.liveFeeder;
   const step = (now, meta) => {
-    if (!state.live.on || !state.liveFeeder) {
+    // (the detector of the moment: a new profile, or a new file, brings new ones, the old freed)
+    const feeder = state.liveFeeder;
+    if (!state.live.on || !feeder) {
       liveLoopActive = false;
       return;
     }
@@ -1281,11 +1402,6 @@ function startLiveLoop() {
   player.requestVideoFrameCallback(step);
 }
 
-/** `?monitor=detect` makes the live monitor run the detector on the player even when a scan exists. */
-function monitorDetectSetting() {
-  return new URLSearchParams(location.search).get('monitor') === 'detect';
-}
-
 /** Pack a scan's per-frame trace into typed arrays (about 24 bytes a frame) for the project store. */
 function packTrace(tr) {
   return { t: Float64Array.from(tr.t), hazard: Uint32Array.from(tr.hazard), hazardRed: Uint32Array.from(tr.hazardRed), ext: Uint32Array.from(tr.ext), pattern: Uint32Array.from(tr.pattern), lum: Float32Array.from(tr.lum) };
@@ -1293,10 +1409,11 @@ function packTrace(tr) {
 
 /**
  * The scan trace as fractions of the area thresholds, built once and
- * extended as a scan goes on (never recomputed per draw).
+ * extended as a scan goes on (never recomputed per draw): the trace of the
+ * scan under way, else of the project's scan.
  */
 function normTrace() {
-  const tr = state.scanTrace;
+  const tr = state.scanning ? state.scanning.trace : state.project && state.project.scan && state.project.scan.trace;
   if (!tr || !state.env) return null;
   let n = state.traceNorm;
   if (!n || n.src !== tr) {
@@ -1324,19 +1441,16 @@ function normTrace() {
   return n;
 }
 
-/** The finished scan of this file under the current profile, as a trace the monitor can read; null to detect live instead. */
+/**
+ * The finished scan of this file under the current profile, as a trace the
+ * monitor can read; null to detect live instead (`?monitor=detect`: always,
+ * even where there is a scan).
+ */
 function monitorTrace() {
-  if (monitorDetectSetting() || !state.project || !state.project.scan || (state.job && state.job.name === 'Scanning for flashes')) return null;
+  if (QUERY.get('monitor') === 'detect' || !state.project || !state.project.scan || state.scanning) return null;
   if (state.project.scan.sig !== wasm.config_signature(state.config)) return null;
   const n = normTrace();
   return n && n.t.length ? n : null;
-}
-
-/** Whether a stored scan counts violation `v` (profiles differ on extended flashes and patterns). */
-function scanReports(scan, v) {
-  if (v.kind === 'extended') return scan.flag_extended !== undefined ? !!scan.flag_extended : scan.profile !== 'wcag';
-  if (v.kind === 'pattern') return !!scan.flag_patterns;
-  return true;
 }
 
 // The meter over the player rises at once and falls back slowly (a full bar
@@ -1392,6 +1506,18 @@ function flushVerdict() {
   if (w) setVerdict(w.cls, w.text, true);
 }
 
+/**
+ * The monitor's verdict on a frame: flashing (`kind`, the violation it is
+ * in, or null), flashing below the limit or stripes (levels `haz`, `ext`,
+ * `pat`, as shares of the limit; stripes count where `patterns`), or how
+ * many violations there were before it (`count`).
+ */
+function meterVerdict(kind, haz, ext, pat, patterns, count) {
+  if (kind) setVerdict('live-verdict bad', kind === 'pattern' ? 'hazardous pattern: stripes' : `flashing: ${kind === 'red' ? 'red flash' : kind === 'extended' ? 'extended flash' : 'general flash'}`);
+  else if (haz > 0 || ext >= 1 || (pat >= 1 && patterns)) setVerdict('live-verdict warn', haz > 0 || ext >= 1 ? 'flashing below the limit' : 'stripes on screen');
+  else setVerdict('live-verdict ok', count ? `${count} violation${count === 1 ? '' : 's'} so far` : 'no flashing so far');
+}
+
 /** The meter and the verdict at time `t`, read from the scan. */
 function monitorFromScan(t) {
   const n = monitorTrace();
@@ -1411,17 +1537,10 @@ function monitorFromScan(t) {
   const pat = n.p[i];
   setHudBars(haz, red, pat);
   const scan = state.project.scan;
-  const viol = scan.violations.filter((v) => scanReports(scan, v));
+  const viol = scan.violations.filter((v) => counts(scan, v));
   const inside = viol.filter((v) => v.start <= t && t <= v.end);
   const before = viol.filter((v) => v.end < t).length;
-  if (inside.length) {
-    const k = inside[inside.length - 1].kind;
-    setVerdict('live-verdict bad', k === 'pattern' ? 'hazardous pattern: stripes' : `flashing: ${k === 'red' ? 'red flash' : k === 'extended' ? 'extended flash' : 'general flash'}`);
-  } else if (haz > 0 || ext >= 1 || (pat >= 1 && scan.flag_patterns)) {
-    setVerdict('live-verdict warn', haz > 0 || ext >= 1 ? 'flashing below the limit' : 'stripes on screen');
-  } else {
-    setVerdict('live-verdict ok', before ? `${before} violation${before === 1 ? '' : 's'} so far` : 'no flashing so far');
-  }
+  meterVerdict(inside.length ? inside[inside.length - 1].kind : null, haz, ext, pat, scan.flag_patterns, before);
   $('hudInfo').textContent = `from the scan · frame ${i + 1} of ${n.t.length}`;
 }
 
@@ -1440,7 +1559,6 @@ function drainLive() {
     L.t.push(r.t);
     L.hazard.push(r.hazard / thresh);
     L.hazardRed.push(r.hazard_red / thresh);
-    L.pattern.push(r.pattern / pthresh);
   }
   const last = recs[recs.length - 1];
   const haz = last.hazard / thresh;
@@ -1452,17 +1570,9 @@ function drainLive() {
   if (now - L.lastCheck > 700) {
     L.lastCheck = now;
     const res = feeder.finish(false);
-    const viol = res.violations.filter((v) => reported(res, v));
-    L.violations = viol.length;
+    const viol = res.violations.filter((v) => counts(res, v));
     const recent = viol.length && viol[viol.length - 1].end >= last.t - 1.5;
-    if (recent) {
-      const k = viol[viol.length - 1].kind;
-      setVerdict('live-verdict bad', k === 'pattern' ? 'hazardous pattern: stripes' : `flashing: ${k === 'red' ? 'red flash' : k === 'extended' ? 'extended flash' : 'general flash'}`);
-    } else if (haz > 0 || ext >= 1 || (pat >= 1 && res.flag_patterns)) {
-      setVerdict('live-verdict warn', haz > 0 || ext >= 1 ? 'flashing below the limit' : 'stripes on screen');
-    } else {
-      setVerdict('live-verdict ok', viol.length ? `${viol.length} violation${viol.length === 1 ? '' : 's'} so far` : 'no flashing so far');
-    }
+    meterVerdict(recent ? viol[viol.length - 1].kind : null, haz, ext, pat, res.flag_patterns, viol.length);
     $('hudInfo').textContent = `${res.frames} frames watched · ${res.held} re-shown · ${feeder.backend === 'webgpu' ? 'GPU' : 'CPU'} ${(feeder.busyNs / 1e6 / Math.max(1, feeder.fed)).toFixed(2)} ms/frame on the main thread`;
     drawTimeline();
   }
@@ -1473,24 +1583,15 @@ function drainLive() {
 const PLAYER_SIZES = { s: 320, m: 480, l: 720 };
 
 function playerSizeSetting() {
-  try {
-    const v = localStorage.getItem('unflash:playerSize');
-    if (v && PLAYER_SIZES[v]) return v;
-  } catch (e) {
-    /* storage blocked */
-  }
-  return 'm';
+  const v = stored('unflash:playerSize');
+  return v && PLAYER_SIZES[v] ? v : 'm';
 }
 
 function setPlayerSize(size) {
   if (!PLAYER_SIZES[size]) size = 'm';
   $('playerBox').style.setProperty('--player-w', `${PLAYER_SIZES[size]}px`);
   for (const b of document.querySelectorAll('.size-switch [data-size]')) b.classList.toggle('on', b.dataset.size === size);
-  try {
-    localStorage.setItem('unflash:playerSize', size);
-  } catch (e) {
-    /* the choice lasts the session */
-  }
+  store('unflash:playerSize', size);
   drawChart();
 }
 
@@ -1505,11 +1606,7 @@ function applyDim() {
 
 /** Whether the section player plays sound: off unless turned on (remembered in this browser). */
 function soundSetting() {
-  try {
-    return localStorage.getItem('unflash.sectionSound') === '1';
-  } catch (e) {
-    return false;
-  }
+  return stored('unflash.sectionSound') === '1';
 }
 
 /**
@@ -1548,11 +1645,7 @@ function wirePlayer() {
   sectionPlayer = new SectionPlayer($('preview'), { onFrame: onPreviewFrame, onState: onPreviewState, sound: sectionSound });
   $('btnPreviewSound').addEventListener('click', async () => {
     const on = !soundSetting();
-    try {
-      localStorage.setItem('unflash.sectionSound', on ? '1' : '0');
-    } catch (e) {
-      /* not kept */
-    }
+    store('unflash.sectionSound', on ? '1' : '0');
     sectionSound.failed = null;
     renderSoundButton();
     await sectionSound.setOn(on);
@@ -1686,7 +1779,7 @@ function posterSection() {
   }
   sectionPlayer.stop().then(() => {
     if (gen !== state.player.gen || currentSection() !== sec || state.player.mode === 'video') return;
-    sectionPlayer.play({ env: state.env, movie: state.movie, sec, edited: state.player.mode === 'edited', extS: EXT_S, fromSlot: 0, once: true });
+    sectionPlayer.play({ env: state.env, movie: state.movie, sec, edited: state.player.mode === 'edited', fromSlot: 0, once: true });
   });
 }
 
@@ -1697,24 +1790,22 @@ function playSection(fromSlot = 0) {
   if (state.player.mode === 'video') setPlayerSource('edited');
   state.player.gen++;
   sectionPlayer.setSpeed(parseFloat($('previewSpeed').value) || 1);
-  return sectionPlayer.play({ env: state.env, movie: state.movie, sec, edited: state.player.mode === 'edited', extS: EXT_S, fromSlot, loop: () => $('previewLoop').checked });
+  return sectionPlayer.play({ env: state.env, movie: state.movie, sec, edited: state.player.mode === 'edited', fromSlot, loop: () => $('previewLoop').checked });
 }
 
-/** How often the grid's mark of the frame on screen may move while a section plays (ms): the frame viewer's pace. */
-const MARK_EVERY_MS = 400;
 const reducedMotion = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : { matches: false };
 
 /**
  * Mark the tile of the slot on screen (-1: none). While a section plays the
- * mark moves at most every MARK_EVERY_MS (not at all for anyone who asks
- * their system for less motion), and it is a dim bar, not a bright frame: a
- * mark running from tile to tile with every picture would flicker across
- * the grid, which is the last thing this page should do. `exact`: where
- * the player has stopped, at once.
+ * mark moves at most every MIN_GAP_MS, the frame viewer's pace (not at all
+ * for anyone who asks their system for less motion), and it is a dim bar,
+ * not a bright frame: a mark running from tile to tile with every picture
+ * would flicker across the grid, which is the last thing this page should
+ * do. `exact`: where the player has stopped, at once.
  */
 function markPlaying(k, exact = false) {
   const now = performance.now();
-  if (!exact && k >= 0 && (reducedMotion.matches || now - (state.player.markAt || 0) < MARK_EVERY_MS)) return;
+  if (!exact && k >= 0 && (reducedMotion.matches || now - (state.player.markAt || 0) < MIN_GAP_MS)) return;
   const grid = $('frameGrid');
   const prev = state.player.playingTile;
   if (prev === k) return;
@@ -1801,7 +1892,7 @@ function renderPlayerWarning() {
     else if (c.safe) {
       text = `✓ Section #${sec.id} with your marks: passes the check.${dim}`;
       ok = true;
-    } else if (c.wcag_safe) text = `Section #${sec.id} with your marks: passes WCAG; ${remainingKinds(c).join(' and ') || 'something the profile flags'} remain${remainingKinds(c).length === 1 ? 's' : ''}.${dim}`;
+    } else if (c.wcag_safe) text = `Section #${sec.id} with your marks: passes WCAG; ${remains(remainingKinds(c))}.${dim}`;
     else text = `⚠ Section #${sec.id} with your marks: still fails the check.${dim}`;
   }
   w.textContent = text;
@@ -1891,7 +1982,7 @@ function drawTimeline(dragSpan = null) {
       }
     }
   }
-  // the live trace (and the scan trace while scanning)
+  // the live monitor's trace while it detects, else the scan's (the one under way, or the last)
   const norm = state.live.on && !state.live.fromScan ? null : normTrace();
   const trace = state.live.on && !state.live.fromScan ? { t: state.live.t, h: state.live.hazard, r: state.live.hazardRed } : norm ? { t: norm.t, h: norm.h, r: norm.r } : null;
   if (trace && trace.t.length) {
@@ -1922,7 +2013,7 @@ function drawTimeline(dragSpan = null) {
       g.stroke();
     }
   }
-  // threshold line label
+  // the baseline the trace stands on
   g.fillStyle = ink.line2;
   g.fillRect(0, H - 24, W, 1);
   // what a running scan has found so far (dashed: its edges may still move)
@@ -2006,9 +2097,20 @@ function sectionBadge(s) {
 function remainingKinds(c) {
   const inside = c.inside || c.violations || [];
   const out = [];
-  if (c.flag_extended !== false && inside.some((v) => v.kind === 'extended')) out.push('extended flash');
-  if (c.flag_patterns !== false && inside.some((v) => v.kind === 'pattern')) out.push('stripes');
+  if (inside.some((v) => v.kind === 'extended' && counts(c, v))) out.push('extended flash');
+  if (inside.some((v) => v.kind === 'pattern' && counts(c, v))) out.push('stripes');
   return out;
+}
+
+/** Problems `kinds` (remainingKinds) as what remains: "extended flash remains", "stripes remain". */
+function remains(kinds) {
+  if (!kinds.length) return 'something the profile flags remains';
+  return `${kinds.join(' and ')} remain${kinds.length === 1 && kinds[0] === 'extended flash' ? 's' : ''}`;
+}
+
+/** How many of a section's frames its marks change, as the export applies them: removed, held or blended. */
+function markCount(s) {
+  return Object.values(s.edits || {}).filter((e) => e.removed || e.extended).length + blendMarks(s).length;
 }
 
 /** Back to the whole video: no section open, the player on the file, the chart around the playhead. */
@@ -2036,8 +2138,12 @@ function renderSectionList() {
   for (const s of state.project.sectionsSorted()) {
     const el = document.createElement('div');
     el.className = 'sec-item' + (state.current === s.id ? ' current' : '');
-    const kinds = (s.kinds || []).map((k) => `<span class="badge kind-${k}">${KIND_LABEL[k] || k}</span>`).join(' ');
-    const marks = Object.values(s.edits || {}).filter((e) => e.removed || e.extended).length;
+    // (the kinds a scan names: what a project file says goes no further into the page)
+    const kinds = (s.kinds || [])
+      .filter((k) => KIND_LABEL[k])
+      .map((k) => `<span class="badge kind-${k}">${KIND_LABEL[k]}</span>`)
+      .join(' ');
+    const marks = markCount(s);
     el.innerHTML = `<div class="sec-title">#${s.id} ${sectionBadge(s)}</div><div class="sec-times">${fmt(s.start)} – ${fmt(s.end)} · ${(s.end - s.start).toFixed(1)} s${marks ? ` · ${marks} marks` : ''}${s.custom ? ' · custom' : ''}</div><div>${kinds}</div>`;
     el.addEventListener('click', () => openSection(s.id));
     list.appendChild(el);
@@ -2060,18 +2166,33 @@ function renderAll() {
 async function prepareAll() {
   for (const s of state.project.sectionsSorted()) {
     if (s.prepared) continue;
-    await doPrepare(s);
+    // (one cancelled, or failed, ends it: the rest are not started)
+    if (!(await doPrepare(s))) break;
   }
 }
 
 async function checkAll() {
   for (const s of state.project.sectionsSorted()) {
     if (!s.prepared) continue;
-    const c = await runJob(`Checking section #${s.id}`, async () => checkSection(state.env, state.project, s, null, { extS: EXT_S }));
-    if (c) s.check = c;
+    // (as Prepare all)
+    if (!(await checkJob(s))) break;
   }
   renderAll();
   await state.project.save();
+}
+
+/**
+ * Check section `sec` as a job and keep the verdict: stale when its marks
+ * changed while it ran (it judged the ones before). Resolves to it, or null
+ * when cancelled or failed.
+ */
+async function checkJob(sec) {
+  const marks = markSnapshot(sec);
+  const c = await runJob(`Checking section #${sec.id}`, (progress, cancelled) => checkSection(state.env, state.project, sec, null, { cancel: cancelled }));
+  if (!c) return null;
+  if (markSnapshot(sec) !== marks) c.stale = true;
+  sec.check = c;
+  return c;
 }
 
 // ---- workspace ----------------------------------------------------------------------
@@ -2104,32 +2225,41 @@ function openSection(id) {
 function wireWorkspace() {
   $('btnPrepare').addEventListener('click', () => doPrepare(currentSection()));
   $('btnReprepare').addEventListener('click', () => doPrepare(currentSection()));
-  $('btnDeleteSection').addEventListener('click', () => {
+  $('btnDeleteSection').addEventListener('click', async () => {
     const sec = currentSection();
-    if (!sec || !confirm(`Delete section #${sec.id}?`)) return;
-    state.project.deleteSection(sec.id);
-    state.current = null;
+    if (!sec || busy('delete the section') || !confirm(`Delete section #${sec.id}?`)) return;
+    // (its frames are freed once no check reads them)
+    await withFeeder(() => state.project.deleteSection(sec.id));
+    if (state.current === sec.id) state.current = null;
     state.project.save();
     renderAll();
   });
-  $('btnApplyRange').addEventListener('click', () => {
+  $('btnApplyRange').addEventListener('click', async () => {
     const sec = currentSection();
-    if (!sec) return;
+    if (!sec || busy('apply the new range')) return;
     const s = wasm.parse_time($('secStart').value);
     const e = wasm.parse_time($('secEnd').value);
     if (s == null || e == null || e <= s) return toast('Enter valid times');
     const [lo, hi] = state.project.bounds;
-    sec.start = Math.max(lo, s);
-    sec.end = Math.min(hi, e);
-    sec.prepared = false;
-    sec.cache = null;
-    sec.blendCache = null;
-    sec.blendKey = null;
-    sec.ctx = null;
-    sec.check = null;
-    sec.edits = {};
-    sec.blend = [];
-    sec.pts = null;
+    const ctxS = wasm.context_seconds(state.config);
+    // Another range is another section: its frames go (once no check reads
+    // them), and its marks and verdict with them, which were made on those
+    // frames; the checks that read its edges, before and after, are stale
+    await withFeeder(() => {
+      state.project.invalidateNeighbours(sec, ctxS);
+      sec.start = Math.max(lo, s);
+      sec.end = Math.min(hi, e);
+      dropCaches(sec);
+      Object.assign(sec, { check: null, edits: {}, keep: [], blend: [], pts: null, nFrames: 0, pattern: null, warnings: [] });
+      state.project.invalidateNeighbours(sec, ctxS);
+    });
+    state.history.delete(sec.id);
+    if (state.current === sec.id) {
+      closeViewer();
+      state.selection.clear();
+      state.anchor = null;
+      posterSection();
+    }
     state.project.save();
     renderAll();
   });
@@ -2168,10 +2298,8 @@ function wireWorkspace() {
   $('btnSuggestFps').addEventListener('click', () => doSuggestFps());
   $('btnFpsMenu').addEventListener('click', (e) => {
     e.stopPropagation();
-    $('fpsMenu').classList.toggle('hidden');
+    toggleMenu('fpsMenu');
   });
-  $('fpsMenu').addEventListener('click', (e) => e.stopPropagation());
-  document.addEventListener('click', () => $('fpsMenu').classList.add('hidden'));
   $('btnFpsSafe').addEventListener('click', () => {
     $('fpsInput').value = wasm.safe_picture_rate(state.config).toString();
     updateFpsNote();
@@ -2196,7 +2324,7 @@ function wireWorkspace() {
   $('btnSelectUnsafe').addEventListener('click', () => {
     const sec = currentSection();
     if (!sec || !sec.check) return;
-    selectFrames(sec, sec.check.flagged || [], 'everything still failing');
+    selectFrames(sec.check.flagged || [], 'everything still failing');
   });
   $('wsFindings').addEventListener('click', (e) => {
     const go = e.target.closest('button[data-open-section]');
@@ -2205,7 +2333,7 @@ function wireWorkspace() {
     const sec = currentSection();
     if (!b || !sec || !sec.check) return;
     const f = findings(sec)[+b.dataset.finding];
-    if (f) selectFrames(sec, f.frames, f.label);
+    if (f) selectFrames(f.frames, f.label);
   });
   const grid = $('frameGrid');
   grid.addEventListener('keydown', (e) => {
@@ -2213,7 +2341,7 @@ function wireWorkspace() {
     if (k === 'A' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       const sec = currentSection();
-      if (sec) state.selection = new Set(Array.from({ length: sec.nFrames }, (_, i) => i));
+      if (sec) state.selection = new Set(Array.from({ length: shownCount(sec) }, (_, i) => i));
       renderGridMarks();
     }
   });
@@ -2296,7 +2424,7 @@ function onKey(e) {
     const from = viewerOpen() ? state.viewerAt : state.selection.size ? Math.min(...state.selection) : null;
     if (from == null) return;
     e.preventDefault();
-    const i = Math.max(0, Math.min(sec.nFrames - 1, from + (e.key === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 10 : 1)));
+    const i = Math.max(0, Math.min(shownCount(sec) - 1, from + (e.key === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 10 : 1)));
     if (viewerOpen()) return openViewer(i);
     state.selection.clear();
     state.selection.add(i);
@@ -2347,12 +2475,8 @@ function renderWorkspace() {
   renderSoften(sec);
   renderBlend(sec);
   renderUndo();
-  if (sec.prepared) {
-    $('frameCount').textContent = `(${sec.nFrames})`;
-    renderGrid(sec);
-  }
+  if (sec.prepared) renderGrid(sec);
   drawChart();
-  renderPlayerWarning();
 }
 
 /** The blend strength: shown when the section has frames marked B. */
@@ -2380,7 +2504,10 @@ function renderSoften(sec) {
   $('softenNote').textContent = note;
 }
 
+/** Section `sec`'s verdict, the button to select what fails and the findings, when it is the section open. */
 function renderVerdict(sec) {
+  // (a check that ends after another section was opened draws nothing there)
+  if (sec !== currentSection()) return;
   const v = $('wsVerdict');
   const c = sec.check;
   if (!c) {
@@ -2395,14 +2522,14 @@ function renderVerdict(sec) {
   } else if (c.wcag_safe) {
     const kinds = remainingKinds(c);
     v.className = 'verdict ' + (kinds.includes('stripes') ? 'pat' : 'ext');
-    v.textContent = kinds.length ? `passes WCAG, ${kinds.join(' and ')} remain${kinds.length === 1 && kinds[0] === 'extended flash' ? 's' : ''}` : 'passes WCAG';
+    v.textContent = kinds.length ? `passes WCAG, ${remains(kinds)}` : 'passes WCAG';
   } else {
     v.className = 'verdict unsafe';
     v.textContent = describeFailure(sec, c);
   }
   $('btnSelectUnsafe').classList.toggle('hidden', !(c && !c.safe && c.flagged && c.flagged.length));
   renderFindings(sec);
-  if (sec === currentSection()) renderPlayerWarning();
+  renderPlayerWarning();
 }
 
 /**
@@ -2413,21 +2540,28 @@ function renderVerdict(sec) {
 function findings(sec) {
   const c = sec.check;
   if (!c || c.stale || !c.seq || !c.seq.t) return [];
-  const t = c.seq.t;
   const out = [];
-  for (const v of (c.inside || []).filter((v) => c[`flag_${v.kind === 'pattern' ? 'patterns' : v.kind}`] !== false)) {
-    const lo = Math.min(v.onset, v.start);
-    const frames = [];
-    for (let i = 0; i < t.length; i++) if (lo - 0.05 <= t[i] && t[i] <= v.end + 0.05) frames.push(i);
+  for (const v of (c.inside || []).filter((v) => counts(c, v))) {
+    const frames = framesOf(c.seq.t, v);
     if (!frames.length) continue;
     out.push({ v, kind: v.kind, frames, first: frames[0], last: frames[frames.length - 1], label: `the ${KIND_LABEL[v.kind] || v.kind} at frames ${frames[0]}–${frames[frames.length - 1]}` });
   }
   return out;
 }
 
+/** The frames of a checked sequence (times `t`) that violation `v` covers, in order (editing::flagged_frames, for the one). */
+function framesOf(t, v) {
+  return Array.from(wasm.flagged_frames(Float64Array.from(t), JSON.stringify([v])));
+}
+
 /** When frame `i` of a prepared section is, on the whole video's clock. */
 function frameVideoTime(sec, i) {
   return sec.start + sec.pts[i];
+}
+
+/** How many frames the grid shows of prepared section `sec` (a frame on its very end gives it its length, but shows after it). */
+function shownCount(sec) {
+  return shownPts(wasm, sec).length;
 }
 
 /**
@@ -2489,8 +2623,8 @@ function outsideOf(sec, v) {
   return { text: parts.join('; '), open };
 }
 
-/** Select `frames`, bring the first into view and say what was selected. */
-function selectFrames(sec, frames, what) {
+/** Select `frames` of the open section, bring the first into view and say what was selected. */
+function selectFrames(frames, what) {
   if (!frames.length) return toast('Nothing to select: the last check found nothing failing in this section.');
   state.selection = new Set(frames);
   state.anchor = frames[0];
@@ -2509,7 +2643,7 @@ function selectFrames(sec, frames, what) {
 function runUpFlashing(sec) {
   const c = sec.check;
   if (!c || c.stale || !c.before) return [];
-  return c.before.filter((v) => v.kind !== 'pattern' && c[`flag_${v.kind}`] !== false && v.end >= -1);
+  return c.before.filter((v) => v.kind !== 'pattern' && counts(c, v) && v.end >= -1);
 }
 
 /** The list under the verdict: each remaining problem, where it is, and what fixes it. */
@@ -2570,13 +2704,8 @@ const THUMB_SIZES = { s: 110, m: 146, l: 220, xl: 320 };
 let THUMB_W = 160;
 
 function thumbSizeSetting() {
-  try {
-    const v = localStorage.getItem('unflash:thumbSize');
-    if (THUMB_SIZES[v]) return v;
-  } catch (e) {
-    /* storage blocked */
-  }
-  return 'm';
+  const v = stored('unflash:thumbSize');
+  return THUMB_SIZES[v] ? v : 'm';
 }
 
 function setThumbSize(size, redraw = true) {
@@ -2586,11 +2715,7 @@ function setThumbSize(size, redraw = true) {
   // drawn a little over the tile's size for a sharp picture, never far past the cache's own
   THUMB_W = Math.round(Math.max(160, min * 1.3));
   for (const b of document.querySelectorAll('.thumb-size [data-thumb]')) b.classList.toggle('on', b.dataset.thumb === size);
-  try {
-    localStorage.setItem('unflash:thumbSize', size);
-  } catch (e) {
-    /* the choice lasts the session */
-  }
+  store('unflash:thumbSize', size);
   const sec = currentSection();
   if (redraw && sec && sec.prepared && sec.cache) renderGrid(sec);
 }
@@ -2607,7 +2732,7 @@ function viewerOpen() {
 function openViewer(i) {
   const sec = currentSection();
   if (!sec || !sec.prepared || !state.movie) return;
-  i = Math.max(0, Math.min(sec.nFrames - 1, i));
+  i = Math.max(0, Math.min(shownCount(sec) - 1, i));
   state.selection.clear();
   state.selection.add(i);
   state.anchor = i;
@@ -2638,7 +2763,7 @@ function renderViewerInfo() {
   if (e.extended) marks.push('held for 1 s');
   if ((sec.keep || []).includes(i)) marks.push('keep');
   if ((sec.blend || []).includes(i)) marks.push(`blended ${Math.round(blendStrength(sec) * 100)}% with the frames around it in the export (shown here as it is)`);
-  $('viewerInfo').textContent = `Section #${sec.id}, frame ${i} of ${sec.nFrames} · ${fmt(frameVideoTime(sec, i))} in the video, ${(sec.pts[i] - sec.pts[0]).toFixed(3)} s into the section${marks.length ? ' · ' + marks.join(' · ') : ''} · ${state.movie.width}×${state.movie.height}`;
+  $('viewerInfo').textContent = `Section #${sec.id}, frame ${i} of ${shownCount(sec)} · ${fmt(frameVideoTime(sec, i))} in the video, ${(sec.pts[i] - sec.pts[0]).toFixed(3)} s into the section${marks.length ? ' · ' + marks.join(' · ') : ''} · ${state.movie.width}×${state.movie.height}`;
 }
 
 /**
@@ -2670,6 +2795,7 @@ function renderGrid(sec) {
   grid.innerHTML = '';
   if (tileObserver) tileObserver.disconnect();
   const shown = shownPts(wasm, sec);
+  $('frameCount').textContent = `(${shown.length})`;
   const aw = sec.cache.width();
   const ah = sec.cache.height();
   const tw = THUMB_W;
@@ -2733,7 +2859,7 @@ function renderGrid(sec) {
       const next = i + 1 < sec.pts.length ? frameVideoTime(sec, i + 1) : Infinity;
       if (frameVideoTime(sec, i) <= want.hi && next > want.lo) frames.push(i);
     }
-    if (frames.length) selectFrames(sec, frames, `the frames at ${fmt(want.lo)}–${fmt(want.hi)} in the video, where the check of the export found ${KIND_LABEL[want.kind] ? `the ${KIND_LABEL[want.kind]}` : 'flashing'}`);
+    if (frames.length) selectFrames(frames, `the frames at ${fmt(want.lo)}–${fmt(want.hi)} in the video, where the check of the export found ${KIND_LABEL[want.kind] ? `the ${KIND_LABEL[want.kind]}` : 'flashing'}`);
   }
 }
 
@@ -2746,8 +2872,9 @@ function onTileClick(i, e) {
       const cols = Math.max(1, Math.round($('frameGrid').clientWidth / ($('frameGrid').children[0].offsetWidth + 6)));
       const [r0, c0] = [Math.floor(state.anchor / cols), state.anchor % cols];
       const [r1, c1] = [Math.floor(i / cols), i % cols];
+      const n = shownCount(sec);
       sel.clear();
-      for (let r = Math.min(r0, r1); r <= Math.max(r0, r1); r++) for (let c = Math.min(c0, c1); c <= Math.max(c0, c1); c++) if (r * cols + c < sec.nFrames) sel.add(r * cols + c);
+      for (let r = Math.min(r0, r1); r <= Math.max(r0, r1); r++) for (let c = Math.min(c0, c1); c <= Math.max(c0, c1); c++) if (r * cols + c < n) sel.add(r * cols + c);
     } else {
       sel.clear();
       for (let k = Math.min(state.anchor, i); k <= Math.max(state.anchor, i); k++) sel.add(k);
@@ -2769,30 +2896,18 @@ function renderGridMarks() {
   const sec = currentSection();
   if (!sec || !sec.prepared) return;
   const grid = $('frameGrid');
-  const rep = Array.from(wasm.replacement_map(JSON.stringify(sec.edits || {}), sec.nFrames));
-  const flagged = new Set(sec.check && !sec.check.stale ? sec.check.flagged || [] : []);
-  const redFlag = new Set();
-  const patFlag = new Set();
-  const extFlag = new Set();
-  if (sec.check && sec.check.inside) {
-    const seqT = sec.check.seq ? sec.check.seq.t : null;
-    if (seqT) {
-      for (const v of sec.check.inside) {
-        const into = v.kind === 'red' ? redFlag : v.kind === 'pattern' ? patFlag : v.kind === 'extended' ? extFlag : null;
-        if (!into) continue;
-        for (let i = 0; i < seqT.length; i++) if (Math.min(v.onset, v.start) - 0.05 <= seqT[i] && seqT[i] <= v.end + 0.05) into.add(i);
-      }
-    }
-  }
+  // (what a removed frame shows instead, as the export's sequence of the frames shown has it)
+  const rep = Array.from(wasm.replacement_map(JSON.stringify(sec.edits || {}), shownCount(sec)));
+  const c = sec.check;
+  // the frames each kind of violation covers (a stale check's too: until the next one, the best guess)
+  const of = { flash: new Set(), red: new Set(), pattern: new Set(), extended: new Set() };
+  if (c && c.inside && c.seq && c.seq.t) for (const v of c.inside) if (of[v.kind]) for (const i of framesOf(c.seq.t, v)) of[v.kind].add(i);
+  const redFlag = of.red;
+  const patFlag = of.pattern;
+  const extFlag = of.extended;
   // (a frame in a flash too shows the flash: that is the one to fix first)
-  const genFlag = new Set([...flagged].filter((i) => !extFlag.has(i)));
-  if (sec.check && sec.check.inside) {
-    const seqT = sec.check.seq ? sec.check.seq.t : null;
-    for (const v of sec.check.inside) {
-      if (v.kind !== 'flash' || !seqT) continue;
-      for (let i = 0; i < seqT.length; i++) if (Math.min(v.onset, v.start) - 0.05 <= seqT[i] && seqT[i] <= v.end + 0.05) genFlag.add(i);
-    }
-  }
+  const genFlag = new Set([...(c && !c.stale ? c.flagged || [] : [])].filter((i) => !extFlag.has(i)));
+  for (const i of of.flash) genFlag.add(i);
   const soft = new Set(sec.soften && sec.check && !sec.check.stale ? sec.check.soft_frames || [] : []);
   const kept = new Set(sec.keep || []);
   const blendSet = new Set(blendMarks(sec));
@@ -2903,26 +3018,31 @@ function markSelection(key) {
   }
   sec.keep = [...keep].sort((a, b) => a - b);
   sec.blend = [...blend].sort((a, b) => a - b);
-  renderBlend(sec);
   afterEdit(sec);
 }
 
+/** After a change of the open section's marks: what shows them, its verdict (stale until checked again) and its neighbours'. */
 function afterEdit(sec) {
   if (sec.check) sec.check.stale = true;
   state.project.invalidateNeighbours(sec, wasm.context_seconds(state.config));
   state.project.save();
+  renderSoften(sec);
+  renderBlend(sec);
   renderGridMarks();
   renderVerdict(sec);
   renderSectionList();
   renderUndo();
-  renderPlayerWarning();
   drawChart();
   if ($('autoCheck').checked) scheduleCheck(120);
-  // a section playing edited picks the change up where it is
-  if (sec.id === state.current && state.player.mode === 'edited' && sectionPlayer && sectionPlayer.active && !sectionPlayer.paused) {
-    clearTimeout(state.player.restartTimer);
-    state.player.restartTimer = setTimeout(() => playSection(Math.max(0, sectionPlayer.slot)), 150);
-  }
+  // (a run of keys restarts the player once)
+  replayEdited(sec, 150);
+}
+
+/** A section playing edited picks a change of its marks up where it is: it restarts, from the slot on screen, `ms` later. */
+function replayEdited(sec, ms = 0) {
+  if (sec.id !== state.current || state.player.mode !== 'edited' || !sectionPlayer || !sectionPlayer.active || sectionPlayer.paused) return;
+  clearTimeout(state.player.restartTimer);
+  state.player.restartTimer = setTimeout(() => playSection(Math.max(0, sectionPlayer.slot)), ms);
 }
 
 // ---- undo / redo of a section's marks --------------------------------------------------
@@ -2959,28 +3079,24 @@ function restoreMarks(sec, snap) {
   sec.blendStrength = o.blendStrength == null ? null : o.blendStrength;
 }
 
-function undo() {
+/** Take the open section's marks a step back through its history (`back`: undo) or forward again (redo). */
+function stepHistory(back) {
   const sec = currentSection();
   if (!sec || !sec.prepared) return;
   const h = historyOf(sec);
-  if (!h.undo.length) return toast('Nothing to undo');
-  h.redo.push(markSnapshot(sec));
-  restoreMarks(sec, h.undo.pop());
-  renderSoften(sec);
-  renderBlend(sec);
+  const from = back ? h.undo : h.redo;
+  if (!from.length) return toast(back ? 'Nothing to undo' : 'Nothing to redo');
+  (back ? h.redo : h.undo).push(markSnapshot(sec));
+  restoreMarks(sec, from.pop());
   afterEdit(sec);
 }
 
+function undo() {
+  return stepHistory(true);
+}
+
 function redo() {
-  const sec = currentSection();
-  if (!sec || !sec.prepared) return;
-  const h = historyOf(sec);
-  if (!h.redo.length) return toast('Nothing to redo');
-  h.undo.push(markSnapshot(sec));
-  restoreMarks(sec, h.redo.pop());
-  renderSoften(sec);
-  renderBlend(sec);
-  afterEdit(sec);
+  return stepHistory(false);
 }
 
 function renderUndo() {
@@ -3010,10 +3126,17 @@ async function runCheck(announce) {
   v.textContent = 'checking…';
   const t0 = performance.now();
   try {
-    const c = await withFeeder(() => checkSection(state.env, state.project, sec, null, { extS: EXT_S }));
+    // once no job is under way, and the last one's caller has taken in what
+    // it made (a suggestion's marks go in as it ends): those are the marks
+    // it checks, and the ones it compares with when it is done
+    while (state.job) await afterJobs();
+    const marks = markSnapshot(sec);
+    const c = await withFeeder(() => checkSection(state.env, state.project, sec, null));
+    // (the marks changed while it ran: it judged the ones before, and says so)
+    if (markSnapshot(sec) !== marks) c.stale = true;
     sec.check = c;
     sec.checkMs = performance.now() - t0;
-    if (announce) toast(`${c.safe ? 'Passes' : 'Fails'} (${c.frames} frames checked in ${(sec.checkMs / 1000).toFixed(2)} s)`);
+    if (announce && !c.stale) toast(`${c.safe ? 'Passes' : 'Fails'} (${c.frames} frames checked in ${(sec.checkMs / 1000).toFixed(2)} s)`);
   } catch (e) {
     console.error(e);
     banner(`Check failed: ${e.message || e}`);
@@ -3035,10 +3158,11 @@ async function runCheck(announce) {
 async function doPrepare(sec) {
   if (!sec) return;
   if (!state.decode.supported) return banner(`Preparing needs WebCodecs to decode ${state.movie.video.codec}: ${state.decode.reason}`);
-  // (before the eviction: a running job may be reading another section's frames)
   if (busy('prepare the section')) return false;
-  state.project.evictCaches(sec, cacheBudget());
   const ok = await runJob(`Preparing section #${sec.id}`, async (progress, cancelled) => {
+    // room for its frames: other sections' go, the least lately used first
+    // (here, in the job, under the feeder lock: no check is reading them)
+    state.project.evictCaches(sec, cacheBudget());
     await prepareSection(state.env, state.movie, sec, {
       cancel: cancelled,
       spans: scanSegments(),
@@ -3071,72 +3195,74 @@ function applySuggestion(sec, res, only) {
   sec.edits = JSON.parse(wasm.apply_suggestion(JSON.stringify(sec.edits || {}), JSON.stringify(res.edits), only ? JSON.stringify(only) : undefined, keepJson(sec)));
   sec.check = res.verdict || null;
   state.project.invalidateNeighbours(sec, wasm.context_seconds(state.config));
-  if (sec.id === state.current && state.player.mode === 'edited' && sectionPlayer && sectionPlayer.active && !sectionPlayer.paused) playSection(Math.max(0, sectionPlayer.slot));
+  replayEdited(sec);
 }
 
-async function doSuggest(prefer) {
-  const sec = currentSection();
-  if (!sec || !sec.prepared) return;
-  const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
-  const what = prefer === 'fewest' ? 'fewest removals' : `keep ${prefer}`;
-  const res = await runJob(`Suggesting (${what})`, async (progress, cancelled) => suggestEdits(state.env, state.project, sec, prefer, only, { extS: EXT_S, cancel: cancelled, onProgress: (r) => progress(Math.min(0.95, 0.1 + r * 0.08), `check ${r + 1}`) }));
-  if (!res) return;
-  applySuggestion(sec, res, only);
-  renderAll();
-  await state.project.save();
-  toast(res.note, 6000);
-}
-
-/** Blend frames ("lower contrast"): blend the flashing frames with the frames around them, as little as passes. */
-async function doSuggestBlend() {
-  const sec = currentSection();
-  if (!sec || !sec.prepared) return;
-  const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
-  const res = await runJob('Suggesting (blend frames)', async (progress, cancelled) => suggestBlend(state.env, state.project, sec, only, { extS: EXT_S, cancel: cancelled, onProgress: (r) => progress(Math.min(0.95, 0.05 + r * 0.09), `check ${r + 1}`) }));
-  if (!res) return;
+/** The blend suggestion's result into the section (undoably): its marks and their strength in place of the section's, and its verdict. */
+function applyBlend(sec, res) {
   pushHistory(sec);
   sec.edits = res.edits;
   sec.blend = res.blend;
   sec.blendStrength = res.strength;
   sec.check = res.verdict || null;
   state.project.invalidateNeighbours(sec, wasm.context_seconds(state.config));
-  if (sec.id === state.current && state.player.mode === 'edited' && sectionPlayer && sectionPlayer.active && !sectionPlayer.paused) playSection(Math.max(0, sectionPlayer.slot));
+  replayEdited(sec);
+}
+
+/** A frame rate's suggestion into the section, and the rate (the menu names it). */
+function applyRate(sec, res, only) {
+  applySuggestion(sec, res, only);
+  sec.fpsFound = res.fps;
+}
+
+/**
+ * Run suggester `run(sec, only, progress, cancelled)` on the open section
+ * (on the frames selected, with "selection only") as job `name`, take its
+ * result in with `take` (undoably) and say its note for `ms`. A suggestion
+ * is made from the marks the section had when it started: when they change
+ * while it runs (a key pressed meanwhile), it is not taken, so that nothing
+ * marked meanwhile is overwritten.
+ */
+async function suggestJob(name, run, ms, take = applySuggestion) {
+  const sec = currentSection();
+  if (!sec || !sec.prepared) return;
+  const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
+  const marks = markSnapshot(sec);
+  const res = await runJob(name, (progress, cancelled) => run(sec, only, progress, cancelled));
+  if (!res) return;
+  if (markSnapshot(sec) !== marks) return toast(`${name}: the section's marks changed while it ran, so its suggestion was not applied. Suggest again.`, 8000);
+  take(sec, res, only);
   renderAll();
   await state.project.save();
-  toast(res.note, 8000);
+  toast(res.note, ms);
+}
+
+function doSuggest(prefer) {
+  const what = prefer === 'fewest' ? 'fewest removals' : `keep ${prefer}`;
+  return suggestJob(`Suggesting (${what})`, (sec, only, progress, cancel) => suggestEdits(state.env, state.project, sec, prefer, only, { cancel, onProgress: (r) => progress(Math.min(0.95, 0.1 + r * 0.08), `check ${r + 1}`) }), 6000);
+}
+
+/** Blend frames ("lower contrast"): blend the flashing frames with the frames around them, as little as passes. */
+function doSuggestBlend() {
+  return suggestJob('Suggesting (blend frames)', (sec, only, progress, cancel) => suggestBlend(state.env, state.project, sec, only, { cancel, onProgress: (r) => progress(Math.min(0.95, 0.05 + r * 0.09), `check ${r + 1}`) }), 8000, applyBlend);
 }
 
 /** Reduce FPS: from twice the guaranteed-safe rate down, a tenth at a time, to the first rate that passes. */
-async function doSuggestFps() {
-  const sec = currentSection();
-  if (!sec || !sec.prepared) return;
-  const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
-  const res = await runJob('Reducing the frame rate', async (progress, cancelled) =>
-    searchFrameRate(state.env, state.project, sec, only, { extS: EXT_S, sourceFps: state.movie.fps, cancel: cancelled, onProgress: (p, r) => progress(p, `checking ${r} pictures/s`) })
-  );
-  if (!res) return;
-  applySuggestion(sec, res, only);
-  sec.fpsFound = res.fps;
-  $('fpsInput').value = String(res.fps);
-  renderAll();
-  await state.project.save();
-  toast(res.note, 9000);
+function doSuggestFps() {
+  const take = (sec, res, only) => {
+    applyRate(sec, res, only);
+    $('fpsInput').value = String(res.fps);
+  };
+  return suggestJob('Reducing the frame rate', (sec, only, progress, cancel) => searchFrameRate(state.env, state.project, sec, only, { sourceFps: state.movie.fps, cancel, onProgress: (p, r) => progress(p, `checking ${r} pictures/s`) }), 9000, take);
 }
 
 /** Reduce FPS to exactly the rate typed in the menu. */
-async function doSuggestFpsExact() {
-  const sec = currentSection();
-  if (!sec || !sec.prepared) return;
+function doSuggestFpsExact() {
+  const open = currentSection();
+  if (!open || !open.prepared) return;
   const v = parseFloat($('fpsInput').value);
   if (!(v > 0)) return toast('Type a rate, in pictures a second');
-  const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
-  const res = await runJob(`Thinning to ${v} pictures/s`, async (progress, cancelled) => suggestFrameRate(state.env, state.project, sec, only, v, { extS: EXT_S, cancel: cancelled }));
-  if (!res) return;
-  applySuggestion(sec, res, only);
-  sec.fpsFound = res.fps;
-  renderAll();
-  await state.project.save();
-  toast(res.note, 7000);
+  return suggestJob(`Thinning to ${v} pictures/s`, (sec, only, progress, cancel) => suggestFrameRate(state.env, state.project, sec, only, v, { cancel }), 7000, applyRate);
 }
 
 // ---- chart -------------------------------------------------------------------------------
@@ -3152,22 +3278,13 @@ function chartMode() {
 const CHART_SPANS = [10, 30, 120, 0];
 
 function chartSpanSetting() {
-  try {
-    const v = localStorage.getItem('unflash.chartSpan');
-    if (v !== null && CHART_SPANS.includes(+v)) return +v;
-  } catch (e) {
-    /* no storage */
-  }
-  return 30;
+  const v = stored('unflash.chartSpan');
+  return v !== null && CHART_SPANS.includes(+v) ? +v : 30;
 }
 
 function setChartSpan(span, redraw = true) {
   state.chartSpan = span;
-  try {
-    localStorage.setItem('unflash.chartSpan', String(span));
-  } catch (e) {
-    /* no storage */
-  }
+  store('unflash.chartSpan', String(span));
   for (const b of document.querySelectorAll('#chartSpan [data-span]')) b.classList.toggle('on', +b.dataset.span === span);
   if (redraw) drawChart();
 }
@@ -3199,13 +3316,16 @@ function lowerBound(ts, t) {
 function scanStatus() {
   const p = state.project;
   if (!p) return null;
-  if (state.job && state.job.name === 'Scanning for flashes') return { badge: '<span class="badge">scanning…</span>', text: 'scanning…' };
+  if (state.scanning) return { badge: '<span class="badge">scanning…</span>', text: 'scanning…', scanning: true };
   const s = p.scan;
   if (!s) return { badge: '<span class="badge">not scanned</span>', text: state.decode.supported ? 'not scanned yet' : 'this browser cannot scan it' };
   if (s.sig !== wasm.config_signature(state.config)) return { badge: '<span class="badge stale">scan again</span>', text: 'scanned under another profile: scan again' };
+  // (numbers: a scan can come from a project file, and these go into the page as HTML)
+  const frames = Number(s.frames);
+  const n = Number(s.counted);
   const kinds = `flashing${s.flag_extended ? ' (extended flashes included)' : ''}${s.flag_patterns ? ' or stripe patterns' : ''}`;
-  if (s.safe) return { badge: '<span class="badge safe">nothing found</span>', text: `✓ no ${kinds} found in ${s.frames} frames`, safe: true, kinds };
-  return { badge: `<span class="badge unsafe">${s.counted} found</span>`, text: `${s.counted} violation${s.counted === 1 ? '' : 's'} found in ${s.frames} frames` };
+  if (s.safe) return { badge: '<span class="badge safe">nothing found</span>', text: `✓ no ${kinds} found in ${frames} frames`, safe: true, kinds };
+  return { badge: `<span class="badge unsafe">${n} found</span>`, text: `${n} violation${n === 1 ? '' : 's'} found in ${frames} frames` };
 }
 
 function drawChart() {
@@ -3392,7 +3512,7 @@ function drawVideoChart(g, W, H) {
     g.fillText(`#${s.id}`, x0 + 3, top + 10);
   }
   // what the scan found, along the top
-  const found = state.scanning ? state.scanning.violations : scan ? scan.violations.filter((v) => scanReports(scan, v)) : [];
+  const found = state.scanning ? state.scanning.violations : scan ? scan.violations.filter((v) => counts(scan, v)) : [];
   for (const v of found) {
     if (v.end < t0 || v.start > t1) continue;
     g.fillStyle = kindInk(v.kind);
@@ -3464,7 +3584,7 @@ function drawVideoChart(g, W, H) {
   // the words under it
   const st = scanStatus();
   let lead = '';
-  if (!n || !n.t.length) lead = st && st.text === 'scanning…' ? 'Scanning… ' : 'Scan the video to chart its flashing. ';
+  if (!n || !n.t.length) lead = st && st.scanning ? 'Scanning… ' : 'Scan the video to chart its flashing. ';
   else if (st && st.safe) {
     const pk = n.peak;
     const worst = pk.h[0] >= pk.r[0] ? ['general', pk.h] : ['red', pk.r];
@@ -3525,7 +3645,7 @@ async function openExport() {
   const p = state.project;
   if (!p) return;
   const rows = p.sectionsSorted().map((s) => {
-    const marks = Object.values(s.edits || {}).filter((e) => e.removed || e.extended).length + (s.blend || []).length;
+    const marks = markCount(s);
     const applies = marks || (s.soften && softenPlan(s));
     const status = !applies ? 'nothing to apply' : !(s.pts && s.pts.length) ? 'has marks but was never prepared: marks will NOT be applied' : s.check && !s.check.stale ? (s.check.safe ? 'passes' : 'still failing') : 'unchecked';
     return `<tr><td>#${s.id}</td><td>${fmt(s.start)} – ${fmt(s.end)}</td><td>${marks} marks</td><td>${status}</td></tr>`;
@@ -3553,8 +3673,6 @@ async function openExport() {
   }
   $('exportName').value = chosenExportName();
   $('exportWhere').textContent = exportWhere();
-  $('exportDownload').classList.toggle('hidden', !(state.exportBlob && $('exportDownload').getAttribute('href')));
-  $('btnVerifyExport').disabled = !state.exportBlob;
   $('btnVerifyExport').title = state.exportBlob ? 'Scan the exported file again, every frame, with the current profile' : 'Export first (or check a file you saved with "verify a saved file…")';
   $('exportModal').classList.remove('hidden');
 }
@@ -3565,7 +3683,7 @@ async function renderExportChoice() {
   const chosen = cands.find((c) => c.label === $('exportCodec').value) || cands[0];
   const softened = state.project.sectionsSorted().filter((s) => s.soften && softenPlan(s));
   const blended = state.project.sectionsSorted().filter((s) => s.pts && s.pts.length && blendMarks(s).length);
-  const plan = chosen ? await exportPlan(state.env, state.movie, state.project, { extS: EXT_S, codec: chosen.config.codec, smartCut: smartCutSetting(), parallel: parallelSetting() }) : null;
+  const plan = chosen ? await exportPlan(state.env, state.movie, state.project, { codec: chosen.config.codec, smartCut: smartCutSetting(), parallel: parallelSetting() }) : null;
   state.exportPlan = plan;
   $('exportFormatNote').textContent = chosen ? formatInfo(chosen, state.movie).note : '';
   $('exportPlan').textContent = plan ? describePlan(plan, state.movie, softened, blended) : 'This browser has no WebCodecs video encoder, so it cannot export.';
@@ -3627,29 +3745,32 @@ async function doExport() {
   if (sinkInfo && sinkInfo.cancelled) return;
   if (!sinkInfo) sinkInfo = await privateFileSink(estimateExportBytes(movie, quality, state.exportPlan), exportOwner(state.project.key));
   $('exportModal').classList.add('hidden');
-  const res = await runJob('Exporting', async (progress, cancelled) =>
-    exportMovie(state.env, movie, state.project, {
-      encoder: $('exportCodec').value,
-      quality,
-      extS: EXT_S,
+  const res = await exportJob(movie, state.project, { encoder: $('exportCodec').value, quality, smartCut: smartCutSetting(), parallel: parallelSetting() }, sinkInfo);
+  $('exportModal').classList.remove('hidden');
+  if (!res) return;
+  showExportResult(res, name, sinkInfo && !sinkInfo.private && sinkInfo.handle ? sinkInfo.handle.name : null);
+}
+
+/**
+ * Export `project` as the job 'Exporting' (`opts` as exportMovie's), to
+ * `sinkInfo`'s sink, if any, and read back what went to disk. Resolves to
+ * the export, or null (cancelled, or failed): what it wrote is thrown away.
+ */
+async function exportJob(movie, project, opts, sinkInfo) {
+  const res = await runJob('Exporting', (progress, cancelled) =>
+    exportMovie(state.env, movie, project, {
+      ...opts,
       sink: sinkInfo ? sinkInfo.sink : null,
       cancel: cancelled,
-      smartCut: smartCutSetting(),
-      parallel: parallelSetting(),
       onProgress: (p, frames, ms, copied, sound) => progress(p, exportProgressText(frames, ms, copied, sound)),
     })
   );
-  $('exportModal').classList.remove('hidden');
   if (!res) {
     if (sinkInfo) await sinkInfo.sink.abort();
-    return;
+    return null;
   }
   await readBackExport(res, sinkInfo);
-  showExportResult(res, name, sinkInfo && !sinkInfo.private && sinkInfo.handle ? sinkInfo.handle.name : null);
-  if (res.saved) {
-    state.exportBlob = res.saved;
-    $('btnVerifyExport').disabled = false;
-  }
+  return res;
 }
 
 function exportProgressText(frames, ms, copied, sound) {
@@ -3689,12 +3810,9 @@ function exportName(movie) {
 function wireProjectMenu() {
   $('btnProject').addEventListener('click', (e) => {
     e.stopPropagation();
-    $('alertsMenu').classList.add('hidden');
-    $('projectMenu').classList.toggle('hidden');
+    toggleMenu('projectMenu');
     renderProjectNote();
   });
-  $('projectMenu').addEventListener('click', (e) => e.stopPropagation());
-  document.addEventListener('click', () => $('projectMenu').classList.add('hidden'));
   $('btnProjectSave').addEventListener('click', saveProjectFile);
   $('projectInput').addEventListener('change', async () => {
     const f = $('projectInput').files[0];
@@ -3708,7 +3826,7 @@ function wireProjectMenu() {
 function renderProjectNote() {
   const p = state.project;
   if (!p) return ($('projectNote').textContent = '');
-  const marks = p.sections.reduce((n, s) => n + Object.values(s.edits || {}).filter((e) => e.removed || e.extended).length + (s.blend || []).length, 0);
+  const marks = p.sections.reduce((n, s) => n + markCount(s), 0);
   $('projectNote').textContent = `Here now: ${p.sections.length} section${p.sections.length === 1 ? '' : 's'}${marks ? `, ${marks} marks` : ''}${p.scan ? ', a scan' : ''}.`;
 }
 
@@ -3749,13 +3867,15 @@ async function loadProjectFile(f) {
   if (state.job) return toast('Wait for the job under way to finish (or cancel it), then load the project.');
   if (sectionPlayer) await sectionPlayer.stop();
   closeViewer();
-  for (const s of p.sections) dropCaches(s);
   const before = p.profile;
-  p.restore(doc.saved);
+  // (the frames of the sections here are freed once no check reads them)
+  await withFeeder(() => {
+    for (const s of p.sections) dropCaches(s);
+    p.restore(doc.saved);
+  });
   state.current = null;
   state.history.clear();
   state.lastScan = null;
-  state.scanTrace = p.scan && p.scan.trace ? p.scan.trace : null;
   state.traceNorm = null;
   if (p.profile !== before) {
     $('profileSel').value = p.profile;
@@ -3771,22 +3891,34 @@ async function loadProjectFile(f) {
 
 /** Show a finished export in the export dialog: what was written (and, `savedAs`, the file it went to), a download link, and the verify button. */
 function showExportResult(res, name, savedAs = null) {
-  const lines = [exportSummary(res) + (savedAs ? ` Saved as ${escapeHtml(savedAs)}.` : ''), ...res.warnings];
-  $('exportResult').innerHTML = lines.map((l) => `<p>${l}</p>`).join('');
-  // the dialog offers this export and no earlier one
+  const lines = [exportSummary(res) + (savedAs ? ` Saved as ${savedAs}.` : ''), ...res.warnings];
+  // (as text: a warning can quote the file, a sound track's language, say)
+  $('exportResult').innerHTML = lines.map((l) => `<p>${escapeHtml(l)}</p>`).join('');
+  // the dialog offers this export and no earlier one (a file saved where the visitor chose, to verify only)
+  offerExport(res.blob || res.saved || null, res.holds || null, res.blob ? name : null);
+}
+
+/**
+ * The export the dialog offers (`blob`; null: none) to verify, and to
+ * download as `name` (null: to verify only), with where its frames were
+ * held (`holds`, on the video's clock: its times run that much later than
+ * the video's).
+ */
+function offerExport(blob, holds = null, name = chosenExportName()) {
+  state.exportBlob = blob;
+  state.exportHolds = holds;
   const a = $('exportDownload');
   if (a.getAttribute('href')) {
     URL.revokeObjectURL(a.href);
     a.removeAttribute('href');
   }
-  state.exportBlob = res.blob || null;
-  // (where its frames were held: its times run that much later than the video's)
-  state.exportHolds = res.holds || null;
-  a.classList.toggle('hidden', !res.blob);
-  $('btnVerifyExport').disabled = !res.blob;
-  if (!res.blob) return;
-  a.href = URL.createObjectURL(res.blob);
-  a.download = name;
+  const download = !!blob && name !== null;
+  a.classList.toggle('hidden', !download);
+  if (download) {
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+  }
+  $('btnVerifyExport').disabled = !blob;
 }
 
 /** Whose an export kept on disk is: the video's name and size, as a project is found again whatever its modified time. */
@@ -3803,32 +3935,17 @@ function forgetExport(keep = null) {
   if (state.auto && state.auto.blobUrl) URL.revokeObjectURL(state.auto.blobUrl);
   state.auto = null;
   renderAuto();
-  state.exportBlob = null;
-  state.exportHolds = null;
-  const a = $('exportDownload');
-  if (a.getAttribute('href')) {
-    URL.revokeObjectURL(a.href);
-    a.removeAttribute('href');
-  }
-  a.classList.add('hidden');
-  $('btnVerifyExport').disabled = true;
+  offerExport(null);
   discardPrivateExport(null, keep);
 }
 
 /**
  * An export of this video from before the page was reloaded, kept in private
- * storage: offered again, to download or verify, as if just made.
+ * storage (`found`, as findPrivateExport gives it): offered again, to
+ * download or verify, as if just made.
  */
-async function restoreExport(key, movie) {
-  const found = await findPrivateExport(key);
-  if (!found) return;
-  state.exportBlob = found.file;
-  state.exportHolds = null;
-  const a = $('exportDownload');
-  a.href = URL.createObjectURL(found.file);
-  a.download = chosenExportName();
-  a.classList.remove('hidden');
-  $('btnVerifyExport').disabled = false;
+function offerKeptExport(found) {
+  offerExport(found.file);
   const at = new Date(found.madeAt);
   const when = at.toDateString() === new Date().toDateString() ? at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : at.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
   $('exportResult').innerHTML = `<p>The export made at ${when} (${fmtBytes(found.file.size)}) is still here, kept in this browser's storage: download it, or verify it. Exporting again replaces it.</p>`;
@@ -3868,7 +3985,7 @@ async function verifyBlob(blob, holds = null) {
       return await scanWithPlan({ wasm, config: state.config, feeder }, m, {
         cancel: cancelled,
         segments: scanSegments(),
-        forceSegments: segmentsForced(),
+        forceSegments: SEGMENTS > 0,
         makeFeeder: () => makeFeeder(m.width, m.height),
         onProgress: (p, _t, count, ms) => progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`),
       });
@@ -3881,7 +3998,7 @@ async function verifyBlob(blob, holds = null) {
   state.lastVerify = res;
   const v = res.result.violations;
   const wcagBad = v.filter((x) => x.kind === 'flash' || x.kind === 'red');
-  const ext = v.filter((x) => x.kind === 'extended');
+  const ext = v.filter((x) => x.kind === 'extended' && counts(res.result, x));
   const pat = v.filter((x) => x.kind === 'pattern');
   // where each is in the video, and the section to fix it in: held frames
   // push the file's times later than the video's (by the export's holds, or,
@@ -3898,7 +4015,7 @@ async function verifyBlob(blob, holds = null) {
   const list = (xs, html, kind) => xs.slice(0, 8).map((x) => `${kind ? x.kind + ' ' : ''}${fmt(x.start)}–${fmt(x.end)}${where(x, html)}`).join(', ');
   const describe = (html) => {
     let msg = wcagBad.length ? `<b>Fails WCAG:</b> ${wcagBad.length} violation${wcagBad.length === 1 ? '' : 's'}: ` + list(wcagBad, html, true) : '<b>Passes WCAG.</b>';
-    if (ext.length && res.result.flag_extended) msg += ` ${ext.length} extended flash${ext.length === 1 ? '' : 'es'} remain${ext.length === 1 ? 's' : ''}: ` + list(ext, html);
+    if (ext.length) msg += ` ${ext.length} extended flash${ext.length === 1 ? '' : 'es'} remain${ext.length === 1 ? 's' : ''}: ` + list(ext, html);
     if (res.result.flag_patterns) {
       if (pat.length) msg += ` ${pat.length} hazardous stripe pattern${pat.length === 1 ? '' : 's'} remain${pat.length === 1 ? 's' : ''}: ` + list(pat, html);
       else msg += ' No hazardous stripe patterns.';
@@ -3938,20 +4055,13 @@ function exportToVideo(a, b, holds) {
  * hand editing beats, so it is something to ask for.
  */
 function initialAutoSetting() {
-  const q = new URLSearchParams(location.search).get('auto');
-  if (q === '0' || q === 'off') return false;
-  if (q === '1' || q === 'on') return true;
-  try {
-    return localStorage.getItem('unflash:auto') === '1';
-  } catch (e) {
-    return false;
-  }
+  const forced = onOff('auto');
+  return forced !== null ? forced : stored('unflash:auto') === '1';
 }
 
 /** Whether a file is scanned as soon as it is opened: always, except with `?auto=0` (nothing automatic at all). */
 function autoScanEnabled() {
-  const q = new URLSearchParams(location.search).get('auto');
-  return !(q === '0' || q === 'off');
+  return onOff('auto') !== false;
 }
 
 /** Whether opening a file (or changing the profile) starts the unattended run: the switch decides. */
@@ -3959,12 +4069,8 @@ function autoEnabled() {
   return $('autoToggle').checked;
 }
 
-const AUTO_STEPS = [
-  ['scan', 'scan'],
-  ['fix', 'fix'],
-  ['export', 'export'],
-  ['verify', 'verify'],
-];
+/** The unattended run's steps, in order, as its strip names them. */
+const AUTO_STEPS = ['scan', 'fix', 'export', 'verify'];
 
 function autoStep(auto, name, status, text = '') {
   auto.steps[name] = { status, text };
@@ -3981,13 +4087,13 @@ function renderAuto() {
   box.classList.remove('hidden');
   const steps = $('autoSteps');
   steps.innerHTML = '';
-  for (const [key, label] of AUTO_STEPS) {
+  for (const key of AUTO_STEPS) {
     const s = a.steps[key] || { status: 'pending', text: '' };
     const el = document.createElement('span');
     el.className = `auto-step ${s.status}`;
     el.dataset.step = key;
     const b = document.createElement('b');
-    b.textContent = label;
+    b.textContent = key;
     el.appendChild(b);
     if (s.text) {
       const t = document.createElement('span');
@@ -4016,12 +4122,9 @@ async function stopAuto() {
   const a = state.auto;
   if (!a || !a.running) return;
   a.stopped = true;
-  const until = performance.now() + 30000;
-  while (a.running && performance.now() < until) {
-    // whatever job the run is on, or starts next, is cancelled too
-    if (state.job) state.job.cancelled = true;
-    await new Promise((r) => setTimeout(r, 50));
-  }
+  // (the run asks `stopped` before each job it starts: only the one under way needs cancelling)
+  if (state.job) state.job.cancelled = true;
+  await a.ended;
 }
 
 /**
@@ -4038,6 +4141,8 @@ async function autopilot({ rescan = false } = {}) {
   const project = state.project;
   if (state.auto && state.auto.blobUrl) URL.revokeObjectURL(state.auto.blobUrl);
   const auto = { running: true, stopped: false, steps: {}, summary: '', blobUrl: null, fileName: null };
+  // (settled once the run is over: stopAuto waits on it)
+  auto.ended = new Promise((r) => (auto.end = r));
   state.auto = auto;
   renderAuto();
   const halted = () => auto.stopped || state.movie !== movie;
@@ -4103,7 +4208,7 @@ async function autopilot({ rescan = false } = {}) {
     }
     // to disk when the browser has private storage; in memory otherwise, and
     // only when it will fit
-    const plan = await exportPlan(state.env, movie, project, { extS: EXT_S, codec: cands[0].config.codec, smartCut: smartCutSetting(), parallel: parallelSetting() });
+    const plan = await exportPlan(state.env, movie, project, { codec: cands[0].config.codec, smartCut: smartCutSetting(), parallel: parallelSetting() });
     const need = estimateExportBytes(movie, quality, plan);
     const sinkInfo = await privateFileSink(need, exportOwner(project.key));
     if (!sinkInfo && need > memoryExportLimit()) {
@@ -4112,23 +4217,14 @@ async function autopilot({ rescan = false } = {}) {
       auto.summary = `The sections are fixed. The export would be about ${fmtBytes(need)}, more than this browser can hold in memory: ${window.showSaveFilePicker ? 'use Export… to write it to a file of your choice' : 'export from a browser with a save dialog or private storage'}.`;
       return;
     }
-    autoStep(auto, 'export', 'running', `${plan.mode === 'smart' ? `re-encoding ${plan.spans} span${plan.spans === 1 ? '' : 's'} with ${cands[0].label}, copying ${plan.copied} frames` : `encoding with ${cands[0].label}`}${sinkInfo ? ' to private storage on disk' : ''}`);
-    const res = await runJob('Exporting', (progress, cancelled) =>
-      exportMovie(state.env, movie, project, {
-        encoder: cands[0].label,
-        quality,
-        extS: EXT_S,
-        sink: sinkInfo ? sinkInfo.sink : null,
-        cancel: cancelled,
-        plan,
-        onProgress: (p, frames, ms, copied, sound) => progress(p, exportProgressText(frames, ms, copied, sound)),
-      })
-    );
-    if (!res || halted()) {
+    // (stopped while the export was planned: no job is under way for the stop to cancel)
+    if (halted()) {
       if (sinkInfo) await sinkInfo.sink.abort();
-      return bail('export', 'The export did not finish.');
+      return bail('export', '');
     }
-    await readBackExport(res, sinkInfo);
+    autoStep(auto, 'export', 'running', `${plan.mode === 'smart' ? `re-encoding ${plan.spans} span${plan.spans === 1 ? '' : 's'} with ${cands[0].label}, copying ${plan.copied} frames` : `encoding with ${cands[0].label}`}${sinkInfo ? ' to private storage on disk' : ''}`);
+    const res = await exportJob(movie, project, { encoder: cands[0].label, quality, plan }, sinkInfo);
+    if (!res || halted()) return bail('export', 'The export did not finish.');
     if (!res.blob) return bail('export', 'The exported file could not be read back.');
     auto.fileName = exportName(movie);
     auto.blobUrl = URL.createObjectURL(res.blob);
@@ -4148,19 +4244,16 @@ async function autopilot({ rescan = false } = {}) {
     auto.summary = v.wcagBad.length ? `The exported file still fails WCAG. ${v.text}` : `Done: the fixed video is ready to download. ${v.text}${left}`;
   } catch (e) {
     console.error(e);
-    const step = AUTO_STEPS.map(([k]) => k).find((k) => auto.steps[k] && auto.steps[k].status === 'running') || 'scan';
+    const step = AUTO_STEPS.find((k) => auto.steps[k] && auto.steps[k].status === 'running') || 'scan';
     autoStep(auto, step, 'failed', e && e.message ? e.message : String(e));
     auto.summary = 'Auto-fix stopped on an error; the buttons do each step by hand.';
   } finally {
     auto.running = false;
+    auto.end();
     if (state.auto === auto) renderAuto();
-    // the run was one wait: its alert comes now
-    if (chain.active) {
-      if (auto.steps.verify && auto.steps.verify.status === 'failed') chain.ok = false;
-      chain.end = performance.now();
-      clearTimeout(chain.timer);
-      chain.timer = setTimeout(finishChain, CHAIN_GRACE_MS);
-    }
+    // the run was one wait: its alert comes now (an export that still fails fails it, though no job failed)
+    if (chain.active && auto.steps.verify && auto.steps.verify.status === 'failed') chain.ok = false;
+    chainEnd('ok', '');
   }
 }
 
@@ -4179,12 +4272,7 @@ async function autoFixSection(sec, auto) {
   const ctxS = wasm.context_seconds(state.config);
   const hadMarks = hasMarks(sec);
   if (!sec.prepared && !(await doPrepare(sec))) return null;
-  const check = async () => {
-    if (auto.stopped) return null;
-    const c = await runJob(`Checking section #${sec.id}`, () => checkSection(env, project, sec, null, { extS: EXT_S }));
-    if (c) sec.check = c;
-    return c;
-  };
+  const check = () => (auto.stopped ? null : checkJob(sec));
   const standing = (note) => ({ note, safe: !!(sec.check && sec.check.safe), wcagSafe: !!(sec.check && sec.check.wcag_safe) });
   // a check's verdict counts what runs past the section's end too
   const violations = (x) => x.violations || x.inside || [];
@@ -4193,7 +4281,7 @@ async function autoFixSection(sec, auto) {
   if (c.safe) return standing(hadMarks ? 'passes with the marks from before' : 'already passes');
   const did = [];
   // stripes cannot be removed a frame at a time: soften them
-  if (c.flag_patterns && violations(c).some((v) => v.kind === 'pattern') && !sec.soften && softenPlan(sec)) {
+  if (violations(c).some((v) => v.kind === 'pattern' && counts(c, v)) && !sec.soften && softenPlan(sec)) {
     pushHistory(sec);
     sec.soften = true;
     project.invalidateNeighbours(sec, ctxS);
@@ -4203,15 +4291,17 @@ async function autoFixSection(sec, auto) {
     if (c.safe) return standing(did.join(' · '));
   }
   // flashing: the gentle suggesters first, the guaranteed one last
-  const flashing = violations(c).some((v) => v.kind === 'flash' || v.kind === 'red' || (v.kind === 'extended' && c.flag_extended));
+  const flashing = violations(c).some((v) => v.kind !== 'pattern' && counts(c, v));
   if (flashing) {
     const rounds = (progress) => (r) => progress(Math.min(0.95, 0.2 + r * 0.06), `check ${r + 1}`);
     const tries = [
-      ['fewest removals', (progress, cancel) => suggestEdits(env, project, sec, 'fewest', null, { extS: EXT_S, cancel, onProgress: rounds(progress) })],
-      ['keep dark', (progress, cancel) => suggestEdits(env, project, sec, 'dark', null, { extS: EXT_S, cancel, onProgress: rounds(progress) })],
-      ['keep light', (progress, cancel) => suggestEdits(env, project, sec, 'light', null, { extS: EXT_S, cancel, onProgress: rounds(progress) })],
-      ['reduce the frame rate', (progress, cancel) => searchFrameRate(env, project, sec, null, { extS: EXT_S, sourceFps: state.movie.fps, cancel, onProgress: (p, r) => progress(p, `checking ${r} pictures/s`) })],
+      ['fewest removals', (progress, cancel) => suggestEdits(env, project, sec, 'fewest', null, { cancel, onProgress: rounds(progress) })],
+      ['keep dark', (progress, cancel) => suggestEdits(env, project, sec, 'dark', null, { cancel, onProgress: rounds(progress) })],
+      ['keep light', (progress, cancel) => suggestEdits(env, project, sec, 'light', null, { cancel, onProgress: rounds(progress) })],
+      ['reduce the frame rate', (progress, cancel) => searchFrameRate(env, project, sec, null, { sourceFps: state.movie.fps, cancel, onProgress: (p, r) => progress(p, `checking ${r} pictures/s`) })],
     ];
+    // (the marks the suggestions are made from: changed meanwhile, as suggestJob, none is taken)
+    const marks = markSnapshot(sec);
     let last = null;
     for (const [label, run] of tries) {
       if (auto.stopped) return null;
@@ -4221,6 +4311,10 @@ async function autoFixSection(sec, auto) {
       if (res.safe) break;
     }
     const [label, res] = last;
+    if (markSnapshot(sec) !== marks) {
+      toast(`Section #${sec.id}: its marks changed while auto-fix worked on it, so its suggestion was not applied.`, 8000);
+      return null;
+    }
     applySuggestion(sec, res, null);
     did.push(`${label}: ${res.note}`);
     if (!sec.check && !(await check())) return null;

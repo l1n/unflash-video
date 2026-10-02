@@ -103,7 +103,7 @@ try {
   results.loadToast = await page.textContent('#toast');
   console.log('loaded:', results.loadToast);
   assert(JSON.stringify(results.loaded) === JSON.stringify(results.before), 'the sections and marks come back as they were: ' + JSON.stringify(results.loaded));
-  assert(await page.evaluate(() => !!(window.__unflash.state.scanTrace && window.__unflash.state.scanTrace.t.length === 300)), 'and the scan trace');
+  assert(await page.evaluate(() => { const s = window.__unflash.state.project.scan; return !!(s && s.trace && s.trace.t.length === 300); }), 'and the scan trace');
   assert(/^Loaded flash\.unflash\.json: 1 section and the scan/.test(results.loadToast), 'the toast says what was loaded: ' + results.loadToast);
   // the loaded section prepares and checks again when opened
   await page.click('#sectionList .sec-item');
@@ -197,6 +197,20 @@ try {
   // and a file that is not a project
   await page.setInputFiles('#projectInput', { name: 'notes.json', mimeType: 'application/json', buffer: Buffer.from('{"hello": 1}') });
   await page.waitForFunction(() => /not an Unflash project file/.test(document.querySelector('#bannerText').textContent), null, { timeout: 10000 });
+
+  // a project file is text anyone can write: markup in it does not become the
+  // page's (a section's kinds and its id went into the list as HTML)
+  await openClip('flash.webm', clip);
+  const crafted = JSON.parse(text);
+  const markup = (n) => `<img src="x" onerror="window.__ran = ${n}">`;
+  const own = crafted.project.sections[0];
+  own.kinds = [...own.kinds, markup(1)];
+  crafted.project.sections.push({ ...own, id: markup(2), start: 9, end: 9.5 });
+  await page.setInputFiles('#projectInput', { name: 'crafted.unflash.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(crafted)) });
+  await page.waitForFunction(() => /^Loaded crafted\.unflash\.json/.test(document.querySelector('#toast').textContent), null, { timeout: 30000 });
+  results.crafted = await page.evaluate(() => ({ images: document.querySelectorAll('#sectionList img, #workspace img').length, sections: window.__unflash.state.project.sections.map((s) => ({ id: s.id, kinds: s.kinds })), list: document.querySelector('#sectionList').textContent }));
+  console.log('a crafted project file:', JSON.stringify(results.crafted));
+  assert(results.crafted.images === 0 && results.crafted.sections.length === 1 && results.crafted.sections[0].kinds.every((k) => ['flash', 'red', 'extended', 'pattern'].includes(k)), 'markup in a project file does not become the page\'s: ' + JSON.stringify(results.crafted));
 
   if (errors.length) throw new Error('page errors:\n' + errors.join('\n'));
   console.log('PROJECT OK');

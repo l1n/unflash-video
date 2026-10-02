@@ -264,8 +264,8 @@ class FileSink {
  * stripes" blurs. With `edited` false, the section as it is (the section
  * player's "original").
  */
-export function sectionRenderPlan(env, movie, s, extS, { edited = true } = {}) {
-  const { tl, shown, seq, holds: sectionHolds } = sectionSequence(env.wasm, s, edited ? s.edits : null, extS);
+export function sectionRenderPlan(env, movie, s, { edited = true } = {}) {
+  const { tl, shown, seq, holds: sectionHolds } = sectionSequence(env.wasm, s, edited ? s.edits : null);
   // where the section waits for its held frames, in source seconds: the
   // frame times above come from the same list, and so does the silence the
   // export puts into the sound, so the two cannot disagree
@@ -310,11 +310,11 @@ export function sectionRenderPlan(env, movie, s, extS, { edited = true } = {}) {
  * too, and re-encoded as it is. Sections with marks but no frame times are
  * named in `warnings`: theirs cannot be applied.
  */
-function sectionPlans(env, movie, project, extS, warnings) {
+function sectionPlans(env, movie, project, warnings) {
   const sections = project
     .sectionsSorted()
     .filter((s) => s.pts && s.pts.length)
-    .map((s) => sectionRenderPlan(env, movie, s, extS));
+    .map((s) => sectionRenderPlan(env, movie, s));
   const unprepared = project.sections.filter((s) => !(s.pts && s.pts.length) && hasMarks(s));
   if (unprepared.length) warnings.push(`Sections ${unprepared.map((s) => '#' + s.id).join(', ')} have marks but were never prepared; their marks were not applied. Prepare them and export again.`);
   return sections;
@@ -384,9 +384,9 @@ class CutPoints {
  * into pieces at keyframes for the parallel workers. `spans` adds source
  * intervals to re-encode besides the sections' (tests).
  */
-export async function exportPlan(env, movie, project, { extS = 1.0, codec = null, smartCut = true, parallel = 0, spans = null } = {}) {
+export async function exportPlan(env, movie, project, { codec = null, smartCut = true, parallel = 0, spans = null } = {}) {
   const warnings = [];
-  const sections = sectionPlans(env, movie, project, extS, warnings);
+  const sections = sectionPlans(env, movie, project, warnings);
   const v = movie.v;
   const n = v.pts.length;
   const K = parallel > 0 ? parallel : movie.software ? 1 : Math.min(4, Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 2)));
@@ -819,13 +819,13 @@ class SpliceError extends Error {
 
 const hex = (b) => Array.from(b || [], (x) => x.toString(16).padStart(2, '0')).join(' ');
 
-async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, sink = null, onProgress, cancel, smartCut = true, parallel = 0, spans = null, makeEncoder = null, candidate = null, plan: given = null } = {}) {
+async function exportOnce(env, movie, project, { encoder, quality, sink = null, onProgress, cancel, smartCut = true, parallel = 0, spans = null, makeEncoder = null, candidate = null, plan: given = null } = {}) {
   const { wasm } = env;
   const fps = movie.fps;
   const cands = candidate ? [candidate] : await encoderCandidates(movie.width, movie.height, fps, quality);
   const chosen = encoder ? cands.find((c) => c.label === encoder) || cands[0] : cands[0];
   if (!chosen) throw new Error('This browser has no video encoder WebCodecs can use.');
-  const plan = given || (await exportPlan(env, movie, project, { extS, codec: chosen.config.codec, smartCut, parallel, spans }));
+  const plan = given || (await exportPlan(env, movie, project, { codec: chosen.config.codec, smartCut, parallel, spans }));
   const warnings = plan.warnings.slice();
   const total = plan.encoded + plan.copied;
   const started = performance.now();

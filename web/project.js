@@ -5,6 +5,8 @@
 
 const DB_NAME = 'unflash';
 const STORE = 'projects';
+/** The kinds of violation a scan names a section for. */
+const KINDS = ['flash', 'red', 'extended', 'pattern'];
 
 let opened = null;
 
@@ -172,19 +174,27 @@ export class Project {
     return p;
   }
 
-  /** Take on what `toSaved` made (from this browser or a project file). */
+  /**
+   * Take on what `toSaved` made (from this browser or a project file). A
+   * project file is text anyone can write, and the page puts some of it into
+   * its HTML: a section's id is made a number (one that is none is left
+   * out), its kinds the ones a scan names, its verdict what toSaved keeps.
+   */
   restore(saved) {
     this.profile = saved.profile || 'wcag_ext';
     this.nextId = saved.nextId || 1;
     this.scan = saved.scan || null;
-    this.sections = (saved.sections || []).map((s) => ({
+    const sections = (saved.sections || []).filter((s) => s && Number.isFinite(Number(s.id)));
+    this.sections = sections.map((s) => ({
       ...s,
+      id: Number(s.id),
+      kinds: Array.isArray(s.kinds) ? s.kinds.filter((k) => KINDS.includes(k)) : [],
       prepared: false,
       cache: null,
       softCache: null,
       blendCache: null,
       ctx: null,
-      check: s.check || null,
+      check: s.check ? summarizeCheck(s.check) : null,
       edits: s.edits || {},
       keep: s.keep || [],
       blend: s.blend || [],

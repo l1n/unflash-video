@@ -40,7 +40,7 @@ try {
   console.log('toast:', await page.textContent('#toast'));
   const scan = await page.evaluate(() => {
     const s = window.__unflash.state;
-    return { violations: window.__unflash.lastScan && window.__unflash.lastScan.result.violations, segments: window.__unflash.lastScan && window.__unflash.lastScan.segments, trace: s.scanTrace, route: s.env.feeder.route, area: s.env.feeder.det.area_thresh() };
+    return { violations: window.__unflash.lastScan && window.__unflash.lastScan.result.violations, segments: window.__unflash.lastScan && window.__unflash.lastScan.segments, trace: s.project.scan && s.project.scan.trace, route: s.env.feeder.route, area: s.env.feeder.det.area_thresh() };
   });
   console.log('route:', scan.route, '| segments:', scan.segments, '| area threshold (px):', scan.area);
   console.log('violations:', JSON.stringify(scan.violations, null, 1));

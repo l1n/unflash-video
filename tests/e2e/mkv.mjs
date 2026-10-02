@@ -123,7 +123,30 @@ try {
   await page.waitForFunction(() => document.querySelector('#player').readyState >= 1, null, { timeout: 30000 });
   results.webmPlayer = await page.textContent('#playerWarning');
   assert(/whole video as it is/.test(results.webmPlayer), 'the WebM plays in the page: ' + results.webmPlayer);
+  // (the live monitor on: it goes off, its switch with it, when the player cannot play the next file)
+  await page.check('#liveToggle');
   const h264Playable = await page.evaluate(() => document.createElement('video').canPlayType('video/mp4; codecs="avc1.42E01E"') !== '');
+  // an MKV's open cancelled as it reads the file through (an MKV keeps no
+  // index) leaves the WebM open, as it was
+  {
+    await page.evaluate(() => {
+      const u = window.__unflash;
+      const watch = new MutationObserver(() => {
+        const job = u.state.job;
+        if (job && job.name === 'Opening video' && job.pct >= 10) {
+          watch.disconnect();
+          document.querySelector('#btnCancelJob').click();
+        }
+      });
+      watch.observe(document.querySelector('#jobBar'), { attributes: true, attributeFilter: ['style'] });
+    });
+    await page.setInputFiles('#fileInput', path.join(MEDIA, 'flash.mkv'));
+    await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Opening video: cancelled', null, { timeout: 30000 });
+    await jobDone();
+    results.mkvCancelled = await page.evaluate(() => ({ video: document.querySelector('#videoInfo').textContent, movie: window.__unflash.state.movie.name, live: window.__unflash.state.live.on }));
+    console.log('an MKV open cancelled:', JSON.stringify(results.mkvCancelled));
+    assert(/flash\.webm/.test(results.mkvCancelled.video) && results.mkvCancelled.movie === 'flash.webm' && results.mkvCancelled.live, 'an open cancelled as it reads the file leaves the video that was open: ' + JSON.stringify(results.mkvCancelled));
+  }
   await page.setInputFiles('#fileInput', path.join(MEDIA, 'flash.mkv'));
   await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash.mkv'), null, { timeout: 60000 });
   await jobDone();
@@ -131,7 +154,11 @@ try {
   await page.waitForFunction(() => window.__unflash.state.player.playable === false || document.querySelector('#player').readyState >= 1, null, { timeout: 30000 });
   results.mkvPlayer = { playable: await page.evaluate(() => window.__unflash.state.player.playable), text: await page.textContent('#playerWarning'), h264Playable };
   console.log('player:', JSON.stringify(results.mkvPlayer));
-  if (!results.mkvPlayer.playable) assert(/can't play this MKV file/.test(results.mkvPlayer.text), 'the player says it cannot play the MKV: ' + results.mkvPlayer.text);
+  if (!results.mkvPlayer.playable) {
+    assert(/can't play this MKV file/.test(results.mkvPlayer.text), 'the player says it cannot play the MKV: ' + results.mkvPlayer.text);
+    const live = await page.evaluate(() => ({ on: window.__unflash.state.live.on, ticked: document.querySelector('#liveToggle').checked }));
+    assert(!live.on && !live.ticked, 'the live monitor is off, and its switch says so: ' + JSON.stringify(live));
+  }
 
   // a container Unflash does not read
   await page.setInputFiles('#fileInput', { name: 'old.avi', mimeType: 'video/x-msvideo', buffer: Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('AVI LIST'), Buffer.alloc(2000)]) });

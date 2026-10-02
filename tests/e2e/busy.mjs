@@ -1,13 +1,15 @@
 // The page while a job runs. A second Scan click while a scan runs is
 // turned away with a word, and the running scan finishes as if nothing had
 // happened (it used to kill it: "can't access property "length",
-// state.provisional is null"); so is a video opened meanwhile. And a scan
-// never keeps the page's thread for long, however far its decoders get
-// ahead of the detector: a chunked scan fed every picture it held in one
-// go, for seconds on a slow machine, and Firefox offered to stop the page;
-// nor does a scan through the built-in decoder, whose workers decode ahead
-// too. The detector is made slow here (a few milliseconds more a picture),
-// as a slow machine's is, so that the decoders get ahead on a short clip.
+// state.provisional is null"); so is a video opened meanwhile, and another
+// profile chosen (the scan, made under the first, was kept as the second's).
+// And a scan never keeps the page's thread for long, however far its
+// decoders get ahead of the detector: a chunked scan fed every picture it
+// held in one go, for seconds on a slow machine, and Firefox offered to stop
+// the page; nor does a scan through the built-in decoder, whose workers
+// decode ahead too. The detector is made slow here (a few milliseconds more
+// a picture), as a slow machine's is, so that the decoders get ahead on a
+// short clip.
 //   node tests/e2e/busy.mjs
 import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
@@ -64,9 +66,10 @@ try {
 
   await page.click('#btnScan');
   await page.waitForFunction(() => window.__unflash.state.job && window.__unflash.state.job.name === 'Scanning for flashes', null, { timeout: 10000 });
-  // Scan again, and another video, while it runs
+  // Scan again, another video and another profile, while it runs
   await page.click('#btnScan');
   await page.setInputFiles('#fileInput', path.join(MEDIA, 'steady.mp4'));
+  await page.selectOption('#profileSel', 'wcag');
   const during = await page.evaluate(() => !!(window.__unflash.state.job && window.__unflash.state.scanning));
   await idle();
   const r = await page.evaluate(() => {
@@ -80,6 +83,7 @@ try {
       chunks: u.lastScan && u.lastScan.chunked ? u.lastScan.chunked.chunks : 0,
       peak: u.lastScan && u.lastScan.chunked ? u.lastScan.chunked.peak : 0,
       scanning: u.state.scanning,
+      profile: [u.state.project.profile, document.querySelector('#profileSel').value, u.state.project.scan && u.state.project.scan.profile],
       long: window.__long.slice().sort((a, b) => b - a),
       toasts: window.__toasts.slice(),
     };
@@ -89,12 +93,13 @@ try {
   assert(!r.banner, 'the scan was not killed: ' + r.banner);
   assert(r.frames === 300 && r.violations.join() === 'flash,red' && r.chunks > 1, 'the first scan finished, whole: ' + JSON.stringify(r));
   assert(/flash\.webm/.test(r.video) && r.scanning === null, 'the video opened meanwhile was not, and the scan left nothing behind: ' + r.video);
+  assert(r.profile.every((p) => p === 'wcag_ext'), 'the profile chosen meanwhile was not, and the scan is kept as the profile it ran under: ' + JSON.stringify(r.profile));
   // (the decoders were ahead: dozens of pictures waited for the detector)
   assert(r.peak > 40 * 256 * 144 * 4, 'the decoders got ahead of the slowed detector: ' + r.peak);
   assert(!r.long.length || r.long[0] < 250, 'the scan never kept the page for long: ' + r.long.join(', '));
   assert(during, 'the first scan was still running when both were turned away');
   const said = (re) => r.toasts.some((x) => re.test(x));
-  assert(said(/^Scanning for flashes is under way: scan once it has finished/) && said(/^Scanning for flashes is under way: open the video once it has finished/), 'and the page said why: ' + JSON.stringify(r.toasts));
+  assert(said(/^Scanning for flashes is under way: scan once it has finished/) && said(/^Scanning for flashes is under way: open the video once it has finished/) && said(/^Scanning for flashes is under way: change the profile once it has finished/), 'and the page said why: ' + JSON.stringify(r.toasts));
 
   // the built-in decoder (HEVC, which this browser has no decoder for): its
   // workers decode ahead of the slowed detector, and the pictures they had
