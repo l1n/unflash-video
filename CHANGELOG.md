@@ -14,6 +14,13 @@ it with node tests/e2e/whatsnew.mjs NAME (it is checked for flashing
 there, and tests/e2e/whatsnew-check.mjs holds every change to having
 one); tour:ID names a tour of it (web/tours.js). -->
 
+## 2026-10-02
+
+- <!-- 08:35 shot:cancel --> **A job you cancel changes nothing.** Cancelling stopped a job, but what it had done so far was kept: *Verify*, cancelled, said *Passes WCAG* about the part of the export it had read (and auto-fix took that for a pass); *re-prepare*, cancelled, left the section with fewer frames than its marks were made on; a suggestion, cancelled, was applied all the same. Now a cancelled job leaves everything as it was: the section, its marks and its last check. Cancel while a video opens and the last video stays open; *prepare all* and *check all* stop at a cancel too.
+- <!-- 08:35 shot:marks-kept --> **A mark made while Unflash works on a section counts.** A check that was running when you marked a frame showed its verdict, about the marks from before, as the section's; a suggestion that was running put its own marks over yours. Now that verdict says *needs re-check*, and a suggestion made for marks that have changed since is not applied: Unflash says so, and you can ask for it again.
+- <!-- 08:35 shot:profile-wait --> **Changing the profile during a scan waits for the scan**, which was kept as the new profile's though it ran under the old one. And the live meter keeps going when the profile changes, or another video is opened while it is on: it used to stop for the rest of the visit.
+- <!-- 08:35 shot:joined-ts --> **Joined recordings open at their start.** A transport stream made of two recordings joined end to end, where the clock goes back as the second begins, started hours in; it now starts at 0:00 and runs as long as the two. Damaged files fare better too: an MKV with a damaged cluster passes over it instead of failing to open, and a file whose index is damaged says so instead of stopping the page.
+
 ## 2026-09-30
 
 - <!-- 21:27 shot:dts-sound --> **DTS sound plays.** Films and Blu-ray rips often have their sound in DTS, which no browser decodes for a web page. A video whose sound is DTS, in an MKV, an MP4 or a transport stream, now has its sound in the section player, decoded by Unflash itself and mixed down to stereo, and an export keeps it (from an MKV or a transport stream re-encoded to AAC, else Opus, as MP4 players seldom play DTS). DTS-HD tracks (Master Audio, High Resolution) play the DTS core nearly all of them carry: at most 5.1, at 48 kHz. DTS Express, which has no core, still can't be played, and Unflash says so.

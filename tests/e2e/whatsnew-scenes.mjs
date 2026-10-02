@@ -84,6 +84,94 @@ const RACE = {
 };
 
 export const SCENES = [
+  // ======== 2026-10-02 ==========================================================
+  {
+    name: 'cancel',
+    alt: 'A failing section of 247 frames is prepared again, and the job cancelled halfway: Unflash says it was cancelled, and the section keeps its 247 frames and its verdict.',
+    query: Q,
+    async setup(d) {
+      await inSection(d);
+      await toTop(d, '.ws-head');
+    },
+    view: { x: 264, y: 0, width: 1016, height: 635 },
+    async play(d) {
+      await d.point('#frameCount', { ms: 600 });
+      await d.wait(900);
+      await d.job(async () => {
+        await d.click('#btnReprepare', { after: 0 });
+        // (the pointer waits on cancel, which is clicked once the job is
+        // halfway: a prepare can take less than a second)
+        await d.point('#btnCancelJob', { ms: 300 });
+        await d.until(() => !window.__unflash.state.job || window.__unflash.state.job.pct >= 40);
+        await d.page.mouse.click(d.x, d.y);
+      });
+      if (!/cancelled/.test(await d.eval(() => document.querySelector('#toast').textContent))) throw new Error('the prepare ended before the cancel');
+      await d.camera({ x: 264, y: 165, width: 1016, height: 635 }, { ms: 900 });
+      await d.point('#frameCount', { ms: 700 });
+      await d.wait(2600);
+    },
+  },
+  {
+    name: 'marks-kept',
+    alt: 'A frame of a failing section is selected and Suggest: blend frames started; while it runs, R marks the frame for removal. The suggestion is not applied: Unflash says the marks changed while it ran, and the frame keeps its R.',
+    query: Q,
+    async setup(d) {
+      await inSection(d);
+      await toTop(d, '.ws-head');
+    },
+    view: { x: 264, y: 165, width: 1016, height: 635 },
+    async play(d) {
+      await d.click('#frameGrid .frame[data-i="2"]', { after: 600 });
+      await d.job(async () => {
+        await d.click('#btnSuggestBlend', { after: 250 });
+        await d.press('R', { after: 0 });
+      });
+      if (!/marks changed while it ran/.test(await d.eval(() => document.querySelector('#toast').textContent))) throw new Error('the suggestion ended before the mark');
+      await d.wait(3600);
+    },
+  },
+  {
+    name: 'profile-wait',
+    alt: 'During a scan, another profile is picked: Unflash says the scan is under way and to change the profile once it has finished, the choice goes back to the profile the scan runs under, and the scan goes on to the end.',
+    query: QA,
+    setup: (d) => d.open('flash-minute.mp4'),
+    view: (d) => d.around(['#profileSel', '#btnScan']),
+    async play(d) {
+      await d.click('#btnScan', { after: 900 });
+      await d.point('#profileSel', { ms: 600 });
+      await d.eval(() => {
+        const s = document.querySelector('#profileSel');
+        s.value = 'strict';
+        s.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await d.wait(300);
+      await d.camera('#toast', { ms: 900 });
+      await d.wait(2800);
+      await d.camera(['#profileSel', '#btnScan'], { ms: 900 });
+      await d.idle();
+      await d.wait(600);
+    },
+  },
+  {
+    name: 'joined-ts',
+    alt: 'A transport stream made of two recordings joined end to end, the second with its clock an hour back: it opens at 0:00, twenty seconds long, and the scan marks the flashing in both halves on the timeline.',
+    query: QA,
+    view: { x: 0, y: 0, width: 1280, height: 800 },
+    async play(d) {
+      await d.camera({ x: 0, y: 0, width: 880, height: 550 }, { ms: 0 });
+      await d.pick('label.filebtn.primary', 'joined.ts');
+      await d.opened('joined.ts');
+      await d.point('#videoInfo', { dx: 0.62, ms: 700 });
+      await d.wait(1600);
+      await d.camera({ x: 0, y: 0, width: 1280, height: 800 }, { ms: 900 });
+      await d.job(() => d.click('#btnScan'));
+      await d.point('#timeline', { dx: 0.4, dy: 0.4, ms: 700 });
+      await d.wait(1200);
+      await d.point('#timeline', { dx: 0.8, dy: 0.4, ms: 700 });
+      await d.wait(1800);
+    },
+  },
+
   // ======== 2026-09-24 ==========================================================
   {
     name: 'guide-parts',

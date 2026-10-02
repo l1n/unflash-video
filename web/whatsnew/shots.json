@@ -83,6 +83,18 @@
    "violations": 0
   }
  },
+ "cancel": {
+  "w": 720,
+  "h": 450,
+  "seconds": 11.9,
+  "alt": "A failing section of 247 frames is prepared again, and the job cancelled halfway: Unflash says it was cancelled, and the section keeps its 247 frames and its verdict.",
+  "sha256": "0b25bb046587494c4d99353dea98be91124ad682af7fc25715cbeb6d5659c00b",
+  "checked": {
+   "profile": "strict",
+   "frames": 358,
+   "violations": 0
+  }
+ },
  "clean-scan": {
   "w": 720,
   "h": 450,
@@ -397,6 +409,18 @@
    "violations": 0
   }
  },
+ "joined-ts": {
+  "w": 720,
+  "h": 450,
+  "seconds": 17.9,
+  "alt": "A transport stream made of two recordings joined end to end, the second with its clock an hour back: it opens at 0:00, twenty seconds long, and the scan marks the flashing in both halves on the timeline.",
+  "sha256": "037b14f0ab1f230a74dd7a84fecdeeb7c55404b017a00729300c881287ae6a60",
+  "checked": {
+   "profile": "strict",
+   "frames": 539,
+   "violations": 0
+  }
+ },
  "keys": {
   "w": 720,
   "h": 450,
@@ -430,6 +454,18 @@
   "checked": {
    "profile": "strict",
    "frames": 330,
+   "violations": 0
+  }
+ },
+ "marks-kept": {
+  "w": 720,
+  "h": 450,
+  "seconds": 20.7,
+  "alt": "A frame of a failing section is selected and Suggest: blend frames started; while it runs, R marks the frame for removal. The suggestion is not applied: Unflash says the marks changed while it ran, and the frame keeps its R.",
+  "sha256": "389ccaec1155f62f1c2d4e63383ad7705212a377023105f473cca18833f9c80e",
+  "checked": {
+   "profile": "strict",
+   "frames": 623,
    "violations": 0
   }
  },
@@ -527,6 +563,18 @@
   "checked": {
    "profile": "strict",
    "frames": 394,
+   "violations": 0
+  }
+ },
+ "profile-wait": {
+  "w": 720,
+  "h": 450,
+  "seconds": 19.8,
+  "alt": "During a scan, another profile is picked: Unflash says the scan is under way and to change the profile once it has finished, the choice goes back to the profile the scan runs under, and the scan goes on to the end.",
+  "sha256": "bd1eb47c2b9714bd1747af55a786ae5b129c254491480c1cee6f65e0839abcee",
+  "checked": {
+   "profile": "strict",
+   "frames": 595,
    "violations": 0
   }
  },

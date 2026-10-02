@@ -710,6 +710,13 @@ const DERIVED = {
   },
   // an AVI, which Unflash recognises and says how to convert
   'clip.avi': (out) => ffmpeg(['-i', path.join(MEDIA, 'flash.mp4'), '-t', '2', '-c:v', 'mpeg4', '-q:v', '5', '-an', out]),
+  // two recordings of a transport stream joined end to end, the first an hour
+  // on in its clock: where the second begins, the clock goes back an hour
+  'joined.ts': (out) => {
+    const first = out + '.first.ts';
+    ffmpeg(['-i', path.join(MEDIA, 'flash.ts'), '-c', 'copy', '-output_ts_offset', '3600', first]);
+    fs.writeFileSync(out, Buffer.concat([fs.readFileSync(first), fs.readFileSync(path.join(MEDIA, 'flash.ts'))]));
+  },
 };
 
 function concat(out, names) {
