@@ -509,7 +509,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
   const looks = [];
   const partial = (fromLook) => {
     if (!onPartial) return;
-    const res = feeder.finish(false);
+    const res = feeder.partialVerdict();
     const until = trace.t.length ? trace.t[trace.t.length - 1] : movie.tsMin;
     const found = res.violations.filter((v) => reports(res, v));
     onPartial({ until, violations: [...found, ...early.filter((v) => v.start > until)], early: fromLook });
@@ -694,7 +694,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
   const endLook = async (lane, s) => {
     const f = s.look.feeder;
     await f.drain();
-    const res = f.finish(false);
+    const res = f.partialVerdict();
     const from = chunks.t[s.look.from];
     const to = chunks.t[s.last + 1];
     const found = res.violations.filter((v) => v.end >= from && v.start < to && reports(res, v));

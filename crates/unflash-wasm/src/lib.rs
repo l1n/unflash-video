@@ -998,10 +998,19 @@ impl Detector {
     }
 
     /// The verdict over everything fed so far; `include_stats` adds every
-    /// frame's statistics (a partial verdict's violations need none, and
-    /// copying them each time costs more the longer a scan has run).
+    /// frame's statistics. (What a scan reads after each chunk, and the live
+    /// monitor at each check, is `partial_verdict`.)
     pub fn finish(&self, include_stats: bool) -> Result<String, JsValue> {
         to_json(&self.det.finish(include_stats))
+    }
+
+    /// The verdict so far for reading while frames are still coming in: the
+    /// violations, which kinds the profile reports and how many frames (and
+    /// repeats) it has seen, under `finish`'s names. Unlike `finish(false)`
+    /// it neither copies nor writes out the events, which grow with the
+    /// video (and a scan asks after every chunk).
+    pub fn partial_verdict(&self) -> Result<String, JsValue> {
+        to_json(&self.det.temporal().partial_verdict())
     }
 
     pub fn reset(&mut self) {
@@ -1450,6 +1459,27 @@ mod tests {
             assert_eq!(yuv.take_capture(i), want_yuv.take_capture(i), "I420 capture {i}");
         }
         assert_eq!(rgba.finish(false).unwrap(), want_rgb.finish(false).unwrap());
+    }
+
+    /// A partial verdict is the whole verdict's violations, flags and frame
+    /// counts under the same names, without the events: the page reads
+    /// either alike (its `reports` and `counts` look at the flags by name).
+    #[test]
+    fn partial_verdict_is_the_verdict_less_its_events() {
+        let cfg = serde_json::to_string(&Profile::WcagExt.config()).unwrap();
+        let mut det = Detector::new(&cfg, 512, 288).unwrap();
+        let (aw, ah) = (det.analysis_width(), det.analysis_height());
+        for i in 0..96 {
+            det.feed_rgba(&picture(aw as usize, ah as usize, 4, i / 3), aw, ah, i as f64 / 24.0, false).unwrap();
+        }
+        let full: serde_json::Value = serde_json::from_str(&det.finish(false).unwrap()).unwrap();
+        let part: serde_json::Value = serde_json::from_str(&det.partial_verdict().unwrap()).unwrap();
+        assert!(!full["violations"].as_array().unwrap().is_empty() && !full["events"].as_array().unwrap().is_empty(), "{full}");
+        let part = part.as_object().unwrap();
+        assert_eq!(part.keys().map(|k| k.as_str()).collect::<Vec<_>>(), ["flag_extended", "flag_patterns", "frames", "held", "violations"]);
+        for (k, v) in part {
+            assert_eq!(v, &full[k], "{k}");
+        }
     }
 
     /// `web/media.js`'s yuvLayoutWords: the matrix and range it gives a

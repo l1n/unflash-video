@@ -176,6 +176,23 @@ impl AnalysisResult {
     }
 }
 
+/// The verdict over the frames fed so far as the page reads it while more
+/// are coming in (after every chunk of a scan, every early look and every
+/// live-monitor check): the violations, which kinds the profile reports, and
+/// how many frames it has seen, named as in [`AnalysisResult`] so that the
+/// page reads either the same way.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PartialVerdict {
+    pub violations: Vec<Violation>,
+    pub frames: usize,
+    /// Frames that only repeated the picture before them.
+    pub held: usize,
+    /// Profile treats extended flashes as violations to fix.
+    pub flag_extended: bool,
+    /// Profile treats regular patterns as violations to fix.
+    pub flag_patterns: bool,
+}
+
 /// One segment of a file scanned in parallel with the others: its result,
 /// and where its own span begins. Everything the detector saw before `from`
 /// was the segment's run-up (the run-up plus run-out a section check uses),
@@ -752,33 +769,39 @@ impl Temporal {
         t
     }
 
-    /// The verdict over the frames fed so far. `with_stats` adds a copy of
-    /// every frame's statistics (for the chart, and for [`merge_segments`]
-    /// to join); without them a verdict costs little more than finding its
-    /// violations, which the page does after every chunk of a scan and the
-    /// live monitor several times a second.
-    pub fn finish(&self, with_stats: bool) -> AnalysisResult {
+    /// The [`PartialVerdict`] over the frames fed so far:
+    /// [`finish`](Self::finish) without its copy of every event, which grows
+    /// with the video, so that asking after every chunk of a scan costs only
+    /// the finding of the violations.
+    pub fn partial_verdict(&self) -> PartialVerdict {
         let cfg = &self.cfg;
-        let mut res = AnalysisResult {
-            events: self.events.clone(),
-            frames: self.n,
-            duration: if self.n > 0 { self.stats.tc[self.n - 1] - self.stats.tc[0] } else { 0.0 },
-            anomalies: self.clock.anomalies,
-            held: self.held,
-            frame_stats: if with_stats { self.stats.clone() } else { FrameStats::default() },
-            flag_extended: cfg.flag_extended(),
-            flag_patterns: cfg.flag_patterns(),
-            area_thresh: self.geom.area_thresh,
-            pattern_thresh: self.pattern_thresh(),
-            ..Default::default()
-        };
         let mut v = self.strobe_violations(&self.stats.hazard, &self.stats.hazard_onset, ViolationKind::Flash);
         v.extend(self.strobe_violations(&self.stats.hazard_red, &self.stats.hazard_red_onset, ViolationKind::Red));
         v.extend(self.extended_violations());
         v.extend(self.pattern_violations());
         v.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
-        res.violations = v;
-        res
+        PartialVerdict { violations: v, frames: self.n, held: self.held, flag_extended: cfg.flag_extended(), flag_patterns: cfg.flag_patterns() }
+    }
+
+    /// The verdict over the frames fed so far: the
+    /// [partial verdict](Self::partial_verdict), every event, and with
+    /// `with_stats` a copy of every frame's statistics (for the chart, and
+    /// for [`merge_segments`] to join).
+    pub fn finish(&self, with_stats: bool) -> AnalysisResult {
+        let PartialVerdict { violations, frames, held, flag_extended, flag_patterns } = self.partial_verdict();
+        AnalysisResult {
+            events: self.events.clone(),
+            violations,
+            frames,
+            duration: if self.n > 0 { self.stats.tc[self.n - 1] - self.stats.tc[0] } else { 0.0 },
+            anomalies: self.clock.anomalies,
+            held,
+            frame_stats: if with_stats { self.stats.clone() } else { FrameStats::default() },
+            flag_extended,
+            flag_patterns,
+            area_thresh: self.geom.area_thresh,
+            pattern_thresh: self.pattern_thresh(),
+        }
     }
 
     /// Frames where concurrently-strobing pixels cover the area threshold,

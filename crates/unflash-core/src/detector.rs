@@ -499,10 +499,11 @@ mod tests {
         assert_eq!(whole.finish(), det.finish(true));
     }
 
-    /// A verdict without the per-frame statistics (what the page asks for
-    /// after every chunk of a scan, and the live monitor several times a
-    /// second) is the full verdict less them: the same violations and
-    /// events, and no copy of every frame's statistics.
+    /// A verdict without the per-frame statistics is the full verdict less
+    /// them: the same violations and events, and no copy of every frame's
+    /// statistics. A partial verdict (what the page asks for after every
+    /// chunk of a scan and at every live-monitor check) is the full verdict's
+    /// violations, frame counts and flags alone.
     #[test]
     fn finish_without_stats_is_the_verdict_alone() {
         let cfg = Profile::WcagExt.config();
@@ -528,5 +529,9 @@ mod tests {
         assert_eq!(lean.violations, full.violations);
         assert_eq!(lean.events, full.events);
         assert_eq!((lean.frames, lean.held, lean.duration, lean.anomalies), (full.frames, full.held, full.duration, full.anomalies));
+        let part = det.temporal().partial_verdict();
+        assert!(!full.events.is_empty() && full.held > 0, "events and repeats to leave out and count: {:?}", full.events);
+        assert_eq!(part.violations, full.violations);
+        assert_eq!((part.frames, part.held, part.flag_extended, part.flag_patterns), (full.frames, full.held, full.flag_extended, full.flag_patterns));
     }
 }

@@ -572,4 +572,14 @@ export class Feeder {
   finish(includeStats = false) {
     return JSON.parse(this.det.finish(includeStats));
   }
+
+  /**
+   * The verdict so far, for reading while pictures are still coming in (a
+   * scan after each chunk and early look, the live monitor at each check):
+   * { violations, flag_extended, flag_patterns, frames, held }, named as in
+   * finish()'s, without the events finish() copies (more, the longer it has run).
+   */
+  partialVerdict() {
+    return JSON.parse(this.det.partial_verdict());
+  }
 }

@@ -1569,7 +1569,7 @@ function drainLive() {
   const now = performance.now();
   if (now - L.lastCheck > 700) {
     L.lastCheck = now;
-    const res = feeder.finish(false);
+    const res = feeder.partialVerdict();
     const viol = res.violations.filter((v) => counts(res, v));
     const recent = viol.length && viol[viol.length - 1].end >= last.t - 1.5;
     meterVerdict(recent ? viol[viol.length - 1].kind : null, haz, ext, pat, res.flag_patterns, viol.length);
