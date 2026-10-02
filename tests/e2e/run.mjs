@@ -1165,7 +1165,10 @@ try {
     assert(h.rebalanced && slow.every((l) => l.aside > 0) && builtIn.aside === 0 && builtIn.frames > (r.frames * 3) / 4, 'the slow lanes were set aside, the built-in decoder did the most: ' + JSON.stringify(h.lanes));
     assert(h.grown >= 1 && builtIn.workers > 2, 'and grew into the cores they left: ' + JSON.stringify({ grown: h.grown, workers: builtIn.workers }));
     assert(r.ms < results.overtaken.ms * 1.25 + 500, `and the scan was no slower than with take-overs alone: ${r.ms} ms against ${results.overtaken.ms}`);
-    assert(/each chunk to the lane that would finish it first, the built-in decoder grown by \d+ workers? for the lanes set aside/.test(r.report) && /set aside [\d.]+ s/.test(r.report), 'the debug report tells of it:\n' + r.report);
+    // (the report gives a lane's time set aside only past half a second, web/debug.js: a quick
+    // runner sets the slow lanes aside for less, and the report rightly leaves it out)
+    const namedAside = (r.report.match(/set aside [\d.]+ s/g) || []).length;
+    assert(/each chunk to the lane that would finish it first, the built-in decoder grown by \d+ workers? for the lanes set aside/.test(r.report) && namedAside === h.lanes.filter((l) => l.aside > 500).length, 'the debug report tells of it:\n' + r.report);
   }
   assert(/built-in decoder ×2/.test(results.hybrid.report), 'the debug report shows the built-in decoder:\n' + results.hybrid.report);
   const gaveUp = results.hybridFail.chunked.lanes.find((l) => l.kind === 'built-in');
