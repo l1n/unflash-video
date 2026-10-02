@@ -877,7 +877,8 @@ older one says so and offers *new version: reload* in the header; the debug
 report names the build. `node site.mjs OUT --build ID [--keep-from URL|DIR]`
 makes one by hand (after `./build.sh`); `tests/e2e/site.mjs` tests it.
 `.github/workflows/ci.yml` runs the Rust tests (on lavapipe), builds the
-WASM and runs the browser test on every push.
+WASM once and runs the browser tests on it in parts side by side, on every
+push.
 
 ## Testing
 

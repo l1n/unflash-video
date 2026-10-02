@@ -50,15 +50,11 @@ jobs:
         timeout-minutes: 15
         run: cargo run --release -p unflash-gpu --example bench -- 1920x1080 0.25 200
 
-  web:
-    # the browser suite in parts, side by side (see tests/e2e/run.mjs --part)
-    name: Browser tests (${{ matrix.part }})
+  build:
+    # the WebAssembly and the synthetic clips, made once for every browser part
+    name: Build for the browser tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [editing, files, gpu, routes, auto, formats, firefox]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -66,12 +62,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          # one cache for every part, saved by one of them
           shared-key: web
-          save-if: ${{ matrix.part == 'editing' }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
       - name: wasm-bindgen (prebuilt, falling back to cargo install)
         run: |
           set -e
@@ -107,6 +98,43 @@ jobs:
       - name: Synthetic videos
         if: steps.clips.outputs.cache-hit != 'true'
         run: python3 tests/media/gen_e2e.py
+      # what build.sh makes (the modules, their glue, the page's copy of the
+      # changelog) and the clips, for the parts below
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: |
+            web/pkg/
+            web/pkg-dec/
+            web/CHANGELOG.md
+            tests/media/e2e/
+          if-no-files-found: error
+          retention-days: 3
+      # the app as built, to try or look into
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web
+          path: web/
+
+  web:
+    # the browser suites in parts, side by side, on the one build (see
+    # tests/e2e/run.mjs --part; `others` runs the suites of their own)
+    name: Browser tests (${{ matrix.part }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [editing, files, gpu, routes, auto, others, firefox]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
       - name: Playwright's Chromium, from the cache
         if: matrix.part != 'firefox'
         uses: actions/cache@v4
@@ -121,14 +149,14 @@ jobs:
           # the runner image has Chrome's libraries; fetch them only if the browser won't start
           node --input-type=module -e "import { loadPlaywright } from './tests/e2e/playwright.mjs'; const { chromium } = await loadPlaywright(); await (await chromium.launch()).close();" || npx "playwright@$PLAYWRIGHT_VERSION" install-deps chromium
       - name: End-to-end, ${{ matrix.part }} (headless Chromium, WebGPU on SwiftShader)
-        if: matrix.part != 'formats' && matrix.part != 'firefox'
+        if: matrix.part != 'others' && matrix.part != 'firefox'
         run: node tests/e2e/run.mjs --part=${{ matrix.part }}
       # (beside the shortest part)
       - name: Transport streams, PCM and DTS sound, and the choice of sound track (headless Chromium)
         if: matrix.part == 'files'
         run: node tests/e2e/streams.mjs
       - name: Smart-cut splice, MKV and WebM, the sound of held frames, project files, the guided tour, the page while a job runs, the built-in HEVC, VP9, VP8 and AV1 decoders (headless Chromium), the shrink in WebAssembly, What's new's films, the site as published
-        if: matrix.part == 'formats'
+        if: matrix.part == 'others'
         run: |
           node tests/e2e/whatsnew-check.mjs
           node tests/e2e/site.mjs
@@ -173,8 +201,3 @@ jobs:
             tests/e2e/out/
             !tests/e2e/out/site/
           if-no-files-found: ignore
-      - uses: actions/upload-artifact@v4
-        if: matrix.part == 'editing'
-        with:
-          name: web
-          path: web/
