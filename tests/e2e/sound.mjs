@@ -14,18 +14,9 @@
 // browser's WebCodecs decodes, plays through the app's own decoder, and an
 // export with a held frame re-encodes it with the silence in place.
 //   node tests/e2e/sound.mjs
-import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
-import { serve } from './server.mjs';
+import { MEDIA, OUT, assert, chromium, watch, job, open } from './playwright.mjs';
 import { SoundRun } from '../../web/sound.js';
-
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const WEB = path.join(ROOT, 'web');
-const MEDIA = path.join(ROOT, 'tests/media/e2e');
-
-function assert(cond, msg) {
-  if (!cond) throw new Error('ASSERT: ' + msg);
-}
 
 // --- SoundRun on its own: where every sample lands ---------------------------
 {
@@ -142,40 +133,63 @@ const exportedSound = (p) =>
   });
 
 // --- in the browser: an E mark exported -----------------------------------------
-const { chromium } = await loadPlaywright();
-const { srv, port } = await serve(WEB);
-const browser = await chromium.launch({
-  headless: true,
-  channel: 'chromium',
-  args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader'],
-});
+// (no flag lets this Chromium play sound before a click: sound comes after one, as for anyone)
+const { browser, port, close } = await chromium();
 const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
 const errors = [];
-page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
-page.on('console', (m) => {
-  if (m.type() === 'error' && !/Failed to load resource/i.test(m.text())) errors.push('console: ' + m.text());
-  if (process.env.E2E_VERBOSE) console.log('[browser]', m.type(), m.text());
-});
-const jobDone = (timeout = 300000) => page.waitForFunction(() => document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout });
-const jobStarted = () => page.waitForFunction(() => !document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout: 30000 }).catch(() => {});
+watch(page, errors, /Failed to load resource/i);
 const results = {};
 
+/** Page `p` at the app, the clip `name` opened in it and scanned, and its first section prepared and checked. */
+async function inSection(p, name) {
+  await p.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0&tour=0`);
+  await p.waitForFunction(() => window.__unflash && window.__unflash.changes, null, { timeout: 60000 });
+  await open(p, path.join(MEDIA, name));
+  await job(p, () => p.click('#btnScan'));
+  await p.click('#sectionList .sec-item');
+  await p.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent) && !window.__unflash.state.job, null, { timeout: 180000 });
+}
+
+/** From now on, what reaches the speakers of page `p` (its section player's sound, turned on): an analyser on it. */
+const tap = (p) =>
+  p.evaluate(() => {
+    const s = window.__unflash.sectionSound;
+    s.tap = s.ctx.createAnalyser();
+    s.tap.fftSize = 2048;
+    s.out.connect(s.tap);
+    window.__peak = 0;
+  });
+
+/**
+ * Listened to (the tap) until it is loud, or the sound has failed, 4 s at
+ * most (the section holds a frame early on, and the second of silence
+ * under it may come first): how loud it was, and what the page says.
+ */
+async function heard(p) {
+  await p
+    .waitForFunction(
+      () => {
+        const s = window.__unflash.sectionSound;
+        const buf = new Float32Array(s.tap.fftSize);
+        s.tap.getFloatTimeDomainData(buf);
+        for (const x of buf) window.__peak = Math.max(window.__peak, Math.abs(x));
+        return window.__peak > 0.05 || s.failed;
+      },
+      null,
+      { timeout: 4000, polling: 40 }
+    )
+    .catch(() => {});
+  return p.evaluate(() => {
+    const s = window.__unflash.sectionSound;
+    return { peak: window.__peak, failed: s.failed, output: s.ctx.state, button: document.querySelector('#btnPreviewSound').textContent, report: window.__unflash.debugReport().split('\n').find((l) => /section player's sound/.test(l)) || '' };
+  });
+}
+
 try {
-  await page.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0`);
-  await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+  // the first section, prepared; one frame in it marked E
+  await inSection(page, 'flash.webm');
   const canOpus = await page.evaluate(async () => typeof AudioEncoder !== 'undefined' && (await AudioEncoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1, bitrate: 64000 })).supported);
   assert(canOpus, 'this Chromium encodes Opus');
-
-  await page.setInputFiles('#fileInput', path.join(MEDIA, 'flash.webm'));
-  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash.webm'), null, { timeout: 60000 });
-  await jobDone();
-  await page.click('#btnScan');
-  await jobStarted();
-  await jobDone();
-  // the first section, prepared; one frame in it marked E
-  await page.click('#sectionList .sec-item');
-  await page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout: 180000 });
-  await jobDone();
   const slot = 12;
   await page.click(`#frameGrid .frame:nth-child(${slot + 1})`);
   await page.click('#wsTitle'); // the keys work with the focus anywhere but a field
@@ -199,9 +213,7 @@ try {
   await page.waitForSelector('#exportModal', { state: 'visible' });
   results.plan = await page.textContent('#exportPlan');
   assert(/silence under the held frame/.test(results.plan), 'the plan says the sound gets silence under the held frame: ' + results.plan);
-  await page.click('#btnDoExport');
-  await jobStarted();
-  await jobDone(600000);
+  await job(page, () => page.click('#btnDoExport'), 600000);
   await page.waitForFunction(() => !document.querySelector('#btnVerifyExport').disabled, null, { timeout: 30000 });
   results.exportResult = await page.textContent('#exportResult');
   console.log('export:', results.exportResult);
@@ -235,27 +247,10 @@ try {
   await page.selectOption('#previewSpeed', '0.5');
   assert((await page.textContent('#btnPreviewSound')) === 'sound at 1× only', 'slowed, the button says the sound plays at 1× only: ' + (await page.textContent('#btnPreviewSound')));
   await page.selectOption('#previewSpeed', '1');
-  // what reaches the speakers, from here on
-  await page.evaluate(() => {
-    const s = window.__unflash.sectionSound;
-    s.tap = s.ctx.createAnalyser();
-    s.tap.fftSize = 2048;
-    s.out.connect(s.tap);
-  });
+  await tap(page);
   await page.click('#btnPreviewPlay');
   await page.waitForFunction(() => window.__unflash.sectionSound.log.length > 0, null, { timeout: 60000 });
-  // (listening for up to 4 s: the section holds a frame early on, and the second of silence under it may come first)
-  results.heard = await page.evaluate(async () => {
-    const s = window.__unflash.sectionSound;
-    const buf = new Float32Array(s.tap.fftSize);
-    let peak = 0;
-    for (let k = 0; k < 100 && peak <= 0.05; k++) {
-      s.tap.getFloatTimeDomainData(buf);
-      for (const x of buf) peak = Math.max(peak, Math.abs(x));
-      await new Promise((r) => setTimeout(r, 40));
-    }
-    return { peak, output: s.ctx.state, button: document.querySelector('#btnPreviewSound').textContent, report: window.__unflash.debugReport().split('\n').find((l) => /section player's sound/.test(l)) || '' };
-  });
+  results.heard = await heard(page);
   console.log('heard:', JSON.stringify(results.heard));
   assert(results.heard.output === 'running' && results.heard.peak > 0.05, `the sound reaches the speakers: ${JSON.stringify(results.heard)}`);
   assert(results.heard.button === 'sound on' && /section player's sound: on \(audio output running\)/.test(results.heard.report), 'the button and the debug report say it is on: ' + JSON.stringify(results.heard));
@@ -305,7 +300,8 @@ try {
   // --- no sound to be had: the button says so, and why ------------------------
   // (a browser whose audio never starts, as with nothing to play it on, and
   // that can't decode the sound)
-  const quiet = await (await browser.newContext({ viewport: { width: 1400, height: 1000 } })).newPage();
+  const quietContext = await browser.newContext({ viewport: { width: 1400, height: 1000 } });
+  const quiet = await quietContext.newPage();
   await quiet.addInitScript(() => {
     const Real = window.AudioContext;
     window.AudioContext = class extends Real {
@@ -320,14 +316,7 @@ try {
     AudioDecoder.isConfigSupported = async (cfg) => ({ supported: false, config: cfg });
   });
   quiet.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
-  await quiet.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0&tour=0`);
-  await quiet.waitForFunction(() => window.__unflash && window.__unflash.changes, null, { timeout: 60000 });
-  await quiet.setInputFiles('#fileInput', path.join(MEDIA, 'flash.webm'));
-  await quiet.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash.webm') && !window.__unflash.state.job, null, { timeout: 60000 });
-  await quiet.click('#btnScan');
-  await quiet.waitForFunction(() => window.__unflash.state.project.scan && !window.__unflash.state.job, null, { timeout: 300000 });
-  await quiet.click('#sectionList .sec-item');
-  await quiet.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent) && !window.__unflash.state.job, null, { timeout: 180000 });
+  await inSection(quiet, 'flash.webm');
   await quiet.click('#btnPreviewSound');
   await quiet.waitForFunction(() => document.querySelector('#btnPreviewSound').textContent === 'sound held back', null, { timeout: 10000 });
   assert(/hasn't started the sound/.test(await quiet.getAttribute('#btnPreviewSound', 'title')), 'held back, the button says the browser has not started the sound');
@@ -337,46 +326,50 @@ try {
   console.log('no sound:', JSON.stringify(results.undecodable));
   assert(/can't decode this video's sound \(Opus, opus\)/.test(results.undecodable.title) && /^No sound: this browser can't decode/.test(results.undecodable.toast), "where the sound can't be decoded, the button and a note say so: " + JSON.stringify(results.undecodable));
   assert(/section player's sound: none: this browser can't decode/.test(results.undecodable.report), 'and so does the debug report: ' + results.undecodable.report);
-  await quiet.close();
+  // nor does the finish alert's beep: it gives up after a moment and lets
+  // its audio go (it waited for ever, and every long job kept one more open)
+  results.heldBeep = await quiet.evaluate(async () => {
+    const { beep } = await import('./alerts.js');
+    const Held = window.AudioContext;
+    const made = [];
+    window.AudioContext = class extends Held {
+      constructor(o) {
+        super(o);
+        made.push(this);
+      }
+      close() {
+        this.closed = true;
+        return super.close();
+      }
+    };
+    try {
+      const beeped = await Promise.race([beep(), new Promise((r) => setTimeout(() => r('still waiting after 5 s'), 5000))]);
+      return { beeped, made: made.length, closed: made.every((c) => c.closed) };
+    } finally {
+      window.AudioContext = Held;
+    }
+  });
+  console.log('a beep held back:', JSON.stringify(results.heldBeep));
+  assert(results.heldBeep.beeped === false && results.heldBeep.made === 1 && results.heldBeep.closed, 'a beep the browser holds back gives up, and closes its audio: ' + JSON.stringify(results.heldBeep));
+  await quietContext.close();
 
   // --- Dolby sound (E-AC-3), which no browser's WebCodecs decodes: the app's own
   // decoder plays it in the section player, and re-encodes it for an export with a held frame
-  const dolby = await (await browser.newContext({ viewport: { width: 1400, height: 1000 } })).newPage();
+  const dolbyContext = await browser.newContext({ viewport: { width: 1400, height: 1000 } });
+  const dolby = await dolbyContext.newPage();
   dolby.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
-  await dolby.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0&tour=0`);
-  await dolby.waitForFunction(() => window.__unflash && window.__unflash.changes, null, { timeout: 60000 });
+  await inSection(dolby, 'flash_eac3.mp4');
   results.eac3Native = await dolby.evaluate(async () => (await AudioDecoder.isConfigSupported({ codec: 'ec-3', sampleRate: 48000, numberOfChannels: 1 }).catch(() => ({ supported: false }))).supported);
   assert(!results.eac3Native, "this browser's WebCodecs does not decode E-AC-3 (else this test would not reach the built-in decoder)");
-  await dolby.setInputFiles('#fileInput', path.join(MEDIA, 'flash_eac3.mp4'));
-  await dolby.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash_eac3.mp4') && !window.__unflash.state.job, null, { timeout: 60000 });
-  await dolby.click('#btnScan');
-  await dolby.waitForFunction(() => window.__unflash.state.project.scan && !window.__unflash.state.job, null, { timeout: 300000 });
-  await dolby.click('#sectionList .sec-item');
-  await dolby.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent) && !window.__unflash.state.job, null, { timeout: 180000 });
   await dolby.click(`#frameGrid .frame:nth-child(${slot + 1})`);
   await dolby.click('#wsTitle');
   await dolby.keyboard.press('e');
   await dolby.keyboard.press('Escape');
   await dolby.click('#btnPreviewSound');
-  await dolby.evaluate(() => {
-    const s = window.__unflash.sectionSound;
-    s.tap = s.ctx.createAnalyser();
-    s.tap.fftSize = 2048;
-    s.out.connect(s.tap);
-  });
+  await tap(dolby);
   await dolby.click('#btnPreviewPlay');
   await dolby.waitForFunction(() => window.__unflash.sectionSound.log.length > 0 || window.__unflash.sectionSound.failed, null, { timeout: 60000 });
-  results.dolbyHeard = await dolby.evaluate(async () => {
-    const s = window.__unflash.sectionSound;
-    const buf = new Float32Array(s.tap.fftSize);
-    let peak = 0;
-    for (let k = 0; k < 100 && peak <= 0.05 && !s.failed; k++) {
-      s.tap.getFloatTimeDomainData(buf);
-      for (const x of buf) peak = Math.max(peak, Math.abs(x));
-      await new Promise((r) => setTimeout(r, 40));
-    }
-    return { peak, failed: s.failed, button: document.querySelector('#btnPreviewSound').textContent, report: window.__unflash.debugReport().split('\n').find((l) => /section player's sound/.test(l)) || '' };
-  });
+  results.dolbyHeard = await heard(dolby);
   console.log('E-AC-3 heard:', JSON.stringify(results.dolbyHeard));
   assert(!results.dolbyHeard.failed && results.dolbyHeard.peak > 0.05 && results.dolbyHeard.button === 'sound on', 'the E-AC-3 sound plays in the section player: ' + JSON.stringify(results.dolbyHeard));
   assert(/decoded by the built-in AC-3 decoder/.test(results.dolbyHeard.report), 'by the built-in decoder, as the debug report says: ' + results.dolbyHeard.report);
@@ -397,15 +390,14 @@ try {
   const dx = await exportedSound(dolby);
   console.log('E-AC-3 exported:', JSON.stringify({ codec: dx.codec, quiet: dx.quiet, soundSeconds: dx.soundSeconds, hold: dolbyHold }));
   assert(dx.quiet.length === 1 && Math.abs(dx.quiet[0][0] - dolbyHold.at) < 0.03 && Math.abs(dx.quiet[0][1] - (dolbyHold.at + 1)) < 0.03, `its sound is silent exactly under the hold: ${JSON.stringify(dx.quiet)} for ${JSON.stringify(dolbyHold)}`);
-  await dolby.close();
+  await dolbyContext.close();
 
   if (errors.length) throw new Error('page errors:\n' + errors.join('\n'));
   console.log('SOUND OK');
 } catch (e) {
   console.error(e);
-  await page.screenshot({ path: path.join(ROOT, 'tests/e2e/out/sound-failure.png') }).catch(() => {});
+  await page.screenshot({ path: path.join(OUT, 'sound-failure.png') }).catch(() => {});
   process.exitCode = 1;
 } finally {
-  await browser.close();
-  srv.close();
+  await close();
 }

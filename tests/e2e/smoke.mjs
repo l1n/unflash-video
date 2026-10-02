@@ -5,15 +5,13 @@
 // --extsrc makes the GPU detector take its pictures the way Firefox's
 // WebGPU needs them (through a canvas) or as RGBA pixels.
 import path from 'node:path';
-import { loadPlaywright } from './playwright.mjs';
+import { MEDIA, chromium, errorBanner } from './playwright.mjs';
 
 const url = process.argv[2] || 'http://127.0.0.1:8765/';
 const useGpu = process.argv.includes('--gpu');
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const { chromium } = await loadPlaywright();
 // SMOKE_CHROMIUM_ARGS adds launch flags (e.g. --disable-http2 behind a proxy that resets h2 tunnels)
 const extraArgs = (process.env.SMOKE_CHROMIUM_ARGS || '').split(/\s+/).filter(Boolean);
-const browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader', ...extraArgs] });
+const { browser } = await chromium(extraArgs, { root: null });
 // SMOKE_IGNORE_TLS=1 for sandboxes whose outbound HTTPS is intercepted by a proxy CA
 const page = await browser.newPage({ ignoreHTTPSErrors: !!process.env.SMOKE_IGNORE_TLS });
 const errors = [];
@@ -52,11 +50,11 @@ try {
   // the published test clip, through the welcome page's button
   await page.click('[data-clip="stripes.mp4"]');
   await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('stripes.mp4') || !document.querySelector('#banner').classList.contains('hidden'), null, { timeout: 120000 });
-  const banner = await page.evaluate(() => (document.querySelector('#banner').classList.contains('hidden') ? '' : document.querySelector('#bannerText').textContent));
+  const banner = await errorBanner(page);
   if (banner) throw new Error('banner: ' + banner);
   await scan(/1 violation found \(1 regular pattern/);
   // a local file through the file input
-  await page.setInputFiles('#fileInput', path.join(ROOT, 'tests/media/e2e/flash.mp4'));
+  await page.setInputFiles('#fileInput', path.join(MEDIA, 'flash.mp4'));
   await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash.mp4'), null, { timeout: 60000 });
   await scan(/2 violations found/);
   // the published H.264 clip: WebCodecs where the browser has H.264, the built-in decoder otherwise
@@ -68,7 +66,7 @@ try {
   target.searchParams.set('auto', '1');
   await page.goto(target.toString(), { timeout: 120000 });
   await page.waitForFunction(() => document.querySelector('#support') && document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 120000 });
-  await page.setInputFiles('#fileInput', path.join(ROOT, 'tests/media/e2e/flash.mp4'));
+  await page.setInputFiles('#fileInput', path.join(MEDIA, 'flash.mp4'));
   await page.waitForFunction(() => window.__unflash && window.__unflash.auto && Object.keys(window.__unflash.auto.steps).length > 0, null, { timeout: 120000 });
   await page.waitForFunction(() => !window.__unflash.auto.running, null, { timeout: 900000 });
   const auto = await page.evaluate(() => ({ steps: window.__unflash.auto.steps, summary: window.__unflash.auto.summary }));

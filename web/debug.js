@@ -88,9 +88,11 @@ const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
 const int = (n) => Math.round(n).toLocaleString('en');
 
 function duration(s) {
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const r = s - h * 3600 - m * 60;
+  // (rounded to tenths first: 59.96 s is 1:00.0, not 0:60.0)
+  const t = Math.round(s * 10) / 10;
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const r = t - h * 3600 - m * 60;
   return `${h ? `${h}:${String(m).padStart(2, '0')}` : m}:${r.toFixed(1).padStart(4, '0')}`;
 }
 
@@ -170,24 +172,24 @@ export function debugReport({ version, build = null, state, profile, gpu, segmen
     ])
   );
   const env = state.env;
+  const m = state.movie;
   if (env) {
     const f = env.feeder;
     const det = [];
     det.push(`${f.backend === 'webgpu' ? 'WebGPU' : 'CPU (WebAssembly)'} at ${f.aw}×${f.ah}${f.detail || f.note ? ` (${f.detail || f.note})` : ''}`);
     det.push(`pictures reach it as: ${f.route || 'nothing yet'}${f.routeDetail ? ` (${f.routeDetail})` : ''}${f.takesFrames === false && f.backend === 'webgpu' ? ' · this WebGPU takes no decoded frame' : ''}`);
-    const m = state.movie;
     const lanes = hybrid ? hybrid.hw : segments;
     const scans = `long files scanned in chunks by ${lanes} lane${lanes === 1 ? '' : 's'} of the browser's decoder${hybrid && hybrid.sw ? ` + the built-in decoder in ${hybrid.sw} worker${hybrid.sw === 1 ? '' : 's'}` : ''}, one detector in order`;
     det.push(`decoding: ${state.decode && state.decode.software && m && m.builtIn ? `the built-in ${m.builtIn.name} decoder` : m && m.decodeInWorkers ? 'WebCodecs, in workers' : 'WebCodecs, on the page'} · ${scans}`);
     lines.push(...block('Detector', det));
   }
-  const m = state.movie;
   if (m) {
     const v = m.video || {};
     const a = m.audio;
+    const spacing = keyframeSpacing(m);
     lines.push(
       ...block('Video', [
-        [`${String(m.format || '?').toUpperCase()}${m.info && m.info.fragmented ? ' (fragmented)' : ''}`, v.codec, `${m.width}×${m.height}`, `${(m.fps || 0).toFixed(3)} fps`, duration(m.duration || 0), `${int(m.frameCount || 0)} frames`, m.file ? bytes(m.file.size) : null, keyframeSpacing(m) ? `keyframes every ${keyframeSpacing(m).toFixed(1)} s` : null].filter(Boolean).join(' · '),
+        [`${String(m.format || '?').toUpperCase()}${m.info && m.info.fragmented ? ' (fragmented)' : ''}`, v.codec, `${m.width}×${m.height}`, `${(m.fps || 0).toFixed(3)} fps`, duration(m.duration || 0), `${int(m.frameCount || 0)} frames`, m.file ? bytes(m.file.size) : null, spacing ? `keyframes every ${spacing.toFixed(1)} s` : null].filter(Boolean).join(' · '),
         a ? `audio ${a.codec}${a.copyable === false ? ' (re-encoded on export)' : ''}${m.audioTracks > 1 ? ` · track ${(m.audioSkipped || []).length + 1} of ${m.audioTracks}${(m.audioSkipped || []).length ? ` (${m.audioSkipped.map((t) => t.codec).join(', ')} before it can't be played here)` : ''}` : ''}${sound ? ` · the section player's sound: ${soundLine(sound)}` : ''}` : 'no audio',
         state.decode && !state.decode.supported && state.decode.reason ? `cannot decode: ${state.decode.reason}` : null,
       ])

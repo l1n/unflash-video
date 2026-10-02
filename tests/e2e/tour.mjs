@@ -7,22 +7,11 @@
 // What's new offers a "show me" for each. An automated browser gets no tour
 // unless it asks (?tour=1), so the other tests see the page as it is.
 //   node tests/e2e/tour.mjs
-import { loadPlaywright } from './playwright.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
-import { serve } from './server.mjs';
+import { MEDIA, assert, chromium, open, still } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const WEB = path.join(ROOT, 'web');
-const MEDIA = path.join(ROOT, 'tests/media/e2e');
-
-function assert(cond, msg) {
-  if (!cond) throw new Error('ASSERT: ' + msg);
-}
-
-const { chromium } = await loadPlaywright();
-const { srv, port } = await serve(WEB);
-const browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist'] });
+const { browser, port, close } = await chromium();
 const errors = [];
 const results = {};
 const VIEW = { width: 1280, height: 800 };
@@ -45,53 +34,18 @@ const tourNow = (page) =>
     };
   });
 
-/**
- * Until the tour's light and card are still: nothing of it gliding, and in
- * the same place three frames running. (They glide a fifth of a second to
- * a new part, and again whenever the part they light moves: a section's
- * player takes its size a moment after it opens. Measured mid-glide, the
- * card can be crossing the light.)
- */
-const tourSettled = (page) =>
-  page.waitForFunction(
-    () => {
-      const t = document.querySelector('.tour');
-      if (!t) return true;
-      if (t.getAnimations({ subtree: true }).some((a) => a.playState === 'running')) {
-        window.__tourStill = 0;
-        return false;
-      }
-      const c = t.querySelector('.tour-card').getBoundingClientRect();
-      const s = t.querySelector('.tour-spot').getBoundingClientRect();
-      const key = [c.left, c.top, s.left, s.top, s.width, s.height].map(Math.round).join();
-      if (key !== window.__tourKey) {
-        window.__tourKey = key;
-        window.__tourStill = 0;
-        return false;
-      }
-      return ++window.__tourStill >= 3;
-    },
-    null,
-    { timeout: 10000, polling: 'raf' }
-  );
-
 /** Step through the tour on screen with the keyboard, checking every step; returns the titles. */
 async function walk(page, name) {
   const titles = [];
   for (let k = 0; k < 20; k++) {
-    await tourSettled(page);
+    await still(page);
     const t = await tourNow(page);
     if (!t) break;
     titles.push(t.title);
     const inView = t.card.left >= 0 && t.card.top >= 0 && t.card.right <= t.vw + 0.5 && t.card.bottom <= t.vh + 0.5;
     assert(inView, `${name}, "${t.title}": the card is on screen: ${JSON.stringify(t)}`);
     if (!t.centred) {
-      const target = await page.evaluate(() => {
-        // the tour lights what it points at: find the lit element's box again from the page
-        const s = document.querySelector('.tour-spot').getBoundingClientRect();
-        return { w: s.width, h: s.height };
-      });
-      assert(target.w > 4 && target.h > 4, `${name}, "${t.title}": something is lit`);
+      assert(t.spot.right - t.spot.left > 4 && t.spot.bottom - t.spot.top > 4, `${name}, "${t.title}": something is lit`);
       // a card beside a light it fits beside does not cover it
       const small = t.spot.bottom - t.spot.top < t.vh / 3 && t.spot.right - t.spot.left < t.vw / 2;
       const overlap = !(t.card.right <= t.spot.left || t.card.left >= t.spot.right || t.card.bottom <= t.spot.top || t.card.top >= t.spot.bottom);
@@ -104,10 +58,7 @@ async function walk(page, name) {
   return titles;
 }
 
-async function openClip(page, name) {
-  await page.setInputFiles('#fileInput', { name, mimeType: 'video/webm', buffer: fs.readFileSync(path.join(MEDIA, name)) });
-  await page.waitForFunction((n) => document.querySelector('#videoInfo').textContent.includes(n), name, { timeout: 60000 });
-}
+const openClip = (page, name) => open(page, { name, mimeType: 'video/webm', buffer: fs.readFileSync(path.join(MEDIA, name)) });
 
 try {
   // --- a first visit ------------------------------------------------------------
@@ -132,7 +83,6 @@ try {
 
   // the first video: its part of the tour once the scan is done
   await openClip(page, 'flash.webm');
-  await page.waitForFunction(() => !window.__unflash.state.job, null, { timeout: 60000 });
   assert(await page.evaluate(() => !window.__unflash.tours.where().video && window.__unflash.tours.where(true).video), "a video's part waits for its scan (unless asked for)");
   await page.click('#btnScan');
   await page.waitForSelector('.tour-card', { timeout: 60000 });
@@ -152,6 +102,16 @@ try {
   await page.keyboard.press('r');
   assert(!(await page.evaluate(() => (window.__unflash.currentSection().edits || {})[3])), 'R does not mark a frame while the tour shows');
   assert(await tourNow(page), 'and the tour stays');
+  // the browser's own shortcuts are left to it while the tour shows (zoom,
+  // find, reload: it held them back too); the page's own keys wait
+  const held = await page.evaluate(() =>
+    [{ key: '=', ctrlKey: true }, { key: 'f', ctrlKey: true }, { key: 'F5' }, { key: 'r' }].map((k) => {
+      const e = new KeyboardEvent('keydown', { ...k, bubbles: true, cancelable: true });
+      document.body.dispatchEvent(e);
+      return e.defaultPrevented;
+    })
+  );
+  assert(JSON.stringify(held) === '[false,false,false,true]', 'while the tour shows, Ctrl+=, Ctrl+F and F5 are left to the browser, R is not: ' + JSON.stringify(held));
   results.section = await walk(page, 'first section');
   assert(results.section.length >= 4 && results.section[0] === 'Does it pass?', 'the section tour: ' + results.section);
   const done = await page.evaluate(() => JSON.parse(localStorage.getItem('unflash:tours')).done);
@@ -243,6 +203,5 @@ try {
   console.error(e);
   process.exitCode = 1;
 } finally {
-  await browser.close();
-  srv.close();
+  await close();
 }

@@ -35,8 +35,7 @@ async function inSection(d, clip = 'flash.mp4', n = 1) {
  */
 async function fixedSection(d, clip = 'flash.mp4', n = 1, still = false) {
   await inSection(d, clip, n);
-  await click(d, still ? '#btnSuggestDark' : '#btnSuggestFewest');
-  await d.started(5000);
+  await d.job(() => click(d, still ? '#btnSuggestDark' : '#btnSuggestFewest'));
   await d.verdict(/^passes/);
   await hideToast(d);
 }
@@ -116,9 +115,7 @@ export const SCENES = [
       await fixedSection(d);
       await click(d, '#btnExport');
       await d.until(() => !document.querySelector('#btnDoExport').disabled);
-      await click(d, '#btnDoExport');
-      await d.started();
-      await d.idle();
+      await d.job(() => click(d, '#btnDoExport'));
       await d.until(() => !document.querySelector('#btnVerifyExport').disabled);
       await click(d, '#btnCloseExport');
       await d.eval(() => window.__unflash.state.project.save());
@@ -135,9 +132,7 @@ export const SCENES = [
       await d.click('#btnExport', { after: 400 });
       await d.camera('#exportModal .modal-box', { pad: 6, ms: 900 });
       await d.wait(2400);
-      await d.click('#btnVerifyExport');
-      await d.started();
-      await d.idle();
+      await d.job(() => d.click('#btnVerifyExport'));
       await d.until(() => /frames re-scanned/.test(document.querySelector('#exportResult').textContent));
       await d.camera('#exportModal .modal-box', { pad: 6, ms: 500 });
     },
@@ -191,8 +186,7 @@ export const SCENES = [
         await d.until(() => !document.querySelector('#wsBody').classList.contains('hidden'));
         await d.verdict();
       }
-      await click(d, '#btnSuggestFewest');
-      await d.started(5000);
+      await d.job(() => click(d, '#btnSuggestFewest'));
       await d.verdict(/^passes/);
       await hideToast(d);
       await toTop(d, '.ws-head');
@@ -245,8 +239,7 @@ export const SCENES = [
     },
     view: (d) => d.from('.ws-head'),
     async play(d) {
-      await d.click('#btnSuggestBlend');
-      await d.started(5000);
+      await d.job(() => d.click('#btnSuggestBlend'));
       await d.verdict(/^passes/);
       await d.wait(900);
       await d.eval(() => document.querySelector('#frameGrid .frame[data-i="42"]').scrollIntoView({ block: 'start' }));
@@ -303,8 +296,7 @@ export const SCENES = [
       await d.scrollTo('.ws-head');
       await d.point('#wsVerdict', { ms: 600 });
       await d.wait(900);
-      await d.click('#btnSuggestFewest');
-      await d.started(5000);
+      await d.job(() => d.click('#btnSuggestFewest'));
       await d.verdict(/^passes/);
       await hideToast(d);
       await d.point('#wsVerdict', { ms: 400 });
@@ -640,8 +632,7 @@ export const SCENES = [
     },
     view: (d) => d.from('.toolbar'),
     async play(d) {
-      await d.click('#btnSuggestFewest');
-      await d.started(5000);
+      await d.job(() => d.click('#btnSuggestFewest'));
       await d.verdict(/^passes/);
       await d.eval(() => document.querySelector('#frameGrid .frame[data-i="36"]').scrollIntoView({ block: 'start' }));
       await d.camera('#frameGrid .frame[data-i="36"]', { anchor: true, pad: 20, ms: 700 });
@@ -739,14 +730,12 @@ export const SCENES = [
     },
     view: (d) => d.from('.ws-head'),
     async play(d) {
-      await d.click('#btnSuggestDark');
-      await d.started(5000);
+      await d.job(() => d.click('#btnSuggestDark'));
       await d.verdict();
       await d.wait(1800);
       await d.press('Control+Z', { after: 900 });
       await d.verdict();
-      await d.click('#btnSuggestFewest');
-      await d.started(5000);
+      await d.job(() => d.click('#btnSuggestFewest'));
       await d.verdict();
       await d.wait(1200);
     },
@@ -924,12 +913,8 @@ export const SCENES = [
     async play(d) {
       await d.point('#exportPlan', { dx: 0.3, ms: 600 });
       await d.wait(2400);
-      await d.click('#btnDoExport');
-      await d.started();
-      await d.idle();
-      await d.click('#btnVerifyExport');
-      await d.started();
-      await d.idle();
+      await d.job(() => d.click('#btnDoExport'));
+      await d.job(() => d.click('#btnVerifyExport'));
       await d.camera('#exportModal .modal-box', { pad: 6, ms: 500 });
     },
   },
@@ -1114,21 +1099,12 @@ export const SCENES = [
       await d.click('#sectionList .sec-item');
       await d.verdict();
       await hideToast(d);
-      await d.click('#btnSuggestFewest');
-      await d.started(5000);
+      await d.job(() => d.click('#btnSuggestFewest'));
       await d.verdict(/^passes/);
       await d.click('#btnExport', { after: 400 });
       await d.camera('#exportModal .modal-box', { pad: 6, ms: 700 });
-      await d.click('#btnDoExport');
-      await d.faster(async () => {
-        await d.started();
-        await d.idle();
-      }, 3);
-      await d.click('#btnVerifyExport');
-      await d.faster(async () => {
-        await d.started();
-        await d.idle();
-      }, 3);
+      await d.job(() => d.click('#btnDoExport'), 3);
+      await d.job(() => d.click('#btnVerifyExport'), 3);
       await d.camera('#exportModal .modal-box', { pad: 6, ms: 400 });
     },
   },
@@ -1208,9 +1184,7 @@ export const SCENES = [
       await d.wait(900);
       await d.type('#exportName', 'my video, safe to watch');
       await d.press('Tab', { after: 1800 });
-      await d.click('#btnDoExport');
-      await d.started();
-      await d.idle();
+      await d.job(() => d.click('#btnDoExport'));
       await d.until(() => !document.querySelector('#exportDownload').classList.contains('hidden') && document.querySelector('#exportDownload').download === 'my video, safe to watch.mp4');
       await d.point('#exportDownload', { ms: 700 });
       await d.wait(2000);
@@ -1267,16 +1241,12 @@ export const SCENES = [
       await inSection(d);
       await click(d, '#btnExport');
       await d.until(() => !document.querySelector('#btnDoExport').disabled);
-      await click(d, '#btnDoExport');
-      await d.started();
-      await d.idle();
+      await d.job(() => click(d, '#btnDoExport'));
       await d.until(() => !document.querySelector('#btnVerifyExport').disabled);
     },
     view: (d) => d.around('#exportModal .modal-box', 4),
     async play(d) {
-      await d.click('#btnVerifyExport');
-      await d.started();
-      await d.faster(() => d.idle(), 4);
+      await d.job(() => d.click('#btnVerifyExport'), 4);
       await d.until(() => /re-scanned/.test(document.querySelector('#exportResult').textContent));
       await d.camera('#exportModal .modal-box', { pad: 6, ms: 500 });
       await d.point('#exportResult button[data-open-at]', { ms: 700 });
@@ -1296,8 +1266,7 @@ export const SCENES = [
     async play(d) {
       await d.point('#wsVerdict', { ms: 600 });
       await d.wait(1200);
-      await d.click('#btnSuggestFewest');
-      await d.started(5000);
+      await d.job(() => d.click('#btnSuggestFewest'));
       await d.verdict(/^passes/);
       await d.camera(await d.around(['#wsVerdict', '#btnSuggestFewest', '#toast'], 10), { ms: 800 });
       await d.wait(3600);
@@ -1394,9 +1363,7 @@ export const SCENES = [
       await d.opened('flash_ac3.m2ts');
       await d.point('#videoInfo', { dx: 0.7, ms: 700 });
       await d.wait(2200);
-      await d.click('#btnScan');
-      await d.started();
-      await d.idle();
+      await d.job(() => d.click('#btnScan'));
       await d.wait(600);
       await d.camera(await d.around(['#timelineWrap', '#sectionList'], 8), { ms: 800 });
       await d.wait(2600);
@@ -1446,9 +1413,7 @@ export const SCENES = [
       await d.wait(2600);
       await d.click('#btnExport');
       await d.until(() => !document.querySelector('#btnDoExport').disabled);
-      await d.click('#btnDoExport');
-      await d.started();
-      await d.faster(() => d.idle(), 4);
+      await d.job(() => d.click('#btnDoExport'), 4);
       await d.until(() => !document.querySelector('#btnVerifyExport').disabled);
       await d.camera('#exportModal .modal-box', { pad: 6, ms: 600 });
       await d.wait(3200);

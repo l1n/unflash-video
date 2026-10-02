@@ -5,10 +5,11 @@
 //   node tests/e2e/shrink.mjs        (after ./build.sh)
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { WEB } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const mod = await import(path.join(ROOT, 'web/pkg/unflash.js'));
-await mod.default({ module_or_path: fs.readFileSync(path.join(ROOT, 'web/pkg/unflash_bg.wasm')) });
+const mod = await import(pathToFileURL(path.join(WEB, 'pkg/unflash.js')));
+await mod.default({ module_or_path: fs.readFileSync(path.join(WEB, 'pkg/unflash_bg.wasm')) });
 
 // yuv::YuvLayout::coefficients: [ky, kr, kgu, kgv, kb, yoff] by (bt709, full range)
 const COEF = { '1,0': [76309, 117489, 13975, 34925, 138438, 16], '0,0': [76309, 104597, 25675, 53279, 132201, 16], '1,1': [65536, 103206, 12276, 30679, 121608, 0], '0,1': [65536, 91881, 22553, 46802, 116129, 0] };

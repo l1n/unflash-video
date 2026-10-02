@@ -8,83 +8,30 @@
 // the same violations. The synthetic clips come from tests/media/gen_e2e.py;
 // they are also copied to web/clips so the welcome page's "open" buttons
 // (the published test clips) can be exercised.
-import { loadPlaywright } from './playwright.mjs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
-import { serve } from './server.mjs';
+import { WEB, MEDIA, OUT, assert, chromium, watch, idle, job, cancelledJob, errorBanner, open, scan as scanVideo, flashesAsInTheMp4, sameViolations } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const WEB = path.join(ROOT, 'web');
-const MEDIA = path.join(ROOT, 'tests/media/e2e');
-const OUT = path.join(ROOT, 'tests/e2e/out');
 const CLIPS = path.join(WEB, 'clips');
 fs.mkdirSync(OUT, { recursive: true });
 fs.mkdirSync(CLIPS, { recursive: true });
-for (const f of fs.readdirSync(MEDIA)) if (f.endsWith('.mp4') && !fs.existsSync(path.join(CLIPS, f))) fs.copyFileSync(path.join(MEDIA, f), path.join(CLIPS, f));
+// (every time: a copy left there from older media made the GPU scan of a
+// clip opened from the welcome page a scan of another file than the one
+// the CPU scan it is held to read)
+for (const f of fs.readdirSync(MEDIA)) if (f.endsWith('.mp4')) fs.copyFileSync(path.join(MEDIA, f), path.join(CLIPS, f));
 
-function assert(cond, msg) {
-  if (!cond) throw new Error('ASSERT: ' + msg);
-}
-const jobDone = (page, timeout = 300000) => page.waitForFunction(() => document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout });
-// jobs can finish before a poll sees the job bar: wait for the toast to change instead
-const toastBefore = (page) => page.evaluate(() => (window.__toastSeq = (window.__toastSeq || 0), document.querySelector('#toast').textContent));
-// an error banner (info banners, such as the built-in decoder notice, are fine)
-const errorBanner = (page) => page.evaluate(() => {
-  const b = document.querySelector('#banner');
-  return b.classList.contains('hidden') || b.classList.contains('info') ? '' : document.querySelector('#bannerText').textContent;
-});
-const jobStarted = async (page) => {
-  await page.waitForFunction(() => !document.querySelector('#jobbar').classList.contains('hidden') || (!document.querySelector('#banner').classList.contains('hidden') && !document.querySelector('#banner').classList.contains('info')), null, { timeout: 30000 }).catch(() => {});
-  const banner = await errorBanner(page);
-  if (banner) throw new Error('banner: ' + banner);
-};
 const noBanner = async (page) => {
   const banner = await errorBanner(page);
   if (banner) throw new Error('banner: ' + banner);
 };
 const verdictReady = (page, timeout = 120000) => page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout });
-// click `selector`, and cancel the job it starts with the job bar's button
-// as soon as that job's progress reaches `pct` percent (as its bar moves);
-// resolves to the job's name once it has ended
-const cancelledJob = async (page, selector, pct = 1) => {
-  const name = await page.evaluate(
-    ([sel, at]) => {
-      const u = window.__unflash;
-      document.querySelector(sel).click();
-      const job = u.state.job;
-      if (!job) return null;
-      const watch = new MutationObserver(() => {
-        if (u.state.job !== job) watch.disconnect();
-        else if (job.pct >= at) {
-          watch.disconnect();
-          document.querySelector('#btnCancelJob').click();
-        }
-      });
-      watch.observe(document.querySelector('#jobBar'), { attributes: true, attributeFilter: ['style'] });
-      return job.name;
-    },
-    [selector, pct]
-  );
-  if (!name) throw new Error(`${selector} started no job`);
-  await jobDone(page);
-  return name;
-};
 
-const { chromium } = await loadPlaywright();
-const { srv, port } = await serve(WEB);
-const browser = await chromium.launch({
-  headless: !process.argv.includes('--headed'),
-  channel: 'chromium',
-  // (ForceEagerMeasureMemory: performance.measureUserAgentSpecificMemory() answers at once)
-  args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--autoplay-policy=no-user-gesture-required', '--enable-blink-features=ForceEagerMeasureMemory'],
-});
+// (ForceEagerMeasureMemory: performance.measureUserAgentSpecificMemory() answers at once)
+const { browser, port, close } = await chromium(['--autoplay-policy=no-user-gesture-required', '--enable-blink-features=ForceEagerMeasureMemory'], { headless: !process.argv.includes('--headed') });
 const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
 const errors = [];
-page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
-page.on('console', (m) => {
-  if (m.type() === 'error') errors.push('console: ' + m.text());
-  if (process.env.E2E_VERBOSE) console.log('[browser]', m.type(), m.text());
-});
+watch(page, errors);
 
 const results = {};
 const partArg = (process.argv.find((a) => a.startsWith('--part=')) || '').slice('--part='.length);
@@ -94,30 +41,29 @@ for (const p of parts) if (!PARTS.includes(p)) throw new Error(`unknown part ${p
 const runs = (p) => parts.includes(p);
 let scan;
 let t0;
-async function openFile(name) {
-  await page.setInputFiles('#fileInput', path.join(MEDIA, name));
-  await page.waitForFunction((n) => document.querySelector('#videoInfo').textContent.includes(n), name, { timeout: 60000 });
-  await page.waitForFunction(() => !document.querySelector('#status').textContent.includes('ready ·'), null, { timeout: 60000 });
-}
+const openFile = (name) => open(page, path.join(MEDIA, name));
 // a section prepares itself when it is opened
 async function openSectionPrepared(selector = '#sectionList .sec-item', timeout = 120000) {
   await page.click(selector);
   await page.waitForFunction(() => !document.querySelector('#wsBody').classList.contains('hidden'), null, { timeout });
 }
+// a suggestion says what it did once the project is saved, after its job:
+// until the toast says something else (or an error banner comes), and no
+// job runs
 const toastChange = async (before, timeout = 300000) => {
-  await page.waitForFunction((t) => document.querySelector('#toast').textContent !== t || !document.querySelector('#banner').classList.contains('hidden'), before, { timeout });
+  await page.waitForFunction(
+    (t) => {
+      const b = document.querySelector('#banner');
+      return document.querySelector('#toast').textContent !== t || !(b.classList.contains('hidden') || b.classList.contains('info'));
+    },
+    before,
+    { timeout }
+  );
   await noBanner(page);
-  await jobDone(page);
+  await idle(page);
 };
-async function scanCurrent() {
-  const t0 = Date.now();
-  await page.click('#btnScan');
-  await jobStarted(page);
-  await jobDone(page);
-  const ms = Date.now() - t0;
-  const project = await page.evaluate(() => JSON.parse(localStorage.getItem('unflash:lastScan') || 'null'));
-  return { ms, project, status: await page.textContent('#status'), toast: await page.textContent('#toast') };
-}
+/** Scan the open video: what scan() gives, and the status line. */
+const scanCurrent = async () => ({ ...(await scanVideo(page)), status: await page.textContent('#status') });
 
 /** The app at `?query`, unless the page is there already (a part carrying on from the one before). */
 async function ensurePage(query) {
@@ -187,10 +133,7 @@ try {
   assert(sections[0].includes('flash') && sections[0].includes('red flash'), 'the section must carry both kinds');
   results.cpuViolations = await page.evaluate(() => window.__unflash && window.__unflash.lastScan ? window.__unflash.lastScan.result.violations : null);
   assert(results.cpuViolations && results.cpuViolations.length >= 2, 'expected a general and a red violation: ' + JSON.stringify(results.cpuViolations));
-  const gen = results.cpuViolations.find((v) => v.kind === 'flash');
-  const red = results.cpuViolations.find((v) => v.kind === 'red');
-  assert(gen && gen.start > 3.5 && gen.start < 4.6 && gen.end > 5.2 && gen.end < 5.8, 'general flash reported at 3.9-5.5 s: ' + JSON.stringify(gen));
-  assert(red && red.start > 7.5 && red.start < 8.6 && red.end > 8.2 && red.end < 8.8, 'red flash reported at 7.9-8.5 s: ' + JSON.stringify(red));
+  flashesAsInTheMp4('flash.mp4', results.cpuViolations);
 
   // --- open the section: it prepares itself and is checked --------------------
   t0 = Date.now();
@@ -381,7 +324,7 @@ try {
   await page.keyboard.up('Shift');
   await page.keyboard.press('r');
   await page.waitForFunction((k) => document.querySelector(`#frameGrid .frame:nth-child(${k})`).classList.contains('removed'), f0 + 3);
-  await page.waitForFunction(() => document.querySelector('#wsVerdict').textContent.includes('checking'), null, { timeout: 5000 }).catch(() => {});
+  // (the marks made the verdict "needs re-check" as they went on: the next to pass or fail is the check of them)
   await verdictReady(page);
   results.verdictAfterMarks = await page.textContent('#wsVerdict');
   results.checkMs = await page.evaluate(() => window.__unflash.currentSection().checkMs);
@@ -456,14 +399,14 @@ try {
       });
     const before = await section();
     // a suggestion stops at its next check, and none of it is applied
-    const suggesting = await cancelledJob(page, '#btnSuggestFewest');
+    const suggesting = await cancelledJob(page, () => page.click('#btnSuggestFewest'));
     const afterSuggest = { section: await section(), toast: await page.textContent('#toast') };
     // "re-prepare", cancelled part way through the section's own frames (at
     // a quarter on the job bar: past the run-up, before the section's end),
     // stops at its next picture: the section keeps the frames its marks
     // were made on (cut short, the export would apply them to part of it and
     // leave the rest as it is)
-    const preparing = await cancelledJob(page, '#btnReprepare', 25);
+    const preparing = await cancelledJob(page, () => page.click('#btnReprepare'), 25);
     const afterPrepare = { section: await section(), toast: await page.textContent('#toast') };
     console.log('cancelled:', afterSuggest.toast, '|', afterPrepare.toast);
     assert(afterSuggest.toast === `${suggesting}: cancelled` && afterSuggest.section === before, 'a cancelled suggestion is not applied: ' + JSON.stringify({ before, afterSuggest }));
@@ -480,29 +423,18 @@ try {
         return JSON.stringify({ video: document.querySelector('#videoInfo').textContent, movie: u.state.movie.name, current: u.state.current, edits: u.currentSection().edits, sections: u.state.project.sections.length, profile: document.querySelector('#profileSel').value });
       });
     const before = await opened();
-    await page.evaluate(() => {
-      const u = window.__unflash;
-      const watch = new MutationObserver(() => {
-        const job = u.state.job;
-        if (job && job.name === 'Opening video' && job.pct >= 36) {
-          watch.disconnect();
-          document.querySelector('#btnCancelJob').click();
-        }
-      });
-      watch.observe(document.querySelector('#jobBar'), { attributes: true, attributeFilter: ['style'] });
-    });
-    await page.setInputFiles('#fileInput', path.join(MEDIA, 'steady.mp4'));
-    await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Opening video: cancelled', null, { timeout: 60000 });
-    await jobDone(page);
+    const opening = await cancelledJob(page, () => page.setInputFiles('#fileInput', path.join(MEDIA, 'steady.mp4')), 36);
     const after = await opened();
+    const toast = await page.textContent('#toast');
     console.log('an open cancelled:', after === before ? 'the page as it was' : after);
+    assert(opening === 'Opening video' && toast === 'Opening video: cancelled', 'the open was cancelled part way: ' + JSON.stringify({ opening, toast }));
     assert(after === before && !(await page.evaluate(() => window.__unflash.state.job)), 'an open cancelled part way leaves the video that was open: ' + JSON.stringify({ before, after }));
     await noBanner(page);
   }
   // a re-scan cancelled part way leaves nothing of what it saw: the timeline,
   // the chart and the monitor read the last whole scan's trace again
   {
-    const scanning = await cancelledJob(page, '#btnScan', 30);
+    const scanning = await cancelledJob(page, () => page.click('#btnScan'), 30);
     const trace = await page.evaluate(() => {
       const u = window.__unflash;
       const n = u.state.traceNorm;
@@ -516,9 +448,7 @@ try {
   t0 = Date.now();
   const toast0 = await page.textContent('#toast');
   await page.click('#btnSuggestDark');
-  await page.waitForFunction((t) => document.querySelector('#toast').textContent !== t || !document.querySelector('#banner').classList.contains('hidden'), toast0, { timeout: 300000 });
-  await noBanner(page);
-  await jobDone(page);
+  await toastChange(toast0);
   await verdictReady(page);
   results.suggestMs = Date.now() - t0;
   results.verdictAfterSuggest = await page.textContent('#wsVerdict');
@@ -533,9 +463,7 @@ try {
   await verdictReady(page);
   const toastF = await page.textContent('#toast');
   await page.click('#btnSuggestFewest');
-  await page.waitForFunction((t) => document.querySelector('#toast').textContent !== t || !document.querySelector('#banner').classList.contains('hidden'), toastF, { timeout: 300000 });
-  await noBanner(page);
-  await jobDone(page);
+  await toastChange(toastF);
   await verdictReady(page);
   results.fewest = {
     verdict: await page.textContent('#wsVerdict'),
@@ -578,9 +506,7 @@ try {
   assert((await page.textContent('#wsVerdict')).startsWith('fails'), 'clearing the marks brings the flashing back');
   const toast1 = await page.textContent('#toast');
   await page.click('#btnSuggestFps');
-  await page.waitForFunction((t) => document.querySelector('#toast').textContent !== t || !document.querySelector('#banner').classList.contains('hidden'), toast1, { timeout: 300000 });
-  await noBanner(page);
-  await jobDone(page);
+  await toastChange(toast1);
   await verdictReady(page);
   results.fpsVerdict = await page.textContent('#wsVerdict');
   results.fpsToast = await page.textContent('#toast');
@@ -788,9 +714,7 @@ try {
   await page.press('#exportName', 'Tab');
   assert((await page.inputValue('#exportName')) === 'my export final.mp4', 'a name typed in is made fit for a file: ' + (await page.inputValue('#exportName')));
   t0 = Date.now();
-  await page.click('#btnDoExport');
-  await jobStarted(page);
-  await jobDone(page, 600000);
+  await job(page, () => page.click('#btnDoExport'), 600000);
   results.exportMs = Date.now() - t0;
   try {
     await page.waitForFunction(() => !document.querySelector('#btnVerifyExport').disabled, null, { timeout: 30000 });
@@ -820,7 +744,7 @@ try {
   // a verify cancelled part way says nothing of the file: it saw part of it
   {
     const before = await page.textContent('#exportResult');
-    const verifying = await cancelledJob(page, '#btnVerifyExport');
+    const verifying = await cancelledJob(page, () => page.click('#btnVerifyExport'));
     await page.waitForFunction(() => !document.querySelector('#exportModal').classList.contains('hidden'));
     const after = { result: await page.textContent('#exportResult'), toast: await page.textContent('#toast') };
     console.log('verify cancelled:', after.toast);
@@ -828,9 +752,8 @@ try {
     await noBanner(page);
   }
   t0 = Date.now();
-  await page.click('#btnVerifyExport');
-  await jobStarted(page);
-  await jobDone(page, 600000);
+  await job(page, () => page.click('#btnVerifyExport'), 600000);
+  await noBanner(page);
   results.verifyMs = Date.now() - t0;
   results.verify = await page.textContent('#exportResult');
   console.log('verify:', results.verifyMs, 'ms;', results.verify);
@@ -846,9 +769,8 @@ try {
   // export had kept it): the verify says which section each problem is in,
   // and the section opens with the frames on screen during it selected
   {
-    await page.setInputFiles('#verifyFileInput', path.join(MEDIA, 'flash.mp4'));
-    await jobStarted(page);
-    await jobDone(page, 600000);
+    await job(page, () => page.setInputFiles('#verifyFileInput', path.join(MEDIA, 'flash.mp4')), 600000);
+    await noBanner(page);
     await page.waitForFunction(() => /flash\.mp4: .*re-scanned/.test(document.querySelector('#exportResult').textContent), null, { timeout: 30000 });
     const found = await page.evaluate(() => ({
       text: document.querySelector('#exportResult').textContent.split('flash.mp4: ').pop(),
@@ -880,25 +802,24 @@ try {
   // --- the live monitor on the original -------------------------------------
   await page.selectOption('#playerSource', 'video');
   await page.check('#liveToggle');
+  // (every verdict it gives as it plays, watched until it reports the
+  // flashing, eight seconds at most: "flashing: general flash", "1 violation
+  // so far"; "no flashing so far" is not it)
   await page.evaluate(() => {
+    const el = document.querySelector('#liveVerdict');
+    window.__verdicts = [el.textContent];
+    new MutationObserver(() => window.__verdicts.push(el.textContent)).observe(el, { childList: true, characterData: true, subtree: true });
     const v = document.querySelector('#player');
     v.muted = true;
     v.currentTime = 2.0;
     return v.play();
   });
-  const seen = new Set();
-  const until = Date.now() + 8000;
-  // (watching until it reports the flashing, eight seconds at most: "flashing:
-  // general flash", "1 violation so far"; "no flashing so far" is not it)
-  const reported = (set) => [...set].some((s) => /^flashing:|violations? so far/.test(s));
-  while (Date.now() < until && !reported(seen)) {
-    seen.add(await page.textContent('#liveVerdict'));
-    await page.waitForTimeout(200);
-  }
-  results.liveVerdicts = [...seen];
+  await page.waitForFunction(() => window.__verdicts.some((s) => /^flashing:|violations? so far/.test(s)), null, { timeout: 8000 }).catch(() => {});
+  const seen = await page.evaluate(() => [...new Set(window.__verdicts)]);
+  results.liveVerdicts = seen;
   results.hud = await page.textContent('#hudInfo');
   console.log('live verdicts seen:', results.liveVerdicts, '|', results.hud);
-  assert(reported(seen), 'the live monitor must report the flashing while it plays: ' + JSON.stringify([...seen]));
+  assert(seen.some((s) => /^flashing:|violations? so far/.test(s)), 'the live monitor must report the flashing while it plays: ' + JSON.stringify(seen));
   // a scan of this file exists, so the meter reads it instead of detecting again
   assert(/from the scan/.test(results.hud), 'after a scan the monitor reads the scan trace: ' + results.hud);
   await page.screenshot({ path: path.join(OUT, '5-live.png') });
@@ -926,9 +847,7 @@ try {
       await page.selectOption('#profileSel', name);
       await page.waitForFunction(() => document.querySelector('#toast').textContent.includes('Profile changed'), null, { timeout: 30000 });
     };
-    await page.setInputFiles('#fileInput', path.join(MEDIA, 'steady.mp4'));
-    await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('steady.mp4'), null, { timeout: 60000 });
-    await jobDone(page);
+    await openFile('steady.mp4');
     await play();
     await watching();
     await profile('wcag');
@@ -939,7 +858,6 @@ try {
     // (back as it was: the default profile, and the first video open)
     await profile('wcag_ext');
     await openFile('flash.mp4');
-    await jobDone(page);
   }
   await page.uncheck('#liveToggle');
   await page.evaluate(() => document.querySelector('#player').pause());
@@ -993,7 +911,7 @@ try {
     await page.fill('#addEnd', String(b));
     await page.click('#btnAddSection');
     await page.waitForFunction((a) => { const s = window.__unflash.currentSection(); return s && Math.abs(s.start - a) < 1e-6 && s.prepared; }, a, { timeout: 120000 });
-    await jobDone(page);
+    await idle(page);
     await verdictReady(page);
   };
   await addByHand(0, 5);
@@ -1056,13 +974,13 @@ try {
       return name;
     });
     await page.waitForFunction((name) => document.querySelector('#toast').textContent === `${name}: cancelled`, checking, { timeout: 60000 });
-    await jobDone(page);
+    await idle(page);
     const stale = await page.evaluate(() => window.__unflash.state.project.sections.map((s) => s.check.stale));
     await page.evaluate(async () => {
       const { dropCaches } = await import('./project.js');
       window.__unflash.state.project.sections.forEach(dropCaches);
     });
-    const preparing = await cancelledJob(page, '#btnPrepareAll', 10);
+    const preparing = await cancelledJob(page, () => page.click('#btnPrepareAll'), 10);
     const prepared = await page.evaluate(() => window.__unflash.state.project.sections.map((s) => s.prepared));
     console.log('Check all cancelled:', JSON.stringify(stale), '| Prepare all cancelled:', preparing, JSON.stringify(prepared));
     assert(stale.length === 2 && stale.every((x) => x), 'Check all ends at a cancel: ' + JSON.stringify(stale));
@@ -1186,16 +1104,13 @@ try {
   results.stripesPlan = await page.textContent('#exportPlan');
   assert(results.stripesPlan.includes('softened'), 'the export plan mentions the softening: ' + results.stripesPlan);
   t0 = Date.now();
-  await page.click('#btnDoExport');
-  await jobStarted(page);
-  await jobDone(page, 600000);
+  await job(page, () => page.click('#btnDoExport'), 600000);
   await page.waitForFunction(() => !document.querySelector('#btnVerifyExport').disabled, null, { timeout: 30000 });
   results.stripesExport = await page.textContent('#exportResult');
   console.log('stripes export:', Date.now() - t0, 'ms;', results.stripesExport);
   assert(/softened/.test(results.stripesExport), 'the export reports the softened frames: ' + results.stripesExport);
-  await page.click('#btnVerifyExport');
-  await jobStarted(page);
-  await jobDone(page, 600000);
+  await job(page, () => page.click('#btnVerifyExport'), 600000);
+  await noBanner(page);
   results.stripesVerify = await page.textContent('#exportResult');
   console.log('stripes verify:', results.stripesVerify);
   assert(results.stripesVerify.includes('Passes WCAG') && results.stripesVerify.includes('No hazardous stripe patterns'), 'the softened export has no stripes left: ' + results.stripesVerify);
@@ -1216,13 +1131,8 @@ try {
   results.h264Route = await page.evaluate(() => window.__unflash.state.env.feeder.route);
   if (!h264Decodable) assert(results.h264Route === 'raw', 'the built-in decoder hands its I420 pictures straight to the detector: ' + results.h264Route);
   console.log('h264 scan:', scan.ms, 'ms |', scan.toast, '|', JSON.stringify(results.h264Violations));
-  assert(results.h264Violations.length === results.cpuViolations.length, 'the H.264 copy of the flash clip has the same violations as the VP9 one');
-  for (let i = 0; i < results.h264Violations.length; i++) {
-    const a = results.h264Violations[i];
-    const b = results.cpuViolations[i];
-    // a different encoder, so the edges of the flashing may land a frame apart
-    assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.15 && Math.abs(a.end - b.end) < 0.15, `H.264 violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
-  }
+  // (a different encoder, so the edges of the flashing may land a frame apart)
+  sameViolations('the H.264 copy of the flash clip against the VP9 one', results.h264Violations, results.cpuViolations, 0.15, ['start', 'end']);
   // an interlaced (MBAFF) H.264 copy of the same clip through the built-in decoder
   if (!h264Decodable) {
     await openFile('flash_h264i.mp4');
@@ -1230,12 +1140,7 @@ try {
     scan = await scanCurrent();
     results.h264iViolations = await page.evaluate(() => window.__unflash.lastScan.result.violations);
     console.log('h264 interlaced scan:', scan.ms, 'ms |', scan.toast, '|', JSON.stringify(results.h264iViolations));
-    assert(results.h264iViolations.length === results.cpuViolations.length, 'the interlaced H.264 copy has the same violations as the VP9 one');
-    for (let i = 0; i < results.h264iViolations.length; i++) {
-      const a = results.h264iViolations[i];
-      const b = results.cpuViolations[i];
-      assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.15 && Math.abs(a.end - b.end) < 0.15, `interlaced H.264 violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
-    }
+    sameViolations('the interlaced H.264 copy against the VP9 one', results.h264iViolations, results.cpuViolations, 0.15, ['start', 'end']);
     await openFile('flash_h264.mp4');
     page.once('dialog', (d) => d.accept());
     await page.click('#btnDeleteAll');
@@ -1309,6 +1214,16 @@ try {
   assert(/A long job: 7\.5 s ok\n\s+reading the index 1\.2 s · reading … of … pieces 6\.0 s\n/.test(steps), "a long job's report lists its big steps (a step's changing numbers are one step): " + steps.split('\n').filter((l) => /long job|reading/.test(l)).join(' / '));
   assert(/A long scan: 6\.0 s ok\n(?!\s+… frames)/.test(steps), "a scan's running counts are no steps: " + steps.split('\n').filter((l) => /long scan|frames/.test(l)).join(' / '));
   assert(/A short job: 1\.8 s ok\n(?!\s+reading the index)/.test(steps), 'a job of under two seconds lists no steps');
+  // a video's length is rounded to tenths before the minutes and hours are
+  // taken from it: 59.96 s is 1:00.0 (it was 0:60.0)
+  const lengths = await page.evaluate(async () => {
+    const { debugReport } = await import('./debug.js');
+    return [59.96, 119.97, 3599.96, 10, 3725.2].map((duration) => {
+      const report = debugReport({ version: '', state: { movie: { format: 'mp4', video: {}, width: 640, height: 360, fps: 30, duration, frameCount: 300 } }, profile: { summary: () => '' }, segments: 1 });
+      return (/ · ([\d:.]+) · 300 frames/.exec(report) || [])[1];
+    });
+  });
+  assert(JSON.stringify(lengths) === JSON.stringify(['1:00.0', '2:00.0', '1:00:00.0', '0:10.0', '1:02:05.2']), "the debug report gives a video's length in whole minutes and hours: " + JSON.stringify(lengths));
 
   // --- what's new: someone coming back sees what changed since they were here ---
   {
@@ -1402,7 +1317,18 @@ try {
     // with less motion asked for, none plays by itself; a click plays one
     await p.emulateMedia({ reducedMotion: 'reduce' });
     await p.click('#btnChanges');
-    await p.waitForTimeout(1500);
+    // (the films play once the page sees them in view: once an observer made
+    // after the page's has seen the first one, the page has had its turn)
+    await p.evaluate(
+      () =>
+        new Promise((r) => {
+          const io = new IntersectionObserver(() => {
+            io.disconnect();
+            r();
+          });
+          io.observe(document.querySelector('#changesList .shot-film'));
+        })
+    );
     assert(await p.evaluate(() => [...document.querySelectorAll('#changesList video')].every((v) => v.paused)), 'with less motion asked for, no film plays by itself');
     await p.click('#changesList .shot-film');
     await p.waitForFunction(() => !document.querySelector('#changesList .shot-film video').paused, null, { timeout: 30000 });
@@ -1435,22 +1361,22 @@ try {
   await page.goto(`http://127.0.0.1:${port}/?auto=0`);
   await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
   // the welcome page's test clips open straight into the app
-  await page.click('[data-clip="stripes.mp4"]');
-  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('stripes.mp4'), null, { timeout: 60000 });
-  await page.waitForFunction(() => !document.querySelector('#status').textContent.includes('ready ·'), null, { timeout: 60000 });
+  await job(page, () => page.click('[data-clip="stripes.mp4"]'), 120000);
   await noBanner(page);
+  // (the very file the CPU scan read: a copy left in web/clips from older
+  // media was another, and the two scans could not agree)
+  const opened = await page.evaluate(async () => {
+    const bytes = await window.__unflash.state.movie.file.arrayBuffer();
+    return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((x) => x.toString(16).padStart(2, '0')).join('');
+  });
+  assert(opened === crypto.createHash('sha256').update(fs.readFileSync(path.join(MEDIA, 'stripes.mp4'))).digest('hex'), 'the clip the welcome page opens is the stripes.mp4 the CPU scan read');
   page.once('dialog', (d) => d.accept());
   await page.click('#btnDeleteAll');
   await page.waitForFunction(() => document.querySelectorAll('#sectionList .sec-item').length === 1);
   scan = await scanCurrent();
   results.gpuStripes = await page.evaluate(() => window.__unflash.lastScan.result.violations);
   console.log('gpu stripes scan:', scan.ms, 'ms |', scan.toast, '|', JSON.stringify(results.gpuStripes));
-  assert(results.gpuStripes.length === results.stripesViolations.length, 'GPU and CPU scans must find the same pattern violations');
-  for (let i = 0; i < results.gpuStripes.length; i++) {
-    const a = results.gpuStripes[i];
-    const b = results.stripesViolations[i];
-    assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.05 && Math.abs(a.end - b.end) < 0.05, `pattern violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
-  }
+  sameViolations('the stripes on the GPU against the CPU', results.gpuStripes, results.stripesViolations, 0.05, ['start', 'end']);
   await openFile('flash.mp4');
   results.gpuStatus = await page.textContent('#status');
   assert(results.gpuStatus.includes('WebGPU'), 'the default detector must be WebGPU: ' + results.gpuStatus);
@@ -1463,14 +1389,9 @@ try {
   results.gpuViolations = await page.evaluate(() => window.__unflash.lastScan.result.violations);
   results.gpuWhole = await page.evaluate(() => ({ frames: window.__unflash.lastScan.frames, held: window.__unflash.lastScan.result.held }));
   console.log('gpu violations:', JSON.stringify(results.gpuViolations));
-  assert(results.gpuViolations.length === results.cpuViolations.length, 'GPU and CPU scans must find the same violations');
-  for (let i = 0; i < results.gpuViolations.length; i++) {
-    const a = results.gpuViolations[i];
-    const b = results.cpuViolations[i];
-    // the two ingest paths get their RGB from different browser colour
-    // conversions, so allow a frame's difference at the edges
-    assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.05 && Math.abs(a.end - b.end) < 0.05, `violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
-  }
+  // (the two ingest paths get their RGB from different browser colour
+  // conversions, so a frame's difference at the edges is allowed)
+  sameViolations('the GPU against the CPU', results.gpuViolations, results.cpuViolations, 0.05, ['start', 'end']);
   await page.screenshot({ path: path.join(OUT, '6-gpu-scan.png') });
 
   // ======== the same scan in two segments run at once must merge into the same result
@@ -1485,12 +1406,7 @@ try {
   console.log('gpu scan in 2 segments:', scan.ms, 'ms |', scan.toast, '|', JSON.stringify(results.segScan));
   assert(results.segScan.segments === 2, 'the scan ran in two segments: ' + JSON.stringify(results.segScan));
   assert(results.segScan.frames === results.gpuWhole.frames, `frames ${results.segScan.frames} vs ${results.gpuWhole.frames}`);
-  assert(results.segScan.violations.length === results.gpuViolations.length, 'the segmented scan finds the same violations as the whole scan');
-  for (let i = 0; i < results.segScan.violations.length; i++) {
-    const a = results.segScan.violations[i];
-    const b = results.gpuViolations[i];
-    assert(a.kind === b.kind && Math.abs(a.start - b.start) < 1e-6 && Math.abs(a.end - b.end) < 1e-6 && Math.abs(a.onset - b.onset) < 1e-6, `segmented violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
-  }
+  sameViolations('the scan in two segments against the whole scan', results.segScan.violations, results.gpuViolations, 1e-6, ['start', 'end', 'onset']);
   assert(results.segScan.held === results.gpuWhole.held, `held frames ${results.segScan.held} vs ${results.gpuWhole.held}`);
 
   // ======== a scan in chunks must give exactly what the scan in one piece
@@ -1506,21 +1422,12 @@ try {
     await page.goto(`http://127.0.0.1:${port}/?auto=0&${query}`);
     await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
     await openFile('flash_h264.mp4');
-    scan = await scanCurrent();
-    return page.evaluate(() => {
-      const s = window.__unflash.lastScan;
-      return { ms: Math.round(s.elapsedMs), frames: s.frames, held: s.result.held, violations: s.result.violations, chunked: s.chunked || null, partials: window.__unflash.partials, report: window.__unflash.debugReport() };
-    });
+    const r = await scanVideo(page);
+    return { ...r, ...(await page.evaluate(() => ({ partials: window.__unflash.partials, report: window.__unflash.debugReport() }))) };
   };
   const sameAsWhole = (name, r, w = results.h264Whole) => {
     assert(r.frames === w.frames && r.held === w.held, `${name}: frames ${r.frames} (held ${r.held}) vs ${w.frames} (held ${w.held})`);
-    assert(r.violations.length > 0 && r.violations.length === w.violations.length, `${name}: the violations of the scan in one piece: ${JSON.stringify(r.violations)} vs ${JSON.stringify(w.violations)}`);
-    for (let i = 0; i < r.violations.length; i++) {
-      const a = r.violations[i];
-      const b = w.violations[i];
-      const same = a.kind === b.kind && ['start', 'end', 'onset', 'peak', 'count'].every((k) => Math.abs(a[k] - b[k]) < 1e-6);
-      assert(same, `${name}: violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
-    }
+    sameViolations(name, r.violations, w.violations);
   };
   results.h264Whole = await hybridScan('hybrid=0');
   assert(!results.h264Whole.chunked, 'a ten-second file is scanned in one piece: ' + JSON.stringify(results.h264Whole.chunked));
@@ -1747,12 +1654,7 @@ try {
     console.log(`gpu scan, pictures via ${route}:`, scan.ms, 'ms |', scan.toast, '| route', taken, inWorkers ? '(decoded in workers)' : '', '|', JSON.stringify(violations));
     assert(taken === route, `?${query} must feed pictures as ${route}, not ${taken}`);
     assert(inWorkers === (route === 'raw'), `?${query}: decoding in workers only when WebGPU takes no frame and no route is forced`);
-    assert(violations.length === results.cpuViolations.length, `the ${route} route must find the same violations as the CPU scan`);
-    for (let i = 0; i < violations.length; i++) {
-      const a = violations[i];
-      const b = results.cpuViolations[i];
-      assert(a.kind === b.kind && Math.abs(a.start - b.start) < 0.05 && Math.abs(a.end - b.end) < 0.05, `violation ${i} differs via ${route}: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
-    }
+    sameViolations(`the ${route} route against the CPU scan`, violations, results.cpuViolations, 0.05, ['start', 'end']);
     results[`gpuScan_${route}`] = { ms: scan.ms, violations };
     // the live monitor feeds the <video> element by its own routes
     await page.check('#liveToggle');
@@ -1942,7 +1844,8 @@ try {
   // the switch in the header turns it off: the file is scanned and nothing more
   await page.uncheck('#autoToggle');
   await openFile('steady.mp4');
-  await page.waitForTimeout(800);
+  // (its scan done, or taken from the last visit: what an unattended run would start after)
+  await page.waitForFunction(() => window.__unflash.state.project.scan && !window.__unflash.state.job, null, { timeout: 120000 });
   assert(await page.$eval('#auto', (e) => e.classList.contains('hidden')), 'with auto-fix off, opening a file starts no unattended run');
   assert(await page.evaluate(() => !window.__unflash.auto), 'no run was started');
   await page.check('#autoToggle');
@@ -1965,10 +1868,7 @@ try {
 } finally {
   fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 2));
   if (errors.length) console.log('BROWSER ERRORS:\n' + errors.join('\n'));
-  if (!process.argv.includes('--keep')) {
-    await browser.close();
-    srv.close();
-  }
+  if (!process.argv.includes('--keep')) await close();
 }
 if (errors.length) {
   console.log('FAILED: browser errors');

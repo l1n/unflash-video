@@ -33,14 +33,13 @@ const PAD = 6;
 
 export class Tour {
   /**
-   * `onEnd(how, shown)` is called once, `how` 'done' (the last step's
-   * button) or 'skipped' (skip, Esc, a click outside the card), `shown` the
-   * steps that were shown.
+   * `onEnd(how)` is called once, `how` 'done' (the last step's button),
+   * 'skipped' (skip, Esc, a click outside the card) or 'empty' (none of the
+   * steps was on screen: the tour never showed).
    */
-  constructor(steps, { onEnd = null, label = 'Tour' } = {}) {
+  constructor(steps, { onEnd }) {
     this.steps = steps.filter(stepShowable);
     this.onEnd = onEnd;
-    this.label = label;
     this.i = -1;
     this.el = null;
     this.target = null;
@@ -55,7 +54,7 @@ export class Tour {
 
   start() {
     if (!this.steps.length) {
-      if (this.onEnd) this.onEnd('empty', 0);
+      this.onEnd('empty');
       return false;
     }
     this.returnFocus = document.activeElement;
@@ -113,7 +112,7 @@ export class Tour {
     this.i = i;
     // a target gone since the tour began (a menu closed): the card goes in the middle
     this.target = resolve(step.target);
-    const label = step.label || this.label;
+    const label = step.label;
     this.el.querySelector('.tour-count').textContent = this.steps.length > 1 ? `${label} · ${i + 1} of ${this.steps.length}` : label;
     this.el.querySelector('.tour-title').textContent = step.title || '';
     this.el.querySelector('.tour-text').innerHTML = step.html || '';
@@ -147,7 +146,7 @@ export class Tour {
     this.el = null;
     const back = this.returnFocus;
     if (back && back.isConnected && back.focus) back.focus({ preventScroll: true });
-    if (this.onEnd) this.onEnd(how, this.i + 1);
+    this.onEnd(how);
   }
 
   key(e) {
@@ -179,8 +178,10 @@ export class Tour {
       return;
     }
     // the page's own keys (the marks, say) wait until the tour is over;
-    // a button on the card still takes Enter and space
+    // a button on the card still takes Enter and space, and the browser
+    // its own shortcuts (zoom, find, reload)
     e.stopPropagation();
+    if (e.ctrlKey || e.metaKey || e.altKey || /^F\d+$/.test(e.key)) return;
     if (!(inCard && (e.key === 'Enter' || e.key === ' '))) e.preventDefault();
   }
 

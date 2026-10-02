@@ -10,32 +10,19 @@
 // Then how an export ends when the later of two spans fails, and the sound
 // copied as it is (from flash.mp4: AAC beside VP9).
 //   node tests/e2e/splice.mjs
-import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
 import fs from 'node:fs';
-import { serve } from './server.mjs';
+import { ROOT, WEB, MEDIA, assert, chromium, watch } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const WEB = path.join(ROOT, 'web');
 const CLIPS = path.join(WEB, 'clips');
 fs.mkdirSync(CLIPS, { recursive: true });
 for (const f of ['splice_a.mp4', 'splice_b.mp4']) fs.copyFileSync(path.join(ROOT, 'tests/media/h264', f), path.join(CLIPS, f));
-fs.copyFileSync(path.join(ROOT, 'tests/media/e2e/flash.mp4'), path.join(CLIPS, 'flash.mp4'));
+fs.copyFileSync(path.join(MEDIA, 'flash.mp4'), path.join(CLIPS, 'flash.mp4'));
 
-function assert(cond, msg) {
-  if (!cond) throw new Error('ASSERT: ' + msg);
-}
-
-const { chromium } = await loadPlaywright();
-const { srv, port } = await serve(WEB);
-const browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader'] });
+const { browser, port, close } = await chromium();
 const page = await browser.newPage();
 const errors = [];
-page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
-page.on('console', (m) => {
-  if (m.type() === 'error') errors.push('console: ' + m.text());
-  if (process.env.E2E_VERBOSE) console.log('[browser]', m.type(), m.text());
-});
+watch(page, errors);
 await page.goto(`http://127.0.0.1:${port}/?auto=0&cpu=1`);
 await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
 
@@ -131,12 +118,6 @@ const r = await page.evaluate(async () => {
   const candidate = { label: 'stand-in H.264', config: { codec: 'avc1.64000A', width: a.width, height: a.height } };
   const project = { sectionsSorted: () => [], sections: [] };
   const env = { wasm, feeder: null };
-  const paramSets = (desc) => {
-    const nsps = desc[5] & 31;
-    let p = 6;
-    for (let i = 0; i < nsps; i++) p += 2 + ((desc[p] << 8) | desc[p + 1]);
-    return [nsps, desc[p]];
-  };
   // what a record carries after its parameter sets (a High profile's chroma format and bit depths)
   const recordTail = (desc) => {
     let p = 6;
@@ -168,7 +149,8 @@ const r = await page.evaluate(async () => {
     }
     const timingInfo = { editShift: m.video.edit_shift, first: Array.from({ length: 6 }, (_, i) => [m.v.ptsTicks[i], m.v.dtsTicks[i]]) };
     const record = m.dx.track_description(m.video.index);
-    return { name, mode: res.mode, spans: res.spans, frames: res.frames, copied: res.copied, parallel: res.parallel, codec: res.codec, plan: plan.pieces.map((p) => `${p.kind} ${p.from}-${p.to}`), paramSets: paramSets(record), tail: recordTail(record), outFrames: ho.length, mismatches, timing, timingInfo, keyRequests: encoded.filter((e) => e.key).map((e) => e.t), size: res.blob.size, hasAudio: !!m.audio };
+    const sets = avccSets(record);
+    return { name, mode: res.mode, spans: res.spans, frames: res.frames, copied: res.copied, parallel: res.parallel, codec: res.codec, plan: plan.pieces.map((p) => `${p.kind} ${p.from}-${p.to}`), paramSets: [sets.sps.length, sets.pps.length], tail: recordTail(record), outFrames: ho.length, mismatches, timing, timingInfo, keyRequests: encoded.filter((e) => e.key).map((e) => e.t), size: res.blob.size, hasAudio: !!m.audio };
   };
   const results = {};
   // one span in the middle: GOP 1 (frames 10..19, an IDR every 10 frames)
@@ -377,5 +359,4 @@ assert(sc.mode === 'smart' && sc.copied > 0 && sc.sound && sc.pictures, 'the sam
 assert(sc.runs < sc.packets && sc.soundReads === sc.runs, `the sound is copied a run of samples at a time: ${sc.soundReads} reads for ${sc.runs} runs of ${sc.packets} packets`);
 assert(sc.cancelled === 'cancelled' && sc.readsBeforeStop === 1, 'a cancel stops the copy of the sound: ' + JSON.stringify({ cancelled: sc.cancelled, reads: sc.readsBeforeStop }));
 console.log('SPLICE OK');
-await browser.close();
-srv.close();
+await close();

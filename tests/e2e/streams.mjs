@@ -13,19 +13,10 @@
 // An MKV with two sound tracks, the first ALAC (which no browser plays),
 // takes the second, and the export says which it kept and why.
 //   node tests/e2e/streams.mjs
-import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
-import { serve } from './server.mjs';
+import { MEDIA, OUT, assert, chromium, watch, job, open as openFile, scan, flashesAsInTheMp4 } from './playwright.mjs';
 import { PcmDecoder } from '../../web/audiodec.js';
 import { readsAsTheMp4 } from './ts-parity.mjs';
-
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const WEB = path.join(ROOT, 'web');
-const MEDIA = path.join(ROOT, 'tests/media/e2e');
-
-function assert(cond, msg) {
-  if (!cond) throw new Error('ASSERT: ' + msg);
-}
 
 // --- the PCM decoder on its own: each form, two channels ---------------------
 {
@@ -64,37 +55,21 @@ function assert(cond, msg) {
   console.log('PCM decoder: every form OK');
 }
 
-const { chromium } = await loadPlaywright();
-const { srv, port } = await serve(WEB);
-const browser = await chromium.launch({
-  headless: true,
-  channel: 'chromium',
-  args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--autoplay-policy=no-user-gesture-required'],
-});
+const { browser, port, close } = await chromium(['--autoplay-policy=no-user-gesture-required']);
 const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
 const errors = [];
-page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
 // (a crashed page leaves what waits on it waiting: end the run instead)
 page.on('crash', () => {
   console.error('the page crashed');
   process.exitCode = 1;
   browser.close();
 });
-page.on('console', (m) => {
-  if (m.type() === 'error' && !/Failed to load resource|MEDIA_ERR|DEMUXER_ERROR|PIPELINE_ERROR/i.test(m.text())) errors.push('console: ' + m.text());
-  if (process.env.E2E_VERBOSE) console.log('[browser]', m.type(), m.text());
-});
-const jobDone = (timeout = 300000) => page.waitForFunction(() => document.querySelector('#jobbar').classList.contains('hidden') && !window.__unflash.state.job, null, { timeout });
-const bannerText = () => page.evaluate(() => (document.querySelector('#banner').classList.contains('hidden') ? '' : document.querySelector('#bannerText').textContent));
+watch(page, errors, /Failed to load resource|MEDIA_ERR|DEMUXER_ERROR|PIPELINE_ERROR/i);
 const results = {};
 
-/** Open `name` as the user does, and wait until it is open. */
+/** Open `name` as the user does, and wait until it is open: what it is. */
 async function open(name) {
-  await page.setInputFiles('#fileInput', path.join(MEDIA, name));
-  await page.waitForFunction((n) => document.querySelector('#videoInfo').textContent.includes(n), name, { timeout: 60000 });
-  await jobDone();
-  const b = await bannerText();
-  assert(!b || (await page.evaluate(() => document.querySelector('#banner').classList.contains('info'))), `${name}: opening it raised: ${b}`);
+  await openFile(page, path.join(MEDIA, name));
   return page.evaluate(() => {
     const m = window.__unflash.state.movie;
     return { format: m.format, video: m.video.codec, audio: m.audio && m.audio.codec, copyable: m.audio && m.audio.copyable, frames: m.frameCount, fps: m.fps, duration: m.duration, info: document.querySelector('#videoInfo').textContent };
@@ -102,21 +77,7 @@ async function open(name) {
 }
 
 /** Scan the open video; its violations. */
-async function scan() {
-  await page.click('#btnScan');
-  await page.waitForFunction(() => !document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout: 30000 }).catch(() => {});
-  await jobDone();
-  return page.evaluate(() => window.__unflash.lastScan.result.violations);
-}
-
-/** The flash clip's flashing: a general flash at 3.9-5.5 s, a red one at 7.9-8.5 s. */
-function flashesAsInTheMp4(name, v) {
-  const gen = v.find((x) => x.kind === 'flash');
-  const red = v.find((x) => x.kind === 'red');
-  console.log(`${name}: violations`, JSON.stringify(v.map((x) => [x.kind, x.start.toFixed(2), x.end.toFixed(2)])));
-  assert(gen && gen.start > 3.5 && gen.start < 4.6 && gen.end > 5.2 && gen.end < 5.8, `${name}: general flash at 3.9-5.5 s: ${JSON.stringify(gen)}`);
-  assert(red && red.start > 7.5 && red.start < 8.6 && red.end > 8.2 && red.end < 8.8, `${name}: red flash at 7.9-8.5 s: ${JSON.stringify(red)}`);
-}
+const violations = async () => (await scan(page)).violations;
 
 /**
  * The open video's sound, decoded as the section player and the export
@@ -168,9 +129,7 @@ async function exportAsItIs() {
   await page.click('#btnExport');
   await page.waitForSelector('#exportModal', { state: 'visible' });
   const plan = await page.textContent('#exportPlan');
-  await page.click('#btnDoExport');
-  await page.waitForFunction(() => !document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout: 30000 }).catch(() => {});
-  await jobDone(600000);
+  await job(page, () => page.click('#btnDoExport'), 600000);
   await page.waitForFunction(() => !document.querySelector('#btnVerifyExport').disabled, null, { timeout: 60000 });
   const result = await page.textContent('#exportResult');
   const exported = await page.evaluate(async () => {
@@ -212,13 +171,13 @@ try {
   console.log('flash.ts', JSON.stringify(results.ts));
   assert(results.ts.format === 'mpegts' && /^avc1\./.test(results.ts.video) && results.ts.audio === 'mp4a.40.2' && results.ts.copyable, `flash.ts: its tracks: ${JSON.stringify(results.ts)}`);
   assert(results.ts.frames === 300 && Math.abs(results.ts.fps - 30) < 0.01 && Math.abs(results.ts.duration - 10) < 0.05, `flash.ts: 300 frames at 30 fps: ${JSON.stringify(results.ts)}`);
-  flashesAsInTheMp4('flash.ts', await scan());
+  flashesAsInTheMp4('flash.ts', await violations());
 
   // --- the .m2ts: scanned, its AC-3 sound played by the app's decoder, exported --
   results.m2ts = await open('flash_ac3.m2ts');
   console.log('flash_ac3.m2ts', JSON.stringify(results.m2ts));
   assert(results.m2ts.format === 'mpegts' && results.m2ts.audio === 'ac-3' && results.m2ts.frames === 300, `flash_ac3.m2ts: its tracks: ${JSON.stringify(results.m2ts)}`);
-  flashesAsInTheMp4('flash_ac3.m2ts', await scan());
+  flashesAsInTheMp4('flash_ac3.m2ts', await violations());
   results.m2tsSound = await decodedSound();
   console.log('flash_ac3.m2ts sound:', JSON.stringify(results.m2tsSound));
   assert(results.m2tsSound.builtIn === 'AC-3' && Math.abs(results.m2tsSound.seconds - 10) < 0.1 && results.m2tsSound.peak > 0.1, `the AC-3 sound decodes, by the app's own decoder, to ten seconds of tone: ${JSON.stringify(results.m2tsSound)}`);
@@ -272,9 +231,8 @@ try {
 } catch (e) {
   console.error(e);
   console.error(JSON.stringify(results));
-  await page.screenshot({ path: path.join(ROOT, 'tests/e2e/out/streams-failure.png') }).catch(() => {});
+  await page.screenshot({ path: path.join(OUT, 'streams-failure.png') }).catch(() => {});
   process.exitCode = 1;
 } finally {
-  await browser.close();
-  srv.close();
+  await close();
 }

@@ -11,25 +11,13 @@
 // a picture), as a slow machine's is, so that the decoders get ahead on a
 // short clip.
 //   node tests/e2e/busy.mjs
-import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
-import { serve } from './server.mjs';
+import { MEDIA, assert, chromium, idle, job, open } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const WEB = path.join(ROOT, 'web');
-const MEDIA = path.join(ROOT, 'tests/media/e2e');
-
-function assert(cond, msg) {
-  if (!cond) throw new Error('ASSERT: ' + msg);
-}
-
-const { chromium } = await loadPlaywright();
-const { srv, port } = await serve(WEB);
-const browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist'] });
+const { browser, port, close } = await chromium();
 const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 const errors = [];
 page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
-const idle = () => page.waitForFunction(() => !window.__unflash.state.job && document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout: 180000 });
 /** From now on, the tasks that keep the page's thread 50 ms or more (window.__long), and a slow machine's detector: 6 ms more a picture. */
 const slowDetector = () =>
   page.evaluate(() => {
@@ -53,9 +41,7 @@ try {
   // the one the detector is on
   await page.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0&chunk=2&segments=3`);
   await page.waitForFunction(() => window.__unflash && window.__unflash.changes, null, { timeout: 30000 });
-  await page.setInputFiles('#fileInput', path.join(MEDIA, 'flash.webm'));
-  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash.webm'), null, { timeout: 60000 });
-  await idle();
+  await open(page, path.join(MEDIA, 'flash.webm'));
   await slowDetector();
   await page.evaluate(() => {
     // every word the page says, as it says it
@@ -71,7 +57,7 @@ try {
   await page.setInputFiles('#fileInput', path.join(MEDIA, 'steady.mp4'));
   await page.selectOption('#profileSel', 'wcag');
   const during = await page.evaluate(() => !!(window.__unflash.state.job && window.__unflash.state.scanning));
-  await idle();
+  await idle(page, 180000);
   const r = await page.evaluate(() => {
     window.__unslow();
     const u = window.__unflash;
@@ -106,13 +92,9 @@ try {
   // decoded were fed to it one after another, without a turn for the page
   await page.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0`);
   await page.waitForFunction(() => window.__unflash && window.__unflash.changes, null, { timeout: 30000 });
-  await page.setInputFiles('#fileInput', path.join(MEDIA, 'flash_hevc.mp4'));
-  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash_hevc.mp4'), null, { timeout: 60000 });
-  await idle();
+  await open(page, path.join(MEDIA, 'flash_hevc.mp4'));
   await slowDetector();
-  await page.click('#btnScan');
-  await page.waitForFunction(() => window.__unflash.state.job && window.__unflash.state.job.name === 'Scanning for flashes', null, { timeout: 10000 });
-  await idle();
+  await job(page, () => page.click('#btnScan'), 180000);
   const b = await page.evaluate(() => {
     window.__unslow();
     const u = window.__unflash;
@@ -128,6 +110,5 @@ try {
   console.error(e);
   process.exitCode = 1;
 } finally {
-  await browser.close();
-  srv.close();
+  await close();
 }

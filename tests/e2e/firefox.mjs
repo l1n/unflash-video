@@ -15,38 +15,13 @@
 // stream is read as ffmpeg reads it, scanned, and its AC-3 sound decoded.
 //   FIREFOX=/path/to/firefox node tests/e2e/firefox.mjs
 // (puppeteer-core found locally or globally: npm install -g puppeteer-core)
-import { createRequire } from 'node:module';
 import { execSync } from 'node:child_process';
-import fs from 'node:fs';
 import path from 'node:path';
 import { serve } from './server.mjs';
 import { readsAsTheMp4 } from './ts-parity.mjs';
+import { WEB, MEDIA, assert, loadPuppeteer, FIREFOX_PREFS, FirefoxPage, idle, job, open, scan, sameViolations } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const WEB = path.join(ROOT, 'web');
-const MEDIA = path.join(ROOT, 'tests/media/e2e');
 const CLIP = 'flash.webm';
-
-function assert(cond, msg) {
-  if (!cond) throw new Error('ASSERT: ' + msg);
-}
-
-async function loadPuppeteer() {
-  const require = createRequire(import.meta.url);
-  const candidates = [];
-  try {
-    candidates.push(require.resolve('puppeteer-core'));
-  } catch (e) {
-    /* not local */
-  }
-  try {
-    candidates.push(`${execSync('npm root -g', { encoding: 'utf8' }).trim()}/puppeteer-core/lib/puppeteer/puppeteer-core.js`);
-  } catch (e) {
-    /* no npm */
-  }
-  for (const c of candidates) if (fs.existsSync(c)) return (await import(c)).default;
-  throw new Error('puppeteer-core not found; npm install -g puppeteer-core');
-}
 
 function firefoxPath() {
   if (process.env.FIREFOX) return process.env.FIREFOX;
@@ -58,46 +33,25 @@ function firefoxPath() {
 }
 
 const puppeteer = await loadPuppeteer();
+if (!puppeteer) throw new Error('puppeteer-core not found; npm install -g puppeteer-core');
 const { srv, port } = await serve(WEB);
-// WebGPU on the software adapter lavapipe gives it, where it is not on by default
-const prefs = { 'dom.webgpu.enabled': true, 'gfx.webgpu.ignore-blocklist': true, 'gfx.webgpu.force-enabled': true, 'dom.webgpu.allow-software-adapter': true };
-const browser = await puppeteer.launch({ browser: 'firefox', executablePath: firefoxPath(), headless: true, extraPrefsFirefox: prefs, protocolTimeout: 600000 });
+const browser = await puppeteer.launch({ browser: 'firefox', executablePath: firefoxPath(), headless: true, extraPrefsFirefox: FIREFOX_PREFS, protocolTimeout: 600000 });
 const errors = [];
 const results = {};
 
+/** A page at `?query`, as Playwright's (FirefoxPage), once the app is up. */
 async function newPage(query) {
-  const page = await browser.newPage();
-  page.on('pageerror', (e) => errors.push(`pageerror (${query}): ${e.message}`));
-  await page.goto(`http://127.0.0.1:${port}/?${query}`, { waitUntil: 'load' });
-  await page.waitForFunction(() => window.__unflash && window.__unflash.changes, { timeout: 60000 });
+  const p = await browser.newPage();
+  p.on('pageerror', (e) => errors.push(`pageerror (${query}): ${e.message}`));
+  const page = new FirefoxPage(p);
+  await page.goto(`http://127.0.0.1:${port}/?${query}`);
+  await page.waitForFunction(() => window.__unflash && window.__unflash.changes, null, { timeout: 60000 });
   return page;
 }
-const idle = (page, timeout = 300000) => page.waitForFunction(() => !window.__unflash.state.job && document.querySelector('#jobbar').classList.contains('hidden'), { timeout, polling: 100 });
-async function openClip(page, name = CLIP) {
-  await (await page.$('#fileInput')).uploadFile(path.join(MEDIA, name));
-  await page.waitForFunction((n) => document.querySelector('#videoInfo').textContent.includes(n), { timeout: 120000 }, name);
-  await idle(page);
-}
-const scanned = (page) =>
-  page.evaluate(() => {
-    const s = window.__unflash.lastScan;
-    return { ms: Math.round(s.elapsedMs), frames: s.frames, held: s.result.held, violations: s.result.violations, chunked: s.chunked || null, report: window.__unflash.debugReport() };
-  });
-async function scan(page) {
-  await page.click('#btnScan');
-  await page.waitForFunction(() => window.__unflash.state.job, { timeout: 30000, polling: 20 }).catch(() => {});
-  await idle(page);
-  return scanned(page);
-}
+const openClip = (page, name = CLIP) => open(page, path.join(MEDIA, name));
 function same(name, r, w) {
   assert(r.frames === w.frames && r.held === w.held, `${name}: frames ${r.frames} (held ${r.held}) vs ${w.frames} (held ${w.held})`);
-  assert(r.violations.length > 0 && r.violations.length === w.violations.length, `${name}: the same violations: ${JSON.stringify(r.violations)} vs ${JSON.stringify(w.violations)}`);
-  for (let i = 0; i < r.violations.length; i++) {
-    const a = r.violations[i];
-    const b = w.violations[i];
-    const ok = a.kind === b.kind && ['start', 'end', 'onset', 'peak', 'count'].every((k) => Math.abs(a[k] - b[k]) < 1e-6);
-    assert(ok, `${name}: violation ${i} differs: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
-  }
+  sameViolations(name, r.violations, w.violations);
 }
 
 try {
@@ -120,8 +74,8 @@ try {
       s.dispatchEvent(new Event('input', { bubbles: true }));
       return document.querySelector('#exportQualityText').textContent;
     });
-    await q.reload({ waitUntil: 'load' });
-    await q.waitForFunction(() => window.__unflash && window.__unflash.changes, { timeout: 60000 });
+    await q.reload();
+    await q.waitForFunction(() => window.__unflash && window.__unflash.changes, null, { timeout: 60000 });
     results.quality = { set, after: await q.evaluate(() => [document.querySelector('#exportQuality').value, document.querySelector('#exportQualityText').textContent]) };
     await q.close();
     console.log('export quality, set and after a reload:', JSON.stringify(results.quality));
@@ -154,10 +108,13 @@ try {
     new MutationObserver(() => window.__toasts.push(t.textContent)).observe(t, { childList: true, characterData: true, subtree: true });
   });
   await page.click('#btnScan');
-  await page.waitForFunction(() => window.__unflash.state.job, { timeout: 30000, polling: 20 });
+  await page.waitForFunction(() => window.__unflash.state.job, null, { timeout: 30000, polling: 20 });
   await page.click('#btnScan');
   await idle(page);
-  results.gpu = await scanned(page);
+  results.gpu = await page.evaluate(() => {
+    const s = window.__unflash.lastScan;
+    return { ms: Math.round(s.elapsedMs), frames: s.frames, held: s.result.held, violations: s.result.violations };
+  });
   const held = await page.evaluate(() => {
     clearInterval(window.__tick);
     return { gaps: window.__gaps.slice().sort((a, b) => b - a).slice(0, 5).map(Math.round), toasts: window.__toasts };
@@ -170,19 +127,18 @@ try {
 
   // --- a section: prepared through the workers, checked, fixed ---------------
   await page.click('#sectionList .sec-item');
-  await page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), { timeout: 180000, polling: 200 });
-  results.sectionBefore = await page.$eval('#wsVerdict', (e) => e.textContent);
+  await page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout: 180000, polling: 200 });
+  const verdict = () => page.evaluate(() => document.querySelector('#wsVerdict').textContent);
+  results.sectionBefore = await verdict();
   assert(/^fails/.test(results.sectionBefore), 'the first section fails as it is: ' + results.sectionBefore);
-  await page.click('#btnSuggestFewest');
-  await page.waitForFunction(() => window.__unflash.state.job, { timeout: 30000, polling: 20 }).catch(() => {});
-  await idle(page);
-  await page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), { timeout: 60000, polling: 200 });
-  results.sectionAfter = await page.$eval('#wsVerdict', (e) => e.textContent);
+  await job(page, () => page.click('#btnSuggestFewest'));
+  await page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout: 60000, polling: 200 });
+  results.sectionAfter = await verdict();
   console.log('section:', results.sectionBefore, '→ after fewest removals:', results.sectionAfter);
   assert(/^passes/.test(results.sectionAfter), 'fewest removals fixes it: ' + results.sectionAfter);
   // the export dialog: the file's name, and how to have Firefox ask where to save it (it has no save dialog for pages)
   await page.click('#btnExport');
-  await page.waitForFunction(() => !document.querySelector('#exportModal').classList.contains('hidden') && document.querySelector('#exportName').value, { timeout: 30000, polling: 100 });
+  await page.waitForFunction(() => !document.querySelector('#exportModal').classList.contains('hidden') && document.querySelector('#exportName').value, null, { timeout: 30000 });
   results.exportWhere = await page.evaluate(() => ({ name: document.querySelector('#exportName').value, where: document.querySelector('#exportWhere').textContent }));
   assert(/\.unflashed\.mp4$/.test(results.exportWhere.name) && /Always ask you where to save files/.test(results.exportWhere.where), "in Firefox the export dialog says how to choose the folder: " + JSON.stringify(results.exportWhere));
   await page.click('#btnCloseExport');
@@ -225,7 +181,7 @@ try {
     i.hidden = true;
     document.body.append(i);
   });
-  await (await ts.$('#probeFiles')).uploadFile(path.join(MEDIA, 'flash_ac3.m2ts'), path.join(MEDIA, 'flash_ac3_m2ts.mp4'));
+  await ts.setInputFiles('#probeFiles', [path.join(MEDIA, 'flash_ac3.m2ts'), path.join(MEDIA, 'flash_ac3_m2ts.mp4')]);
   results.tsParity = await ts.evaluate(readsAsTheMp4, '#probeFiles');
   console.log('a transport stream, read as ffmpeg reads it:', JSON.stringify(results.tsParity));
   const p = results.tsParity[0];

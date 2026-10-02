@@ -12,9 +12,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseChangelog } from '../../web/changes.js';
 import { SCENES } from './whatsnew-scenes.mjs';
+import { ROOT, WEB } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const DIR = path.join(ROOT, 'web/whatsnew');
+const DIR = path.join(WEB, 'whatsnew');
 const problems = [];
 const log = parseChangelog(fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8'));
 const shots = JSON.parse(fs.readFileSync(path.join(DIR, 'shots.json'), 'utf8'));

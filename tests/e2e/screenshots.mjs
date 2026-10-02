@@ -3,28 +3,21 @@
 // section with what still fails, the same section fixed, and the export.
 // Written to web/screenshots/ (the site serves them too).
 //   node tests/e2e/screenshots.mjs
-import { loadPlaywright } from './playwright.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
-import { serve } from './server.mjs';
+import { WEB, MEDIA, chromium, idle, open, scan, still } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const WEB = path.join(ROOT, 'web');
-const MEDIA = path.join(ROOT, 'tests/media/e2e');
 const OUT = path.join(WEB, 'screenshots');
 fs.mkdirSync(OUT, { recursive: true });
 
-const { chromium } = await loadPlaywright();
-const { srv, port } = await serve(WEB);
-const browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist'] });
+const { browser, port, close } = await chromium();
 const VIEW = { width: 1280, height: 800 };
 const shot = async (page, name, clip) => {
-  await page.waitForTimeout(400);
+  await still(page);
   const file = path.join(OUT, `${name}.png`);
   await page.screenshot({ path: file, clip });
   console.log(`${name}.png: ${Math.round(fs.statSync(file).size / 1024)} KB`);
 };
-const idle = (page, timeout = 180000) => page.waitForFunction(() => !window.__unflash.state.job && document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout });
 
 try {
   // the start page, the tour on its first steps
@@ -41,12 +34,8 @@ try {
   page = await ctx.newPage();
   await page.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0`);
   await page.waitForFunction(() => window.__unflash && window.__unflash.changes, null, { timeout: 30000 });
-  await page.setInputFiles('#fileInput', path.join(MEDIA, 'flash.mp4'));
-  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash.mp4'), null, { timeout: 60000 });
-  await idle(page);
-  await page.click('#btnScan');
-  await page.waitForFunction(() => window.__unflash.state.project.scan, null, { timeout: 120000 });
-  await idle(page);
+  await open(page, path.join(MEDIA, 'flash.mp4'));
+  await scan(page);
   await page.click('#chartSpan button[data-span="0"]');
   // the pointer over the flashing, for the readout
   const box = await page.$eval('#chart', (c) => {
@@ -58,12 +47,8 @@ try {
   await shot(page, 'scan');
 
   // a section of the red-flash clip: what still fails
-  await page.setInputFiles('#fileInput', path.join(MEDIA, 'redflash.mp4'));
-  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('redflash.mp4'), null, { timeout: 60000 });
-  await idle(page);
-  await page.click('#btnScan');
-  await page.waitForFunction(() => window.__unflash.state.project.scan, null, { timeout: 120000 });
-  await idle(page);
+  await open(page, path.join(MEDIA, 'redflash.mp4'));
+  await scan(page);
   await page.click('#sectionList .sec-item');
   await page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout: 180000 });
   await idle(page);
@@ -98,6 +83,5 @@ try {
   console.error(e);
   process.exitCode = 1;
 } finally {
-  await browser.close();
-  srv.close();
+  await close();
 }

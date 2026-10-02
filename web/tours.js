@@ -12,6 +12,12 @@ import { Tour, stepShowable } from './tour.js';
 
 const GETTING_STARTED = ['start', 'video', 'section'];
 
+/** The element a part of the screen lives in (its group, its label). */
+const around = (sel, up) => () => {
+  const el = document.querySelector(sel);
+  return el && el.closest(up);
+};
+
 /** The tours: where each can be shown (`context`), and its steps. */
 export const TOURS = {
   start: {
@@ -25,7 +31,7 @@ export const TOURS = {
       { target: 'label.filebtn.primary', title: 'Open a video', html: 'Start here: open a video from your disk (MP4, MOV, MKV, WebM or a transport stream: .ts, .m2ts, .mts), or drop one anywhere on the page. It is scanned as soon as it opens, every frame of it.' },
       { target: 'table.clips', placement: 'top', title: 'Or try a test clip', html: 'No video to hand? Each of these short clips has a known problem in it. <b>open</b> loads one straight in.' },
       { target: '#profileSel', title: 'What counts as a problem', html: 'The default flags WCAG failures, and also extended flashes and stripe patterns: WCAG lets those through, but they still affect some viewers. <i>Exact WCAG only</i> and <i>Stricter than WCAG</i> are the other two.' },
-      { target: () => document.querySelector('#autoToggle') && document.querySelector('#autoToggle').closest('label'), title: 'Auto-fix', html: 'Tick this and a video is fixed unattended as soon as it opens: scanned, every problem fixed, exported and checked. Treat what it makes as a starting point: fixing by hand gives better results.' },
+      { target: around('#autoToggle', 'label'), title: 'Auto-fix', html: 'Tick this and a video is fixed unattended as soon as it opens: scanned, every problem fixed, exported and checked. Treat what it makes as a starting point: fixing by hand gives better results.' },
       { target: '#btnHome', title: 'The guide', html: "Everything explained: with a video open, every part of the screen, each with a <b>show me</b>, and the keys; and this tour again. <b>What's new</b>, beside it, lists every change, and anything new gets a short tour of its own." },
     ],
   },
@@ -48,7 +54,7 @@ export const TOURS = {
       { target: '#wsVerdict', title: 'Does it pass?', html: 'The section is checked the moment anything in it changes, with the video either side of it, exactly as the export will have it.' },
       { target: '#wsFindings', title: 'What still fails', html: 'Each problem that is left, with its frames and times and how to fix it. <b>select these frames</b> picks them out below.' },
       { target: '#frameGrid', placement: 'top', title: 'Every frame', html: 'A double-click shows a frame at full size, decoded from the file (to read a subtitle); S to XL make the thumbnails bigger. Click a frame to select it (shift-click for a run). Then <b>R</b> removes it (the frame before shows in its place), <b>F</b> the same with the frame after, <b>E</b> holds it for a second, <b>B</b> blends it with the frames either side, <b>K</b> keeps it out of every suggestion. The same key again takes the mark off; <b>Ctrl+Z</b> undoes.' },
-      { target: () => document.querySelector('#btnSuggestLight') && document.querySelector('#btnSuggestLight').closest('.group'), title: 'Suggestions', html: 'A first pass to work from. They choose by brightness alone, so look at what they did: they can take out a line of subtitles or an image that matters. Tick <b>selection only</b> to have them work on the frames you selected.' },
+      { target: around('#btnSuggestLight', '.group'), title: 'Suggestions', html: 'A first pass to work from. They choose by brightness alone, so look at what they did: they can take out a line of subtitles or an image that matters. Tick <b>selection only</b> to have them work on the frames you selected.' },
       { target: '#previewBar', title: 'Watch it', html: 'Plays the section with your marks, exactly as the export renders it; switch the player to <i>original</i> to compare. The sound is off to start with.' },
     ],
   },
@@ -84,12 +90,6 @@ export const TOURS = {
     context: 'any',
     steps: [{ target: '#btnHome', title: 'A guided tour', html: 'Like this one. The guide has the whole tour whenever you want it, and anything new gets a short tour of its own the first time you are where it is.' }],
   },
-};
-
-/** The element a part of the screen lives in (its group, its label). */
-const around = (sel, up) => () => {
-  const el = document.querySelector(sel);
-  return el && el.closest(up);
 };
 
 /**
@@ -223,7 +223,7 @@ export class TourGuide {
     if (byHand) this.ready(TOURS[ids[0]].context);
     const steps = ids.flatMap((id) => TOURS[id].steps.map((s) => ({ ...s, label: TOURS[id].label })));
     const tour = new Tour(steps, {
-      onEnd: (how, shown) => {
+      onEnd: (how) => {
         if (this.tour === tour) this.tour = null;
         // shown, or turned down: either way it has had its turn (a tour
         // with nothing on screen waits for its place)

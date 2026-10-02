@@ -62,7 +62,9 @@ def phase(t, hz):
     return int(math.floor(t * hz * 2)) % 2
 
 
-def times_2997(n):
+def times_2997(secs):
+    """The frame times of `secs` seconds at 29.97 fps."""
+    n = int(round(secs * 30000 / 1001))
     return [i * 1001 / 30000 for i in range(n)]
 
 
@@ -74,14 +76,13 @@ def gen_square(t, hz, frac, lo, hi, bg=20):
 
 
 def scenario_square(hz, secs, frac, lo, hi):
-    n = int(round(secs * 30000 / 1001))
-    ts = times_2997(n)
+    ts = times_2997(secs)
     return ts, [gen_square(t, hz, frac, lo, hi) for t in ts]
 
 
 def scenario_noise_drift(secs, amp):
-    n = int(round(secs * 30000 / 1001))
-    ts = times_2997(n)
+    ts = times_2997(secs)
+    n = len(ts)
     frames = []
     for i in range(n):
         base = 30 + (i * 170) // n
@@ -90,46 +91,9 @@ def scenario_noise_drift(secs, amp):
     return ts, frames
 
 
-def scenario_red_grey(secs, hz, grey):
-    n = int(round(secs * 30000 / 1001))
-    ts = times_2997(n)
-    frames = []
-    for t in ts:
-        f = np.empty((H, W, 3), np.uint8)
-        if phase(t, hz) == 0:
-            f[..., 0] = 255
-            f[..., 1] = 0
-            f[..., 2] = 0
-        else:
-            f[...] = grey
-        frames.append(f)
-    return ts, frames
-
-
-def scenario_red_equilum(secs, hz):
-    """Saturated red against a grey of the same relative luminance: no
-    luminance flash at all, only the colour moves."""
-    n = int(round(secs * 30000 / 1001))
-    ts = times_2997(n)
-    frames = []
-    for t in ts:
-        f = np.empty((H, W, 3), np.uint8)
-        if phase(t, hz) == 0:
-            f[..., 0] = 250
-            f[..., 1] = 0
-            f[..., 2] = 0
-        else:
-            f[..., 0] = 122
-            f[..., 1] = 124
-            f[..., 2] = 122
-        frames.append(f)
-    return ts, frames
-
-
 def scenario_red_pair(secs, hz, a, b):
     """The whole picture swapping between two colours."""
-    n = int(round(secs * 30000 / 1001))
-    ts = times_2997(n)
+    ts = times_2997(secs)
     frames = []
     for t in ts:
         f = np.empty((H, W, 3), np.uint8)
@@ -139,8 +103,7 @@ def scenario_red_pair(secs, hz, a, b):
 
 
 def scenario_pan_bar(secs):
-    n = int(round(secs * 30000 / 1001))
-    ts = times_2997(n)
+    ts = times_2997(secs)
     bw = W // 10
     frames = []
     for t in ts:
@@ -159,8 +122,7 @@ def scenario_repeat120(secs, hz):
 
 
 def scenario_vfr(secs, hz):
-    n = int(round(secs * 30000 / 1001))
-    base = times_2997(n)
+    base = times_2997(secs)
     ts = []
     for i, t in enumerate(base):
         if 60 <= i < 120:
@@ -173,15 +135,13 @@ def scenario_vfr(secs, hz):
 
 
 def scenario_ramp(secs):
-    n = int(round(secs * 30000 / 1001))
-    ts = times_2997(n)
+    ts = times_2997(secs)
     codes = [40, 75, 110, 145, 180, 145, 110, 75]
-    return ts, [solid(codes[i % 8]) for i in range(n)]
+    return ts, [solid(codes[i % 8]) for i in range(len(ts))]
 
 
 def scenario_partial(secs, hz, rw, rh):
-    n = int(round(secs * 30000 / 1001))
-    ts = times_2997(n)
+    ts = times_2997(secs)
     frames = []
     for t in ts:
         f = solid(20)
@@ -191,8 +151,7 @@ def scenario_partial(secs, hz, rw, rh):
 
 
 def scenario_red_noise(secs, hz, amp):
-    n = int(round(secs * 30000 / 1001))
-    ts = times_2997(n)
+    ts = times_2997(secs)
     x0, y0, x1, y1 = rect_centred(0.5)
     frames = []
     for i, t in enumerate(ts):
@@ -212,8 +171,10 @@ SCENARIOS = {
     "square4hz": (lambda: scenario_square(4.0, 6.0, 0.5, 20, 200), ["wcag"]),
     "square3hz": (lambda: scenario_square(3.0, 10.0, 0.5, 20, 200), ["wcag_ext", "wcag", "strict"]),
     "noise_drift": (lambda: scenario_noise_drift(8.0, 12), ["wcag_ext"]),
-    "red_grey": (lambda: scenario_red_grey(5.0, 4.0, 144), ["wcag"]),
-    "red_equilum": (lambda: scenario_red_equilum(5.0, 5.0), ["wcag"]),
+    "red_grey": (lambda: scenario_red_pair(5.0, 4.0, (255, 0, 0), 144), ["wcag"]),
+    # saturated red against a grey of the same relative luminance: no
+    # luminance flash at all, only the colour moves
+    "red_equilum": (lambda: scenario_red_pair(5.0, 5.0, (250, 0, 0), (122, 124, 122)), ["wcag"]),
     "pan_bar": (lambda: scenario_pan_bar(6.0), ["wcag_ext"]),
     "repeat120": (lambda: scenario_repeat120(4.0, 4.0), ["wcag"]),
     "vfr": (lambda: scenario_vfr(8.0, 4.0), ["wcag"]),

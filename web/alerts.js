@@ -24,8 +24,9 @@ export function saveAlertSettings(s) {
 
 /**
  * Two rising notes when a job went well, two falling ones when it did not.
- * The page has been clicked by then (a file was opened), which is what
- * browsers ask before a page may make a sound.
+ * The page has usually been clicked by then (a file was opened), which is
+ * what browsers ask before a page may make a sound; where the sound is
+ * held back (a file dropped on a fresh tab: no click), there is no beep.
  */
 export async function beep(ok = true) {
   const AC = window.AudioContext || window.webkitAudioContext;
@@ -33,7 +34,13 @@ export async function beep(ok = true) {
   let ctx;
   try {
     ctx = new AC();
-    if (ctx.state === 'suspended') await ctx.resume();
+    // (a sound held back leaves resume() waiting until a click: given up
+    // after a moment and closed, or every long job kept one more open)
+    if (ctx.state === 'suspended') await Promise.race([ctx.resume(), new Promise((r) => setTimeout(r, 1500))]);
+    if (ctx.state !== 'running') {
+      ctx.close().catch(() => {});
+      return false;
+    }
     const t0 = ctx.currentTime + 0.03;
     const notes = ok ? [880, 1318.5] : [659.25, 440];
     notes.forEach((f, i) => {
@@ -51,7 +58,7 @@ export async function beep(ok = true) {
       o.stop(s + 0.5);
     });
     setTimeout(() => ctx.close().catch(() => {}), 1500);
-    return ctx.state === 'running';
+    return true;
   } catch (e) {
     console.warn('[unflash] could not beep:', e);
     if (ctx) ctx.close().catch(() => {});

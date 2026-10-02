@@ -19,20 +19,15 @@
 //   node tests/e2e/whatsnew.mjs --list
 // (the Firefox scenes need FIREFOX=/path/to/firefox and puppeteer-core, as
 // tests/e2e/firefox.mjs does; without them they are left as they are)
-import { loadPlaywright } from './playwright.mjs';
-import { createRequire } from 'node:module';
-import { execFileSync, execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { serve } from './server.mjs';
 import { SCENES } from './whatsnew-scenes.mjs';
+import { WEB, MEDIA, OUT as TEST_OUT, chromium, loadPuppeteer, FIREFOX_PREFS, FirefoxPage, jobEnd, job, open } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const WEB = path.join(ROOT, 'web');
-const MEDIA = path.join(ROOT, 'tests/media/e2e');
 const OUT = path.join(WEB, 'whatsnew');
-const WORK = path.join(ROOT, 'tests/e2e/out/whatsnew');
+const WORK = path.join(TEST_OUT, 'whatsnew');
 const MANIFEST = path.join(OUT, 'shots.json');
 /** Pictures a second the films are sampled at. */
 const FPS = 30;
@@ -132,10 +127,6 @@ const OVERLAY = `(() => {
       return o;
     },
     view: { x: 0, y: 0, width: innerWidth, height: innerHeight },
-    pointer(show) {
-      make();
-      document.getElementById('demo-pointer').style.opacity = show ? '1' : '0';
-    },
     // a ring where the pointer is, as a click makes
     ring(x, y) {
       make();
@@ -168,12 +159,6 @@ const OVERLAY = `(() => {
       const draw = () => this.caption(label + ' ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s');
       draw();
       this.ticking = setInterval(draw, 100);
-    },
-    moveTo(x, y) {
-      make();
-      const p = document.getElementById('demo-pointer');
-      p.style.display = 'block';
-      p.style.transform = 'translate(' + (x - 1.5) + 'px,' + (y - 1.5) + 'px)';
     },
   };
   if (document.readyState === 'loading') addEventListener('DOMContentLoaded', make);
@@ -317,69 +302,6 @@ class ScreenshotFilm extends Film {
   }
 }
 
-/** A Firefox page (puppeteer-core) with the few calls of Playwright's that a scene makes. */
-class FirefoxPage {
-  constructor(page, viewport) {
-    this.p = page;
-    this.vp = viewport;
-    this.mouse = {
-      move: (x, y) => page.mouse.move(x, y),
-      down: () => page.mouse.down(),
-      up: () => page.mouse.up(),
-      click: (x, y, o = {}) => page.mouse.click(x, y, o.clickCount ? { count: o.clickCount, clickCount: o.clickCount } : {}),
-      wheel: (dx, dy) => page.mouse.wheel({ deltaX: dx, deltaY: dy }),
-    };
-    this.keyboard = page.keyboard;
-  }
-
-  goto(url) {
-    return this.p.goto(url, { waitUntil: 'load' });
-  }
-
-  reload() {
-    return this.p.reload({ waitUntil: 'load' });
-  }
-
-  waitForFunction(fn, arg, opts = {}) {
-    return this.p.waitForFunction(fn, { timeout: opts.timeout || 30000, polling: opts.polling || 100 }, arg);
-  }
-
-  evaluate(fn, arg) {
-    return this.p.evaluate(fn, arg);
-  }
-
-  async setInputFiles(sel, file) {
-    await (await this.p.$(sel)).uploadFile(file);
-  }
-
-  async selectOption(sel, value) {
-    await this.p.select(sel, value);
-  }
-
-  locator(sel) {
-    const p = this.p;
-    const one = {
-      scrollIntoViewIfNeeded: async () => {
-        const h = await p.$(sel);
-        if (h) await h.evaluate((e) => e.scrollIntoView({ block: 'nearest', inline: 'nearest' }));
-      },
-      boundingBox: async () => {
-        const h = await p.$(sel);
-        return h ? h.boundingBox() : null;
-      },
-    };
-    return { first: () => one };
-  }
-
-  viewportSize() {
-    return this.vp;
-  }
-
-  screenshot(o) {
-    return this.p.screenshot(o);
-  }
-}
-
 // ---- what a scene can do: the pointer, clicks, keys, captions, the camera ----
 export class Demo {
   constructor(page, port, film, size = SIZE, browser = 'chromium') {
@@ -489,9 +411,19 @@ export class Demo {
     await this.until(() => !window.__unflash.state.job && document.querySelector('#jobbar').classList.contains('hidden') && !(window.__unflash.state.auto && window.__unflash.state.auto.running), null, timeout);
   }
 
-  /** Until a job starts (or `ms` go by without one). */
-  async started(ms = 20000) {
-    await this.page.waitForFunction(() => !!window.__unflash.state.job, null, { timeout: ms, polling: 20 }).catch(() => {});
+  /**
+   * Do `act` (a click), which starts a job, until the job is over, however
+   * quickly it went, and nothing runs: what comes after the click filmed
+   * `f` times as fast.
+   */
+  async job(act, f = 1) {
+    const end = await jobEnd(this.page);
+    await act();
+    const over = async () => {
+      await end();
+      await this.idle();
+    };
+    await (f > 1 ? this.faster(over, f) : over());
   }
 
   /** Open a clip from the test media (or one made from them, `DERIVED`), as the file picker would. */
@@ -517,12 +449,6 @@ export class Demo {
       await sleep(ms);
       if (await this.eval(() => !window.__unflash.state.job)) return;
     }
-  }
-
-  async scan() {
-    await this.eval(() => document.querySelector('#btnScan').click());
-    await this.started();
-    await this.settled();
   }
 
   /** Open the section list's `n`th section (from 1), prepared and checked. */
@@ -760,11 +686,6 @@ export class Demo {
       await sleep(30);
     }
   }
-
-  /** The pointer leaves the picture, or comes back. */
-  async pointer(show) {
-    await this.eval((s) => window.__demo.pointer(s), !!show);
-  }
 }
 
 // ---- clips made from the test media for a scene ---------------------------
@@ -781,7 +702,6 @@ const DERIVED = {
   'flash-long-h264.mp4': (out) => concat(out, Array(13).fill('flash_h264.mp4')),
   // the flash clip at 1920×1080, twice over
   'flash-1080p.mp4': (out) => ffmpeg(['-stream_loop', '1', '-i', path.join(MEDIA, 'flash.mp4'), '-vf', 'scale=1920:1080:flags=bicubic', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-g', '60', '-pix_fmt', 'yuv420p', '-c:a', 'copy', out]),
-  // an hour of it in an MKV, which keeps no index: the whole file is read through to open it
   // six hours of MKV, of a still picture (550 MB): it keeps no index, so opening it reads it through
   'six-hours.mkv': (out) => {
     const list = out + '.txt';
@@ -893,14 +813,10 @@ function encode(name, parts) {
  * violations }`.
  */
 async function check(page, file) {
-  const name = path.basename(file);
-  await page.setInputFiles('#fileInput', file);
-  await page.waitForFunction((n) => document.querySelector('#videoInfo').textContent.includes(n), name, { timeout: 60000 });
-  await page.waitForFunction(() => !window.__unflash.state.job, null, { timeout: 60000 });
+  await open(page, file);
   await page.selectOption('#profileSel', 'strict');
   await page.waitForFunction(() => !window.__unflash.state.job && window.__unflash.state.project.profile === 'strict', null, { timeout: 60000 });
-  await page.click('#btnScan');
-  await page.waitForFunction(() => window.__unflash.state.project.scan && !window.__unflash.state.job, null, { timeout: 300000, polling: 100 });
+  await job(page, () => page.click('#btnScan'));
   return page.evaluate(() => {
     const s = window.__unflash.lastScan;
     return { frames: s.frames, profile: window.__unflash.state.project.profile, violations: s.result.violations.map((v) => ({ kind: v.kind, start: +v.start.toFixed(2), end: +v.end.toFixed(2) })) };
@@ -908,27 +824,6 @@ async function check(page, file) {
 }
 
 // ---- the browsers ------------------------------------------------------------
-const CHROMIUM_ARGS = ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--autoplay-policy=no-user-gesture-required', '--enable-blink-features=ForceEagerMeasureMemory'];
-// WebGPU on the software adapter lavapipe gives it, as in tests/e2e/firefox.mjs
-const FIREFOX_PREFS = { 'dom.webgpu.enabled': true, 'gfx.webgpu.ignore-blocklist': true, 'gfx.webgpu.force-enabled': true, 'dom.webgpu.allow-software-adapter': true, 'media.autoplay.default': 0 };
-
-async function loadPuppeteer() {
-  const require = createRequire(import.meta.url);
-  const candidates = [];
-  try {
-    candidates.push(require.resolve('puppeteer-core'));
-  } catch (e) {
-    /* not local */
-  }
-  try {
-    candidates.push(`${execSync('npm root -g', { encoding: 'utf8' }).trim()}/puppeteer-core/lib/puppeteer/puppeteer-core.js`);
-  } catch (e) {
-    /* no npm */
-  }
-  for (const c of candidates) if (fs.existsSync(c)) return (await import(c)).default;
-  return null;
-}
-
 /** A page in a fresh browser context, the overlay in it, and its film. */
 async function newPage(browsers, scene, part) {
   const viewport = scene.viewport || VIEW;
@@ -1012,16 +907,16 @@ fs.mkdirSync(WORK, { recursive: true });
 // the clips the scenes use, made now rather than while the camera runs
 for (const name of Object.keys(DERIVED)) if (scenes.some((s) => [s.setup, s.play].some((f) => f && String(f).includes(`'${name}'`)))) media(name);
 const manifest = fs.existsSync(MANIFEST) ? JSON.parse(fs.readFileSync(MANIFEST, 'utf8')) : {};
-const { chromium } = await loadPlaywright();
-const { srv, port } = await serve(WEB);
+// (films play by themselves, with their sound; ForceEagerMeasureMemory: performance.measureUserAgentSpecificMemory() answers at once)
+const { browser: chromiumBrowser, port, close } = await chromium(['--autoplay-policy=no-user-gesture-required', '--enable-blink-features=ForceEagerMeasureMemory']);
 let firefox = null;
 const browsers = {
-  chromium: await chromium.launch({ headless: true, channel: 'chromium', args: CHROMIUM_ARGS }),
+  chromium: chromiumBrowser,
   async firefox() {
     if (firefox) return firefox;
     const puppeteer = await loadPuppeteer();
     if (!puppeteer || !process.env.FIREFOX) throw new Error('a Firefox scene: set FIREFOX to its binary and install puppeteer-core');
-    firefox = await puppeteer.launch({ browser: 'firefox', executablePath: process.env.FIREFOX, headless: true, extraPrefsFirefox: FIREFOX_PREFS, protocolTimeout: 600000 });
+    firefox = await puppeteer.launch({ browser: 'firefox', executablePath: process.env.FIREFOX, headless: true, extraPrefsFirefox: { ...FIREFOX_PREFS, 'media.autoplay.default': 0 }, protocolTimeout: 600000 });
     return firefox;
   },
 };
@@ -1060,9 +955,8 @@ try {
     }
   }
 } finally {
-  await browsers.chromium.close();
+  await close();
   if (firefox) await firefox.close();
-  srv.close();
 }
 if (failed.length) {
   console.error('failed: ' + failed.join(' '));

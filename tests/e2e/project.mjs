@@ -6,33 +6,14 @@
 // The page keeps one connection to the database, and a save whose
 // transaction fails as it commits settles all the same.
 //   node tests/e2e/project.mjs
-import { loadPlaywright } from './playwright.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
-import { serve } from './server.mjs';
+import { MEDIA, OUT, assert, chromium, watch, idle, job, open } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const WEB = path.join(ROOT, 'web');
-const MEDIA = path.join(ROOT, 'tests/media/e2e');
-
-function assert(cond, msg) {
-  if (!cond) throw new Error('ASSERT: ' + msg);
-}
-
-const { chromium } = await loadPlaywright();
-const { srv, port } = await serve(WEB);
-const browser = await chromium.launch({
-  headless: true,
-  channel: 'chromium',
-  args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader'],
-});
+const { browser, port, close } = await chromium();
 const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
 const errors = [];
-page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
-page.on('console', (m) => {
-  if (m.type() === 'error' && !/Failed to load resource/i.test(m.text())) errors.push('console: ' + m.text());
-  if (process.env.E2E_VERBOSE) console.log('[browser]', m.type(), m.text());
-});
+watch(page, errors, /Failed to load resource/i);
 page.on('dialog', (d) => d.accept());
 // how many connections the page opens to IndexedDB
 await page.addInitScript(() => {
@@ -43,29 +24,21 @@ await page.addInitScript(() => {
     return open.apply(this, args);
   };
 });
-const jobDone = (timeout = 300000) => page.waitForFunction(() => document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout });
-const jobStarted = () => page.waitForFunction(() => !document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout: 30000 }).catch(() => {});
 const bannerText = () => page.evaluate(() => (document.querySelector('#banner').classList.contains('hidden') ? '' : document.querySelector('#bannerText').textContent));
 const sectionsNow = () => page.evaluate(() => window.__unflash.state.project.sections.map((s) => ({ id: s.id, start: s.start, end: s.end, edits: s.edits })));
 const clip = fs.readFileSync(path.join(MEDIA, 'flash.webm'));
 // the clip as a fresh file: each one gets its own modified time, as a copy would
-const openClip = async (name, buffer) => {
-  await page.setInputFiles('#fileInput', { name, mimeType: 'video/webm', buffer });
-  await page.waitForFunction((n) => document.querySelector('#videoInfo').textContent.includes(n), name, { timeout: 60000 });
-  await jobDone();
-};
+const openClip = (name, buffer) => open(page, { name, mimeType: 'video/webm', buffer });
 const results = {};
 
 try {
   await page.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0`);
   await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
   await openClip('flash.webm', clip);
-  await page.click('#btnScan');
-  await jobStarted();
-  await jobDone();
+  await job(page, () => page.click('#btnScan'));
   await page.click('#sectionList .sec-item');
   await page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout: 180000 });
-  await jobDone();
+  await idle(page);
   // an E and an R
   for (const [slot, key] of [
     [5, 'e'],
@@ -108,7 +81,7 @@ try {
   // the loaded section prepares and checks again when opened
   await page.click('#sectionList .sec-item');
   await page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout: 180000 });
-  await jobDone();
+  await idle(page);
   assert(await page.evaluate(() => window.__unflash.currentSection().prepared), 'the loaded section prepares when opened');
   await page.evaluate(() => window.__unflash.state.project.save());
   // every save and load so far through one connection (one each, never
@@ -145,9 +118,7 @@ try {
   await page.waitForFunction(() => !document.querySelector('#exportModal').classList.contains('hidden') && !document.querySelector('#btnDoExport').disabled, null, { timeout: 30000 });
   results.beforeExport = await page.textContent('#exportResult');
   assert(/An export stays here/.test(results.beforeExport) && (await page.$eval('#btnVerifyExport', (b) => b.disabled)), 'before an export the dialog says where one will be: ' + results.beforeExport);
-  await page.click('#btnDoExport');
-  await jobStarted();
-  await jobDone();
+  await job(page, () => page.click('#btnDoExport'));
   await page.waitForFunction(() => !document.querySelector('#btnVerifyExport').disabled, null, { timeout: 30000 });
   const exportedBytes = await page.evaluate(() => window.__unflash.state.exportBlob.size);
   await page.click('#btnCloseExport');
@@ -159,14 +130,10 @@ try {
   results.kept = { text: await page.textContent('#exportResult'), verify: !(await page.$eval('#btnVerifyExport', (b) => b.disabled)), download: !(await page.$eval('#exportDownload', (a) => a.classList.contains('hidden'))), bytes: await page.evaluate(() => window.__unflash.state.exportBlob && window.__unflash.state.exportBlob.size) };
   console.log('after a reload:', JSON.stringify(results.kept));
   assert(results.kept.verify && results.kept.download && results.kept.bytes === exportedBytes && /The export made at .* is still here/.test(results.kept.text), 'the export comes back with the video after a reload: ' + JSON.stringify(results.kept));
-  await page.click('#btnVerifyExport');
-  await jobStarted();
-  await jobDone();
+  await job(page, () => page.click('#btnVerifyExport'));
   await page.waitForFunction(() => /frames re-scanned/.test(document.querySelector('#exportResult').textContent), null, { timeout: 60000 });
   // a file saved elsewhere, checked from the dialog
-  await page.setInputFiles('#verifyFileInput', path.join(MEDIA, 'steady.mp4'));
-  await jobStarted();
-  await jobDone();
+  await job(page, () => page.setInputFiles('#verifyFileInput', path.join(MEDIA, 'steady.mp4')));
   await page.waitForFunction(() => /steady\.mp4: .*Passes WCAG/.test(document.querySelector('#exportResult').textContent), null, { timeout: 60000 });
   await page.click('#btnCloseExport');
   await page.evaluate(() => window.__unflash.state.project.save());
@@ -179,9 +146,7 @@ try {
   assert(/Restored the project saved for flash\.webm/.test(results.reopen.toast), 'and says so: ' + results.reopen.toast);
 
   // a project file for another video is turned down
-  await page.setInputFiles('#fileInput', path.join(MEDIA, 'steady.mp4'));
-  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('steady.mp4'), null, { timeout: 60000 });
-  await jobDone();
+  await open(page, path.join(MEDIA, 'steady.mp4'));
   await page.setInputFiles('#projectInput', { name: 'flash.unflash.json', mimeType: 'application/json', buffer: Buffer.from(text) });
   await page.waitForFunction(() => !document.querySelector('#banner').classList.contains('hidden'), null, { timeout: 10000 });
   results.mismatch = await bannerText();
@@ -216,9 +181,8 @@ try {
   console.log('PROJECT OK');
 } catch (e) {
   console.error(e);
-  await page.screenshot({ path: path.join(ROOT, 'tests/e2e/out/project-failure.png') }).catch(() => {});
+  await page.screenshot({ path: path.join(OUT, 'project-failure.png') }).catch(() => {});
   process.exitCode = 1;
 } finally {
-  await browser.close();
-  srv.close();
+  await close();
 }

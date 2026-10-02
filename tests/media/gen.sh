@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Generate small MP4 files (and ffprobe packet listings) for the demuxer and
-# muxer tests. Needs ffmpeg/ffprobe with libx264, libvpx-vp9 and libaom.
+# Generate small files for the demuxer and muxer tests, with what ffprobe
+# and ffmpeg read in them: MP4, MKV / WebM, MOV and MP4 with PCM sound, and
+# MPEG transport streams (each with ffmpeg's MP4 of it). Needs ffmpeg and
+# ffprobe with libx264, libx265, libvpx (VP8, VP9), libaom, libopus,
+# libvorbis and libmp3lame.
 set -euo pipefail
 cd "$(dirname "$0")"
 V="-f lavfi -i testsrc2=size=64x48:rate=30:duration=2"
@@ -30,18 +33,17 @@ done
 mkdir -p mkv
 (
   cd mkv
-  A48="-f lavfi -i sine=frequency=440:sample_rate=48000:duration=2"
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -profile:v high -bf 2 -g 15 -c:a aac -b:a 32k -shortest h264_aac.mkv
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -profile:v high -bf 2 -g 15 -c:a aac -b:a 32k -shortest h264_aac.mkv
   ffmpeg $common $V -f lavfi -i sine=frequency=440:sample_rate=44100:duration=2 -c:v libx264 -pix_fmt yuv420p -bf 0 -g 10 -c:a libmp3lame -b:a 64k -shortest h264_mp3.mkv
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a ac3 -ac 2 -b:a 192k -shortest h264_ac3.mkv
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a eac3 -ac 2 -b:a 192k -shortest h264_eac3.mkv
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a flac -shortest h264_flac.mkv
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a pcm_s16le -shortest h264_pcm.mkv
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a pcm_s24be -shortest h264_pcm_be.mkv
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a dca -strict -2 -shortest h264_dts.mkv
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 2 -g 15 -c:a aac -shortest -live 1 -f matroska live.mkv
-  ffmpeg $common $V $A48 -c:v libvpx-vp9 -b:v 100k -pix_fmt yuv420p -c:a libopus -b:a 48k -shortest vp9_opus.webm
-  ffmpeg $common $V $A48 -c:v libvpx -b:v 100k -c:a libvorbis -shortest vp8_vorbis.webm
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a ac3 -ac 2 -b:a 192k -shortest h264_ac3.mkv
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a eac3 -ac 2 -b:a 192k -shortest h264_eac3.mkv
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a flac -shortest h264_flac.mkv
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a pcm_s16le -shortest h264_pcm.mkv
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a pcm_s24be -shortest h264_pcm_be.mkv
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a dca -strict -2 -shortest h264_dts.mkv
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -bf 2 -g 15 -c:a aac -shortest -live 1 -f matroska live.mkv
+  ffmpeg $common $V $A -c:v libvpx-vp9 -b:v 100k -pix_fmt yuv420p -c:a libopus -b:a 48k -shortest vp9_opus.webm
+  ffmpeg $common $V $A -c:v libvpx -b:v 100k -c:a libvorbis -shortest vp8_vorbis.webm
   ffmpeg $common -f lavfi -i testsrc2=size=64x48:rate=30:duration=1 -f lavfi -i sine=frequency=440:sample_rate=48000:duration=1 -c:v libaom-av1 -cpu-used 8 -b:v 100k -pix_fmt yuv420p -c:a libopus -shortest av1_opus.webm || echo "av1 skipped"
   ffmpeg $common $V -c:v libx265 -x265-params log-level=none -pix_fmt yuv420p -g 15 -an hevc.mkv || echo "hevc skipped"
   # (ffprobe's hash is of the packets as demuxed; ffmpeg -c copy rewrites AV1's)
@@ -79,19 +81,18 @@ mkdir -p pcm
 mkdir -p ts
 (
   cd ts
-  A48="-f lavfi -i sine=frequency=440:sample_rate=48000:duration=2"
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 2 -g 15 -c:a aac -b:a 64k -shortest h264_aac.ts
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a ac3 -b:a 192k -shortest -mpegts_m2ts_mode 1 h264_ac3.m2ts
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a eac3 -b:a 192k -shortest h264_eac3.ts
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -g 12 -c:a mp2 -shortest h264_mp2.ts
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -flags +ildct+ilme -x264-params interlaced=1 -c:a aac -shortest h264_mbaff.ts
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -g 12 -c:a dca -strict -2 -shortest h264_dts.ts
-  ffmpeg $common $V $A48 -c:v libx265 -x265-params log-level=none -pix_fmt yuv420p -g 15 -c:a libmp3lame -b:a 64k -shortest hevc_mp3.ts || echo "hevc skipped"
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -bf 2 -g 15 -c:a aac -b:a 64k -shortest h264_aac.ts
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a ac3 -b:a 192k -shortest -mpegts_m2ts_mode 1 h264_ac3.m2ts
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -bf 1 -g 12 -c:a eac3 -b:a 192k -shortest h264_eac3.ts
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -g 12 -c:a mp2 -shortest h264_mp2.ts
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -flags +ildct+ilme -x264-params interlaced=1 -c:a aac -shortest h264_mbaff.ts
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -g 12 -c:a dca -strict -2 -shortest h264_dts.ts
+  ffmpeg $common $V $A -c:v libx265 -x265-params log-level=none -pix_fmt yuv420p -g 15 -c:a libmp3lame -b:a 64k -shortest hevc_mp3.ts || echo "hevc skipped"
   for f in *.ts *.m2ts; do
     ffmpeg $common -i "$f" -map 0 -c copy -f mp4 "$f.mp4"
   done
   # Blu-ray's LPCM, which an MP4 can't hold: ffprobe's packets (a PES each, its header in)
-  ffmpeg $common $V $A48 -c:v libx264 -pix_fmt yuv420p -g 12 -c:a pcm_bluray -shortest -mpegts_m2ts_mode 1 h264_lpcm.m2ts
+  ffmpeg $common $V $A -c:v libx264 -pix_fmt yuv420p -g 12 -c:a pcm_bluray -shortest -mpegts_m2ts_mode 1 h264_lpcm.m2ts
   ffprobe -v error -select_streams a:0 -show_entries "packet=pts_time,size" -of json h264_lpcm.m2ts > h264_lpcm.m2ts.audio.json
 )
 ls -la

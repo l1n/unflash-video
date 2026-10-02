@@ -160,7 +160,7 @@ function shotHtml(name, shots) {
  * its opening bold words (the whole of it when there are none). Where the
  * headline is not a sentence of its own, the rest is the whole change again.
  */
-export function briefly(html, film = '') {
+function briefly(html, film = '') {
   const m = /^<b>([\s\S]*?)<\/b>([\s\S]*)$/.exec(html);
   if (!m || (!m[2].trim() && !film)) return html + film;
   const head = m[1];

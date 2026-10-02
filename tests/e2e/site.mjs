@@ -13,19 +13,12 @@
 //   - a build replaced more than three days ago, or one that can't be
 //     copied as it was published, is left out; --keep bounds how many stay.
 //   node tests/e2e/site.mjs    (after ./build.sh)
-import { loadPlaywright } from './playwright.mjs';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { serve } from './server.mjs';
+import { ROOT, MEDIA, assert, chromium, open as openFile, scan as scanVideo } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const MEDIA = path.join(ROOT, 'tests/media/e2e');
 const OUT = path.join(ROOT, 'tests/e2e/out/site');
-
-function assert(cond, msg) {
-  if (!cond) throw new Error('ASSERT: ' + msg);
-}
 const site = (...args) => execFileSync('node', [path.join(ROOT, 'site.mjs'), ...args], { cwd: ROOT, encoding: 'utf8' });
 const versions = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'versions.json'), 'utf8'));
 
@@ -57,9 +50,7 @@ fs.copyFileSync(path.join(A, 'index.html'), path.join(B, 'index-aaaa.html'));
 fs.copyFileSync(path.join(ROOT, 'web/index.html'), path.join(B, 'index-unversioned.html'));
 
 // ---- in the browser ------------------------------------------------------------
-const { chromium } = await loadPlaywright();
-const { srv, port } = await serve(B);
-const browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--autoplay-policy=no-user-gesture-required'] });
+const { browser, port, close } = await chromium(['--autoplay-policy=no-user-gesture-required'], { root: B });
 const results = {};
 try {
   /** A page of the site, its requests for code (by folder) and anything not found. */
@@ -81,13 +72,9 @@ try {
     return { ctx, p, seen };
   }
   async function scan(p, name) {
-    await p.setInputFiles('#fileInput', path.join(MEDIA, name));
-    await p.waitForFunction((n) => document.querySelector('#videoInfo').textContent.includes(n), name, { timeout: 60000 });
-    await p.waitForFunction(() => !document.querySelector('#status').textContent.includes('ready ·'), null, { timeout: 60000 }).catch(() => {});
-    await p.click('#btnScan');
-    await p.waitForFunction(() => !!window.__unflash.state.job, null, { timeout: 30000, polling: 20 }).catch(() => {});
-    await p.waitForFunction(() => !window.__unflash.state.job && document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout: 300000 });
-    return p.evaluate(() => ({ builtIn: window.__unflash.state.movie.builtIn ? window.__unflash.state.movie.builtIn.name : null, violations: window.__unflash.lastScan.result.violations.length }));
+    await openFile(p, path.join(MEDIA, name));
+    const { violations } = await scanVideo(p);
+    return { builtIn: await p.evaluate(() => (window.__unflash.state.movie.builtIn ? window.__unflash.state.movie.builtIn.name : null)), violations: violations.length };
   }
   /** The decoders module's sound decoder, loaded as the app loads it (from the folder of the code it runs). */
   const soundDecoder = (p) =>
@@ -150,8 +137,7 @@ try {
     await ctx.close();
   }
 } finally {
-  await browser.close();
-  srv.close();
+  await close();
 }
 
 // ---- what is kept, and what not ---------------------------------------------------

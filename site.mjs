@@ -26,8 +26,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = path.dirname(new URL(import.meta.url).pathname);
+// (a file path, not a URL's: a checkout under a name with a space in it works too)
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const WEB = path.join(ROOT, 'web');
 /** Where the code goes, under the site: the app finds its build from this. */
 const CODE_DIR = 'v/';

@@ -6,34 +6,14 @@
 // verification. A file in a container Unflash does not read gets a message
 // that says what it is.
 //   node tests/e2e/mkv.mjs
-import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
-import { serve } from './server.mjs';
+import { MEDIA, OUT, assert, chromium, watch, idle, job, cancelledJob, open, scan, flashesAsInTheMp4 } from './playwright.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const WEB = path.join(ROOT, 'web');
-const MEDIA = path.join(ROOT, 'tests/media/e2e');
-
-function assert(cond, msg) {
-  if (!cond) throw new Error('ASSERT: ' + msg);
-}
-
-const { chromium } = await loadPlaywright();
-const { srv, port } = await serve(WEB);
-const browser = await chromium.launch({
-  headless: true,
-  channel: 'chromium',
-  args: ['--enable-unsafe-webgpu', '--use-angle=swiftshader', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--autoplay-policy=no-user-gesture-required'],
-});
+const { browser, port, close } = await chromium(['--autoplay-policy=no-user-gesture-required']);
 const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
 const errors = [];
-page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
-page.on('console', (m) => {
-  // (the player turning a file down, and the AVI this test opens on purpose, are expected)
-  if (m.type() === 'error' && !/Failed to load resource|MEDIA_ERR|DEMUXER_ERROR|PIPELINE_ERROR|This is an AVI file/i.test(m.text())) errors.push('console: ' + m.text());
-  if (process.env.E2E_VERBOSE) console.log('[browser]', m.type(), m.text());
-});
-const jobDone = (timeout = 300000) => page.waitForFunction(() => document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout });
+// (the player turning a file down, and the AVI this test opens on purpose, are expected)
+watch(page, errors, /Failed to load resource|MEDIA_ERR|DEMUXER_ERROR|PIPELINE_ERROR|This is an AVI file/i);
 const bannerText = () => page.evaluate(() => (document.querySelector('#banner').classList.contains('hidden') ? '' : document.querySelector('#bannerText').textContent));
 const results = {};
 
@@ -47,10 +27,7 @@ try {
     ['flash_vorbis.webm', { format: 'webm', video: /^vp09\./, audio: 'vorbis', copyable: false, exportAudio: /^(opus|mp4a\.40\.2)$/ }],
   ]) {
     const r = (results[name] = {});
-    await page.setInputFiles('#fileInput', path.join(MEDIA, name));
-    await page.waitForFunction((n) => document.querySelector('#videoInfo').textContent.includes(n), name, { timeout: 60000 });
-    await jobDone();
-    assert(!(await bannerText()) || (await page.evaluate(() => document.querySelector('#banner').classList.contains('info'))), `${name}: opening it raised: ${await bannerText()}`);
+    await open(page, path.join(MEDIA, name));
     r.movie = await page.evaluate(() => {
       const m = window.__unflash.state.movie;
       return { format: m.format, video: m.video.codec, audio: m.audio && m.audio.codec, copyable: m.audio && m.audio.copyable, frames: m.frameCount, fps: m.fps, duration: m.duration };
@@ -60,29 +37,19 @@ try {
     assert(r.movie.frames === 300 && Math.abs(r.movie.fps - 30) < 0.01 && Math.abs(r.movie.duration - 10) < 0.05, `${name}: 300 frames at 30 fps: ${JSON.stringify(r.movie)}`);
 
     // the scan finds what it finds in the MP4
-    await page.click('#btnScan');
-    await page.waitForFunction(() => !document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout: 30000 }).catch(() => {});
-    await jobDone();
-    const v = await page.evaluate(() => window.__unflash.lastScan.result.violations);
-    const gen = v.find((x) => x.kind === 'flash');
-    const red = v.find((x) => x.kind === 'red');
-    console.log(`${name}: violations`, JSON.stringify(v.map((x) => [x.kind, x.start.toFixed(2), x.end.toFixed(2)])));
-    assert(gen && gen.start > 3.5 && gen.start < 4.6 && gen.end > 5.2 && gen.end < 5.8, `${name}: general flash at 3.9-5.5 s: ${JSON.stringify(gen)}`);
-    assert(red && red.start > 7.5 && red.start < 8.6 && red.end > 8.2 && red.end < 8.8, `${name}: red flash at 7.9-8.5 s: ${JSON.stringify(red)}`);
+    flashesAsInTheMp4(name, (await scan(page)).violations);
     if (name === 'flash.webm') continue;
 
     // a section: prepared, fixed (keep dark), exported, verified
     await page.click('#sectionList .sec-item');
     await page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout: 180000 });
-    await jobDone();
+    await idle(page);
     await page.click('#btnSuggestDark');
     await page.waitForFunction(() => document.querySelector('#wsVerdict').textContent === 'passes', null, { timeout: 180000 });
     await page.click('#btnExport');
     await page.waitForSelector('#exportModal', { state: 'visible' });
     r.plan = await page.textContent('#exportPlan');
-    await page.click('#btnDoExport');
-    await page.waitForFunction(() => !document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout: 30000 }).catch(() => {});
-    await jobDone(600000);
+    await job(page, () => page.click('#btnDoExport'), 600000);
     await page.waitForFunction(() => !document.querySelector('#btnVerifyExport').disabled, null, { timeout: 30000 });
     r.exportResult = await page.textContent('#exportResult');
     console.log(`${name}: plan: ${r.plan}\n  export: ${r.exportResult}`);
@@ -106,9 +73,7 @@ try {
     console.log(`${name}: exported`, JSON.stringify(r.exported));
     assert(r.exported.format === 'mp4' && r.exported.audio && expect.exportAudio.test(r.exported.audio), `${name}: the export carries the audio: ${JSON.stringify(r.exported)}`);
     assert(Math.abs(r.exported.audioSeconds - 10) < 0.2, `${name}: all of the audio: ${JSON.stringify(r.exported)}`);
-    await page.click('#btnVerifyExport');
-    await page.waitForFunction(() => !document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout: 30000 }).catch(() => {});
-    await jobDone(600000);
+    await job(page, () => page.click('#btnVerifyExport'), 600000);
     r.verify = await page.textContent('#exportResult');
     assert(r.verify.includes('Passes WCAG'), `${name}: the export passes: ${r.verify}`);
     await page.click('#btnCloseExport');
@@ -116,9 +81,7 @@ try {
 
   // the whole-video player: a WebM plays here; an MKV of H.264 this Chromium
   // cannot play is said to be so
-  await page.setInputFiles('#fileInput', path.join(MEDIA, 'flash.webm'));
-  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash.webm'), null, { timeout: 60000 });
-  await jobDone();
+  await open(page, path.join(MEDIA, 'flash.webm'));
   await page.evaluate(() => window.__unflash.setPlayerSource('video'));
   await page.waitForFunction(() => document.querySelector('#player').readyState >= 1, null, { timeout: 30000 });
   results.webmPlayer = await page.textContent('#playerWarning');
@@ -129,27 +92,13 @@ try {
   // an MKV's open cancelled as it reads the file through (an MKV keeps no
   // index) leaves the WebM open, as it was
   {
-    await page.evaluate(() => {
-      const u = window.__unflash;
-      const watch = new MutationObserver(() => {
-        const job = u.state.job;
-        if (job && job.name === 'Opening video' && job.pct >= 10) {
-          watch.disconnect();
-          document.querySelector('#btnCancelJob').click();
-        }
-      });
-      watch.observe(document.querySelector('#jobBar'), { attributes: true, attributeFilter: ['style'] });
-    });
-    await page.setInputFiles('#fileInput', path.join(MEDIA, 'flash.mkv'));
-    await page.waitForFunction(() => document.querySelector('#toast').textContent === 'Opening video: cancelled', null, { timeout: 30000 });
-    await jobDone();
-    results.mkvCancelled = await page.evaluate(() => ({ video: document.querySelector('#videoInfo').textContent, movie: window.__unflash.state.movie.name, live: window.__unflash.state.live.on }));
+    const cancelled = await cancelledJob(page, () => page.setInputFiles('#fileInput', path.join(MEDIA, 'flash.mkv')), 10);
+    results.mkvCancelled = await page.evaluate(() => ({ toast: document.querySelector('#toast').textContent, video: document.querySelector('#videoInfo').textContent, movie: window.__unflash.state.movie.name, live: window.__unflash.state.live.on }));
     console.log('an MKV open cancelled:', JSON.stringify(results.mkvCancelled));
+    assert(cancelled === 'Opening video' && results.mkvCancelled.toast === 'Opening video: cancelled', 'the open was cancelled as it read the file: ' + JSON.stringify({ cancelled, toast: results.mkvCancelled.toast }));
     assert(/flash\.webm/.test(results.mkvCancelled.video) && results.mkvCancelled.movie === 'flash.webm' && results.mkvCancelled.live, 'an open cancelled as it reads the file leaves the video that was open: ' + JSON.stringify(results.mkvCancelled));
   }
-  await page.setInputFiles('#fileInput', path.join(MEDIA, 'flash.mkv'));
-  await page.waitForFunction(() => document.querySelector('#videoInfo').textContent.includes('flash.mkv'), null, { timeout: 60000 });
-  await jobDone();
+  await open(page, path.join(MEDIA, 'flash.mkv'));
   await page.evaluate(() => window.__unflash.setPlayerSource('video'));
   await page.waitForFunction(() => window.__unflash.state.player.playable === false || document.querySelector('#player').readyState >= 1, null, { timeout: 30000 });
   results.mkvPlayer = { playable: await page.evaluate(() => window.__unflash.state.player.playable), text: await page.textContent('#playerWarning'), h264Playable };
@@ -171,9 +120,8 @@ try {
   console.log('MKV OK');
 } catch (e) {
   console.error(e);
-  await page.screenshot({ path: path.join(ROOT, 'tests/e2e/out/mkv-failure.png') }).catch(() => {});
+  await page.screenshot({ path: path.join(OUT, 'mkv-failure.png') }).catch(() => {});
   process.exitCode = 1;
 } finally {
-  await browser.close();
-  srv.close();
+  await close();
 }

@@ -103,7 +103,7 @@ def av1_encoder():
     return ["-c:v", "libaom-av1", "-cpu-used", "8", "-row-mt", "1", "-crf", "35", "-b:v", "0", "-pix_fmt", "yuv420p", "-g", "30"]
 
 
-def flash_frames(secs=10.0, red=True):
+def flash_frames(secs=10.0):
     n = int(secs * FPS)
     for i in range(n):
         t = i / FPS
@@ -111,7 +111,7 @@ def flash_frames(secs=10.0, red=True):
         if 3.0 <= t < 5.5:
             phase = int(t * 8) % 2
             f[...] = 30 if phase == 0 else 200
-        elif red and 7.0 <= t < 8.5:
+        elif 7.0 <= t < 8.5:
             phase = int(t * 8) % 2
             if phase == 0:
                 f[..., 0] = 255
@@ -202,13 +202,13 @@ if __name__ == "__main__":
     encode("flash_vp8.webm", flash_frames(), "vp8", 10)
     encode("flash_av1.mp4", flash_frames(), "av1", 10)
     encode("bursts.mp4", bursts_frames(), "vp9", 8)
-    # the same pictures in Matroska / WebM
-    for src, dst, audio in [("flash_h264.mp4", "flash.mkv", ["-c:a", "copy"]), ("flash.mp4", "flash.webm", ["-c:a", "libopus", "-b:a", "64k"]), ("flash.mp4", "flash_vorbis.webm", ["-c:a", "libvorbis", "-q:a", "3"]), ("flash.mp4", "flash_eac3.mp4", ["-c:a", "eac3", "-b:a", "96k"])]:
-        path = os.path.join(OUT, dst)
-        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", os.path.join(OUT, src), "-c:v", "copy", *audio, path], check=True)
-        print("wrote", path, os.path.getsize(path), "bytes")
-    # transport streams, sound as PCM and DTS, and two sound tracks
+    # the same pictures in Matroska / WebM, in transport streams, with their
+    # sound as E-AC-3, PCM and DTS, and with two sound tracks
     for src, dst, args in [
+        ("flash_h264.mp4", "flash.mkv", ["-c:a", "copy"]),
+        ("flash.mp4", "flash.webm", ["-c:a", "libopus", "-b:a", "64k"]),
+        ("flash.mp4", "flash_vorbis.webm", ["-c:a", "libvorbis", "-q:a", "3"]),
+        ("flash.mp4", "flash_eac3.mp4", ["-c:a", "eac3", "-b:a", "96k"]),
         ("flash_h264.mp4", "flash.ts", ["-c:a", "copy"]),
         ("flash_h264.mp4", "flash_ac3.m2ts", ["-c:a", "ac3", "-b:a", "192k", "-mpegts_m2ts_mode", "1"]),
         ("flash_h264.mp4", "flash_pcm.mov", ["-c:a", "pcm_s24le"]),

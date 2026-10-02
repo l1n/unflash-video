@@ -142,11 +142,9 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 .chart-box { flex: 1; min-width: 0; }
 .chart-head { display: flex; align-items: center; gap: 8px; min-height: 22px; margin-bottom: 4px; }
 .chart-title { color: var(--fg); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
-.chart-span button { padding: 1px 7px; }
 .chart-wrap { position: relative; }
 #chart { width: 100%; height: 200px; display: block; background: var(--bg); border: 1px solid var(--line2); cursor: pointer; }
 .chart-tip { position: absolute; top: 4px; pointer-events: none; background: var(--bg2); border: 1px solid var(--line2); padding: 2px 7px; font-size: 10px; color: var(--fg); white-space: nowrap; }
-.chart-tip.hidden { display: none; }
 .chart-hint { color: var(--fg2); font-size: 11px; margin-top: 4px; }
 .chart-hint .found-none { color: var(--ok); font-weight: 700; }
 
@@ -172,16 +170,13 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 .fps-row { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
 .alerts-wrap { position: relative; display: inline-flex; }
 .alerts-menu { left: auto; right: 0; width: 300px; display: flex; flex-direction: column; gap: 6px; }
-.alerts-menu.hidden { display: none; }
 .project-menu { left: auto; right: 0; width: 320px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
-.project-menu.hidden { display: none; }
 .project-menu .fps-note { margin: 0; }
 .alerts-menu label.toggle { display: flex; align-items: flex-start; }
 .alerts-menu input[type=number] { width: 80px; }
 .alerts-menu button { align-self: flex-start; }
 .fps-note { color: var(--fg2); font-size: 11px; margin: 6px 0 0; }
 .ws-findings { margin: 6px 0 8px; display: flex; flex-direction: column; gap: 6px; }
-.ws-findings.hidden { display: none; }
 .finding { background: var(--bg2); border: 1px solid var(--line); border-left: 4px solid var(--flash); padding: 5px 10px; font-size: 12px; color: var(--fg); }
 .finding.red { border-left-color: var(--red); }
 .finding.extended { border-left-color: var(--ext); }
@@ -207,7 +202,6 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 .grid-actions { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
 .grid-hint { color: var(--fg2); font-size: 11px; margin: 6px 0; }
 .frame-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--thumb-min, 146px), 1fr)); gap: 6px; outline: none; }
-.thumb-size button { padding: 1px 7px; }
 .frame { position: relative; border: 2px solid transparent; background: var(--bg2); cursor: pointer; user-select: none; }
 .frame canvas { width: 100%; display: block; image-rendering: auto; }
 /* dimmed as the player is (its dim switch): a grid of flashing frames is bright, and they appear as they scroll into view */
@@ -234,10 +228,8 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
    at most every 0.4 s (app.js), not a bright frame running round the grid */
 .frame.playing::before { content: ''; position: absolute; left: -2px; right: -2px; top: -2px; height: 3px; background: var(--fg2); pointer-events: none; }
 .viewer { position: fixed; inset: 0; z-index: 60; background: rgba(0, 0, 0, .9); display: flex; align-items: center; justify-content: center; }
-.viewer.hidden { display: none; }
 .viewer-box { display: flex; flex-direction: column; gap: 6px; max-width: 94vw; }
 .viewer-bar { display: flex; align-items: center; gap: 10px; color: var(--fg); font-size: 12px; }
-.viewer-bar .spacer { flex: 1; }
 #viewerCanvas { max-width: 94vw; max-height: 80vh; width: auto; height: auto; background: black; border: 1px solid var(--line); }
 #viewerCanvas.dim { filter: brightness(.45); }
 .viewer-hint { color: var(--fg2); font-size: 11px; }
@@ -255,7 +247,7 @@ body.has-movie.guide-open .guide-close { display: inline-block; position: sticky
 #welcome li::marker { color: var(--fg2); }
 .disclaimer, .note-extended, .support { color: var(--fg2); font-size: 12px; }
 .clips-head { font-size: 13px; margin: 22px 0 6px; }
-.clips-intro, .clips-note { color: var(--fg2); font-size: 12px; }
+.clips-intro { color: var(--fg2); font-size: 12px; }
 table.clips { border-collapse: collapse; font-size: 12px; margin: 6px 0; }
 table.clips th { text-align: left; color: var(--fg2); font-weight: 400; text-transform: uppercase; letter-spacing: .05em; font-size: 10px; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line2); }
 table.clips td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -309,7 +301,6 @@ table.clips td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); 
 .tour-count { font-size: 10px; color: var(--fg2); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 2px; }
 .tour-title { margin: 0 0 6px; font-size: 13px; }
 .tour-actions { display: flex; gap: 6px; align-items: center; margin-top: 12px; }
-.tour-actions .spacer { flex: 1; }
 .tour-skip { background: none; border-color: transparent; color: var(--fg2); padding-left: 0; }
 .tour-skip:hover { color: var(--fg); background: none; border-color: transparent; }
 .tour-arrow { position: absolute; width: 11px; height: 11px; background: var(--bg2); border: 1px solid var(--fg); transform: rotate(45deg); display: none; }
