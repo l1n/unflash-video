@@ -5,15 +5,13 @@ use crate::bitreader::BitReader;
 use crate::tables::{DEFAULT_SCALING4, DEFAULT_SCALING8, DEQUANT4_INIT, DEQUANT8_INIT, ZIGZAG4X4, ZIGZAG8X8};
 use crate::{Error, Result};
 
-/// The part of the VUI the decoder cares about (colour conversion and
-/// output order).
+/// The part of the VUI the decoder cares about (colour conversion).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Vui {
     pub video_full_range: bool,
     pub colour_primaries: u8,
     pub transfer_characteristics: u8,
     pub matrix_coefficients: u8,
-    pub num_reorder_frames: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,13 +79,20 @@ pub struct Pps {
     pub constrained_intra_pred: bool,
     pub redundant_pic_cnt_present: bool,
     pub transform_8x8_mode: bool,
-    /// Scaling lists as parsed (fallback rule B is applied when the PPS is
-    /// paired with its SPS, see [`ScalingTables::new`]).
+    /// Scaling lists as sent, None where one is not (the fall-back rule
+    /// applies when the PPS is paired with its SPS, see
+    /// [`ScalingTables::new`]).
     pub scaling_present: bool,
-    pub list_present: [bool; 8],
-    pub list_default: [bool; 8],
-    pub lists4: [[u8; 16]; 6],
-    pub lists8: [[u8; 64]; 2],
+    pub sent4: [Option<ScalingList<16>>; 6],
+    pub sent8: [Option<ScalingList<64>>; 2],
+}
+
+/// A scaling list as a parameter set sends it (7.3.2.1.1.1): its own
+/// values, or the default list (useDefaultScalingMatrixFlag).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScalingList<const N: usize> {
+    Default,
+    List([u8; N]),
 }
 
 /// LevelScale4x4 / LevelScale8x8 (8.5.9) for every qP % 6 and list.
@@ -99,46 +104,65 @@ pub struct ScalingTables {
     pub level8: [[[i32; 64]; 2]; 6],
 }
 
-fn flat16() -> [u8; 16] {
-    [16; 16]
-}
-fn flat64() -> [u8; 64] {
-    [16; 64]
-}
-
-/// 7.3.2.1.1.1: one scaling list; returns (list, useDefaultScalingMatrixFlag).
-fn parse_scaling_list_16(r: &mut BitReader) -> Result<([u8; 16], bool)> {
-    let mut list = [0u8; 16];
+/// 7.3.2.1.1.1: one scaling list.
+fn parse_scaling_list<const N: usize>(r: &mut BitReader) -> Result<ScalingList<N>> {
+    let mut list = [0u8; N];
     let mut last = 8i32;
     let mut next = 8i32;
-    let mut use_default = false;
     for (j, slot) in list.iter_mut().enumerate() {
         if next != 0 {
             let delta = r.se()?;
             next = (last + delta + 256).rem_euclid(256);
-            use_default = j == 0 && next == 0;
+            if j == 0 && next == 0 {
+                // useDefaultScalingMatrixFlag (no more deltas follow)
+                return Ok(ScalingList::Default);
+            }
         }
         *slot = if next == 0 { last as u8 } else { next as u8 };
         last = *slot as i32;
     }
-    Ok((list, use_default))
+    Ok(ScalingList::List(list))
 }
 
-fn parse_scaling_list_64(r: &mut BitReader) -> Result<([u8; 64], bool)> {
-    let mut list = [0u8; 64];
-    let mut last = 8i32;
-    let mut next = 8i32;
-    let mut use_default = false;
-    for (j, slot) in list.iter_mut().enumerate() {
-        if next != 0 {
-            let delta = r.se()?;
-            next = (last + delta + 256).rem_euclid(256);
-            use_default = j == 0 && next == 0;
+/// The six 4x4 and two 8x8 scaling lists a parameter set sends (None where
+/// it does not).
+type SentLists = ([Option<ScalingList<16>>; 6], [Option<ScalingList<64>>; 2]);
+
+/// The first `n` of the scaling lists, each with its present flag.
+fn parse_scaling_lists(r: &mut BitReader, n: usize) -> Result<SentLists> {
+    let (mut sent4, mut sent8) = ([None; 6], [None; 2]);
+    for i in 0..n {
+        if !r.flag()? {
+            continue;
         }
-        *slot = if next == 0 { last as u8 } else { next as u8 };
-        last = *slot as i32;
+        if i < 6 {
+            sent4[i] = Some(parse_scaling_list(r)?);
+        } else {
+            sent8[i - 6] = Some(parse_scaling_list(r)?);
+        }
     }
-    Ok((list, use_default))
+    Ok((sent4, sent8))
+}
+
+/// Table 7-2: the lists in use from those a parameter set sends. A Y list
+/// not sent falls back to `fall4` (intra, inter) or `fall8`, a Cb or Cr
+/// list to the list before it.
+fn resolve(sent4: &[Option<ScalingList<16>>; 6], sent8: &[Option<ScalingList<64>>; 2], fall4: [[u8; 16]; 2], fall8: [[u8; 64]; 2]) -> ([[u8; 16]; 6], [[u8; 64]; 2]) {
+    let mut lists4 = [[0u8; 16]; 6];
+    for i in 0..6 {
+        lists4[i] = match sent4[i] {
+            Some(ScalingList::List(l)) => l,
+            Some(ScalingList::Default) => DEFAULT_SCALING4[i / 3],
+            None if i % 3 == 0 => fall4[i / 3],
+            None => lists4[i - 1],
+        };
+    }
+    let lists8 = [0, 1].map(|k| match sent8[k] {
+        Some(ScalingList::List(l)) => l,
+        Some(ScalingList::Default) => DEFAULT_SCALING8[k],
+        None => fall8[k],
+    });
+    (lists4, lists8)
 }
 
 const HIGH_PROFILES: [u8; 13] = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
@@ -207,14 +231,12 @@ fn parse_vui(r: &mut BitReader) -> Result<Vui> {
     }
     r.flag()?; // pic_struct_present_flag
     if r.flag()? {
-        // bitstream_restriction_flag
+        // bitstream_restriction_flag: its fields are read only to check
+        // that they are all there (a VUI cut short is left out)
         r.flag()?;
-        r.ue()?;
-        r.ue()?;
-        r.ue()?;
-        r.ue()?;
-        v.num_reorder_frames = Some(r.ue()?);
-        r.ue()?;
+        for _ in 0..6 {
+            r.ue()?;
+        }
     }
     Ok(v)
 }
@@ -227,8 +249,9 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     let constraint_flags = r.u(8)? as u8;
     let level_idc = r.u(8)? as u8;
     let id = r.ue_max(31, "seq_parameter_set_id")?;
-    let mut scaling4 = [flat16(); 6];
-    let mut scaling8 = [flat64(); 2];
+    // Flat_4x4_16 and Flat_8x8_16 unless the sequence sends lists
+    let mut scaling4 = [[16; 16]; 6];
+    let mut scaling8 = [[16; 64]; 2];
     let mut scaling_present = false;
     if HIGH_PROFILES.contains(&profile_idc) {
         let chroma_format_idc = r.ue_max(3, "chroma_format_idc")?;
@@ -249,37 +272,8 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         scaling_present = r.flag()?;
         if scaling_present {
             // seq_scaling_matrix_present_flag: fall-back rule A
-            for i in 0..8 {
-                let present = r.flag()?;
-                if i < 6 {
-                    scaling4[i] = if present {
-                        let (list, def) = parse_scaling_list_16(&mut r)?;
-                        if def {
-                            DEFAULT_SCALING4[if i < 3 { 0 } else { 1 }]
-                        } else {
-                            list
-                        }
-                    } else {
-                        match i {
-                            0 => DEFAULT_SCALING4[0],
-                            3 => DEFAULT_SCALING4[1],
-                            _ => scaling4[i - 1],
-                        }
-                    };
-                } else {
-                    let k = i - 6;
-                    scaling8[k] = if present {
-                        let (list, def) = parse_scaling_list_64(&mut r)?;
-                        if def {
-                            DEFAULT_SCALING8[k]
-                        } else {
-                            list
-                        }
-                    } else {
-                        DEFAULT_SCALING8[k]
-                    };
-                }
-            }
+            let (sent4, sent8) = parse_scaling_lists(&mut r, 8)?;
+            (scaling4, scaling8) = resolve(&sent4, &sent8, DEFAULT_SCALING4, DEFAULT_SCALING8);
         }
     }
     let log2_max_frame_num = r.ue_max(12, "log2_max_frame_num_minus4")? + 4;
@@ -305,13 +299,23 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     let width_mbs = r.ue_max(1023, "pic_width_in_mbs_minus1")? + 1;
     let height_map_units = r.ue_max(1023, "pic_height_in_map_units_minus1")? + 1;
     let frame_mbs_only = r.flag()?;
+    let height_mbs = height_map_units * if frame_mbs_only { 1 } else { 2 };
+    // the largest pictures any level allows (Table A-1, level 6.2: MaxFS
+    // macroblocks, at most sqrt(8 * MaxFS) wide or high), which also bounds
+    // what a damaged parameter set can make the decoder allocate
+    if width_mbs > 1055 || height_mbs > 1055 || width_mbs * height_mbs > 139_264 {
+        return Err(Error::Unsupported("picture size"));
+    }
     let mbaff = if frame_mbs_only { false } else { r.flag()? };
     let direct_8x8_inference = r.flag()?;
     let mut crop = (0, 0, 0, 0);
     if r.flag()? {
         // frame_cropping_flag; CropUnitX = 2, CropUnitY = 2 * (2 - frame_mbs_only_flag) for 4:2:0
+        // (the offsets bounded as HEVC bounds its conformance window, so
+        // that they in samples and their sums below cannot wrap)
         let cy = if frame_mbs_only { 2 } else { 4 };
-        crop = (r.ue()? * 2, r.ue()? * 2, r.ue()? * cy, r.ue()? * cy);
+        let mut offset = |unit: u32| r.ue_max(8192, "frame_crop_offset").map(|v| v * unit);
+        crop = (offset(2)?, offset(2)?, offset(cy)?, offset(cy)?);
     }
     let vui = if r.flag()? { parse_vui(&mut r).ok() } else { None };
     let sps = Sps {
@@ -329,7 +333,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         max_num_ref_frames,
         gaps_in_frame_num_allowed,
         width_mbs,
-        height_mbs: height_map_units * if frame_mbs_only { 1 } else { 2 },
+        height_mbs,
         frame_mbs_only,
         mbaff,
         direct_8x8_inference,
@@ -371,31 +375,13 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps> {
     let redundant_pic_cnt_present = r.flag()?;
     let mut transform_8x8_mode = false;
     let mut scaling_present = false;
-    let mut list_present = [false; 8];
-    let mut list_default = [false; 8];
-    let mut lists4 = [flat16(); 6];
-    let mut lists8 = [flat64(); 2];
+    let (mut sent4, mut sent8) = ([None; 6], [None; 2]);
     let mut second_cqo = cqo;
     if r.more_rbsp_data() {
         transform_8x8_mode = r.flag()?;
         scaling_present = r.flag()?;
         if scaling_present {
-            let n = 6 + if transform_8x8_mode { 2 } else { 0 };
-            for i in 0..n {
-                list_present[i] = r.flag()?;
-                if !list_present[i] {
-                    continue;
-                }
-                if i < 6 {
-                    let (list, def) = parse_scaling_list_16(&mut r)?;
-                    lists4[i] = list;
-                    list_default[i] = def;
-                } else {
-                    let (list, def) = parse_scaling_list_64(&mut r)?;
-                    lists8[i - 6] = list;
-                    list_default[i] = def;
-                }
-            }
+            (sent4, sent8) = parse_scaling_lists(&mut r, 6 + if transform_8x8_mode { 2 } else { 0 })?;
         }
         second_cqo = r.se()?;
         if !(-12..=12).contains(&second_cqo) {
@@ -417,10 +403,8 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps> {
         redundant_pic_cnt_present,
         transform_8x8_mode,
         scaling_present,
-        list_present,
-        list_default,
-        lists4,
-        lists8,
+        sent4,
+        sent8,
     })
 }
 
@@ -430,52 +414,13 @@ impl ScalingTables {
     /// the SPS carries no matrix and rule B (the SPS lists) when it does
     /// (7.4.2.2, Table 7-2).
     pub fn new(sps: &Sps, pps: &Pps) -> ScalingTables {
-        let mut lists4 = sps.scaling4;
-        let mut lists8 = sps.scaling8;
-        if pps.scaling_present {
-            for i in 0..8 {
-                if i < 6 {
-                    lists4[i] = if pps.list_present[i] {
-                        if pps.list_default[i] {
-                            DEFAULT_SCALING4[if i < 3 { 0 } else { 1 }]
-                        } else {
-                            pps.lists4[i]
-                        }
-                    } else {
-                        match i {
-                            0 => {
-                                if sps.scaling_present {
-                                    sps.scaling4[0]
-                                } else {
-                                    DEFAULT_SCALING4[0]
-                                }
-                            }
-                            3 => {
-                                if sps.scaling_present {
-                                    sps.scaling4[3]
-                                } else {
-                                    DEFAULT_SCALING4[1]
-                                }
-                            }
-                            _ => lists4[i - 1],
-                        }
-                    };
-                } else {
-                    let k = i - 6;
-                    lists8[k] = if pps.list_present[i] {
-                        if pps.list_default[i] {
-                            DEFAULT_SCALING8[k]
-                        } else {
-                            pps.lists8[k]
-                        }
-                    } else if sps.scaling_present {
-                        sps.scaling8[k]
-                    } else {
-                        DEFAULT_SCALING8[k]
-                    };
-                }
-            }
-        }
+        let (lists4, lists8) = if !pps.scaling_present {
+            (sps.scaling4, sps.scaling8)
+        } else if sps.scaling_present {
+            resolve(&pps.sent4, &pps.sent8, [sps.scaling4[0], sps.scaling4[3]], sps.scaling8)
+        } else {
+            resolve(&pps.sent4, &pps.sent8, DEFAULT_SCALING4, DEFAULT_SCALING8)
+        };
         let mut level4 = [[[0i32; 16]; 6]; 6];
         let mut level8 = [[[0i32; 64]; 2]; 6];
         for m in 0..6 {
@@ -527,9 +472,6 @@ mod tests {
 
     #[test]
     fn flat_level_scale_matches_the_normadjust_tables() {
-        let sps = parse_sps(&[66, 192, 30, 0xa6, 0x80, 0x50, 0x1e, 0xc8]).map(|_| ()).err();
-        // (a hand-made SPS is not worth the trouble: just check the tables from flat lists)
-        let _ = sps;
         let sps = Sps {
             id: 0,
             profile_idc: 66,
@@ -570,10 +512,8 @@ mod tests {
             redundant_pic_cnt_present: false,
             transform_8x8_mode: false,
             scaling_present: false,
-            list_present: [false; 8],
-            list_default: [false; 8],
-            lists4: [[16; 16]; 6],
-            lists8: [[16; 64]; 2],
+            sent4: [None; 6],
+            sent8: [None; 2],
         };
         let t = ScalingTables::new(&sps, &pps);
         // qp%6 = 0: v = 10, 16, 13 -> ×16

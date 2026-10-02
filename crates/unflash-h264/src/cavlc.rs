@@ -214,12 +214,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_block_from_the_standards_example() {
-        // 9.2 worked example: coefficients 0,3,0,1,-1,-1,0,1,0... with nC = 0
-        // coeff_token TotalCoeff=5 TrailingOnes=3: 0000 100; signs 0 1 1 (1,-1,-1);
-        // level 1 (+1 after T1s): level_prefix 1 -> "01" gives levelCode 0+2 = 2 -> +2? we
-        // instead round-trip a simpler block: TotalCoeff 1, TrailingOnes 1 at position 0
-        // coeff_token (nC 0-1) for 1/1 = "01", sign 0 (+1), total_zeros for TotalCoeff=1: value 0 = "1"
+    fn a_single_trailing_one() {
+        // one coefficient of +1 with nC 0: coeff_token 01 (TotalCoeff 1,
+        // TrailingOnes 1), its sign bit 0, then total_zeros 0 (1, Table 9-7)
         let bits = [0b0101_0000u8];
         let mut r = BitReader::new(&bits);
         let mut c = [0i32; 16];
@@ -227,7 +224,7 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(c[0], 1);
         assert!(c[1..].iter().all(|&v| v == 0));
-        // the same coefficient at position 2: total_zeros = 2 -> code "010" (Table 9-7, TotalCoeff 1)
+        // the same coefficient after two zeros: total_zeros 2 (010)
         let bits = [0b0100_1000u8];
         let mut r = BitReader::new(&bits);
         let mut c = [0i32; 16];

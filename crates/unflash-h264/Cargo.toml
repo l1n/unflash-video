@@ -2,7 +2,7 @@
 name = "unflash-h264"
 version = "0.1.0"
 edition = "2021"
-description = "A small H.264 / AVC decoder (Constrained Baseline, Main and High, progressive 4:2:0 8-bit) for browsers without one"
+description = "A small H.264 / AVC decoder (Constrained Baseline, Main and High, 4:2:0 8-bit, progressive and interlaced) for browsers without one"
 license = "MIT"
 
 [dependencies]

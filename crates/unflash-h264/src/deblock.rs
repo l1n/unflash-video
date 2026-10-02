@@ -81,12 +81,31 @@ fn boundary_strength(pic: &Picture, p: &MbDeblockInfo, q: &MbDeblockInfo, pb: us
     motion_bs(pic, pb, qb, mvy_limit)
 }
 
-/// The strengths of the internal edges of an inter macroblock (edges 1..3,
-/// both directions; 1 and 3 left alone with the 8x8 transform): 2 where a
+/// The strengths of the internal edges of a macroblock (edges 1..3, both
+/// directions; 1 and 3 left alone with the 8x8 transform): 3 in an intra
+/// macroblock; none in an inter one without coefficients whose blocks all
+/// move as one; else as `inter_bs` finds them.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn internal_bs(pic: &Picture, cur: &MbDeblockInfo, bx0: usize, by0: usize, w4: usize, mvy_limit: i32, bs_v: &mut [[u8; 4]; 4], bs_h: &mut [[u8; 4]; 4]) {
+    if cur.intra {
+        for e in 1..4 {
+            if cur.transform8x8 && e % 2 == 1 {
+                continue;
+            }
+            bs_v[e] = [3; 4];
+            bs_h[e] = [3; 4];
+        }
+    } else if cur.nonzero != 0 || !uniform_motion(pic, bx0, by0, w4) {
+        inter_bs(pic, cur, bx0, by0, w4, mvy_limit, bs_v, bs_h);
+    }
+}
+
+/// The strengths of the internal edges of an inter macroblock: 2 where a
 /// block on either side has coefficients (tested for every segment at once
 /// on the coefficient bits), else the motion test.
 #[allow(clippy::too_many_arguments)]
-fn internal_bs(pic: &Picture, cur: &MbDeblockInfo, bx0: usize, by0: usize, w4: usize, mvy_limit: i32, bs_v: &mut [[u8; 4]; 4], bs_h: &mut [[u8; 4]; 4]) {
+fn inter_bs(pic: &Picture, cur: &MbDeblockInfo, bx0: usize, by0: usize, w4: usize, mvy_limit: i32, bs_v: &mut [[u8; 4]; 4], bs_h: &mut [[u8; 4]; 4]) {
     let nz = cur.nonzero;
     // bit 4k + e - 1: block (e - 1, k) or (e, k) of vertical edge e has coefficients
     let coef_v = nz | (nz >> 1);
@@ -352,8 +371,9 @@ mod simd {
     }
 }
 
-/// The edge filters line by line (builds without the `simd` feature).
-#[cfg(not(feature = "simd"))]
+/// The edge filters line by line (builds without the `simd` feature, and
+/// the reference the tests hold the SIMD filters to).
+#[cfg(any(test, not(feature = "simd")))]
 mod scalar {
     use super::{chroma_line, luma_line};
 
@@ -452,6 +472,67 @@ fn thresholds(qp_p: i32, qp_q: i32, cur: &MbDeblockInfo) -> (i32, i32, [u8; 3]) 
     (ALPHA[index_a] as i32, BETA[index_b] as i32, TC0[index_a])
 }
 
+/// Luma across the vertical edges of a macroblock whose first sample is
+/// `at` (lines `stride` apart): edge 0 against the left macroblock, of QP
+/// `left_qp` (None leaves it alone), then edges 1..3.
+#[inline(always)]
+fn luma_v(y: &mut [u8], at: usize, stride: usize, cur: &MbDeblockInfo, bs: &[[u8; 4]; 4], left_qp: Option<i32>) {
+    for e in 0..4 {
+        if (e == 0 && left_qp.is_none()) || (cur.transform8x8 && e % 2 == 1) || bs[e] == [0; 4] {
+            continue;
+        }
+        let qp_p = if e == 0 { left_qp.unwrap_or(cur.qp) } else { cur.qp };
+        let (alpha, beta, tc0s) = thresholds(qp_p, cur.qp, cur);
+        luma_edge_v(y, at + e * 4, stride, bs[e], tc0_of(bs[e], tc0s), strong(bs[e]), alpha, beta);
+    }
+}
+
+/// Luma across the horizontal edges: edge 0 against the macroblock above,
+/// of QP `above_qp` (None leaves it alone), then edges 1..3.
+#[inline(always)]
+fn luma_h(y: &mut [u8], at: usize, stride: usize, cur: &MbDeblockInfo, bs: &[[u8; 4]; 4], above_qp: Option<i32>) {
+    for e in 0..4 {
+        if (e == 0 && above_qp.is_none()) || (cur.transform8x8 && e % 2 == 1) || bs[e] == [0; 4] {
+            continue;
+        }
+        let qp_p = if e == 0 { above_qp.unwrap_or(cur.qp) } else { cur.qp };
+        let (alpha, beta, tc0s) = thresholds(qp_p, cur.qp, cur);
+        luma_edge_h(y, at + e * 4 * stride, stride, bs[e], tc0_of(bs[e], tc0s), strong(bs[e]), alpha, beta);
+    }
+}
+
+/// Chroma across the vertical edges 0 and 4 of both components (with the
+/// strengths of luma edges 0 and 2): edge 0 against the left macroblock, of
+/// chroma QPs `left_qpc` (None leaves it alone).
+#[inline(always)]
+fn chroma_v(u: &mut [u8], v: &mut [u8], at: usize, stride: usize, cur: &MbDeblockInfo, bs_v: &[[u8; 4]; 4], left_qpc: Option<[i32; 2]>) {
+    for (e, luma_e) in [(0usize, 0usize), (4, 2)] {
+        if (e == 0 && left_qpc.is_none()) || bs_v[luma_e] == [0; 4] {
+            continue;
+        }
+        let qpc_p = if e == 0 { left_qpc.unwrap_or(cur.qpc) } else { cur.qpc };
+        let th = [0, 1].map(|comp| thresholds(qpc_p[comp], cur.qpc[comp], cur));
+        let bs = bs_v[luma_e];
+        chroma_edge_v(u, v, at + e, stride, bs, th.map(|t| tc0_of(bs, t.2)), strong(bs), th.map(|t| t.0), th.map(|t| t.1));
+    }
+}
+
+/// Chroma component `comp` across the horizontal edges 0 and 4: edge 0
+/// against the macroblock above, of chroma QP `above_qpc` (None leaves it
+/// alone).
+#[inline(always)]
+fn chroma_h(plane: &mut [u8], at: usize, stride: usize, cur: &MbDeblockInfo, comp: usize, bs_h: &[[u8; 4]; 4], above_qpc: Option<i32>) {
+    for (e, luma_e) in [(0usize, 0usize), (4, 2)] {
+        if (e == 0 && above_qpc.is_none()) || bs_h[luma_e] == [0; 4] {
+            continue;
+        }
+        let qp_p = if e == 0 { above_qpc.unwrap_or(cur.qpc[comp]) } else { cur.qpc[comp] };
+        let (alpha, beta, tc0s) = thresholds(qp_p, cur.qpc[comp], cur);
+        let bs = bs_h[luma_e];
+        chroma_edge_h(plane, at + e * stride, stride, bs, tc0_of(bs, tc0s), strong(bs), alpha, beta);
+    }
+}
+
 /// Deblock the picture (a frame, or the field `structure` of it) in
 /// macroblock order.
 pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize, height_mbs: usize, structure: u8) {
@@ -474,25 +555,24 @@ pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize
             if !cur.decoded || cur.filter_idc == 1 {
                 continue;
             }
+            // the neighbours across whose edges the filter works
+            let across = |n: &MbDeblockInfo| n.decoded && !(cur.filter_idc == 2 && n.slice != cur.slice);
             let left = if mx > 0 { Some(mbs[my * width_mbs + mx - 1]) } else { None };
+            let left = if left.as_ref().is_some_and(across) { left } else { None };
             let above = if row > 0 { Some(mbs[(my - row_step) * width_mbs + mx]) } else { None };
-            let across = |n: &Option<MbDeblockInfo>| n.map_or(false, |n| n.decoded && !(cur.filter_idc == 2 && n.slice != cur.slice));
-            let do_left = across(&left);
-            let do_above = across(&above);
+            let above = if above.as_ref().is_some_and(across) { above } else { None };
             // boundary strengths: [edge 0..4][segment 0..4]
             let mut bs_v = [[0u8; 4]; 4];
             let mut bs_h = [[0u8; 4]; 4];
             let bx0 = mx * 4;
             let by0 = my * 4;
-            if do_left {
-                let l = left.unwrap();
+            if let Some(l) = left {
                 for k in 0..4 {
                     let qb = (by0 + k) * w4 + bx0;
                     bs_v[0][k] = boundary_strength(pic, &l, &cur, qb - 1, qb, 1 << (k * 4 + 3), 1 << (k * 4), true, mvy_limit);
                 }
             }
-            if do_above {
-                let a = above.unwrap();
+            if let Some(a) = above {
                 // the last block row of the macroblock above (of the same field)
                 let above_off = (4 * row_step - 3) * w4;
                 for k in 0..4 {
@@ -500,66 +580,21 @@ pub fn filter_picture(pic: &mut Picture, mbs: &[MbDeblockInfo], width_mbs: usize
                     bs_h[0][k] = boundary_strength(pic, &a, &cur, qb - above_off, qb, 1 << (12 + k), 1 << k, !field, mvy_limit);
                 }
             }
-            // internal edges
-            if cur.intra {
-                for e in 1..4 {
-                    if cur.transform8x8 && e % 2 == 1 {
-                        continue;
-                    }
-                    bs_v[e] = [3; 4];
-                    bs_h[e] = [3; 4];
-                }
-            } else if cur.nonzero != 0 || !uniform_motion(pic, bx0, by0, w4) {
-                internal_bs(pic, &cur, bx0, by0, w4, mvy_limit, &mut bs_v, &mut bs_h);
-            }
-            if crate::debug_flag("H264_DBG_MB").map_or(false, |v| v == format!("{mx},{row},{structure}")) {
-                eprintln!("deblock mb ({mx},{row}) struct {structure}: intra {} t8 {} qp {} qpc {:?} nz {:#x} slice {} idc {} a/b {}/{} left {:?} above {:?} bs_v {:?} bs_h {:?}", cur.intra, cur.transform8x8, cur.qp, cur.qpc, cur.nonzero, cur.slice, cur.filter_idc, cur.alpha_offset, cur.beta_offset, left.map(|l| (l.qp, l.slice, l.intra)), above.map(|a| (a.qp, a.slice, a.intra)), bs_v, bs_h);
-            }
+            internal_bs(pic, &cur, bx0, by0, w4, mvy_limit, &mut bs_v, &mut bs_h);
             let x0 = mx * 16;
             // the first luma / chroma line of the macroblock, in lines of the frame
             let y0 = if field { 32 * row + parity } else { 16 * my };
             let ybase = y0 * pic.width + x0;
             let cybase = (if field { 16 * row + parity } else { 8 * my }) * (pic.width / 2) + mx * 8;
-            // luma, vertical edges then horizontal edges
-            for e in 0..4 {
-                if (e == 0 && !do_left) || (cur.transform8x8 && e % 2 == 1) || bs_v[e] == [0; 4] {
-                    continue;
-                }
-                let qp_p = if e == 0 { left.unwrap().qp } else { cur.qp };
-                let (alpha, beta, tc0s) = thresholds(qp_p, cur.qp, &cur);
-                luma_edge_v(&mut pic.y, ybase + e * 4, lw, bs_v[e], tc0_of(bs_v[e], tc0s), strong(bs_v[e]), alpha, beta);
-            }
-            for e in 0..4 {
-                if (e == 0 && !do_above) || (cur.transform8x8 && e % 2 == 1) || bs_h[e] == [0; 4] {
-                    continue;
-                }
-                let qp_p = if e == 0 { above.unwrap().qp } else { cur.qp };
-                let (alpha, beta, tc0s) = thresholds(qp_p, cur.qp, &cur);
-                luma_edge_h(&mut pic.y, ybase + e * 4 * lw, lw, bs_h[e], tc0_of(bs_h[e], tc0s), strong(bs_h[e]), alpha, beta);
-            }
-            // chroma: edges 0 and 4 of each 8x8 component, using the luma
-            // edges 0 and 2; the vertical ones of both components together
-            // (each component's vertical edges still come before its
-            // horizontal ones)
-            for (e, luma_e) in [(0usize, 0usize), (4, 2)] {
-                if (e == 0 && !do_left) || bs_v[luma_e] == [0; 4] {
-                    continue;
-                }
-                let th = [0, 1].map(|comp| thresholds(if e == 0 { left.unwrap().qpc[comp] } else { cur.qpc[comp] }, cur.qpc[comp], &cur));
-                let bs = bs_v[luma_e];
-                chroma_edge_v(&mut pic.u, &mut pic.v, cybase + e, cw, bs, th.map(|t| tc0_of(bs, t.2)), strong(bs), th.map(|t| t.0), th.map(|t| t.1));
-            }
+            // luma, vertical edges then horizontal edges; chroma, the vertical
+            // edges of both components together (each component's vertical
+            // edges still come before its horizontal ones)
+            luma_v(&mut pic.y, ybase, lw, &cur, &bs_v, left.map(|l| l.qp));
+            luma_h(&mut pic.y, ybase, lw, &cur, &bs_h, above.map(|a| a.qp));
+            chroma_v(&mut pic.u, &mut pic.v, cybase, cw, &cur, &bs_v, left.map(|l| l.qpc));
             for comp in 0..2 {
-                for (e, luma_e) in [(0usize, 0usize), (4, 2)] {
-                    if (e == 0 && !do_above) || bs_h[luma_e] == [0; 4] {
-                        continue;
-                    }
-                    let qp_p = if e == 0 { above.unwrap().qpc[comp] } else { cur.qpc[comp] };
-                    let (alpha, beta, tc0s) = thresholds(qp_p, cur.qpc[comp], &cur);
-                    let plane = if comp == 0 { &mut pic.u } else { &mut pic.v };
-                    let bs = bs_h[luma_e];
-                    chroma_edge_h(plane, cybase + e * cw, cw, bs, tc0_of(bs, tc0s), strong(bs), alpha, beta);
-                }
+                let plane = if comp == 0 { &mut pic.u } else { &mut pic.v };
+                chroma_h(plane, cybase, cw, &cur, comp, &bs_h, above.map(|a| a.qpc[comp]));
             }
         }
     }
@@ -600,9 +635,11 @@ fn filter_picture_mbaff(pic: &mut Picture, mbs: &[MbDeblockInfo], wm: usize, hm:
                 let left_top = (2 * pr * wm + mx).wrapping_sub(1);
                 let do_left = mx > 0 && avail(&mbs[left_top]);
                 let mixed_left = do_left && pic.mb_field[left_top] != field;
+                // the left macroblock when it is of this one's kind (a mixed
+                // edge is filtered row by row below)
+                let left = if do_left && !mixed_left { Some(mbs[addr - 1]) } else { None };
                 let mut bs_left8 = [0u8; 8];
-                if do_left && !mixed_left {
-                    let l = mbs[addr - 1];
+                if let Some(l) = left {
                     for k in 0..4 {
                         let qb = (by0 + k) * w4 + bx0;
                         bs_v[0][k] = boundary_strength(pic, &l, &cur, qb - 1, qb, 1 << (k * 4 + 3), 1 << (k * 4), true, mvy_limit);
@@ -669,20 +706,7 @@ fn filter_picture_mbaff(pic: &mut Picture, mbs: &[MbDeblockInfo], wm: usize, hm:
                     }
                 }
                 // ---- internal edges
-                if cur.intra {
-                    for e in 1..4 {
-                        if cur.transform8x8 && e % 2 == 1 {
-                            continue;
-                        }
-                        bs_v[e] = [3; 4];
-                        bs_h[e] = [3; 4];
-                    }
-                } else if cur.nonzero != 0 || !uniform_motion(pic, bx0, by0, w4) {
-                    internal_bs(pic, &cur, bx0, by0, w4, mvy_limit, &mut bs_v, &mut bs_h);
-                }
-                if crate::debug_flag("H264_DBG_MB").map_or(false, |v| v == format!("{mx},{my},4")) {
-                    eprintln!("deblock mbaff mb ({mx},{my}) field {field}: intra {} t8 {} qp {} nz {:#x} mixed_left {mixed_left} double_top {double_top} above {:?} bs_left8 {:?} bs_v {:?} bs_h {:?}", cur.intra, cur.transform8x8, cur.qp, cur.nonzero, above_addr, bs_left8, bs_v, bs_h);
-                }
+                internal_bs(pic, &cur, bx0, by0, w4, mvy_limit, &mut bs_v, &mut bs_h);
                 // ---- luma, vertical edges
                 if mixed_left {
                     let lt = mbs[left_top];
@@ -700,14 +724,7 @@ fn filter_picture_mbaff(pic: &mut Picture, mbs: &[MbDeblockInfo], wm: usize, hm:
                         luma_line(s, bs, alpha, beta, tc0);
                     }
                 }
-                for e in 0..4 {
-                    if (e == 0 && (!do_left || mixed_left)) || (cur.transform8x8 && e % 2 == 1) || bs_v[e] == [0; 4] {
-                        continue;
-                    }
-                    let qp_p = if e == 0 { mbs[addr - 1].qp } else { cur.qp };
-                    let (alpha, beta, tc0s) = thresholds(qp_p, cur.qp, &cur);
-                    luma_edge_v(&mut pic.y, ybase + e * 4, lw, bs_v[e], tc0_of(bs_v[e], tc0s), strong(bs_v[e]), alpha, beta);
-                }
+                luma_v(&mut pic.y, ybase, lw, &cur, &bs_v, left.map(|l| l.qp));
                 // ---- luma, horizontal edges
                 let mut double_bs = [[0u8; 4]; 2];
                 if double_top {
@@ -722,14 +739,8 @@ fn filter_picture_mbaff(pic: &mut Picture, mbs: &[MbDeblockInfo], wm: usize, hm:
                         luma_edge_h(&mut pic.y, ybase + j * width, 2 * width, double_bs[j], tc0_of(double_bs[j], tc0s), false, alpha, beta);
                     }
                 }
-                for e in 0..4 {
-                    if (e == 0 && above_addr.is_none()) || (cur.transform8x8 && e % 2 == 1) || bs_h[e] == [0; 4] {
-                        continue;
-                    }
-                    let qp_p = if e == 0 { mbs[above_addr.unwrap()].qp } else { cur.qp };
-                    let (alpha, beta, tc0s) = thresholds(qp_p, cur.qp, &cur);
-                    luma_edge_h(&mut pic.y, ybase + e * 4 * lw, lw, bs_h[e], tc0_of(bs_h[e], tc0s), strong(bs_h[e]), alpha, beta);
-                }
+                let above = above_addr.map(|a| mbs[a]);
+                luma_h(&mut pic.y, ybase, lw, &cur, &bs_h, above.map(|a| a.qp));
                 // ---- chroma (the vertical edges of both components together:
                 // each component's vertical edges still come before its
                 // horizontal ones)
@@ -753,33 +764,17 @@ fn filter_picture_mbaff(pic: &mut Picture, mbs: &[MbDeblockInfo], wm: usize, hm:
                         }
                     }
                 }
-                for (e, luma_e) in [(0usize, 0usize), (4, 2)] {
-                    if (e == 0 && (!do_left || mixed_left)) || bs_v[luma_e] == [0; 4] {
-                        continue;
-                    }
-                    let th = [0, 1].map(|comp| thresholds(if e == 0 { mbs[addr - 1].qpc[comp] } else { cur.qpc[comp] }, cur.qpc[comp], &cur));
-                    let bs = bs_v[luma_e];
-                    chroma_edge_v(&mut pic.u, &mut pic.v, cybase + e, cw, bs, th.map(|t| tc0_of(bs, t.2)), strong(bs), th.map(|t| t.0), th.map(|t| t.1));
-                }
+                chroma_v(&mut pic.u, &mut pic.v, cybase, cw, &cur, &bs_v, left.map(|l| l.qpc));
                 for comp in 0..2 {
+                    let plane = if comp == 0 { &mut pic.u } else { &mut pic.v };
                     if double_top {
                         for j in 0..2 {
                             let nb = mbs[(2 * pr - 2 + j) * wm + mx];
                             let (alpha, beta, tc0s) = thresholds(nb.qpc[comp], cur.qpc[comp], &cur);
-                            let plane = if comp == 0 { &mut pic.u } else { &mut pic.v };
                             chroma_edge_h(plane, cybase + j * cwidth, 2 * cwidth, double_bs[j], tc0_of(double_bs[j], tc0s), false, alpha, beta);
                         }
                     }
-                    for (e, luma_e) in [(0usize, 0usize), (4, 2)] {
-                        if (e == 0 && above_addr.is_none()) || bs_h[luma_e] == [0; 4] {
-                            continue;
-                        }
-                        let qp_p = if e == 0 { mbs[above_addr.unwrap()].qpc[comp] } else { cur.qpc[comp] };
-                        let (alpha, beta, tc0s) = thresholds(qp_p, cur.qpc[comp], &cur);
-                        let plane = if comp == 0 { &mut pic.u } else { &mut pic.v };
-                        let bs = bs_h[luma_e];
-                        chroma_edge_h(plane, cybase + e * cw, cw, bs, tc0_of(bs, tc0s), strong(bs), alpha, beta);
-                    }
+                    chroma_h(plane, cybase, cw, &cur, comp, &bs_h, above.map(|a| a.qpc[comp]));
                 }
             }
         }
@@ -843,13 +838,7 @@ mod tests {
             let tc0 = tc0_of(bs, tc0s);
             let mut want = plane(&mut rng, true);
             let mut got = want.clone();
-            for r in 0..16 {
-                let k = r / 4;
-                if bs[k] != 0 {
-                    let o = (8 + r) * S + 12;
-                    luma_line((&mut want[o..o + 8]).try_into().unwrap(), bs[k], alpha, beta, tc0[k] as i32);
-                }
-            }
+            scalar::luma_edge_v(&mut want, 8 * S + 16, S, bs, tc0, strong(bs), alpha, beta);
             simd::luma_edge_v(&mut got, 8 * S + 16, S, bs, tc0, strong(bs), alpha, beta);
             assert_eq!(want, got, "luma vertical: bs {bs:?} alpha {alpha} beta {beta} tc0 {tc0:?}");
 
@@ -858,16 +847,7 @@ mod tests {
             let tc0 = tc0_of(bs, tc0s);
             let mut want = plane(&mut rng, false);
             let mut got = want.clone();
-            for c in 0..16 {
-                let k = c / 4;
-                if bs[k] != 0 {
-                    let mut s: [u8; 8] = std::array::from_fn(|i| want[(12 + i) * S + 8 + c]);
-                    luma_line(&mut s, bs[k], alpha, beta, tc0[k] as i32);
-                    for (i, v) in s.into_iter().enumerate() {
-                        want[(12 + i) * S + 8 + c] = v;
-                    }
-                }
-            }
+            scalar::luma_edge_h(&mut want, 16 * S + 8, S, bs, tc0, strong(bs), alpha, beta);
             simd::luma_edge_h(&mut got, 16 * S + 8, S, bs, tc0, strong(bs), alpha, beta);
             assert_eq!(want, got, "luma horizontal: bs {bs:?} alpha {alpha} beta {beta} tc0 {tc0:?}");
 
@@ -878,15 +858,8 @@ mod tests {
             let tc = [tc0_of(bs, tc0s), tc0_of(bs, tc0s2)];
             let mut want = [plane(&mut rng, true), plane(&mut rng, true)];
             let mut got = want.clone();
-            for (c, (a, b)) in [(alpha, beta), (alpha2, beta2)].into_iter().enumerate() {
-                for r in 0..8 {
-                    let k = r / 2;
-                    if bs[k] != 0 {
-                        let o = (8 + r) * S + 14;
-                        chroma_line((&mut want[c][o..o + 4]).try_into().unwrap(), bs[k], a, b, tc[c][k] as i32);
-                    }
-                }
-            }
+            let [u, v] = &mut want;
+            scalar::chroma_edge_v(u, v, 8 * S + 16, S, bs, tc, strong(bs), [alpha, alpha2], [beta, beta2]);
             let [u, v] = &mut got;
             simd::chroma_edge_v(u, v, 8 * S + 16, S, bs, tc, strong(bs), [alpha, alpha2], [beta, beta2]);
             assert_eq!(want, got, "chroma vertical: bs {bs:?} alpha {alpha}/{alpha2} beta {beta}/{beta2} tc0 {tc:?}");
@@ -896,16 +869,7 @@ mod tests {
             let tc0 = tc0_of(bs, tc0s);
             let mut want = plane(&mut rng, false);
             let mut got = want.clone();
-            for c in 0..8 {
-                let k = c / 2;
-                if bs[k] != 0 {
-                    let mut s: [u8; 4] = std::array::from_fn(|i| want[(14 + i) * S + 8 + c]);
-                    chroma_line(&mut s, bs[k], alpha, beta, tc0[k] as i32);
-                    for (i, v) in s.into_iter().enumerate() {
-                        want[(14 + i) * S + 8 + c] = v;
-                    }
-                }
-            }
+            scalar::chroma_edge_h(&mut want, 16 * S + 8, S, bs, tc0, strong(bs), alpha, beta);
             simd::chroma_edge_h(&mut got, 16 * S + 8, S, bs, tc0, strong(bs), alpha, beta);
             assert_eq!(want, got, "chroma horizontal: bs {bs:?} alpha {alpha} beta {beta} tc0 {tc0:?}");
         }

@@ -3,9 +3,9 @@
 //!
 //!     cargo run --release -p unflash-h264 --example compare -- file.mp4 [max_frames]
 
-use std::io::Read;
-use std::process::{Command, Stdio};
+mod common;
 
+use common::{ffmpeg_i420, locate};
 use unflash_h264::yuv::to_i420;
 use unflash_h264::Decoder;
 use unflash_mp4::demux::parse_bytes;
@@ -25,8 +25,8 @@ fn main() {
     if std::env::var("H264_DEBUG").is_ok() {
         for id in 0..256 {
             if let Some(pps) = dec.pps(id) {
-                println!("pps {id}: cabac {} t8x8 {} scaling_present {} present {:?} default {:?}", pps.entropy_coding_mode, pps.transform_8x8_mode, pps.scaling_present, pps.list_present, pps.list_default);
-                println!("  lists4[0] {:?}\n  lists8[0][..16] {:?}", pps.lists4[0], &pps.lists8[0][..16]);
+                println!("pps {id}: cabac {} t8x8 {} scaling_present {}", pps.entropy_coding_mode, pps.transform_8x8_mode, pps.scaling_present);
+                println!("  sent4 {:?}\n  sent8 {:?}", pps.sent4, pps.sent8);
             }
         }
     }
@@ -34,15 +34,14 @@ fn main() {
         let bytes = &data[s.offset as usize..(s.offset + s.size as u64) as usize];
         match dec.decode_sample(bytes, s.pts as f64) {
             Ok(Some(f)) => {
-                let sps = dec.sps().unwrap();
-                let (w, h) = sps.cropped_size();
-                to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut buf);
+                to_i420(&f.pic, f.crop, &mut buf);
                 if f.damaged {
                     println!("sample {i} (pts {}): damaged", s.pts);
                 }
                 frames.push((s.pts, buf.clone(), i));
                 kinds.push(dec.last_mb_kinds().to_vec());
                 if std::env::var("H264_DEBUG").is_ok() && frames.len() == 1 {
+                    let sps = dec.sps().unwrap();
                     println!("sps: profile {} level {} poc_type {} refs {} direct_8x8_inference {} crop {:?} scaling_present {}", sps.profile_idc, sps.level_idc, sps.poc_type, sps.max_num_ref_frames, sps.direct_8x8_inference, sps.crop, sps.scaling_present);
                     println!("  scaling4[0] {:?} scaling8[0][..16] {:?}", sps.scaling4[0], &sps.scaling8[0][..16]);
                 }
@@ -69,10 +68,7 @@ fn main() {
     };
     let kinds_sorted: Vec<Vec<unflash_h264::mb::MbKind>> = order.iter().map(|&i| kinds[i].clone()).collect();
     frames.sort_by_key(|f| f.0);
-    // ffmpeg's output in presentation order
-    let mut child = Command::new("ffmpeg").args(["-v", "error", "-i", &path, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]).stdout(Stdio::piped()).spawn().expect("ffmpeg");
-    let mut reference = Vec::new();
-    child.stdout.take().unwrap().read_to_end(&mut reference).unwrap();
+    let reference = ffmpeg_i420(&[], &path);
     let frame_size = w * h + 2 * (w.div_ceil(2) * h.div_ceil(2));
     let nref = reference.len() / frame_size;
     println!("ffmpeg produced {nref} frames");
@@ -89,27 +85,8 @@ fn main() {
         if bad > 3 {
             continue;
         }
-        // locate the first difference
-        let mut first = None;
-        for i in 0..frame_size {
-            if ours[i] != theirs[i] {
-                first = Some(i);
-                break;
-            }
-        }
-        let i = first.unwrap();
-        let (plane, x, y) = if i < w * h {
-            ("Y", i % w, i / w)
-        } else {
-            let ci = i - w * h;
-            let cw = w.div_ceil(2);
-            let csz = cw * h.div_ceil(2);
-            if ci < csz {
-                ("U", (ci % cw) * 2, (ci / cw) * 2)
-            } else {
-                ("V", ((ci - csz) % cw) * 2, ((ci - csz) / cw) * 2)
-            }
-        };
+        let i = (0..frame_size).position(|i| ours[i] != theirs[i]).unwrap();
+        let (plane, x, y) = locate(i, w, h);
         let ndiff = ours.iter().zip(theirs).filter(|(a, b)| a != b).count();
         let maxdiff = ours.iter().zip(theirs).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
         let mbw = w.div_ceil(16);
@@ -120,18 +97,7 @@ fn main() {
                 if ours[i] == theirs[i] {
                     continue;
                 }
-                let (plane, px, py) = if i < w * h {
-                    ("Y", i % w, i / w)
-                } else {
-                    let ci = i - w * h;
-                    let cw = w.div_ceil(2);
-                    let csz = cw * h.div_ceil(2);
-                    if ci < csz {
-                        ("U", (ci % cw) * 2, (ci / cw) * 2)
-                    } else {
-                        ("V", ((ci - csz) % cw) * 2, ((ci - csz) / cw) * 2)
-                    }
-                };
+                let (plane, px, py) = locate(i, w, h);
                 let kd = kinds_sorted[k].get((py / 16) * mbw + px / 16).copied();
                 println!("   {plane} ({px}, {py}) MB ({}, {}) {:?}: ours {} theirs {}", px / 16, py / 16, kd, ours[i], theirs[i]);
                 shown += 1;
@@ -151,10 +117,17 @@ fn main() {
         }
         println!("macroblock kinds: {hist:?}");
     }
-    if bad == 0 {
-        println!("all {} frames identical", frames.len().min(nref));
+    // as many frames as ffmpeg's (at most as many when cut short at max_frames)
+    let missing = if frames.len() < max { frames.len() != nref } else { frames.len() > nref };
+    if missing {
+        println!("{} frames here, {nref} from ffmpeg", frames.len());
+    }
+    if bad == 0 && !missing {
+        println!("all {} frames identical", frames.len());
     } else {
-        println!("{bad} frames differ");
+        if bad > 0 {
+            println!("{bad} frames differ");
+        }
         std::process::exit(1);
     }
 }

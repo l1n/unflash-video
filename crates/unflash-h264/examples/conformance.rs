@@ -38,21 +38,16 @@ fn decode(path: &Path) -> Result<(Vec<String>, usize), Error> {
     let mut md5s = Vec::new();
     let mut damaged = 0;
     let mut buf = Vec::new();
-    let mut push = |dec: &Decoder, f: unflash_h264::DecodedFrame, md5s: &mut Vec<String>, damaged: &mut usize| {
-        let sps = dec.sps().unwrap();
-        let (w, h) = sps.cropped_size();
-        to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut buf);
+    let mut push = |f: unflash_h264::DecodedFrame| {
+        to_i420(&f.pic, f.crop, &mut buf);
         md5s.push(format!("{:x}", md5::compute(&buf)));
-        if f.damaged {
-            *damaged += 1;
-        }
+        damaged += f.damaged as usize;
     };
-    let frames = dec.decode_annexb(&data, 0.0)?;
-    for f in frames {
-        push(&dec, f, &mut md5s, &mut damaged);
+    for f in dec.decode_annexb(&data, 0.0)? {
+        push(f);
     }
     if let Some(f) = dec.flush()? {
-        push(&dec, f, &mut md5s, &mut damaged);
+        push(f);
     }
     Ok((md5s, damaged))
 }

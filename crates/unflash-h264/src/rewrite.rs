@@ -17,6 +17,7 @@
 //! for that encoder's samples, and writes the merged record.
 
 use crate::bitreader::{unescape, BitReader};
+use crate::decoder::sample_nal_units;
 use crate::ps::{parse_pps, parse_sps, Pps, Sps};
 use crate::slice::parse_slice_header;
 use crate::{Error, Result};
@@ -31,10 +32,6 @@ pub struct BitWriter {
 impl BitWriter {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn bit_len(&self) -> usize {
-        self.nbits
     }
 
     #[inline]
@@ -421,22 +418,8 @@ impl Rewriter {
     /// it.
     pub fn rewrite_sample(&mut self, sample: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(sample.len() + 16);
-        let mut p = 0;
-        let n = self.in_len;
-        while p + n <= sample.len() {
-            let mut len = 0usize;
-            for i in 0..n {
-                len = (len << 8) | sample[p + i] as usize;
-            }
-            p += n;
-            if len == 0 {
-                continue;
-            }
-            if p + len > sample.len() {
-                return Err(Error::Bitstream("NAL unit runs past the sample"));
-            }
-            let nal = &sample[p..p + len];
-            p += len;
+        for nal in sample_nal_units(sample, self.in_len) {
+            let nal = nal?;
             let nal = if self.identity { Some(nal.to_vec()) } else { self.rewrite_nal(nal)? };
             if let Some(nal) = nal {
                 let l = nal.len();
@@ -685,7 +668,10 @@ impl AvcRegistry {
 /// (5) starts a stream a decoder can pick up cold.
 pub fn first_vcl_nal_type(sample: &[u8], len_size: usize) -> u8 {
     let mut p = 0;
-    while p + len_size <= sample.len() {
+    // (a NAL unit may run past the data read, so `p` may pass its end: it
+    // saturates rather than wrapping on wasm32 for a length near 2^32, and
+    // the loop compares without adding to it)
+    while sample.len().saturating_sub(p) >= len_size {
         let mut len = 0usize;
         for i in 0..len_size {
             len = (len << 8) | sample[p + i] as usize;
@@ -699,7 +685,7 @@ pub fn first_vcl_nal_type(sample: &[u8], len_size: usize) -> u8 {
         if t == 1 || t == 5 {
             return t;
         }
-        p += len;
+        p = p.saturating_add(len);
     }
     0
 }
@@ -762,6 +748,15 @@ mod tests {
         assert!(strip_buffering_period(&only).is_none());
         let other = [0x06, 5, 3, 1, 2, 3, 0x80];
         assert_eq!(strip_buffering_period(&other).unwrap(), other.to_vec());
+    }
+
+    #[test]
+    fn a_length_near_2_to_the_32_ends_the_search() {
+        // (on wasm32 the position wrapped round to the start, for ever;
+        // natively this passes either way)
+        assert_eq!(first_vcl_nal_type(&[0xff, 0xff, 0xff, 0xfc, 0x06], 4), 0);
+        assert_eq!(first_vcl_nal_type(&[0, 0, 0, 1, 0x06, 0, 0, 0, 9, 0x65], 4), 5);
+        assert_eq!(first_vcl_nal_type(&[0, 0, 0, 9, 0x06, 0, 0], 4), 0);
     }
 
     #[test]

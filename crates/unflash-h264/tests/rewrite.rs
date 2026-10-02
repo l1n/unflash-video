@@ -3,29 +3,15 @@
 //! smart-cut export does) decode as their sources did, in this decoder and
 //! in ffmpeg's.
 
-use std::path::PathBuf;
+mod common;
+
 use std::process::Command;
 
+use common::{expected, md5s, mux, read, sample};
+use unflash_h264::decoder::sample_nal_units;
 use unflash_h264::rewrite::{first_vcl_nal_type, parse_avcc, AvcRegistry};
-use unflash_h264::yuv::to_i420;
 use unflash_h264::Decoder;
 use unflash_mp4::demux::parse_bytes;
-use unflash_mp4::mux::dts_from_cts;
-use unflash_mp4::{Muxer, TrackDesc};
-
-fn media(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/h264").join(name)
-}
-
-fn read(name: &str) -> Vec<u8> {
-    std::fs::read(media(&format!("{name}.mp4"))).expect("run tests/media/h264/gen.sh")
-}
-
-/// ffmpeg's per-frame MD5s of a stream, presentation order.
-fn expected(name: &str) -> Vec<String> {
-    let text = std::fs::read_to_string(media(&format!("{name}.framemd5"))).unwrap();
-    text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).map(|l| l.rsplit(',').next().unwrap().trim().to_string()).collect()
-}
 
 /// Decode a file in memory: the MD5 of every frame in presentation order.
 fn decode(data: &[u8]) -> Vec<String> {
@@ -33,20 +19,7 @@ fn decode(data: &[u8]) -> Vec<String> {
     let track = movie.video().unwrap();
     let mut dec = Decoder::new();
     dec.configure_avcc(track.description.as_ref().unwrap()).unwrap();
-    let mut frames: Vec<(i64, String)> = Vec::new();
-    let mut buf = Vec::new();
-    for s in &track.samples {
-        let bytes = &data[s.offset as usize..(s.offset + s.size as u64) as usize];
-        if let Some(f) = dec.decode_sample(bytes, s.pts as f64).unwrap() {
-            assert!(!f.damaged, "damaged frame at pts {}", s.pts);
-            let sps = dec.sps().unwrap();
-            let (w, h) = sps.cropped_size();
-            to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut buf);
-            frames.push((s.pts, format!("{:x}", md5::compute(&buf))));
-        }
-    }
-    frames.sort_by_key(|f| f.0);
-    frames.into_iter().map(|f| f.1).collect()
+    md5s(&mut dec, data, track, "the file", |b| b.to_vec()).unwrap()
 }
 
 /// Every conformance stream, renumbered away from the ids another stream
@@ -68,21 +41,7 @@ fn renumbered_streams_decode_the_same() {
         assert_eq!(rec.sps.len(), 2, "{name}: the base's SPS and the stream's");
         let mut dec = Decoder::new();
         dec.configure_avcc(&reg.record()).unwrap();
-        let mut frames: Vec<(i64, String)> = Vec::new();
-        let mut buf = Vec::new();
-        for s in &track.samples {
-            let bytes = &data[s.offset as usize..(s.offset + s.size as u64) as usize];
-            let out = rw.rewrite_sample(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-            if let Some(f) = dec.decode_sample(&out, s.pts as f64).unwrap_or_else(|e| panic!("{name}: {e}")) {
-                assert!(!f.damaged, "{name}: damaged frame at pts {}", s.pts);
-                let sps = dec.sps().unwrap();
-                let (w, h) = sps.cropped_size();
-                to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut buf);
-                frames.push((s.pts, format!("{:x}", md5::compute(&buf))));
-            }
-        }
-        frames.sort_by_key(|f| f.0);
-        let got: Vec<String> = frames.into_iter().map(|f| f.1).collect();
+        let got = md5s(&mut dec, &data, track, name, |b| rw.rewrite_sample(b).unwrap_or_else(|e| panic!("{name}: {e}"))).unwrap_or_else(|e| panic!("{name}: {e}"));
         let want = expected(name);
         assert_eq!(got.len(), want.len(), "{name}: frame count");
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -108,37 +67,22 @@ fn splice(base: &str, other: &str) -> Vec<u8> {
     assert!(!rw.is_identity());
     // decode-order runs of 10 samples are the GOPs (closed GOPs: an IDR
     // every 10 frames in both orders)
-    for t in [ta, tb] {
+    for (t, data) in [(ta, &a), (tb, &b)] {
         let len = parse_avcc(t.description.as_ref().unwrap()).unwrap().len_size;
         for (i, s) in t.samples.iter().enumerate() {
-            let data = if std::ptr::eq(t, ta) { &a } else { &b };
-            let bytes = &data[s.offset as usize..(s.offset + s.size as u64) as usize];
             assert_eq!(s.sync, i % 10 == 0, "sync sample {i}");
-            assert_eq!(first_vcl_nal_type(bytes, len), if i % 10 == 0 { 5 } else { 1 }, "IDR at {i}");
+            assert_eq!(first_vcl_nal_type(sample(data, s), len), if i % 10 == 0 { 5 } else { 1 }, "IDR at {i}");
         }
     }
-    let mut mx = Muxer::new();
-    let vt = mx.add_track(TrackDesc::Video { codec: "avc1.640028".into(), width: ta.width, height: ta.height, timescale: ta.timescale, description: reg.record() });
-    let mut file = mx.start();
     let mut payloads: Vec<(Vec<u8>, i64, bool)> = Vec::new();
     for g in 0..4 {
         let (t, data, from_other) = if g % 2 == 0 { (ta, &a, false) } else { (tb, &b, true) };
         for s in &t.samples[g * 10..g * 10 + 10] {
-            let bytes = &data[s.offset as usize..(s.offset + s.size as u64) as usize];
-            let bytes = if from_other { rw.rewrite_sample(bytes).unwrap() } else { bytes.to_vec() };
+            let bytes = if from_other { rw.rewrite_sample(sample(data, s)).unwrap() } else { sample(data, s).to_vec() };
             payloads.push((bytes, s.pts, s.sync));
         }
     }
-    let cts: Vec<i64> = payloads.iter().map(|p| p.1).collect();
-    let timing = dts_from_cts(&cts, ta.samples[0].duration);
-    for ((bytes, pts, sync), (dts, dur)) in payloads.iter().zip(timing) {
-        file.extend_from_slice(bytes);
-        mx.add_sample(vt, dts, *pts, dur, *sync, bytes.len() as u32).unwrap();
-    }
-    let (moov, (at, patch)) = mx.finish().unwrap();
-    file[at as usize..at as usize + 8].copy_from_slice(&patch);
-    file.extend_from_slice(&moov);
-    file
+    mux(reg.record(), ta, &payloads)
 }
 
 fn check_splice(base: &str, other: &str, got: &[String], who: &str) {
@@ -166,8 +110,7 @@ fn ffmpeg_md5(file: &[u8], name: &str) -> Option<Vec<String>> {
     };
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
-    let text = String::from_utf8_lossy(&out.stdout);
-    Some(text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).map(|l| l.rsplit(',').next().unwrap().trim().to_string()).collect())
+    Some(common::framemd5(&String::from_utf8_lossy(&out.stdout)))
 }
 
 #[test]
@@ -212,10 +155,10 @@ fn renumbering_changes_only_the_pps_id() {
         for s in &merged.sps { let x = parse_sps(&unescape(&s[1..])).unwrap(); let id = x.id as usize; spss_new[id] = Some(x); }
         for p in &merged.pps { let x = parse_pps(&unescape(&p[1..])).unwrap(); let id = x.id as usize; ppss_new[id] = Some(x); }
         for (si, s) in track.samples.iter().enumerate() {
-            let bytes = &data[s.offset as usize..(s.offset + s.size as u64) as usize];
+            let bytes = sample(&data, s);
             let out = rw.rewrite_sample(bytes).unwrap();
             // walk NALs of both
-            let nals = |d: &[u8], n: usize| { let mut v = Vec::new(); let mut p = 0; while p + n <= d.len() { let mut len = 0; for i in 0..n { len = (len << 8) | d[p + i] as usize; } p += n; v.push(d[p..p + len].to_vec()); p += len; } v };
+            let nals = |d: &[u8], n: usize| sample_nal_units(d, n).map(|nal| nal.unwrap().to_vec()).collect::<Vec<_>>();
             let a = nals(bytes, orig.len_size);
             let b = nals(&out, merged.len_size);
             assert_eq!(a.len(), b.len(), "{name} sample {si}: NAL count");
@@ -269,8 +212,7 @@ fn identical_parameter_sets_share_ids() {
     let rec2 = parse_avcc(&reg.record()).unwrap();
     assert_eq!((rec2.sps.len(), rec2.pps.len()), (2, 2), "the second encoder adds nothing");
     let track = parse_bytes(&b).unwrap().video().unwrap().clone();
-    let s = &track.samples[0];
-    let bytes = &b[s.offset as usize..(s.offset + s.size as u64) as usize];
+    let bytes = sample(&b, &track.samples[0]);
     assert_eq!(rw1.rewrite_sample(bytes).unwrap(), rw2.rewrite_sample(bytes).unwrap());
 }
 
@@ -330,20 +272,7 @@ fn firefox_style_records_and_inband_parameter_sets() {
     // the decoder takes the damaged record and decodes the stream as ffmpeg does
     let mut dec = Decoder::new();
     dec.configure_avcc(&ff).unwrap();
-    let want = expected("splice_b");
-    let mut frames: Vec<(i64, String)> = Vec::new();
-    let mut buf = Vec::new();
-    for s in &tb.samples {
-        let bytes = &b[s.offset as usize..(s.offset + s.size as u64) as usize];
-        if let Some(f) = dec.decode_sample(bytes, s.pts as f64).unwrap() {
-            let sps = dec.sps().unwrap();
-            let (w, h) = sps.cropped_size();
-            to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut buf);
-            frames.push((s.pts, format!("{:x}", md5::compute(&buf))));
-        }
-    }
-    frames.sort_by_key(|f| f.0);
-    assert_eq!(frames.into_iter().map(|f| f.1).collect::<Vec<_>>(), want, "decoded through the damaged record");
+    assert_eq!(md5s(&mut dec, &b, &tb, "splice_b", |b| b.to_vec()).unwrap(), expected("splice_b"), "decoded through the damaged record");
 
     // splice: GOPs 1 and 3 from the Firefox-style encoder, in-band sets on its IDRs
     let mut reg = AvcRegistry::new(ta.description.as_ref().unwrap()).unwrap();
@@ -359,29 +288,17 @@ fn firefox_style_records_and_inband_parameter_sets() {
         let from_b = g % 2 == 1;
         let (t, data) = if from_b { (&tb, &b) } else { (&ta, &a) };
         for (k, s) in t.samples[g * 10..g * 10 + 10].iter().enumerate() {
-            let bytes = &data[s.offset as usize..(s.offset + s.size as u64) as usize];
             let bytes = if from_b {
                 let sets = if k == 0 { vec![if g == 1 { rec_b.sps[0].clone() } else { sps_other.clone() }, rec_b.pps[0].clone()] } else { vec![] };
-                rw.rewrite_sample(&with_inband(bytes, &sets, rec_b.len_size)).unwrap()
+                rw.rewrite_sample(&with_inband(sample(data, s), &sets, rec_b.len_size)).unwrap()
             } else {
-                bytes.to_vec()
+                sample(data, s).to_vec()
             };
             payloads.push((bytes, s.pts, s.sync));
         }
     }
     // the record is final once every encoder is registered
-    let record = reg.record();
-    let mut mx2 = Muxer::new();
-    let vt2 = mx2.add_track(TrackDesc::Video { codec: "avc1.640028".into(), width: ta.width, height: ta.height, timescale: ta.timescale, description: record });
-    let mut file = mx2.start();
-    let cts: Vec<i64> = payloads.iter().map(|p| p.1).collect();
-    for ((bytes, pts, sync), (dts, dur)) in payloads.iter().zip(dts_from_cts(&cts, ta.samples[0].duration)) {
-        file.extend_from_slice(bytes);
-        mx2.add_sample(vt2, dts, *pts, dur, *sync, bytes.len() as u32).unwrap();
-    }
-    let (moov, (at, patch)) = mx2.finish().unwrap();
-    file[at as usize..at as usize + 8].copy_from_slice(&patch);
-    file.extend_from_slice(&moov);
+    let file = mux(reg.record(), &ta, &payloads);
     check_splice("splice_a", "splice_b", &decode(&file), "this decoder (Firefox-style record, in-band sets)");
     if let Some(md5s) = ffmpeg_md5(&file, "firefox-style") {
         check_splice("splice_a", "splice_b", &md5s, "ffmpeg (Firefox-style record, in-band sets)");

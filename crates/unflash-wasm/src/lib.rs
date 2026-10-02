@@ -1302,7 +1302,7 @@ struct SmallPictures {
 
 #[wasm_bindgen]
 impl H264Decoder {
-    /// `fast` leaves the deblocking filter out (about a quarter of the
+    /// `fast` leaves the deblocking filter out (about a fifth of the
     /// decoding time): pictures good for statistics, not for showing or
     /// re-encoding.
     #[wasm_bindgen(constructor)]
@@ -1349,8 +1349,8 @@ impl H264Decoder {
     /// A finished picture: copied out whole, or made small.
     fn take(&mut self, f: &unflash_h264::DecodedFrame) -> Result<(), JsValue> {
         let sps = self.inner.sps().ok_or_else(|| js_err("no active sequence"))?;
-        let (w, h) = sps.cropped_size();
-        let (cx, cy) = (sps.crop.0 as usize, sps.crop.2 as usize);
+        let (cx, cy, w, h) = f.crop;
+        let (w, h) = (w as u32, h as u32);
         match &mut self.shrink {
             Some(s) => {
                 if !s.shrink.as_ref().is_some_and(|k| k.fits(w, h, s.aw, s.ah)) {
@@ -1361,7 +1361,7 @@ impl H264Decoder {
                 let k = s.shrink.as_mut().unwrap();
                 k.yuv420_planes(&pic.y[cy * lw + cx..], lw, &pic.u[cy / 2 * cw + cx / 2..], cw, &pic.v[cy / 2 * cw + cx / 2..], cw, s.bt709, s.full_range, &mut s.last);
             }
-            None => to_i420(&f.pic, (cx, cy, w as usize, h as usize), &mut self.frame),
+            None => to_i420(&f.pic, f.crop, &mut self.frame),
         }
         if self.width != w || self.height != h {
             self.color = color_space_json(sps);

@@ -429,32 +429,39 @@ impl Picture {
     }
 }
 
+/// A picture's planes, tightly packed as in [`Frame`] (chroma `grey` where
+/// it has none), each row of samples made by `row` from the picture's bytes
+/// of it (two a sample above 8 bits).
+fn read_planes<T: Copy + Default>(pic: &Picture, bits: u8, grey: T, row: impl Fn(&[u8], &mut [T])) -> Result<[Vec<T>; 3]> {
+    let (w, h) = pic.size();
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let bytes = if bits == 8 { 1 } else { 2 };
+    let mut planes = [vec![T::default(); w * h], vec![grey; cw * ch], vec![grey; cw * ch]];
+    let n = if pic.has_chroma() { 3 } else { 1 };
+    for (i, dst) in planes.iter_mut().enumerate().take(n) {
+        let (pw, ph) = if i == 0 { (w, h) } else { (cw, ch) };
+        let (src, stride) = pic.plane(i, ph, pw * bytes)?;
+        for (r, out) in dst.chunks_exact_mut(pw.max(1)).take(ph).enumerate() {
+            row(&src[r * stride..][..pw * bytes], out);
+        }
+    }
+    Ok(planes)
+}
+
 fn to_frame(pic: &Picture, pts: f64, damaged: bool) -> Result<Frame> {
     let bits = pic.check()?;
     let (w, h) = pic.size();
-    let (cw, ch) = ((w + 1) / 2, (h + 1) / 2);
     let (bt709, full_range) = pic.colour();
-    let mut f = Frame { width: w as u32, height: h as u32, y: vec![0; w * h], u: vec![128; cw * ch], v: vec![128; cw * ch], pts, damaged, bt709, full_range };
-    let bytes = if bits == 8 { 1 } else { 2 };
-    let mut planes = vec![(0, w, h, &mut f.y)];
-    if pic.has_chroma() {
-        planes.push((1, cw, ch, &mut f.u));
-        planes.push((2, cw, ch, &mut f.v));
-    }
-    for (i, pw, ph, dst) in planes {
-        let (src, stride) = pic.plane(i, ph, pw * bytes)?;
-        for (r, out) in dst.chunks_exact_mut(pw.max(1)).take(ph).enumerate() {
-            let row = &src[r * stride..][..pw * bytes];
-            if bits == 8 {
-                out.copy_from_slice(row);
-            } else {
-                for (o, s) in out.iter_mut().zip(row.chunks_exact(2)) {
-                    *o = to_8bit(u16::from_ne_bytes([s[0], s[1]]));
-                }
+    let [y, u, v] = read_planes(pic, bits, 128, |row, out| {
+        if bits == 8 {
+            out.copy_from_slice(row);
+        } else {
+            for (o, s) in out.iter_mut().zip(row.chunks_exact(2)) {
+                *o = to_8bit(u16::from_ne_bytes([s[0], s[1]]));
             }
         }
-    }
-    Ok(f)
+    })?;
+    Ok(Frame { width: w as u32, height: h as u32, y, u, v, pts, damaged, bt709, full_range })
 }
 
 /// A 10-bit sample rounded to 8 bits.
@@ -466,27 +473,14 @@ pub fn to_8bit(v: u16) -> u8 {
 fn to_raw(pic: &Picture, pts: f64, damaged: bool) -> Result<RawFrame> {
     let bits = pic.check()?;
     let (w, h) = pic.size();
-    let (cw, ch) = ((w + 1) / 2, (h + 1) / 2);
-    let grey = 1u16 << (bits - 1);
-    let mut f = RawFrame { width: w as u32, height: h as u32, bit_depth: bits, y: vec![0; w * h], u: vec![grey; cw * ch], v: vec![grey; cw * ch], pts, damaged };
-    let bytes = if bits == 8 { 1 } else { 2 };
-    let mut planes = vec![(0, w, h, &mut f.y)];
-    if pic.has_chroma() {
-        planes.push((1, cw, ch, &mut f.u));
-        planes.push((2, cw, ch, &mut f.v));
-    }
-    for (i, pw, ph, dst) in planes {
-        let (src, stride) = pic.plane(i, ph, pw * bytes)?;
-        for (r, out) in dst.chunks_exact_mut(pw.max(1)).take(ph).enumerate() {
-            let row = &src[r * stride..][..pw * bytes];
-            if bits == 8 {
-                out.iter_mut().zip(row).for_each(|(o, &s)| *o = s as u16);
-            } else {
-                out.iter_mut().zip(row.chunks_exact(2)).for_each(|(o, s)| *o = u16::from_ne_bytes([s[0], s[1]]));
-            }
+    let [y, u, v] = read_planes(pic, bits, 1u16 << (bits - 1), |row, out| {
+        if bits == 8 {
+            out.iter_mut().zip(row).for_each(|(o, &s)| *o = s as u16);
+        } else {
+            out.iter_mut().zip(row.chunks_exact(2)).for_each(|(o, s)| *o = u16::from_ne_bytes([s[0], s[1]]));
         }
-    }
-    Ok(f)
+    })?;
+    Ok(RawFrame { width: w as u32, height: h as u32, bit_depth: bits, y, u, v, pts, damaged })
 }
 
 #[cfg(test)]

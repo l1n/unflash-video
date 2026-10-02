@@ -85,7 +85,6 @@ pub struct SliceHeader {
     pub num_ref_idx_active: [u32; 2],
     pub ref_list_mods: [Vec<RefListMod>; 2],
     pub pred_weight: Option<PredWeightTable>,
-    pub no_output_of_prior_pics: bool,
     pub long_term_reference: bool,
     /// None: sliding window marking; Some: adaptive marking operations.
     pub mmco: Option<Vec<Mmco>>,
@@ -103,9 +102,6 @@ impl SliceHeader {
     }
     pub fn is_ref(&self) -> bool {
         self.nal_ref_idc != 0
-    }
-    pub fn has_mmco5(&self) -> bool {
-        matches!(&self.mmco, Some(ops) if ops.contains(&Mmco::UnmarkAll))
     }
     /// The picture structure: 1 top field, 2 bottom field, 3 frame.
     pub fn structure(&self) -> u8 {
@@ -171,8 +167,9 @@ pub fn parse_slice_header(r: &mut BitReader, nal_unit_type: u8, nal_ref_idc: u8,
     let pps_id = r.ue_max(255, "pic_parameter_set_id")?;
     let pps = ppss.get(pps_id as usize).and_then(|p| p.as_ref()).ok_or(Error::Bitstream("slice refers to a missing PPS"))?;
     let sps = spss.get(pps.sps_id as usize).and_then(|s| s.as_ref()).ok_or(Error::Bitstream("PPS refers to a missing SPS"))?;
-    let mb_units = if sps.frame_mbs_only { sps.width_mbs * sps.height_mbs } else { sps.width_mbs * sps.height_mbs / 2 };
-    if first_mb >= mb_units && first_mb >= sps.width_mbs * sps.height_mbs {
+    // (a field has half the frame's macroblocks and an MBAFF frame counts
+    // pairs: SliceDecoder::decode stops a slice that starts past those)
+    if first_mb >= sps.width_mbs * sps.height_mbs {
         return Err(Error::Bitstream("first_mb_in_slice outside the picture"));
     }
     let frame_num = r.u(sps.log2_max_frame_num)?;
@@ -238,12 +235,11 @@ pub fn parse_slice_header(r: &mut BitReader, nal_unit_type: u8, nal_ref_idc: u8,
         }
         pred_weight = Some(PredWeightTable { luma_log2_denom, chroma_log2_denom, lists });
     }
-    let mut no_output_of_prior_pics = false;
     let mut long_term_reference = false;
     let mut mmco = None;
     if nal_ref_idc != 0 {
         if is_idr {
-            no_output_of_prior_pics = r.flag()?;
+            r.flag()?; // no_output_of_prior_pics_flag
             long_term_reference = r.flag()?;
         } else if r.flag()? {
             let mut ops = Vec::new();
@@ -253,13 +249,16 @@ pub fn parse_slice_header(r: &mut BitReader, nal_unit_type: u8, nal_ref_idc: u8,
                     0 => break,
                     1 => ops.push(Mmco::UnmarkShortTerm(r.ue()? + 1)),
                     2 => ops.push(Mmco::UnmarkLongTerm(r.ue()?)),
+                    // (a long-term frame index is below max_num_ref_frames, so
+                    // at most 15, as ffmpeg also requires; unbounded, a damaged
+                    // stream could add long-term frames to the buffer without end)
                     3 => {
                         let d = r.ue()? + 1;
-                        ops.push(Mmco::ShortToLong(d, r.ue()?));
+                        ops.push(Mmco::ShortToLong(d, r.ue_max(15, "long_term_frame_idx")?));
                     }
                     4 => ops.push(Mmco::MaxLongTermIdx(r.ue()?)),
                     5 => ops.push(Mmco::UnmarkAll),
-                    _ => ops.push(Mmco::CurrentToLong(r.ue()?)),
+                    _ => ops.push(Mmco::CurrentToLong(r.ue_max(15, "long_term_frame_idx")?)),
                 }
                 if ops.len() > 66 {
                     return Err(Error::Bitstream("too many marking operations"));
@@ -309,7 +308,6 @@ pub fn parse_slice_header(r: &mut BitReader, nal_unit_type: u8, nal_ref_idc: u8,
         num_ref_idx_active,
         ref_list_mods,
         pred_weight,
-        no_output_of_prior_pics,
         long_term_reference,
         mmco,
         cabac_init_idc,

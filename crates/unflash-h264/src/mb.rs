@@ -360,6 +360,24 @@ impl<'a> SliceDecoder<'a> {
         matches!(self.entropy, Entropy::Cabac(_))
     }
 
+    /// The arithmetic decoder of a CABAC slice.
+    #[inline(always)]
+    fn cabac(&mut self) -> &mut Cabac<'a> {
+        match &mut self.entropy {
+            Entropy::Cabac(c) => c,
+            Entropy::Cavlc(_) => unreachable!("a CABAC syntax element in a CAVLC slice"),
+        }
+    }
+
+    /// The bit reader of a CAVLC slice.
+    #[inline(always)]
+    fn cavlc(&mut self) -> &mut BitReader<'a> {
+        match &mut self.entropy {
+            Entropy::Cavlc(r) => r,
+            Entropy::Cabac(_) => unreachable!("a CAVLC syntax element in a CABAC slice"),
+        }
+    }
+
     /// 7.3.4: decode the slice's macroblocks. Returns the number decoded.
     pub fn decode(&mut self) -> Result<usize> {
         let total = self.width_mbs * self.mb_rows;
@@ -383,9 +401,7 @@ impl<'a> SliceDecoder<'a> {
                     // mb_skip_run precedes every coded macroblock; after
                     // the run (skip_run reaches 0) the next MB is coded
                     if skip_run < 0 {
-                        if let Entropy::Cavlc(r) = &mut self.entropy {
-                            skip_run = r.ue()? as i32;
-                        }
+                        skip_run = self.cavlc().ue()? as i32;
                     }
                     if skip_run > 0 {
                         skip = true;
@@ -398,9 +414,7 @@ impl<'a> SliceDecoder<'a> {
                     skip = self.next_mb_skipped;
                 } else {
                     let inc = self.skip_ctx_inc();
-                    if let Entropy::Cabac(c) = &mut self.entropy {
-                        skip = c.mb_skip_flag(slice_type == SliceType::B, inc);
-                    }
+                    skip = self.cabac().mb_skip_flag(slice_type == SliceType::B, inc);
                 }
             }
             if self.mbaff && !self.mb_bottom {
@@ -413,11 +427,7 @@ impl<'a> SliceDecoder<'a> {
                 if skip {
                     if cabac {
                         let inc = self.skip_ctx_inc_bottom();
-                        let is_b = slice_type == SliceType::B;
-                        let mut next = false;
-                        if let Entropy::Cabac(c) = &mut self.entropy {
-                            next = c.mb_skip_flag(is_b, inc);
-                        }
+                        let next = self.cabac().mb_skip_flag(slice_type == SliceType::B, inc);
                         self.next_mb_skipped = next;
                         coded = !next;
                     } else {
@@ -610,11 +620,9 @@ impl<'a> SliceDecoder<'a> {
         if self.is_cabac() {
             // 9.3.3.1.1.2: condTermFlagN = the neighbouring pair is a field pair
             let inc = self.pair_nb(-1, 0).map_or(0, |a| self.mbs[a].field as usize) + self.pair_nb(0, -1).map_or(0, |b| self.mbs[b].field as usize);
-            let Entropy::Cabac(c) = &mut self.entropy else { unreachable!() };
-            Ok(c.decision(70 + inc) != 0)
+            Ok(self.cabac().decision(70 + inc) != 0)
         } else {
-            let Entropy::Cavlc(r) = &mut self.entropy else { unreachable!() };
-            r.flag()
+            self.cavlc().flag()
         }
     }
 
@@ -833,34 +841,17 @@ impl<'a> SliceDecoder<'a> {
         // mb_type
         let raw = match &mut self.entropy {
             Entropy::Cavlc(r) => r.ue()?,
-            Entropy::Cabac(_) => {
-                let v = match slice_type {
-                    SliceType::I => {
-                        let inc = self.left().map_or(0, |m| (m.kind != MbKind::I4x4 && m.kind != MbKind::I8x8) as usize) + self.above().map_or(0, |m| (m.kind != MbKind::I4x4 && m.kind != MbKind::I8x8) as usize);
-                        if let Entropy::Cabac(c) = &mut self.entropy {
-                            c.mb_type_i(inc)
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                    SliceType::P => {
-                        if let Entropy::Cabac(c) = &mut self.entropy {
-                            c.mb_type_p()
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                    SliceType::B => {
-                        let inc = self.left().map_or(0, |m| (m.kind != MbKind::BSkip && m.kind != MbKind::BDirect16x16) as usize) + self.above().map_or(0, |m| (m.kind != MbKind::BSkip && m.kind != MbKind::BDirect16x16) as usize);
-                        if let Entropy::Cabac(c) = &mut self.entropy {
-                            c.mb_type_b(inc)
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                };
-                v
-            }
+            Entropy::Cabac(_) => match slice_type {
+                SliceType::I => {
+                    let inc = self.left().map_or(0, |m| (m.kind != MbKind::I4x4 && m.kind != MbKind::I8x8) as usize) + self.above().map_or(0, |m| (m.kind != MbKind::I4x4 && m.kind != MbKind::I8x8) as usize);
+                    self.cabac().mb_type_i(inc)
+                }
+                SliceType::P => self.cabac().mb_type_p(),
+                SliceType::B => {
+                    let inc = self.left().map_or(0, |m| (m.kind != MbKind::BSkip && m.kind != MbKind::BDirect16x16) as usize) + self.above().map_or(0, |m| (m.kind != MbKind::BSkip && m.kind != MbKind::BDirect16x16) as usize);
+                    self.cabac().mb_type_b(inc)
+                }
+            },
         };
         // split into intra / inter types
         let intra_offset = match slice_type {
@@ -899,20 +890,7 @@ impl<'a> SliceDecoder<'a> {
         }
         if itype == 0 {
             // I_NxN
-            let mut t8 = false;
-            if self.pps.transform_8x8_mode {
-                t8 = match &mut self.entropy {
-                    Entropy::Cavlc(r) => r.flag()?,
-                    Entropy::Cabac(_) => {
-                        let inc = self.left().map_or(0, |m| m.transform8x8 as usize) + self.above().map_or(0, |m| m.transform8x8 as usize);
-                        if let Entropy::Cabac(c) = &mut self.entropy {
-                            c.transform_size_8x8_flag(inc)
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                };
-            }
+            let t8 = self.pps.transform_8x8_mode && self.parse_transform8x8()?;
             self.cur.transform8x8 = t8;
             self.cur.kind = if t8 { MbKind::I8x8 } else { MbKind::I4x4 };
             // prediction modes
@@ -984,11 +962,7 @@ impl<'a> SliceDecoder<'a> {
             Entropy::Cavlc(r) => r.ue_max(3, "intra_chroma_pred_mode")?,
             Entropy::Cabac(_) => {
                 let inc = self.left().map_or(0, |m| (m.intra && m.kind != MbKind::IPcm && m.chroma_pred_mode != 0) as usize) + self.above().map_or(0, |m| (m.intra && m.kind != MbKind::IPcm && m.chroma_pred_mode != 0) as usize);
-                if let Entropy::Cabac(c) = &mut self.entropy {
-                    c.intra_chroma_pred_mode(inc)
-                } else {
-                    unreachable!()
-                }
+                self.cabac().intra_chroma_pred_mode(inc)
             }
         };
         self.cur.chroma_pred_mode = cpm as u8;
@@ -1130,11 +1104,7 @@ impl<'a> SliceDecoder<'a> {
                     }
                 };
                 let chroma_inc = [chroma_cond(left, false) + 2 * chroma_cond(above, false), chroma_cond(left, true) + 2 * chroma_cond(above, true)];
-                if let Entropy::Cabac(c) = &mut self.entropy {
-                    Ok(c.coded_block_pattern(&luma_inc, chroma_inc) as u8)
-                } else {
-                    unreachable!()
-                }
+                Ok(self.cabac().coded_block_pattern(&luma_inc, chroma_inc) as u8)
             }
         }
     }
@@ -1162,39 +1132,13 @@ impl<'a> SliceDecoder<'a> {
 
     /// CAVLC nC for a luma 4x4 block at (x, y) in the MB (9.2.1).
     fn nc_luma(&self, x: usize, y: usize) -> i32 {
-        let count = |nb: Option<(&MbInfo, usize)>| -> Option<i32> {
-            nb.map(|(m, blk)| match m.kind {
-                MbKind::PSkip | MbKind::BSkip => 0,
-                MbKind::IPcm => 16,
-                _ => m.total_coeff[blk] as i32,
-            })
-        };
-        let a = count(self.nb_block(x as i32 - 1, y as i32));
-        let b = count(self.nb_block(x as i32, y as i32 - 1));
-        match (a, b) {
-            (Some(a), Some(b)) => (a + b + 1) >> 1,
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => 0,
-        }
+        let count = |nb: Option<(&MbInfo, usize)>| nb.map(|(m, blk)| coeffs(m, m.total_coeff[blk]));
+        nc(count(self.nb_block(x as i32 - 1, y as i32)), count(self.nb_block(x as i32, y as i32 - 1)))
     }
 
     fn nc_chroma(&self, comp: usize, x: usize, y: usize) -> i32 {
-        let count = |nb: Option<(&MbInfo, usize)>| -> Option<i32> {
-            nb.map(|(m, blk)| match m.kind {
-                MbKind::PSkip | MbKind::BSkip => 0,
-                MbKind::IPcm => 16,
-                _ => m.total_coeff_c[comp][blk] as i32,
-            })
-        };
-        let a = count(self.nb_chroma_block(x as i32 - 1, y as i32));
-        let b = count(self.nb_chroma_block(x as i32, y as i32 - 1));
-        match (a, b) {
-            (Some(a), Some(b)) => (a + b + 1) >> 1,
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => 0,
-        }
+        let count = |nb: Option<(&MbInfo, usize)>| nb.map(|(m, blk)| coeffs(m, m.total_coeff_c[comp][blk]));
+        nc(count(self.nb_chroma_block(x as i32 - 1, y as i32)), count(self.nb_chroma_block(x as i32, y as i32 - 1)))
     }
 
     /// CABAC coded_block_flag ctxIdxInc for a block (9.3.3.1.1.9). `kind`:
@@ -1262,7 +1206,7 @@ impl<'a> SliceDecoder<'a> {
         match &mut self.entropy {
             Entropy::Cavlc(_) => {
                 let nc = self.nc_luma(x, y);
-                let n = if let Entropy::Cavlc(r) = &mut self.entropy { cavlc::residual_block(r, nc, start, 15, out)? } else { unreachable!() };
+                let n = cavlc::residual_block(self.cavlc(), nc, start, 15, out)?;
                 self.cur.total_coeff[raster] = n;
                 if n != 0 {
                     self.cur.cbf |= 1 << raster;
@@ -1272,12 +1216,12 @@ impl<'a> SliceDecoder<'a> {
             Entropy::Cabac(_) => {
                 let inc = self.cbf_inc(1, 0, x, y);
                 let field = self.mb_field;
-                let c = if let Entropy::Cabac(c) = &mut self.entropy { c } else { unreachable!() };
+                let c = self.cabac();
                 if !c.coded_block_flag(cat, inc) {
                     return Ok(0);
                 }
-                self.cur.cbf |= 1 << raster;
                 let n = c.residual_block(cat, 16 - start, start, out, field)? as u8;
+                self.cur.cbf |= 1 << raster;
                 self.cur.total_coeff[raster] = n;
                 Ok(n)
             }
@@ -1297,17 +1241,14 @@ impl<'a> SliceDecoder<'a> {
             match &mut self.entropy {
                 Entropy::Cavlc(_) => {
                     let nc = self.nc_luma(0, 0);
-                    if let Entropy::Cavlc(r) = &mut self.entropy {
-                        cavlc::residual_block(r, nc, 0, 15, &mut dc)?;
-                    }
+                    cavlc::residual_block(self.cavlc(), nc, 0, 15, &mut dc)?;
                 }
                 Entropy::Cabac(_) => {
                     let inc = self.cbf_inc(0, 0, 0, 0);
-                    if let Entropy::Cabac(c) = &mut self.entropy {
-                        if c.coded_block_flag(0, inc) {
-                            c.residual_block(0, 16, 0, &mut dc, field)?;
-                            self.cur.cbf |= 1 << 24;
-                        }
+                    let c = self.cabac();
+                    if c.coded_block_flag(0, inc) {
+                        c.residual_block(0, 16, 0, &mut dc, field)?;
+                        self.cur.cbf |= 1 << 24;
                     }
                 }
             }
@@ -1323,7 +1264,7 @@ impl<'a> SliceDecoder<'a> {
                     let x = (b8 % 2) * 8;
                     let y = (b8 / 2) * 8;
                     let mut blk = [0i32; 64];
-                    let n = if let Entropy::Cabac(c) = &mut self.entropy { c.residual_block(5, 64, 0, &mut blk, field)? } else { unreachable!() };
+                    let n = self.cabac().residual_block(5, 64, 0, &mut blk, field)?;
                     for k in 0..64 {
                         self.co.luma8[b8][self.scan8[k] as usize] = blk[k];
                     }
@@ -1383,11 +1324,10 @@ impl<'a> SliceDecoder<'a> {
                     }
                     Entropy::Cabac(_) => {
                         let inc = self.cbf_inc(2, comp, 0, 0);
-                        if let Entropy::Cabac(c) = &mut self.entropy {
-                            if c.coded_block_flag(3, inc) {
-                                c.residual_block(3, 4, 0, &mut dc, field)?;
-                                self.cur.cbf |= 1 << (25 + comp);
-                            }
+                        let c = self.cabac();
+                        if c.coded_block_flag(3, inc) {
+                            c.residual_block(3, 4, 0, &mut dc, field)?;
+                            self.cur.cbf |= 1 << (25 + comp);
                         }
                     }
                 }
@@ -1403,7 +1343,7 @@ impl<'a> SliceDecoder<'a> {
                     match &mut self.entropy {
                         Entropy::Cavlc(_) => {
                             let nc = self.nc_chroma(comp, x, y);
-                            let n = if let Entropy::Cavlc(r) = &mut self.entropy { cavlc::residual_block(r, nc, 1, 15, &mut ac)? } else { unreachable!() };
+                            let n = cavlc::residual_block(self.cavlc(), nc, 1, 15, &mut ac)?;
                             self.cur.total_coeff_c[comp][blk] = n;
                             if n != 0 {
                                 self.cur.cbf |= 1 << (16 + comp * 4 + blk);
@@ -1411,12 +1351,11 @@ impl<'a> SliceDecoder<'a> {
                         }
                         Entropy::Cabac(_) => {
                             let inc = self.cbf_inc(3, comp, x, y);
-                            if let Entropy::Cabac(c) = &mut self.entropy {
-                                if c.coded_block_flag(4, inc) {
-                                    self.cur.cbf |= 1 << (16 + comp * 4 + blk);
-                                    let n = c.residual_block(4, 15, 1, &mut ac, field)? as u8;
-                                    self.cur.total_coeff_c[comp][blk] = n;
-                                }
+                            let c = self.cabac();
+                            if c.coded_block_flag(4, inc) {
+                                let n = c.residual_block(4, 15, 1, &mut ac, field)? as u8;
+                                self.cur.cbf |= 1 << (16 + comp * 4 + blk);
+                                self.cur.total_coeff_c[comp][blk] = n;
                             }
                         }
                     }
@@ -1636,9 +1575,6 @@ impl<'a> SliceDecoder<'a> {
             let corner = if avail_corner { self.chroma_at(comp, -1, -1) } else { 128 };
             let mut pred = [0u8; 64];
             intra::pred_chroma(mode, &Edges { above: &above, left: &left, corner, avail_above, avail_left, avail_left_half, avail_corner }, &mut pred);
-            if crate::debug_flag("H264_DBG_INTRA").map_or(false, |v| v == format!("{},{},{}", self.mx, self.my, self.poc)) {
-                eprintln!("intra chroma comp {comp} mb ({},{}) poc {} field {} bottom {} mode {mode} above {avail_above} left {avail_left} halves {:?} corner {avail_corner}\n  above {:?}\n  left {:?}\n  pred rows {:?}", self.mx, self.my, self.poc, self.mb_field, self.mb_bottom, avail_left_half, &above[..8], &left[..8], pred.chunks(8).map(|r| r.to_vec()).collect::<Vec<_>>());
-            }
             let plane = if comp == 0 { &mut self.pic.u } else { &mut self.pic.v };
             for y in 0..8 {
                 plane[cb + y * cs..cb + y * cs + 8].copy_from_slice(&pred[y * 8..y * 8 + 8]);
@@ -1816,11 +1752,7 @@ impl<'a> SliceDecoder<'a> {
             Entropy::Cavlc(r) => r.flag(),
             Entropy::Cabac(_) => {
                 let inc = self.left().map_or(0, |m| m.transform8x8 as usize) + self.above().map_or(0, |m| m.transform8x8 as usize);
-                if let Entropy::Cabac(c) = &mut self.entropy {
-                    Ok(c.transform_size_8x8_flag(inc))
-                } else {
-                    unreachable!()
-                }
+                Ok(self.cabac().transform_size_8x8_flag(inc))
             }
         }
     }
@@ -1880,11 +1812,7 @@ impl<'a> SliceDecoder<'a> {
                     Entropy::Cavlc(r) => r.te(n_active - 1)?,
                     Entropy::Cabac(_) => {
                         let inc = self.ref_idx_ctx_inc(ip, list, p);
-                        if let Entropy::Cabac(c) = &mut self.entropy {
-                            c.ref_idx(inc)?
-                        } else {
-                            unreachable!()
-                        }
+                        self.cabac().ref_idx(inc)?
                     }
                 };
                 if r >= n_active {
@@ -1915,11 +1843,7 @@ impl<'a> SliceDecoder<'a> {
                             Entropy::Cavlc(r) => r.se()?,
                             Entropy::Cabac(_) => {
                                 let sum = self.mvd_ctx_sum(list, comp, x, y);
-                                if let Entropy::Cabac(c) = &mut self.entropy {
-                                    c.mvd(comp, sum)?
-                                } else {
-                                    unreachable!()
-                                }
+                                self.cabac().mvd(comp, sum)?
                             }
                         };
                         if !(-8192..=8191).contains(&v) {
@@ -2400,51 +2324,57 @@ impl<'a> SliceDecoder<'a> {
             }
         };
         // luma
-        if wl.is_none() {
-            let mut first = true;
-            for list in 0..2 {
-                let Some(r) = refs[list] else { continue };
-                let (rp, off, stride, pw, ph, _) = src(list, r);
-                inter::mc_luma(&rp.pic.y[off * pw..], stride, pw, ph, px, py, mvs[list][0], mvs[list][1], w, h, &mut self.pic.y[ybase..], ys, !first);
-                first = false;
+        match wl {
+            None => {
+                let mut first = true;
+                for list in 0..2 {
+                    let Some(r) = refs[list] else { continue };
+                    let (rp, off, stride, pw, ph, _) = src(list, r);
+                    inter::mc_luma(&rp.pic.y[off * pw..], stride, pw, ph, px, py, mvs[list][0], mvs[list][1], w, h, &mut self.pic.y[ybase..], ys, !first);
+                    first = false;
+                }
             }
-        } else {
-            let mut pl = [[0u8; 256]; 2];
-            for list in 0..2 {
-                let Some(r) = refs[list] else { continue };
-                let (rp, off, stride, pw, ph, _) = src(list, r);
-                inter::mc_luma(&rp.pic.y[off * pw..], stride, pw, ph, px, py, mvs[list][0], mvs[list][1], w, h, &mut pl[list], w, false);
-            }
-            if bi {
-                inter::weight_bi(&pl[0], &pl[1], w, h, wl.unwrap(), &mut self.pic.y[ybase..], ys);
-            } else {
-                inter::weight_uni(&pl[single], w, h, wl.unwrap(), &mut self.pic.y[ybase..], ys);
+            Some(wl) => {
+                let mut pl = [[0u8; 256]; 2];
+                for list in 0..2 {
+                    let Some(r) = refs[list] else { continue };
+                    let (rp, off, stride, pw, ph, _) = src(list, r);
+                    inter::mc_luma(&rp.pic.y[off * pw..], stride, pw, ph, px, py, mvs[list][0], mvs[list][1], w, h, &mut pl[list], w, false);
+                }
+                if bi {
+                    inter::weight_bi(&pl[0], &pl[1], w, h, wl, &mut self.pic.y[ybase..], ys);
+                } else {
+                    inter::weight_uni(&pl[single], w, h, wl, &mut self.pic.y[ybase..], ys);
+                }
             }
         }
         // chroma
         for c in 0..2 {
             let dst = if c == 0 { &mut self.pic.u[cbase..] } else { &mut self.pic.v[cbase..] };
-            if wc[c].is_none() {
-                let mut first = true;
-                for list in 0..2 {
-                    let Some(r) = refs[list] else { continue };
-                    let (rp, off, stride, pw, ph, dy) = src(list, r);
-                    let plane = if c == 0 { &rp.pic.u } else { &rp.pic.v };
-                    inter::mc_chroma(&plane[off * (pw / 2)..], stride / 2, pw / 2, ph / 2, px / 2, py / 2, mvs[list][0], mvs[list][1] + dy, cwid, chei, dst, cs, !first);
-                    first = false;
+            match wc[c] {
+                None => {
+                    let mut first = true;
+                    for list in 0..2 {
+                        let Some(r) = refs[list] else { continue };
+                        let (rp, off, stride, pw, ph, dy) = src(list, r);
+                        let plane = if c == 0 { &rp.pic.u } else { &rp.pic.v };
+                        inter::mc_chroma(&plane[off * (pw / 2)..], stride / 2, pw / 2, ph / 2, px / 2, py / 2, mvs[list][0], mvs[list][1] + dy, cwid, chei, dst, cs, !first);
+                        first = false;
+                    }
                 }
-            } else {
-                let mut pc = [[0u8; 64]; 2];
-                for list in 0..2 {
-                    let Some(r) = refs[list] else { continue };
-                    let (rp, off, stride, pw, ph, dy) = src(list, r);
-                    let plane = if c == 0 { &rp.pic.u } else { &rp.pic.v };
-                    inter::mc_chroma(&plane[off * (pw / 2)..], stride / 2, pw / 2, ph / 2, px / 2, py / 2, mvs[list][0], mvs[list][1] + dy, cwid, chei, &mut pc[list], cwid, false);
-                }
-                if bi {
-                    inter::weight_bi(&pc[0], &pc[1], cwid, chei, wc[c].unwrap(), dst, cs);
-                } else {
-                    inter::weight_uni(&pc[single], cwid, chei, wc[c].unwrap(), dst, cs);
+                Some(wc) => {
+                    let mut pc = [[0u8; 64]; 2];
+                    for list in 0..2 {
+                        let Some(r) = refs[list] else { continue };
+                        let (rp, off, stride, pw, ph, dy) = src(list, r);
+                        let plane = if c == 0 { &rp.pic.u } else { &rp.pic.v };
+                        inter::mc_chroma(&plane[off * (pw / 2)..], stride / 2, pw / 2, ph / 2, px / 2, py / 2, mvs[list][0], mvs[list][1] + dy, cwid, chei, &mut pc[list], cwid, false);
+                    }
+                    if bi {
+                        inter::weight_bi(&pc[0], &pc[1], cwid, chei, wc, dst, cs);
+                    } else {
+                        inter::weight_uni(&pc[single], cwid, chei, wc, dst, cs);
+                    }
                 }
             }
         }
@@ -2530,6 +2460,28 @@ fn implicit_table(poc: i32, l0: &[RefPic], l1: &[RefPic]) -> Vec<Vec<(i32, i32)>
                 .collect()
         })
         .collect()
+}
+
+/// The coefficients a neighbouring block counts for CAVLC nC (9.2.1): none
+/// in a skipped macroblock, 16 in an I_PCM one.
+#[inline(always)]
+fn coeffs(m: &MbInfo, total_coeff: u8) -> i32 {
+    match m.kind {
+        MbKind::PSkip | MbKind::BSkip => 0,
+        MbKind::IPcm => 16,
+        _ => total_coeff as i32,
+    }
+}
+
+/// nC from the counts of the blocks to the left and above, those that are
+/// available (9.2.1).
+#[inline(always)]
+fn nc(a: Option<i32>, b: Option<i32>) -> i32 {
+    match (a, b) {
+        (Some(a), Some(b)) => (a + b + 1) >> 1,
+        (Some(n), None) | (None, Some(n)) => n,
+        (None, None) => 0,
+    }
 }
 
 #[inline(always)]

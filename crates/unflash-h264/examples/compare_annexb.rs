@@ -3,10 +3,13 @@
 //! IDR period and POC), reporting the first differing samples.
 //!
 //!     cargo run --release -p unflash-h264 --example compare_annexb -- stream.264 [max_frames]
+//!
+//! With `H264_NO_DEBLOCK` set, both decoders leave the deblocking filter out.
 
-use std::io::Read;
-use std::process::{Command, Stdio};
+mod common;
 
+use common::{ffmpeg_i420, locate};
+use unflash_h264::decoder::annexb_nal_units;
 use unflash_h264::mb::MbKind;
 use unflash_h264::yuv::to_i420;
 use unflash_h264::Decoder;
@@ -14,38 +17,19 @@ use unflash_h264::Decoder;
 fn main() {
     let path = std::env::args().nth(1).expect("file");
     let max: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let no_deblock = std::env::var_os("H264_NO_DEBLOCK").is_some();
     let data = std::fs::read(&path).unwrap();
     let mut dec = Decoder::new();
+    dec.set_skip_deblock(no_deblock);
     // (idr period, poc, frame data, kinds, field flags, damaged)
     let mut frames: Vec<(u32, i32, Vec<u8>, Vec<MbKind>, Vec<bool>, bool, u32)> = Vec::new();
     let mut idr_period = 0u32;
     let mut buf = Vec::new();
-    let mut i = 0;
-    let mut starts = Vec::new();
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            starts.push(i + 3);
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    let mut nals = Vec::new();
-    for (k, &s) in starts.iter().enumerate() {
-        let mut e = if k + 1 < starts.len() { starts[k + 1] - 3 } else { data.len() };
-        while e > s && data[e - 1] == 0 {
-            e -= 1;
-        }
-        if e > s {
-            nals.push(&data[s..e]);
-        }
-    }
+    let nals = annexb_nal_units(&data);
     let mut collect = |dec: &mut Decoder, frames: &mut Vec<(u32, i32, Vec<u8>, Vec<MbKind>, Vec<bool>, bool, u32)>, idr_period: &mut u32| {
         let out = dec.decode_annexb(&[], 0.0).unwrap_or_default();
         for f in out {
-            let sps = dec.sps().unwrap();
-            let (w, h) = sps.cropped_size();
-            to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut buf);
+            to_i420(&f.pic, f.crop, &mut buf);
             if f.pic.is_idr {
                 *idr_period += 1;
             }
@@ -64,9 +48,7 @@ fn main() {
     }
     if frames.len() < max {
         if let Ok(Some(f)) = dec.flush() {
-            let sps = dec.sps().unwrap();
-            let (w, h) = sps.cropped_size();
-            to_i420(&f.pic, (sps.crop.0 as usize, sps.crop.2 as usize, w as usize, h as usize), &mut buf);
+            to_i420(&f.pic, f.crop, &mut buf);
             if f.pic.is_idr {
                 idr_period += 1;
             }
@@ -79,14 +61,11 @@ fn main() {
     let wm = sps.width_mbs as usize;
     println!("decoded {} frames of {w}x{h}", frames.len());
     frames.sort_by_key(|f| (f.0, f.1));
-    let mut args = vec!["-v", "error", "-flags", "unaligned"];
-    if std::env::var_os("H264_NO_DEBLOCK").is_some() {
+    let mut args = vec!["-flags", "unaligned"];
+    if no_deblock {
         args.extend(["-skip_loop_filter", "all"]);
     }
-    args.extend(["-i", &path, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]);
-    let mut child = Command::new("ffmpeg").args(&args).stdout(Stdio::piped()).spawn().expect("ffmpeg");
-    let mut reference = Vec::new();
-    child.stdout.take().unwrap().read_to_end(&mut reference).unwrap();
+    let reference = ffmpeg_i420(&args, &path);
     let frame_size = w * h + 2 * (w.div_ceil(2) * h.div_ceil(2));
     let nref = reference.len() / frame_size;
     println!("ffmpeg produced {nref} frames");
@@ -97,6 +76,7 @@ fn main() {
         }
         let theirs = &reference[k * frame_size..(k + 1) * frame_size];
         if let Some(spec) = std::env::var("H264_ROW").ok() {
+            // H264_ROW=frame,y0,y1,x0,x1: print a window of luma samples from both decoders
             let v: Vec<usize> = spec.split(',').filter_map(|t| t.parse().ok()).collect();
             if v.len() == 5 && v[0] == k {
                 for yy in v[1]..v[2] {
@@ -112,26 +92,8 @@ fn main() {
         if bad > 6 {
             continue;
         }
-        let mut first = None;
-        for i in 0..frame_size {
-            if ours[i] != theirs[i] {
-                first = Some(i);
-                break;
-            }
-        }
-        let i = first.unwrap();
-        let (plane, x, y) = if i < w * h {
-            ("Y", i % w, i / w)
-        } else {
-            let ci = i - w * h;
-            let cw = w.div_ceil(2);
-            let csz = cw * h.div_ceil(2);
-            if ci < csz {
-                ("U", (ci % cw) * 2, (ci / cw) * 2)
-            } else {
-                ("V", ((ci - csz) % cw) * 2, ((ci - csz) / cw) * 2)
-            }
-        };
+        let i = (0..frame_size).position(|i| ours[i] != theirs[i]).unwrap();
+        let (plane, x, y) = locate(i, w, h);
         let ndiff = ours.iter().zip(theirs).filter(|(a, b)| a != b).count();
         let maxdiff = ours.iter().zip(theirs).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
         // the macroblock: field macroblocks live in the rows of their parity
@@ -147,16 +109,6 @@ fn main() {
             if ours[yy * w..yy * w + w] != theirs[yy * w..yy * w + w] {
                 rows_bad += 1;
                 odd += yy % 2;
-            }
-        }
-        if let Some(spec) = std::env::var("H264_ROW").ok() {
-            // H264_ROW=frame,y0,y1,x0,x1: print a window of luma samples from both decoders
-            let v: Vec<usize> = spec.split(',').filter_map(|t| t.parse().ok()).collect();
-            if v.len() == 5 && v[0] == k {
-                for yy in v[1]..v[2] {
-                    println!("   y {yy:3} ours   {}", (v[3]..v[4]).map(|xx| format!("{:3}", ours[yy * w + xx])).collect::<Vec<_>>().join(" "));
-                    println!("   y {yy:3} theirs {}", (v[3]..v[4]).map(|xx| format!("{:3}", theirs[yy * w + xx])).collect::<Vec<_>>().join(" "));
-                }
             }
         }
         if std::env::var("H264_DIFF").ok().and_then(|v| v.parse::<usize>().ok()) == Some(k) {
@@ -231,10 +183,17 @@ fn main() {
         }
         println!("frame {k} (period {period}, poc {poc}, frame_num {frame_num}, damaged {damaged}): {ndiff} samples differ (max |d| {maxdiff}) in {rows_bad} luma rows ({odd} odd); first in {plane} at ({x}, {y}) = MB ({}, {}) field {field_mb} {:?}, ours {} theirs {}", x / 16, y / 16, kind, ours[i], theirs[i]);
     }
-    if bad == 0 {
-        println!("all {} frames identical", frames.len().min(nref));
+    // as many frames as ffmpeg's (at most as many when cut short at max_frames)
+    let missing = if frames.len() < max { frames.len() != nref } else { frames.len() > nref };
+    if missing {
+        println!("{} frames here, {nref} from ffmpeg", frames.len());
+    }
+    if bad == 0 && !missing {
+        println!("all {} frames identical", frames.len());
     } else {
-        println!("{bad} frames differ");
+        if bad > 0 {
+            println!("{bad} frames differ");
+        }
         std::process::exit(1);
     }
 }

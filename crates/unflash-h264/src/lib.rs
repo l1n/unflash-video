@@ -2,8 +2,8 @@
 //! read H.264 files in browsers whose WebCodecs has no H.264 decoder.
 //!
 //! Supported: the Constrained Baseline, Baseline (without FMO / ASO /
-//! redundant slices), Main and High profiles for progressive 4:2:0 8-bit
-//! pictures: CAVLC and CABAC entropy coding, I / P / B slices with any
+//! redundant slices), Main and High profiles for 4:2:0 8-bit pictures:
+//! CAVLC and CABAC entropy coding, I / P / B slices with any
 //! partitioning, multiple references, long-term references and memory
 //! management control operations, weighted prediction (explicit and
 //! implicit), spatial and temporal direct prediction, the 8x8 transform
@@ -17,19 +17,19 @@
 //! exercise these tools (`tests/`).
 
 pub mod bitreader;
-pub mod cabac;
-pub mod cavlc;
-pub mod deblock;
+mod cabac;
+mod cavlc;
+mod deblock;
 pub mod decoder;
-pub mod inter;
-pub mod intra;
+mod inter;
+mod intra;
 pub mod mb;
 pub mod picture;
 pub mod ps;
 pub mod rewrite;
 pub mod slice;
-pub mod tables;
-pub mod transform;
+mod tables;
+mod transform;
 pub mod yuv;
 
 pub use decoder::{DecodedFrame, Decoder};
@@ -57,17 +57,3 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// A debugging environment variable (`H264_TRACE`, `H264_DBG_MB`,
-/// `H264_DBG_INTRA`), read once: the decoder asks for these per macroblock.
-pub(crate) fn debug_flag(name: &str) -> Option<&'static str> {
-    use std::sync::OnceLock;
-    static FLAGS: OnceLock<[Option<String>; 3]> = OnceLock::new();
-    let flags = FLAGS.get_or_init(|| [std::env::var("H264_TRACE").ok(), std::env::var("H264_DBG_MB").ok(), std::env::var("H264_DBG_INTRA").ok()]);
-    let i = match name {
-        "H264_TRACE" => 0,
-        "H264_DBG_MB" => 1,
-        _ => 2,
-    };
-    flags[i].as_deref()
-}

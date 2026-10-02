@@ -33,8 +33,6 @@ pub struct Picture {
     pub frame_num: u32,
     pub is_idr: bool,
     pub is_ref: bool,
-    /// Inserted for a gap in frame_num: no samples of its own.
-    pub non_existing: bool,
     /// The fields holding decoded samples (TOP | BOTTOM).
     pub decoded: u8,
     /// Coded as field pictures / as an MBAFF frame.
@@ -72,7 +70,6 @@ impl Picture {
             frame_num: 0,
             is_idr: false,
             is_ref: false,
-            non_existing: false,
             decoded: 0,
             coded_fields: false,
             mbaff: false,
@@ -95,7 +92,6 @@ impl Picture {
         self.frame_num = 0;
         self.is_idr = false;
         self.is_ref = false;
-        self.non_existing = false;
         self.decoded = 0;
         self.coded_fields = false;
         self.mbaff = false;
@@ -121,13 +117,6 @@ impl Picture {
         }
         self.decoded |= structure;
         self.poc = self.poc_top.min(self.poc_bot);
-    }
-
-    pub fn chroma_width(&self) -> usize {
-        self.width / 2
-    }
-    pub fn chroma_height(&self) -> usize {
-        self.height / 2
     }
 }
 
@@ -263,14 +252,19 @@ impl Dpb {
         self.remove_where(|e| e.reference == 0);
     }
 
-    pub fn prev_ref_frame_num(&self) -> u32 {
-        self.prev_ref_frame_num
-    }
-
     /// 8.2.1: the picture order counts of the picture a slice header starts.
     pub fn compute_poc(&self, sps: &Sps, hdr: &SliceHeader) -> PocState {
         let max_frame_num = sps.max_frame_num() as i32;
         let structure = hdr.structure();
+        // FrameNumOffset (order count types 1 and 2)
+        let prev_offset = if self.prev_had_mmco5 { 0 } else { self.prev_frame_num_offset };
+        let frame_num_offset = if hdr.is_idr() {
+            0
+        } else if self.prev_frame_num > hdr.frame_num {
+            prev_offset + max_frame_num
+        } else {
+            prev_offset
+        };
         let (top, bottom, poc_msb, poc_lsb, frame_num_offset) = match sps.poc_type {
             0 => {
                 let max_lsb = 1i32 << sps.log2_max_poc_lsb;
@@ -288,14 +282,6 @@ impl Dpb {
                 (top, bottom, msb, lsb, 0)
             }
             1 => {
-                let prev_offset = if self.prev_had_mmco5 { 0 } else { self.prev_frame_num_offset };
-                let frame_num_offset = if hdr.is_idr() {
-                    0
-                } else if self.prev_frame_num > hdr.frame_num {
-                    prev_offset + max_frame_num
-                } else {
-                    prev_offset
-                };
                 let cycle = sps.offset_for_ref_frame.len() as i32;
                 let mut abs_frame_num = if cycle != 0 { frame_num_offset + hdr.frame_num as i32 } else { 0 };
                 if hdr.nal_ref_idc == 0 && abs_frame_num > 0 {
@@ -319,14 +305,6 @@ impl Dpb {
                 (top, bottom, 0, 0, frame_num_offset)
             }
             _ => {
-                let prev_offset = if self.prev_had_mmco5 { 0 } else { self.prev_frame_num_offset };
-                let frame_num_offset = if hdr.is_idr() {
-                    0
-                } else if self.prev_frame_num > hdr.frame_num {
-                    prev_offset + max_frame_num
-                } else {
-                    prev_offset
-                };
                 let poc = if hdr.is_idr() {
                     0
                 } else if hdr.nal_ref_idc == 0 {
@@ -500,30 +478,30 @@ impl Dpb {
 
     /// 8.2.5.2: insert the frames a gap in frame_num skipped (or that were
     /// lost), so the reference picture numbering stays consistent. `fill`
-    /// makes the picture used to stand in for them.
-    pub fn fill_frame_num_gap(&mut self, sps: &Sps, hdr: &SliceHeader, fill: &dyn Fn(u32, u32) -> Picture) {
+    /// makes the picture (with the id given) used to stand in for them.
+    pub fn fill_frame_num_gap(&mut self, sps: &Sps, hdr: &SliceHeader, fill: &dyn Fn(u32) -> Picture) {
         if hdr.is_idr() || !self.started {
             return;
         }
         let max = sps.max_frame_num();
-        let prev = self.prev_ref_frame_num;
-        if hdr.frame_num == prev || hdr.frame_num == (prev + 1) % max {
+        let prev = self.prev_ref_frame_num % max;
+        if hdr.frame_num == prev {
             return;
         }
-        let mut num = (prev + 1) % max;
-        let mut guard = 0;
-        while num != hdr.frame_num && guard < 64 {
-            let id = self.alloc_id();
-            let mut pic = fill(id, num);
+        let missing = (hdr.frame_num + max - prev - 1) % max;
+        // only the last max_num_ref_frames of them: each one inserted into
+        // a full buffer pushes out the oldest short-term frame, so the
+        // earlier ones would be gone again by the end
+        let keep = sps.max_num_ref_frames.max(1);
+        for k in (1..=missing.min(keep)).rev() {
+            let num = (hdr.frame_num + max - k) % max;
+            let mut pic = fill(self.alloc_id());
             pic.frame_num = num;
-            pic.non_existing = true;
             pic.is_ref = true;
             pic.decoded = FRAME;
             self.sliding_window(sps, num);
             self.entries.push(DpbEntry { frame_num: num, poc: pic.poc, pic: Rc::new(pic), kind: RefKind::Short, long_term_frame_idx: 0, reference: FRAME });
             self.prev_ref_frame_num = num;
-            num = (num + 1) % max;
-            guard += 1;
         }
     }
 
@@ -562,7 +540,7 @@ impl Dpb {
     /// field), and the state updates for the next one. `pic` is the buffer
     /// later pictures reference; for the second field of a frame it
     /// replaces the first field's.
-    pub fn mark(&mut self, sps: &Sps, hdr: &SliceHeader, pic: Rc<Picture>, poc: PocState, structure: u8) -> Result<()> {
+    pub fn mark(&mut self, sps: &Sps, hdr: &SliceHeader, pic: Rc<Picture>, poc: PocState, structure: u8) {
         let mut had_mmco5 = false;
         let field = structure != FRAME;
         let cur_pic_num = if field { 2 * hdr.frame_num as i32 + 1 } else { hdr.frame_num as i32 };
@@ -671,6 +649,70 @@ impl Dpb {
         self.prev_frame_num = frame_num_after;
         self.prev_frame_num_offset = if had_mmco5 { 0 } else { poc.frame_num_offset };
         self.prev_had_mmco5 = had_mmco5;
-        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bitreader::unescape;
+    use crate::decoder::tests::{header, sps_nal, Seq, Slice};
+    use crate::ps::parse_sps;
+
+    /// A full buffer of four frames, frame_num `last - 3` to `last`, the
+    /// oldest of them long-term when `long_term`.
+    fn buffer(sps: &Sps, last: u32, long_term: bool) -> Dpb {
+        let mut dpb = Dpb::new();
+        let max = sps.max_frame_num();
+        for k in (0..4).rev() {
+            let frame_num = (last + max - k) % max;
+            let kind = if long_term && k == 3 { RefKind::Long } else { RefKind::Short };
+            let pic = Rc::new(Picture::new(dpb.alloc_id(), 1, 1));
+            dpb.entries.push(DpbEntry { pic, kind, long_term_frame_idx: 0, reference: FRAME, frame_num, poc: 2 * frame_num as i32 });
+        }
+        dpb.prev_ref_frame_num = last;
+        dpb.started = true;
+        dpb
+    }
+
+    /// 8.2.5.2 as written: every missing frame, each through the sliding
+    /// window.
+    fn fill_every_frame(dpb: &mut Dpb, sps: &Sps, frame_num: u32) {
+        let max = sps.max_frame_num();
+        let mut num = (dpb.prev_ref_frame_num + 1) % max;
+        while num != frame_num {
+            dpb.sliding_window(sps, num);
+            let pic = Rc::new(Picture::new(dpb.alloc_id(), 1, 1));
+            dpb.entries.push(DpbEntry { pic, kind: RefKind::Short, long_term_frame_idx: 0, reference: FRAME, frame_num: num, poc: 0 });
+            dpb.prev_ref_frame_num = num;
+            num = (num + 1) % max;
+        }
+    }
+
+    fn contents(dpb: &Dpb) -> Vec<(u32, i32, RefKind, u8)> {
+        dpb.entries.iter().map(|e| (e.frame_num, e.poc, e.kind, e.reference)).collect()
+    }
+
+    #[test]
+    fn a_frame_num_gap_fills_in_only_the_frames_that_stay() {
+        let seq = Seq { max_refs: 4, log2_max_frame_num: 8, ..Seq::default() };
+        let sps = parse_sps(&unescape(&sps_nal(&seq)[1..])).unwrap();
+        for last in [10, 250] {
+            for gap in [0, 1, 3, 6, 100, 200] {
+                for long_term in [false, true] {
+                    let frame_num = (last + 1 + gap) % 256;
+                    let hdr = header(&seq, &Slice { frame_num, mbs: 4, ..Slice::default() });
+                    let mut dpb = buffer(&sps, last, long_term);
+                    dpb.fill_frame_num_gap(&sps, &hdr, &|id| Picture::new(id, 1, 1));
+                    let mut every = buffer(&sps, last, long_term);
+                    fill_every_frame(&mut every, &sps, frame_num);
+                    let what = format!("a gap of {gap} after frame_num {last}, long-term {long_term}");
+                    assert_eq!(contents(&dpb), contents(&every), "{what}");
+                    assert_eq!(dpb.prev_ref_frame_num, every.prev_ref_frame_num, "{what}");
+                    // (the four frames of the buffer, then at most four stand-ins)
+                    assert!(dpb.next_id <= 1 + 4 + 4, "{what}: {} stand-ins", dpb.next_id - 5);
+                }
+            }
+        }
     }
 }

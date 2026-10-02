@@ -45,10 +45,6 @@ impl<'a> BitReader<'a> {
         self.data.len() as isize * 8 - self.pos as isize
     }
 
-    pub fn data(&self) -> &'a [u8] {
-        self.data
-    }
-
     /// The next 32 bits (zero-padded past the end), without consuming.
     #[inline]
     pub fn peek32(&self) -> u32 {

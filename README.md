@@ -514,7 +514,7 @@ checks it against). A full
 reconstruction is needed (H.264 predicts every macroblock from its
 neighbours and from earlier pictures, so there is no DC-only or
 low-resolution shortcut as for MPEG-2). The decoder has a **fast mode**
-that leaves out the in-loop deblocking filter (about a tenth of the
+that leaves out the in-loop deblocking filter (about a fifth of the
 decoding time), but nothing that gives a verdict uses it any more: the filter only
 touches block edges, yet later pictures are predicted from the unfiltered
 ones, so the difference grows through each GOP. On a 1080p clip at CRF 26
