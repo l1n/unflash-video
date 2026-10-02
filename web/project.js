@@ -6,15 +6,41 @@
 const DB_NAME = 'unflash';
 const STORE = 'projects';
 
+let opened = null;
+
+/**
+ * The page's connection to the database, opened on first use and kept for
+ * every call after it (each call used to open one of its own and never
+ * close it). Opened again after the browser closes it, or after another
+ * page asks for a new version of the database (this one is closed then, so
+ * as not to hold that page up).
+ */
 function openDb() {
-  return new Promise((resolve, reject) => {
+  if (opened) return opened;
+  const opening = new Promise((resolve, reject) => {
+    const forget = () => {
+      if (opened === opening) opened = null;
+    };
     const req = indexedDB.open(DB_NAME, 1);
     req.onupgradeneeded = () => {
       req.result.createObjectStore(STORE);
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onclose = forget;
+      db.onversionchange = () => {
+        db.close();
+        forget();
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      forget();
+      reject(req.error);
+    };
   });
+  opened = opening;
+  return opening;
 }
 
 async function idbGet(key) {
@@ -34,25 +60,34 @@ async function idbPut(key, value) {
     tx.objectStore(STORE).put(value, key);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
+    // (a transaction that fails as it commits, out of space say, says so only by its abort)
+    tx.onabort = () => reject(tx.error || new Error('the save was aborted'));
+  });
+}
+
+/** `fn(key, value)` for every project saved in this browser. */
+async function idbEach(fn) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, 'readonly').objectStore(STORE).openCursor();
+    req.onsuccess = () => {
+      const cur = req.result;
+      if (!cur) return resolve();
+      fn(cur.key, cur.value);
+      cur.continue();
+    };
+    req.onerror = () => reject(req.error);
   });
 }
 
 /** When a project was last saved in this browser (ms), 0 when none was: roughly when it was last used. */
 export async function lastSavedAt() {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readonly');
-    let last = 0;
-    const req = tx.objectStore(STORE).openCursor();
-    req.onsuccess = () => {
-      const cur = req.result;
-      if (!cur) return resolve(last);
-      const at = cur.value && cur.value.savedAt;
-      if (at > last) last = at;
-      cur.continue();
-    };
-    req.onerror = () => reject(req.error);
+  let last = 0;
+  await idbEach((key, value) => {
+    const at = value && value.savedAt;
+    if (at > last) last = at;
   });
+  return last;
 }
 
 /**
@@ -61,19 +96,11 @@ export async function lastSavedAt() {
  * copy, a download again).
  */
 async function idbLatestLike(prefix) {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readonly');
-    let best = null;
-    const req = tx.objectStore(STORE).openCursor();
-    req.onsuccess = () => {
-      const cur = req.result;
-      if (!cur) return resolve(best);
-      if (typeof cur.key === 'string' && cur.key.startsWith(prefix) && (!best || (cur.value && cur.value.savedAt) > (best.value.savedAt || 0))) best = { key: cur.key, value: cur.value };
-      cur.continue();
-    };
-    req.onerror = () => reject(req.error);
+  let best = null;
+  await idbEach((key, value) => {
+    if (typeof key === 'string' && key.startsWith(prefix) && (!best || (value && value.savedAt) > (best.value.savedAt || 0))) best = { key, value };
   });
+  return best;
 }
 
 export function projectKey(file) {
@@ -274,7 +301,7 @@ export class Project {
 }
 
 /** The part of a check verdict worth keeping across reloads. */
-export function summarizeCheck(c) {
+function summarizeCheck(c) {
   return {
     safe: c.safe,
     wcag_safe: c.wcag_safe,
@@ -317,11 +344,11 @@ function fromBase64(b64) {
 }
 
 /** What identifies the video a project belongs to. */
-export function videoFingerprint(movie, file) {
+function videoFingerprint(movie) {
   return {
-    name: file ? file.name : movie.name,
-    size: file ? file.size : movie.file && movie.file.size,
-    lastModified: file ? file.lastModified : movie.file && movie.file.lastModified,
+    name: movie.name,
+    size: movie.file.size,
+    lastModified: movie.file.lastModified,
     frames: movie.frameCount,
     duration: Math.round(movie.duration * 1e6) / 1e6,
     width: movie.width,
@@ -335,8 +362,8 @@ export function videoFingerprint(movie, file) {
  * project as the browser keeps it (typed arrays, such as the scan's
  * per-frame trace, as base64 of their bytes).
  */
-export function projectFileText(project, movie, file) {
-  const doc = { kind: FILE_KIND, version: FILE_VERSION, saved: new Date().toISOString(), video: videoFingerprint(movie, file), project: project.toSaved() };
+export function projectFileText(project, movie) {
+  const doc = { kind: FILE_KIND, version: FILE_VERSION, saved: new Date().toISOString(), video: videoFingerprint(movie), project: project.toSaved() };
   return JSON.stringify(doc, (k, v) => (ArrayBuffer.isView(v) && !(v instanceof DataView) ? { $typed: v.constructor.name, b64: toBase64(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) } : v));
 }
 
@@ -367,8 +394,8 @@ export function readProjectFile(text) {
  * match (the marks are on frames); the name and the size only say whether it
  * is the very same file. Returns { ok, same, why }.
  */
-export function matchVideo(fp, movie, file) {
-  const here = videoFingerprint(movie, file);
+export function matchVideo(fp, movie) {
+  const here = videoFingerprint(movie);
   const oneFrame = movie.medianDelta || 1 / 30;
   const framesOk = fp.frames === here.frames;
   const lengthOk = Math.abs((fp.duration || 0) - here.duration) <= oneFrame;

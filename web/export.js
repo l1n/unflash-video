@@ -11,9 +11,10 @@
 
 import { decodeRange, waker } from './media.js';
 import { profile } from './profile.js';
-import { shownPts, softenPlan, blendMarks, blendStrength, blendSources, blendWeights } from './analysis.js';
+import { softenPlan, blendMarks, blendStrength, blendSources, blendWeights, hasMarks, sectionSequence } from './analysis.js';
 import { SoundRun, audioData, soundName } from './sound.js';
 import { noSoundDecoder, soundChunk, soundConfig, soundDecoderFor } from './audiodec.js';
+import { builtInFor } from './codecs.js';
 
 function avcLevel(w, h, fps) {
   const mbs = Math.ceil(w / 16) * Math.ceil(h / 16);
@@ -25,16 +26,15 @@ function avcLevel(w, h, fps) {
   return '34'; // 5.2
 }
 
-/** The family of a WebCodecs codec string: 'h264', 'vp9', 'av1', 'hevc' or 'other'. */
-export function codecFamily(codec) {
-  if (/^avc[13]/.test(codec)) return 'h264';
-  if (/^vp09/.test(codec)) return 'vp9';
-  if (/^av01/.test(codec)) return 'av1';
-  if (/^(hvc1|hev1)/.test(codec)) return 'hevc';
-  return 'other';
+/** The family of a WebCodecs codec string, as codecs.js knows it ('h264', 'hevc', 'vp9', 'vp8', 'av1'), or 'other'. */
+const codecFamily = (codec) => (builtInFor(codec) || { id: 'other' }).id;
+
+/** A codec string's family by the name the export dialog gives it. */
+function familyName(codec) {
+  const b = builtInFor(codec);
+  return !b ? 'other' : b.id === 'hevc' ? 'H.265 (HEVC)' : b.name;
 }
 
-const FAMILY_NAME = { h264: 'H.264', vp9: 'VP9', av1: 'AV1', hevc: 'H.265 (HEVC)', other: 'other' };
 const FAMILY_WHERE = {
   h264: 'plays everywhere: phones, QuickTime, Windows, every browser',
   vp9: 'plays in browsers and VLC, but not in QuickTime or on older iPhones',
@@ -52,10 +52,10 @@ export function formatInfo(cand, movie) {
   const family = codecFamily(cand.config.codec);
   const src = codecFamily(movie.video.codec);
   const copies = family === src && (family === 'h264' || family === 'vp9');
-  const name = FAMILY_NAME[family] || cand.label;
+  const name = familyName(cand.config.codec);
   const how = copies
     ? 'Only the stretches around your sections are re-encoded; everything else is copied from your file as it is (fast, and no quality lost outside the sections).'
-    : `Your file is ${FAMILY_NAME[src] || src}, so every frame is re-encoded (slower, and a little quality is lost everywhere).`;
+    : `Your file is ${familyName(movie.video.codec)}, so every frame is re-encoded (slower, and a little quality is lost everywhere).`;
   const short = family === 'h264' ? 'plays everywhere' : family === 'vp9' ? 'browsers and VLC' : family === 'av1' ? 'smallest, slow, newer players' : family === 'hevc' ? 'small, Apple devices' : '';
   return { family, name, copies, label: `${name}: ${short}${copies ? ', copies what you did not edit' : ''}`, note: `${name} ${FAMILY_WHERE[family] ? `${FAMILY_WHERE[family]}. ` : ''}${how}` };
 }
@@ -75,10 +75,12 @@ export function formatChoices(cands) {
   });
 }
 
+/** The bits a pixel of each picture an encoder aims for at `quality` (1 to 10). */
+const bpp = (quality) => 0.03 + (quality / 10) * 0.25;
+
 /** Encoder configurations to try, best first. */
 export async function encoderCandidates(width, height, fps, quality) {
-  const bpp = 0.03 + (quality / 10) * 0.25;
-  const bitrate = Math.round(width * height * fps * bpp);
+  const bitrate = Math.round(width * height * fps * bpp(quality));
   const base = { width, height, framerate: fps, bitrate, latencyMode: 'quality' };
   const level = avcLevel(width, height, fps);
   const list = [
@@ -118,14 +120,6 @@ class MemorySink {
   async close() {
     return new Blob(this.parts, { type: 'video/mp4' });
   }
-  async abort() {
-    this.parts = [];
-  }
-  /** Start the file over (an export that has to be redone another way). */
-  async reset() {
-    this.parts = [];
-    this.size = 0;
-  }
 }
 
 /**
@@ -134,8 +128,7 @@ class MemorySink {
  * bitrate over the whole duration. Plus the copied audio.
  */
 export function estimateExportBytes(movie, quality, plan = null) {
-  const bpp = 0.03 + (quality / 10) * 0.25;
-  const perSecond = (movie.width * movie.height * movie.fps * bpp) / 8;
+  const perSecond = (movie.width * movie.height * movie.fps * bpp(quality)) / 8;
   let video = perSecond * movie.duration;
   if (plan && plan.mode === 'smart') video = plan.copiedBytes + perSecond * plan.encodedSeconds;
   let audio = 0;
@@ -265,12 +258,6 @@ class FileSink {
 // ---- the plan ------------------------------------------------------------------
 
 /**
- * Every prepared section with something to apply, with its edited sequence.
- * Marks were made against a section's frame times, which outlive its frame
- * cache (dropped to save memory, or not rebuilt since the project was
- * restored): every section that was prepared once is applied.
- */
-/**
  * How one prepared section is rendered: its edited sequence (display time,
  * source ordinal), where it starts and ends, how many of its frames it
  * shows, its holds and the seconds they add, and the frames "soften
@@ -278,17 +265,12 @@ class FileSink {
  * player's "original").
  */
 export function sectionRenderPlan(env, movie, s, extS, { edited = true } = {}) {
-  const { wasm } = env;
-  const tl = JSON.parse(wasm.section_timeline(Float64Array.from(s.pts), s.start, s.end));
-  const shown = shownPts(wasm, s);
-  const edits = JSON.stringify(edited ? s.edits || {} : {});
-  const seq = JSON.parse(wasm.edited_sequence(Float64Array.from(shown), edits, extS));
+  const { tl, shown, seq, holds: sectionHolds } = sectionSequence(env.wasm, s, edited ? s.edits : null, extS);
   // where the section waits for its held frames, in source seconds: the
   // frame times above come from the same list, and so does the silence the
   // export puts into the sound, so the two cannot disagree
-  const holds = JSON.parse(wasm.section_holds(Float64Array.from(shown), edits, extS, tl.total)).map((h) => ({ at: s.start + tl.base + h.at, seconds: h.seconds }));
+  const holds = sectionHolds.map((h) => ({ at: s.start + tl.base + h.at, seconds: h.seconds }));
   const extra = holds.reduce((sum, h) => sum + h.seconds, 0);
-  const hasEdits = edited && (Object.values(s.edits || {}).some((e) => e.removed || e.extended) || blendMarks(s).length > 0);
   const needCount = new Map();
   const need = (i) => needCount.set(i, (needCount.get(i) || 0) + 1);
   for (const src of seq.src) need(src);
@@ -317,15 +299,23 @@ export function sectionRenderPlan(env, movie, s, extS, { edited = true } = {}) {
   }
   // where the section ends on the source's clock (where its next frame would come)
   const end = s.start + tl.base + tl.total;
-  return { sec: s, base: tl.base, seq, nOut: tl.n_out, hasEdits, needCount, holds, extra, end, soft, blend };
+  return { sec: s, base: tl.base, seq, nOut: tl.n_out, needCount, holds, extra, end, soft, blend };
 }
 
+/**
+ * The render plans of every section that was prepared once (it has frame
+ * times), in order, its marks applied: marks were made against a section's
+ * frame times, which outlive its frame cache (dropped to save memory, or not
+ * rebuilt since the project was restored). A section without marks is in
+ * too, and re-encoded as it is. Sections with marks but no frame times are
+ * named in `warnings`: theirs cannot be applied.
+ */
 function sectionPlans(env, movie, project, extS, warnings) {
   const sections = project
     .sectionsSorted()
     .filter((s) => s.pts && s.pts.length)
     .map((s) => sectionRenderPlan(env, movie, s, extS));
-  const unprepared = project.sections.filter((s) => !(s.pts && s.pts.length) && (Object.values(s.edits || {}).some((e) => e.removed || e.extended) || (s.blend || []).length));
+  const unprepared = project.sections.filter((s) => !(s.pts && s.pts.length) && hasMarks(s));
   if (unprepared.length) warnings.push(`Sections ${unprepared.map((s) => '#' + s.id).join(', ')} have marks but were never prepared; their marks were not applied. Prepare them and export again.`);
   return sections;
 }
@@ -441,9 +431,8 @@ export async function exportPlan(env, movie, project, { extS = 1.0, codec = null
   }
   // pieces: copies between the spans; long spans cut at keyframes outside
   // the sections so several workers can take them
-  const framesOf = (from, to) => to - from;
   let encodedFrames = 0;
-  for (const [a, b] of ranges) encodedFrames += framesOf(a, b);
+  for (const [a, b] of ranges) encodedFrames += b - a;
   const fps = movie.fps || 30;
   const chunk = Math.max(Math.round(MIN_PIECE_S * fps), Math.ceil(encodedFrames / Math.max(1, K * PIECES_PER_WORKER)));
   const pieces = [];
@@ -452,10 +441,10 @@ export async function exportPlan(env, movie, project, { extS = 1.0, codec = null
   const pushEncode = (from, to) => {
     const startSec = timeOf(from);
     const endSec = timeOf(to);
-    pieces.push({ kind: 'encode', from, to, startSec, endSec, frames: framesOf(from, to), sections: sections.filter((p) => p.sec.start >= startSec - 1e-9 && p.sec.end <= endSec + 1e-9) });
+    pieces.push({ kind: 'encode', from, to, startSec, endSec, frames: to - from, sections: sections.filter((p) => p.sec.start >= startSec - 1e-9 && p.sec.end <= endSec + 1e-9) });
   };
   for (const [a, b] of ranges) {
-    if (a > pos) pieces.push({ kind: 'copy', from: pos, to: a, frames: framesOf(pos, a) });
+    if (a > pos) pieces.push({ kind: 'copy', from: pos, to: a, frames: a - pos });
     let from = a;
     if (K > 1 && b - a > 2 * chunk) {
       let next = a + chunk;
@@ -473,10 +462,11 @@ export async function exportPlan(env, movie, project, { extS = 1.0, codec = null
     pushEncode(from, b);
     pos = b;
   }
-  if (pos < n) pieces.push({ kind: 'copy', from: pos, to: n, frames: framesOf(pos, n) });
+  if (pos < n) pieces.push({ kind: 'copy', from: pos, to: n, frames: n - pos });
   // a section's timing offsets (held frames) reach everything after it
   let offset = 0;
-  const sorted = sections.slice().sort((x, y) => x.sec.start - y.sec.start);
+  // (sectionPlans has them in order)
+  const sorted = sections.slice();
   for (const piece of pieces) {
     const startSec = piece.kind === 'copy' ? timeOf(piece.from) : piece.startSec;
     while (sorted.length && sorted[0].sec.end <= startSec + 1e-9) offset += sorted.shift().extra;
@@ -628,7 +618,7 @@ function startsWithStartCode(b) {
  * length), with the parameter sets it carries: what an encoder that gives
  * no avcC record (WebCodecs' way of saying its stream is Annex B) hands over.
  */
-export function annexbToLengthPrefixed(b) {
+function annexbToLengthPrefixed(b) {
   const starts = [];
   for (let i = 0; i + 2 < b.length; i++) {
     if (b[i] === 0 && b[i + 1] === 0 && b[i + 2] === 1) {
@@ -762,6 +752,31 @@ class PieceEncoder {
   }
 }
 
+/** Bytes copied at a time, at most, where samples are copied as they are. */
+const MAX_RUN = 8 * 1024 * 1024;
+
+/**
+ * Copy samples `from` to `to` - 1 (decode order) of a track's table (`s`:
+ * movie.v or movie.a) into `out` as they are, a run of samples that sit
+ * next to each other in the file at a time; with `prefix` (Matroska's
+ * header stripping: the bytes every packet starts with, put back in front)
+ * one at a time. `done(i, j)` hears of each run (samples i to j - 1) once
+ * it is written, and may throw to stop the copy (a cancel).
+ */
+async function copySamples(reader, out, s, from, to, done, prefix = null) {
+  for (let i = from; i < to; ) {
+    const off = s.offset[i];
+    let len = s.size[i];
+    let j = i + 1;
+    if (!prefix) while (j < to && s.offset[j] === off + len && len + s.size[j] <= MAX_RUN) len += s.size[j++];
+    const bytes = await reader.read(off, len);
+    if (prefix) await out.write(prefix);
+    await out.write(bytes.slice());
+    done(i, j);
+    i = j;
+  }
+}
+
 /** A WebCodecs encoder, configured. Tests substitute their own. */
 function defaultEncoder(config, callbacks) {
   const enc = new VideoEncoder(callbacks);
@@ -861,7 +876,6 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
   const samples = []; // { pts, sync, size } in file order
   const reader = movie.reader;
   const v = movie.v;
-  const MAX_RUN = 8 * 1024 * 1024;
   // H.264: the track's parameter sets. With smart cut, the source's plus
   // each encoder's under ids of their own (samples renumbered to match);
   // without, the first encoder's, with any other encoder's renumbered. The
@@ -918,26 +932,18 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
       throw new SpliceError(why);
     }
   };
+  let blob;
   try {
     for (const piece of plan.pieces) {
       if (cancelled()) throw failed || new Error('cancelled');
       if (piece.kind === 'copy') {
         const offUs = Math.round(piece.offset * 1e6);
-        let i = piece.from;
-        while (i < piece.to) {
-          // a run of samples that sit next to each other in the file
-          const off = v.offset[i];
-          let len = v.size[i];
-          let j = i + 1;
-          while (j < piece.to && v.offset[j] === off + len && len + v.size[j] <= MAX_RUN) len += v.size[j++];
-          const bytes = await reader.read(off, len);
-          await out.write(bytes.slice());
+        await copySamples(reader, out, v, piece.from, piece.to, (i, j) => {
           for (let k = i; k < j; k++) samples.push({ pts: v.pts[k] + offUs, sync: !!v.sync[k], size: v.size[k] });
           copiedFrames += j - i;
-          i = j;
           report();
           if (cancelled()) throw failed || new Error('cancelled');
-        }
+        });
       } else {
         const pe = await piece.done;
         softened += pe.softened;
@@ -954,76 +960,83 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
         pe.chunks.length = 0;
       }
     }
+    if (cancel && cancel()) throw new Error('cancelled');
+
+    // --- video samples: decode order, dts from the sorted presentation times ----
+    const medianUs = ctx.medianUs;
+    const sorted = samples.map((c) => c.pts).sort((a, b) => a - b);
+    let shift = 0;
+    for (let i = 0; i < samples.length; i++) shift = Math.max(shift, sorted[i] - samples[i].pts);
+    if (registry) {
+      // the merged (and repaired) record, and a codec string that covers it
+      description = registry.record();
+      codecString = `avc1.${Array.from(description.subarray(1, 4), (b) => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+    } else if (plan.mode === 'smart' && !description) description = movie.dx.track_description(movie.video.index);
+    const vt = mx.add_video_track(codecString, movie.width, movie.height, 1000000, description || new Uint8Array());
+    // the video ends as much later as all the holds say (the last frame's own too)
+    const endUs = Math.round((movie.tsMax + plan.holds.reduce((sum, h) => sum + h.seconds, 0)) * 1e6);
+    for (let i = 0; i < samples.length; i++) {
+      const dts = sorted[i] - shift;
+      const dur = i + 1 < samples.length ? sorted[i + 1] - sorted[i] : Math.max(medianUs, endUs - sorted[i]);
+      mx.add_sample(vt, dts, samples[i].pts, Math.max(1, dur), samples[i].sync, samples[i].size);
+    }
+
+    // --- audio: copied as it is when an MP4 can hold it and no frame is held;
+    // else re-encoded, with silence under the held frames ------------------------
+    if (movie.audio && movie.a) {
+      const holds = plan.holds;
+      let copy = movie.audio.copyable && !holds.length;
+      if (!copy) {
+        // (the frames are done by now: the sound has a progress figure of its own)
+        const onSound = (f) => onProgress && onProgress(1, encodedFrames, performance.now() - started, copiedFrames, f);
+        const res = await reencodeAudio(wasm, movie, reader, mx, out, { cancel: cancelled, holds, onProgress: onSound });
+        if (res.warning) warnings.push(res.warning);
+        // could not re-encode at all: the sound as it is beats none
+        copy = !res.wrote && movie.audio.copyable;
+      }
+      if (copy) {
+        const at = mx.add_copy_track('audio', movie.dx.track_sample_entry(movie.audio.index), movie.audio.timescale, 0, 0);
+        const a = movie.a;
+        // Matroska header stripping: the bytes every packet starts with go back in front
+        const prefix = movie.audio.prefix && movie.audio.prefix.length ? Uint8Array.from(movie.audio.prefix) : null;
+        await copySamples(
+          reader,
+          out,
+          a,
+          0,
+          a.offset.length,
+          (i, j) => {
+            for (let k = i; k < j; k++) mx.add_sample(at, a.dtsTicks[k], a.ptsTicks[k], a.durTicks[k], true, a.size[k] + (prefix ? prefix.length : 0));
+            if (cancelled()) throw new Error('cancelled');
+          },
+          prefix
+        );
+      }
+    }
+    if (movie.audioTracks > 1) {
+      const label = (t) => (t.language && t.language !== 'und' ? `${t.language}, ${soundName(t.codec)}` : soundName(t.codec));
+      const skipped = movie.audioSkipped || [];
+      warnings.push(`The source has ${movie.audioTracks} audio tracks; the export keeps one (${label(movie.audio)})${skipped.length ? `, the first that can be played here: not ${skipped.map(label).join(' or ')}` : ''}.`);
+    }
+    if (movie.subtitleTracks) warnings.push(`The source's subtitle track${movie.subtitleTracks === 1 ? ' is' : 's are'} left out, as the original tool leaves them out: an MP4 export carries the picture and the sound.`);
+
+    const moov = mx.finish();
+    await out.patch(mx.patch_offset(), mx.patch_bytes());
+    await out.write(moov);
+    blob = await out.close();
   } catch (e) {
     failed = failed || e;
     // let the running pieces wind down before the caller aborts the sink
     await Promise.allSettled(encodePieces.map((p) => p.done).filter(Boolean));
+    // what went wrong first: a piece that failed stops the others, which
+    // then say 'cancelled', and the one the writer waits on may be one of them
+    throw failed;
+  } finally {
+    // (the muxer and the rewriters live in WebAssembly memory, however the export ends)
     for (const rw of rewriters.values()) if (rw) rw.free();
     if (registry) registry.free();
     mx.free();
-    throw e;
   }
-  if (cancel && cancel()) throw new Error('cancelled');
-
-  // --- video samples: decode order, dts from the sorted presentation times ----
-  const medianUs = ctx.medianUs;
-  const sorted = samples.map((c) => c.pts).sort((a, b) => a - b);
-  let shift = 0;
-  for (let i = 0; i < samples.length; i++) shift = Math.max(shift, sorted[i] - samples[i].pts);
-  if (registry) {
-    // the merged (and repaired) record, and a codec string that covers it
-    description = registry.record();
-    codecString = `avc1.${Array.from(description.subarray(1, 4), (b) => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
-  } else if (plan.mode === 'smart' && !description) description = movie.dx.track_description(movie.video.index);
-  const vt = mx.add_video_track(codecString, movie.width, movie.height, 1000000, description || new Uint8Array());
-  // the video ends as much later as all the holds say (the last frame's own too)
-  const endUs = Math.round((movie.tsMax + plan.holds.reduce((sum, h) => sum + h.seconds, 0)) * 1e6);
-  for (let i = 0; i < samples.length; i++) {
-    const dts = sorted[i] - shift;
-    const dur = i + 1 < samples.length ? sorted[i + 1] - sorted[i] : Math.max(medianUs, endUs - sorted[i]);
-    mx.add_sample(vt, dts, samples[i].pts, Math.max(1, dur), samples[i].sync, samples[i].size);
-  }
-
-  // --- audio: copied as it is when an MP4 can hold it and no frame is held;
-  // else re-encoded, with silence under the held frames ------------------------
-  if (movie.audio && movie.a) {
-    const holds = plan.holds;
-    let copy = movie.audio.copyable && !holds.length;
-    if (!copy) {
-      // (the frames are done by now: the sound has a progress figure of its own)
-      const onSound = (f) => onProgress && onProgress(1, encodedFrames, performance.now() - started, copiedFrames, f);
-      const res = await reencodeAudio(wasm, movie, reader, mx, out, { cancel: cancelled, holds, onProgress: onSound });
-      if (res.warning) warnings.push(res.warning);
-      // could not re-encode at all: the sound as it is beats none
-      copy = !res.wrote && movie.audio.copyable;
-    }
-    if (copy) {
-      const at = mx.add_copy_track('audio', movie.dx.track_sample_entry(movie.audio.index), movie.audio.timescale, 0, 0);
-      const a = movie.a;
-      // Matroska header stripping: the bytes every packet starts with go back in front
-      const prefix = movie.audio.prefix && movie.audio.prefix.length ? Uint8Array.from(movie.audio.prefix) : null;
-      for (let i = 0; i < a.offset.length; i++) {
-        const bytes = await reader.read(a.offset[i], a.size[i]);
-        if (prefix) await out.write(prefix);
-        await out.write(bytes.slice());
-        mx.add_sample(at, a.dtsTicks[i], a.ptsTicks[i], a.durTicks[i], true, a.size[i] + (prefix ? prefix.length : 0));
-      }
-    }
-  }
-  if (movie.audioTracks > 1) {
-    const label = (t) => (t.language && t.language !== 'und' ? `${t.language}, ${soundName(t.codec)}` : soundName(t.codec));
-    const skipped = movie.audioSkipped || [];
-    warnings.push(`The source has ${movie.audioTracks} audio tracks; the export keeps one (${label(movie.audio)})${skipped.length ? `, the first that can be played here: not ${skipped.map(label).join(' or ')}` : ''}.`);
-  }
-  if (movie.subtitleTracks) warnings.push(`The source's subtitle track${movie.subtitleTracks === 1 ? ' is' : 's are'} left out, as the original tool leaves them out: an MP4 export carries the picture and the sound.`);
-
-  const moov = mx.finish();
-  await out.patch(mx.patch_offset(), mx.patch_bytes());
-  await out.write(moov);
-  const blob = await out.close();
-  for (const rw of rewriters.values()) if (rw) rw.free();
-  if (registry) registry.free();
-  mx.free();
   const elapsedMs = performance.now() - started;
   profile.report(`export (${chosen.label}, ${plan.mode})`, encodedFrames, elapsedMs);
   return { blob, warnings, frames: encodedFrames, copied: copiedFrames, spans: encodePieces.length, mode: plan.mode, parallel: K, softened, blended, elapsedMs, codec: codecString, encoderLabel: chosen.label, holds: plan.holds };

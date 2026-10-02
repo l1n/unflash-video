@@ -43,6 +43,32 @@ const noBanner = async (page) => {
   if (banner) throw new Error('banner: ' + banner);
 };
 const verdictReady = (page, timeout = 120000) => page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout });
+// click `selector`, and cancel the job it starts with the job bar's button
+// as soon as that job's progress reaches `pct` percent (as its bar moves);
+// resolves to the job's name once it has ended
+const cancelledJob = async (page, selector, pct = 1) => {
+  const name = await page.evaluate(
+    ([sel, at]) => {
+      const u = window.__unflash;
+      document.querySelector(sel).click();
+      const job = u.state.job;
+      if (!job) return null;
+      const watch = new MutationObserver(() => {
+        if (u.state.job !== job) watch.disconnect();
+        else if (job.pct >= at) {
+          watch.disconnect();
+          document.querySelector('#btnCancelJob').click();
+        }
+      });
+      watch.observe(document.querySelector('#jobBar'), { attributes: true, attributeFilter: ['style'] });
+      return job.name;
+    },
+    [selector, pct]
+  );
+  if (!name) throw new Error(`${selector} started no job`);
+  await jobDone(page);
+  return name;
+};
 
 const { chromium } = await loadPlaywright();
 const { srv, port } = await serve(WEB);
@@ -211,6 +237,65 @@ try {
     assert(JSON.stringify(one.pattern) === JSON.stringify(three.pattern), 'span prepare pattern figures differ');
     assert(JSON.stringify(one.hash) === JSON.stringify(three.hash), 'span prepare pictures differ: ' + JSON.stringify([one.hash, three.hash]));
     results.spanPrepare = { one: one.ms, three: three.ms };
+    // the section ends on a frame (the red flash's last, and the 1.5 s pad,
+    // at 30 fps): that frame gives the section its length but is not one of
+    // its own, and the export shows it straight after the section, so the
+    // check's run-out must start with it, not with the frame after
+    const length = await page.evaluate(() => {
+      const s = window.__unflash.currentSection();
+      return s.end - s.start;
+    });
+    console.log('section length', length.toFixed(6), '| last frame cached at', one.pts[one.pts.length - 1], '| run-out from', one.tailPts[0], one.tailPts[1]);
+    assert(Math.abs(one.pts[one.pts.length - 1] - length) < 1e-6, "a frame sits on the section's end: " + JSON.stringify([length, one.pts.slice(-2)]));
+    assert(Math.abs(one.tailPts[0] - length) < 1e-6 && one.tailPts[1] > length + 0.03, "the check's run-out starts with the frame on the section's end: " + JSON.stringify([length, one.tailPts.slice(0, 2)]));
+    // a span that fails stops the others before its detectors and caches are
+    // used again (the prepare goes on in one pass, on the first span's
+    // detector): what comes out is exactly what one pass gives
+    const failed = await page.evaluate(async () => {
+      const u = window.__unflash;
+      const spare = u.state.env.spares[0];
+      spare.videoFrame = async (frame) => {
+        frame.close();
+        delete spare.videoFrame;
+        throw new Error('span 1 failed (a test)');
+      };
+      try {
+        return await u.prepareDigest(u.currentSection().id, 3);
+      } finally {
+        delete spare.videoFrame;
+      }
+    });
+    console.log('a prepare whose second span fails:', failed.spans, 'span(s) in the end,', failed.frames, 'frames');
+    const digest = (d) => JSON.stringify([d.frames, d.lead, d.tail, d.pts, d.leadPts, d.tailPts, d.pattern, d.hash]);
+    assert(failed.spans === 1 && digest(failed) === digest(one), 'a prepare whose second span fails gives, in one pass, what one pass gives: ' + JSON.stringify([failed.frames, failed.lead, failed.tail, failed.hash, one.hash]));
+    // the same for a scan in segments: the scan fails with the segment's
+    // error once the others have stopped, and the next scan on the same
+    // detector sees the file alone (a segment left running fed it its
+    // pictures as well)
+    const segments = await page.evaluate(async () => {
+      const u = window.__unflash;
+      const { scanMovie } = await import('./analysis.js');
+      const env = u.state.env;
+      const spare = env.spares[0];
+      spare.videoFrame = async (frame) => {
+        frame.close();
+        delete spare.videoFrame;
+        throw new Error('segment 1 failed (a test)');
+      };
+      let error = null;
+      try {
+        await scanMovie(env, u.state.movie, { segments: 3, forceSegments: true, moreFeeders: async (n) => env.spares.slice(0, n) });
+      } catch (e) {
+        error = e.message;
+      } finally {
+        delete spare.videoFrame;
+      }
+      const again = await scanMovie(env, u.state.movie, {});
+      return { error, frames: again.frames, anomalies: again.result.anomalies, violations: again.result.violations };
+    });
+    console.log('a scan whose second segment fails:', segments.error, '| the scan after it:', segments.frames, 'frames,', segments.anomalies, 'timestamp anomalies');
+    assert(segments.error === 'segment 1 failed (a test)', 'a scan whose segment fails says why: ' + segments.error);
+    assert(segments.frames === 300 && segments.anomalies === 0 && JSON.stringify(segments.violations) === JSON.stringify(results.cpuViolations), 'and the scan after it is the scan of the file: ' + JSON.stringify(segments));
   }
   // bigger thumbnails, and one frame at full size
   {
@@ -288,6 +373,32 @@ try {
   results.checkMs = await page.evaluate(() => window.__unflash.currentSection().checkMs);
   console.log('after 5 removals:', results.verdictAfterMarks, `(auto-check took ${results.checkMs.toFixed(0)} ms for ${nFrames} frames + context)`);
   assert(results.checkMs < 5000, 'the instant check must be quick');
+
+  // --- cancelled part way, a suggestion and a prepare change nothing -----------
+  {
+    const section = () =>
+      page.evaluate(async () => {
+        const u = window.__unflash;
+        const s = u.currentSection();
+        const { sectionRenderPlan } = await import('./export.js');
+        return JSON.stringify({ edits: s.edits, pts: s.pts.length, nFrames: s.nFrames, prepared: s.prepared, warnings: s.warnings, runOut: s.ctx && s.ctx.tailPts.length, shown: sectionRenderPlan(u.state.env, u.state.movie, s, 1.0).nOut });
+      });
+    const before = await section();
+    // a suggestion stops at its next check, and none of it is applied
+    const suggesting = await cancelledJob(page, '#btnSuggestFewest');
+    const afterSuggest = { section: await section(), toast: await page.textContent('#toast') };
+    // "re-prepare", cancelled part way through the section's own frames (at
+    // a quarter on the job bar: past the run-up, before the section's end),
+    // stops at its next picture: the section keeps the frames its marks
+    // were made on (cut short, the export would apply them to part of it and
+    // leave the rest as it is)
+    const preparing = await cancelledJob(page, '#btnReprepare', 25);
+    const afterPrepare = { section: await section(), toast: await page.textContent('#toast') };
+    console.log('cancelled:', afterSuggest.toast, '|', afterPrepare.toast);
+    assert(afterSuggest.toast === `${suggesting}: cancelled` && afterSuggest.section === before, 'a cancelled suggestion is not applied: ' + JSON.stringify({ before, afterSuggest }));
+    assert(afterPrepare.toast === `${preparing}: cancelled` && afterPrepare.section === before, 'a cancelled prepare leaves the section as it was: ' + JSON.stringify({ before, afterPrepare }));
+    await noBanner(page);
+  }
 
   // --- let the suggester fix it ---------------------------------------------
   t0 = Date.now();
@@ -432,9 +543,30 @@ try {
   await verdictReady(page);
   assert((await page.textContent('#wsVerdict')).startsWith('fails'), 'clearing the marks brings the flashing back');
   toastNow = await page.textContent('#toast');
+  // what the section's own blend marks are at each step of the search (the
+  // grid draws them, and a B pressed meanwhile saves them for undo): the
+  // checks are handed the marks they try, and the section keeps its own
+  const ownBlend = await page.evaluate(() => {
+    const u = window.__unflash;
+    const s = u.currentSection();
+    const own = () => JSON.stringify([s.blend, s.blendStrength]);
+    window.__blendSeen = new Set();
+    window.__blendWatch = new MutationObserver(() => {
+      if (u.state.job && u.state.job.name === 'Suggesting (blend frames)') window.__blendSeen.add(own());
+    });
+    window.__blendWatch.observe(document.querySelector('#jobBar'), { attributes: true, attributeFilter: ['style'] });
+    return own();
+  });
   await page.click('#btnSuggestBlend');
   await toastChange(toastNow);
   await verdictReady(page);
+  {
+    const seen = await page.evaluate(() => {
+      window.__blendWatch.disconnect();
+      return [...window.__blendSeen];
+    });
+    assert(seen.length > 0 && seen.every((x) => x === ownBlend), "a blend suggestion leaves the section's own marks alone while it searches: " + JSON.stringify({ ownBlend, seen: seen.slice(0, 3) }));
+  }
   const blendState = () =>
     page.evaluate(() => {
       const s = window.__unflash.currentSection();
@@ -573,6 +705,16 @@ try {
   // and it downloads under that name
   const [saved] = await Promise.all([page.waitForEvent('download'), page.click('#exportDownload')]);
   assert(saved.suggestedFilename() === 'my export final.mp4', 'the export downloads under the name typed: ' + saved.suggestedFilename());
+  // a verify cancelled part way says nothing of the file: it saw part of it
+  {
+    const before = await page.textContent('#exportResult');
+    const verifying = await cancelledJob(page, '#btnVerifyExport');
+    await page.waitForFunction(() => !document.querySelector('#exportModal').classList.contains('hidden'));
+    const after = { result: await page.textContent('#exportResult'), toast: await page.textContent('#toast') };
+    console.log('verify cancelled:', after.toast);
+    assert(after.toast === `${verifying}: cancelled` && after.result === before, 'a cancelled verify gives no verdict: ' + JSON.stringify({ before, after }));
+    await noBanner(page);
+  }
   t0 = Date.now();
   await page.click('#btnVerifyExport');
   await jobStarted(page);

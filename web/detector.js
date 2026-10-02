@@ -21,7 +21,7 @@ export async function createDetector(wasm, configJson, width, height, { preferGp
       // where a result is wanted after every frame (the live monitor)
       det = await wasm.Detector.createGpu(configJson, width, height, batch || undefined);
       backend = 'webgpu';
-      probe = await SourceProbe.create(externalSources);
+      probe = await sourceProbe(externalSources);
     } catch (e) {
       const why = e && e.message ? e.message : String(e);
       detail = `WebGPU unavailable (${why}); using the CPU detector`;
@@ -38,7 +38,7 @@ export async function createDetector(wasm, configJson, width, height, { preferGp
   // WebGPU the same question as a decoder's; null: not asked, another route
   // being forced)
   feeder.takesFrames = route && route !== 'videoframe' ? null : false;
-  if (backend === 'webgpu' && probe && typeof VideoFrame !== 'undefined' && typeof OffscreenCanvas !== 'undefined' && (!route || route === 'videoframe')) {
+  if (backend === 'webgpu' && typeof VideoFrame !== 'undefined' && typeof OffscreenCanvas !== 'undefined' && (!route || route === 'videoframe')) {
     try {
       const c = new OffscreenCanvas(2, 2);
       c.getContext('2d').fillRect(0, 0, 2, 2);
@@ -70,14 +70,6 @@ function noAdapterNote() {
   return `${ON_THE_CPU} This browser has WebGPU, but it gave the page no graphics adapter to use it with.${chromium ? ` That usually means graphics acceleration is off (Settings › System › "Use graphics acceleration when available": turn it on, then relaunch the browser), or that the browser has turned WebGPU off for this graphics card or its driver (${gpuPage} says which, under WebGPU).` : ''}`;
 }
 
-/**
- * Which kinds of picture the browser's WebGPU accepts as a
- * copyExternalImageToTexture source. Firefox takes only ImageBitmap,
- * HTMLImageElement, HTMLCanvasElement and OffscreenCanvas; a VideoFrame or a
- * <video> makes it throw a TypeError, which wgpu unwraps, and that aborts the
- * whole WASM instance. So every kind of source is tried once on a throwaway
- * device before it is allowed through to WASM.
- */
 /** What the WebGPU adapter says about itself (for the debug report). */
 export const gpuAdapter = { info: null, fallback: false };
 
@@ -91,12 +83,42 @@ function describeAdapter(adapter) {
   }
 }
 
-export class SourceProbe {
+/** The kinds of picture source the routes ask WebGPU about. */
+const KINDS = ['videoframe', 'video', 'canvas'];
+
+let probing = null;
+
+/**
+ * The page's SourceProbe, one for every detector (what WebGPU takes from
+ * the page does not change from one detector to the next), for the same
+ * `allowed`; made again only when it lost its device before it knew every
+ * kind.
+ */
+function sourceProbe(allowed) {
+  const key = JSON.stringify(allowed);
+  if (!probing || probing.key !== key || (probing.probe && probing.probe.gaveUp())) {
+    const p = { key, probe: null };
+    p.ready = SourceProbe.create(allowed).then((probe) => (p.probe = probe));
+    probing = p;
+  }
+  return probing.ready;
+}
+
+/**
+ * Which kinds of picture the browser's WebGPU accepts as a
+ * copyExternalImageToTexture source. Firefox takes only ImageBitmap,
+ * HTMLImageElement, HTMLCanvasElement and OffscreenCanvas; a VideoFrame or a
+ * <video> makes it throw a TypeError, which wgpu unwraps, and that aborts the
+ * whole WASM instance. So every kind of source is tried once on a throwaway
+ * device before it is allowed through to WASM, and the device is destroyed
+ * once every kind is known.
+ */
+class SourceProbe {
   /** `allowed`: an optional list of kinds to treat as accepted without asking (tests: `?extsrc=canvas`). */
   static async create(allowed = null) {
     const p = new SourceProbe();
     if (allowed) {
-      for (const k of ['videoframe', 'video', 'canvas', 'bitmap']) p.support[k] = allowed.includes(k);
+      for (const k of KINDS) p.support[k] = allowed.includes(k);
       return p;
     }
     try {
@@ -131,6 +153,16 @@ export class SourceProbe {
     this.texture = null;
   }
 
+  /** Whether every kind is known, so that the probe needs no device. */
+  knowsAll() {
+    return KINDS.every((k) => this.support[k] !== undefined);
+  }
+
+  /** Whether it has no device left to ask with and some kind is still unknown (lost, or never had one). */
+  gaveUp() {
+    return !this.device && !this.knowsAll();
+  }
+
   /**
    * May `source` (of `kind`) go to WASM? Unknown kinds are tried with this
    * very picture: a TypeError is the browser rejecting the kind for good,
@@ -150,7 +182,7 @@ export class SourceProbe {
       console.debug(`[unflash] WebGPU does not take a ${kind} as a copy source here (${e.message})`);
     }
     this.support[kind] = ok;
-    if (['videoframe', 'video', 'canvas'].every((k) => this.support[k] !== undefined)) this.release();
+    if (this.knowsAll()) this.release();
     return ok;
   }
 }

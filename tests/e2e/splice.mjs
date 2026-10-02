@@ -7,6 +7,8 @@
 // whose record holds both streams' parameter sets. Also the full
 // re-encode, two spans two at a time, and encoders that hand over Annex B
 // with no record (a High-profile one's record must carry the High fields).
+// Then how an export ends when the later of two spans fails, and the sound
+// copied as it is (from flash.mp4: AAC beside VP9).
 //   node tests/e2e/splice.mjs
 import { loadPlaywright } from './playwright.mjs';
 import path from 'node:path';
@@ -18,6 +20,7 @@ const WEB = path.join(ROOT, 'web');
 const CLIPS = path.join(WEB, 'clips');
 fs.mkdirSync(CLIPS, { recursive: true });
 for (const f of ['splice_a.mp4', 'splice_b.mp4']) fs.copyFileSync(path.join(ROOT, 'tests/media/h264', f), path.join(CLIPS, f));
+fs.copyFileSync(path.join(ROOT, 'tests/media/e2e/flash.mp4'), path.join(CLIPS, 'flash.mp4'));
 
 function assert(cond, msg) {
   if (!cond) throw new Error('ASSERT: ' + msg);
@@ -247,6 +250,86 @@ const r = await page.evaluate(async () => {
   };
   results.annexBHigh = await run('annex-b High-profile encoder', { smartCut: false, parallel: 1, makeEncoder: annexBHigh }, () => false);
   results.sourceTail = recordTail(a.dx.track_description(a.video.index));
+  // two spans two at a time, the later one's encoder failing at its first
+  // frame: the export fails with that error. The earlier span, stopped by
+  // the failure, ends with 'cancelled', and the writer waits on it: its
+  // encoder takes no frame until the later one has failed and closed
+  {
+    let laterGone;
+    const gone = new Promise((r) => (laterGone = r));
+    let made = 0;
+    const laterFails = (config, cb) => {
+      const enc = makeEncoder(config, cb);
+      if (made++ === 0) {
+        let held = true;
+        gone.then(() => (held = false));
+        return {
+          ...enc,
+          get encodeQueueSize() {
+            return held ? 9 : 0;
+          },
+        };
+      }
+      return {
+        ...enc,
+        encode() {
+          cb.error(new Error('the encoder failed (a test)'));
+        },
+        close() {
+          enc.close();
+          laterGone();
+        },
+      };
+    };
+    let error = null;
+    try {
+      await exportMovie(env, a, project, { quality: 7, candidate, makeEncoder: laterFails, spans: [[0.4, 0.5], [1.05, 1.1]], parallel: 2 });
+    } catch (e) {
+      error = e.message;
+    }
+    results.laterFails = { error, encoders: made };
+  }
+  // the sound copied as it is: byte for byte, a run of the samples that sit
+  // together in the file at a time (not a read and a write a packet; this
+  // file puts a picture between most of its packets), and a cancel stops it
+  {
+    const blob = await (await fetch('clips/flash.mp4')).blob();
+    const f = await Movie.open(new File([blob], 'flash.mp4', { type: 'video/mp4' }), wasm);
+    const samplesOf = async (m, s) => {
+      const out = [];
+      for (let i = 0; i < s.offset.length; i++) out.push(hash(await m.reader.read(s.offset[i], s.size[i])));
+      return out;
+    };
+    const sound = await samplesOf(f, f.a);
+    const pictures = await samplesOf(f, f.v);
+    let runs = 0;
+    for (let i = 0; i < f.a.offset.length; i++) if (i === 0 || f.a.offset[i] !== f.a.offset[i - 1] + f.a.size[i - 1]) runs++;
+    // the export's reads of the sound's samples, as they come
+    const soundAt = new Set(Array.from(f.a.offset));
+    let soundReads = 0;
+    const read = f.reader.read.bind(f.reader);
+    f.reader.read = (offset, size) => {
+      if (soundAt.has(offset)) soundReads++;
+      return read(offset, size);
+    };
+    // VP9 into VP9 with nothing to re-encode: every sample is copied
+    const vp9 = { label: 'stand-in VP9', config: { codec: 'vp09.00.10.08', width: f.width, height: f.height } };
+    const noEncoder = () => {
+      throw new Error('nothing here is re-encoded');
+    };
+    const res = await exportMovie(env, f, project, { quality: 7, candidate: vp9, makeEncoder: noEncoder });
+    const out = await Movie.open(new File([res.blob], 'copy.mp4', { type: 'video/mp4' }), wasm);
+    const copied = { mode: res.mode, copied: res.copied, soundReads, runs, packets: f.a.offset.length, sound: JSON.stringify(await samplesOf(out, out.a)) === JSON.stringify(sound), pictures: JSON.stringify(await samplesOf(out, out.v)) === JSON.stringify(pictures), warnings: res.warnings };
+    // cancelled at the sound's first read
+    soundReads = 0;
+    let cancelled = null;
+    try {
+      await exportMovie(env, f, project, { quality: 7, candidate: vp9, makeEncoder: noEncoder, cancel: () => soundReads > 0 });
+    } catch (e) {
+      cancelled = e.message;
+    }
+    results.soundCopy = { ...copied, cancelled, readsBeforeStop: soundReads };
+  }
   return { software, frames: ha.length, results };
 });
 console.log(JSON.stringify(r, null, 1));
@@ -287,6 +370,12 @@ assert(abh.mode === 'full' && abh.frames === 40 && abh.copied === 0, 'a High-pro
 assert(abh.outFrames === 40 && abh.mismatches.length === 0 && abh.timing, 'a High-profile Annex B encoder: every frame decodes as its source: ' + JSON.stringify(abh.mismatches));
 // (4:2:0, 8-bit luma and chroma, no SPS extensions: what x264 wrote after splice_a's own sets)
 assert(JSON.stringify(r.results.sourceTail) === '[253,248,248,0]' && JSON.stringify(abh.tail) === JSON.stringify(r.results.sourceTail), 'a High-profile Annex B encoder: the record made for it carries the High profile\'s fields: ' + JSON.stringify([abh.tail, r.results.sourceTail]));
+const lf = r.results.laterFails;
+assert(lf.encoders === 2 && lf.error === 'the encoder failed (a test)', 'an export whose later span fails says why, not "cancelled": ' + JSON.stringify(lf));
+const sc = r.results.soundCopy;
+assert(sc.mode === 'smart' && sc.copied > 0 && sc.sound && sc.pictures, 'the samples are copied byte for byte: ' + JSON.stringify(sc));
+assert(sc.runs < sc.packets && sc.soundReads === sc.runs, `the sound is copied a run of samples at a time: ${sc.soundReads} reads for ${sc.runs} runs of ${sc.packets} packets`);
+assert(sc.cancelled === 'cancelled' && sc.readsBeforeStop === 1, 'a cancel stops the copy of the sound: ' + JSON.stringify({ cancelled: sc.cancelled, reads: sc.readsBeforeStop }));
 console.log('SPLICE OK');
 await browser.close();
 srv.close();

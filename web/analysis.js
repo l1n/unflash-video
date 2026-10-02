@@ -2,7 +2,7 @@
 // same flow as the Python reference (analysis.py / editing.py), driving the
 // WASM detector over WebCodecs frames or cached section frames.
 
-import { breathe, decodeRange, decodeStretchesBuiltIn, tick } from './media.js';
+import { breathe, decodeRange, decodeStretchesBuiltIn, sampleRange } from './media.js';
 import { profile } from './profile.js';
 import { dropCaches } from './project.js';
 import { triageChunks } from './triage.js';
@@ -11,13 +11,79 @@ import { triageChunks } from './triage.js';
 const MIN_SEGMENT_RUNUPS = 4;
 
 /**
+ * Run `run(k, stop)` for k from 0 to n - 1 at the same time and wait for
+ * every one of them. Once one fails, `stop()` turns true for the others,
+ * as it does on a cancel, so they end at their next picture (a decode told
+ * to stop returns quietly) instead of going on with detectors and caches
+ * the caller frees or uses again after. Resolves to what each returned;
+ * throws the first failure, or 'cancelled' when `cancel()` turned true.
+ */
+async function together(n, run, cancel) {
+  let failed = null;
+  const stop = () => failed !== null || !!(cancel && cancel());
+  const settled = await Promise.allSettled(
+    Array.from({ length: n }, (_, k) =>
+      run(k, stop).catch((e) => {
+        if (failed === null) failed = e;
+        throw e;
+      })
+    )
+  );
+  if (failed !== null) throw failed;
+  if (cancel && cancel()) throw new Error('cancelled');
+  return settled.map((r) => r.value);
+}
+
+/** What a scan draws of each frame on the timeline and the monitor. */
+const newTrace = () => ({ t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] });
+
+/** The detector's records onto `trace`, those from `from` (seconds) on. */
+function addRecords(trace, records, from = -Infinity) {
+  for (const r of records) {
+    if (r.t < from - 1e-9) continue;
+    trace.t.push(r.t);
+    trace.hazard.push(r.hazard);
+    trace.hazardRed.push(r.hazard_red);
+    trace.ext.push(Math.max(r.ext, r.ext_red));
+    trace.lum.push(r.lum);
+    trace.pattern.push(r.pattern);
+  }
+}
+
+/**
+ * How pictures decoded in workers reach the detector `f`: made its
+ * analysis size there (unless tests say not to), all it needs.
+ */
+const shrinkFor = (movie, f) => (movie.shrinkInWorkers === false ? null : { aw: f.aw, ah: f.ah });
+
+/**
+ * What every scan returns, from its detector's `result` and its trace: the
+ * sections around the violations and the timeline's summary, and the
+ * profile, reported and kept for the debug report (`what`: how the scan
+ * ran, as the profile says it).
+ */
+function scanResult(env, movie, result, trace, frames, elapsedMs, what) {
+  const { wasm, config } = env;
+  profile.report(`scan of ${(movie.file && movie.file.name) || 'the file'} (${what})`, frames, elapsedMs);
+  // kept for the debug report (the next job starts the profile afresh)
+  const profileText = profile.text(`scan (${what})`, frames, elapsedMs);
+  const profileOps = profile.summary();
+  // no keyframe snapping: the export re-encodes, so sections can follow the
+  // flashing exactly instead of growing to the nearest keyframes
+  const sections = JSON.parse(wasm.violations_to_sections(JSON.stringify(result.violations), config, movie.tsMin, movie.tsMax, new Float64Array()));
+  const summary = JSON.parse(wasm.timeline_summary(JSON.stringify(result), movie.tsMin, movie.tsMax, 1.0));
+  return { result, sections, summary, trace, frames, elapsedMs, profileText, profileOps };
+}
+
+/**
  * Whole-video scan. With `segments` above one and a `makeFeeder`, the file
  * is cut into that many spans scanned at the same time, each by its own
  * decoder and detector, every span after the first starting a run-up early
  * (the same run-up a section check gets) so that the detector's state at
  * the seam is the state a run from the start would have reached; the
  * results are then joined exactly. Returns { result, sections, summary,
- * trace, frames, elapsedMs, segments }.
+ * trace, frames, elapsedMs, segments }; a cancelled scan, which saw only
+ * part of the file, throws instead.
  */
 export async function scanMovie(env, movie, { onProgress, onPartial = null, cancel, segments = 1, makeFeeder = null, moreFeeders = null, forceSegments = false, chunked = null } = {}) {
   if (chunked) return scanChunked(env, movie, { onProgress, onPartial, cancel, makeFeeder, moreFeeders, chunked });
@@ -37,12 +103,12 @@ export async function scanMovie(env, movie, { onProgress, onPartial = null, canc
   const feeders = [feeder];
   if (nseg > 1 && moreFeeders) feeders.push(...(await moreFeeders(nseg - 1)));
   else for (let k = 1; k < nseg; k++) feeders.push(await makeFeeder());
-  const traces = bounds.map(() => ({ t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] }));
+  const traces = bounds.map(newTrace);
   const counts = bounds.map(() => 0);
   const total = Math.max(1, movie.frameCount);
   // the spans' traces in order: the scan's own, made once at the end
   const merged = () => {
-    const out = { t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] };
+    const out = newTrace();
     for (const tr of traces) for (const key of Object.keys(out)) for (const v of tr[key]) out[key].push(v);
     return out;
   };
@@ -50,7 +116,7 @@ export async function scanMovie(env, movie, { onProgress, onPartial = null, canc
   // points each span adds (in no particular order, which a drawing does not
   // need). Merging every span afresh at each report cost time in proportion
   // to the square of the video's length: half a minute of an hour's scan.
-  const live = { t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] };
+  const live = newTrace();
   const sent = bounds.map(() => 0);
   const grown = () => {
     for (let k = 0; k < traces.length; k++) {
@@ -65,22 +131,11 @@ export async function scanMovie(env, movie, { onProgress, onPartial = null, canc
     if (onProgress) onProgress(count / total, grown(), count, performance.now() - started);
     profile.reportEvery(5000, 'scan so far', count, performance.now() - started);
   };
-  const runOne = async (k) => {
+  const runOne = async (k, stop) => {
     const f = feeders[k];
     const { from, to } = bounds[k];
     const tr = traces[k];
     f.reset();
-    const collect = () => {
-      for (const r of f.records()) {
-        if (r.t < from - 1e-9) continue; // the run-up: the previous span's frames
-        tr.t.push(r.t);
-        tr.hazard.push(r.hazard);
-        tr.hazardRed.push(r.hazard_red);
-        tr.ext.push(Math.max(r.ext, r.ext_red));
-        tr.lum.push(r.lum);
-        tr.pattern.push(r.pattern);
-      }
-    };
     let count = 0;
     // segments read different parts of the file: a window each
     const reader = k > 0 ? movie.reader.fork() : null;
@@ -92,30 +147,28 @@ export async function scanMovie(env, movie, { onProgress, onPartial = null, canc
         await f.videoFrame(frame, t, false);
         if (t >= from - 1e-9) counts[k] = ++count;
         if (count % 30 === 0) {
-          collect();
+          // (not the run-up's: those are the previous segment's frames)
+          addRecords(tr, f.records(), from);
           report();
         }
       },
       // the detector needs only its analysis size: pictures decoded in
       // workers are made that small there
-      { cancel, raw: true, reader, shrink: movie.shrinkInWorkers === false ? null : { aw: f.aw, ah: f.ah } }
+      { cancel: stop, raw: true, reader, shrink: shrinkFor(movie, f) }
     );
     await f.drain();
-    collect();
+    addRecords(tr, f.records(), from);
     return { from, result: f.finish(nseg > 1) };
   };
   let parts;
   try {
-    parts = await Promise.all(bounds.map((_, k) => runOne(k)));
+    // (a segment that fails stops the others before their detectors are freed, or used by the next job)
+    parts = await together(nseg, runOne, cancel);
   } finally {
     if (!moreFeeders) for (let k = 1; k < feeders.length; k++) feeders[k].det.free();
   }
   const count = counts.reduce((a, b) => a + b, 0);
   const elapsed = performance.now() - started;
-  profile.report(`scan of ${(movie.file && movie.file.name) || 'the file'} (${movie.width}×${movie.height}, ${feeder.backend}${nseg > 1 ? `, ${nseg} segments` : ''})`, count, elapsed);
-  // kept for the debug report (the next job starts the profile afresh)
-  const profileText = profile.text(`scan (${movie.width}×${movie.height}, ${feeder.backend}${nseg > 1 ? `, ${nseg} segments` : ''})`, count, elapsed);
-  const profileOps = profile.summary();
   let result;
   if (nseg === 1) {
     result = parts[0].result;
@@ -124,13 +177,7 @@ export async function scanMovie(env, movie, { onProgress, onPartial = null, canc
     // the merged run's own statistics are the trace; the rest need not stay
     result.frame_stats = {};
   }
-  const trace = merged();
-  const vjson = JSON.stringify(result.violations);
-  // no keyframe snapping: the export re-encodes, so sections can follow the
-  // flashing exactly instead of growing to the nearest keyframes
-  const sections = JSON.parse(wasm.violations_to_sections(vjson, config, movie.tsMin, movie.tsMax, new Float64Array()));
-  const summary = JSON.parse(wasm.timeline_summary(JSON.stringify(result), movie.tsMin, movie.tsMax, 1.0));
-  return { result, sections, summary, trace, frames: count, elapsedMs: elapsed, segments: nseg, patternThresh: feeder.det.pattern_thresh(), profileText, profileOps };
+  return { ...scanResult(env, movie, result, merged(), count, elapsed, `${movie.width}×${movie.height}, ${feeder.backend}${nseg > 1 ? `, ${nseg} segments` : ''}`), segments: nseg };
 }
 
 /** A chunked scan cuts the file into chunks about this long (seconds of video): what a decoder takes at a time. */
@@ -138,10 +185,12 @@ export const CHUNK_S = 10;
 
 /**
  * Bytes of pictures a chunked scan may hold for its detector, decoded ahead
- * of it: 96 MB for each GB of memory the browser says the machine has
- * (384 MB to 1 GB), or 512 MB when it does not say.
+ * of it: 96 MB for each GB of memory the browser says the machine has, at
+ * least 384 MB, or 512 MB when it does not say. Browsers say 8 GB at most,
+ * so that comes to 768 MB at most (the cap of 1 GB is for one that says
+ * more).
  */
-export function holdBudget() {
+function holdBudget() {
   const gb = typeof navigator !== 'undefined' ? navigator.deviceMemory : 0;
   return (gb ? Math.min(1024, Math.max(384, gb * 96)) : 512) * 1024 * 1024;
 }
@@ -155,18 +204,18 @@ export function holdBudget() {
 export function scanChunks(movie, chunkS = CHUNK_S) {
   const { pts, sync } = movie.v;
   const count = pts.length;
-  const end = movie.tsMax + 1;
   const t = [movie.tsMin];
   const idx = [0];
   for (let i = 1; i < count; i++) {
     if (!sync[i]) continue;
     const ti = pts[i] / 1e6;
-    if (ti - t[t.length - 1] >= chunkS && end - ti >= chunkS / 2) {
+    if (ti - t[t.length - 1] >= chunkS && movie.tsMax - ti >= chunkS / 2) {
       t.push(ti);
       idx.push(i);
     }
   }
-  t.push(end);
+  // (past the last picture, so that a decode up to there takes it in)
+  t.push(movie.tsMax + 1);
   const n = idx.map((a, c) => (c + 1 < idx.length ? idx[c + 1] : count) - a);
   return { t, idx, n, length: idx.length };
 }
@@ -335,15 +384,15 @@ class NotHoldable extends Error {}
  * that fails (a damaged picture) gives its chunks back to the browser's
  * decoder, which goes on from its last picture. Pictures that cannot be
  * held (a decoder that gives only VideoFrames) make it a scan in one piece.
- * Returns what scanMovie does, and `chunked`: the chunks, the order they
- * were taken in, the early looks and what each lane did. For tests,
- * `chunked.sim` stands the built-in decoder, on the page, in for the
- * browser's (a browser without H.264 in WebCodecs, such as the test
- * browser, can then run a hybrid scan), `chunked.failBuiltIn` makes the
- * built-in decoder fail at its tenth picture, `chunked.slow` (ms) holds
- * back every picture of the browser's lanes, as Firefox's copies out of the
- * GPU do, and `chunked.steal` false keeps a lane from taking over another's
- * chunk.
+ * Returns what scanMovie does (and throws, as it does, when cancelled), and
+ * `chunked`: the chunks, the order they were taken in, the early looks and
+ * what each lane did. For tests, `chunked.sim` stands the built-in
+ * decoder, on the page, in for the browser's (a browser without H.264 in
+ * WebCodecs, such as the test browser, can then run a hybrid scan),
+ * `chunked.failBuiltIn` makes the built-in decoder fail at its tenth
+ * picture, `chunked.slow` (ms) holds back every picture of the browser's
+ * lanes, as Firefox's copies out of the GPU do, and `chunked.steal` false
+ * keeps a lane from taking over another's chunk.
  */
 async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, makeFeeder = null, moreFeeders = null, chunked }) {
   const { wasm, config, feeder } = env;
@@ -359,7 +408,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
   const nhw = Math.max(1, Math.floor(chunked.hw || 1));
   const nlanes = nhw + (pool ? 1 : 0);
   // pictures made the detector's size where they are decoded (unless tests say not to)
-  const shrink = movie.shrinkInWorkers === false ? null : { aw: feeder.aw, ah: feeder.ah };
+  const shrink = shrinkFor(movie, feeder);
   const picBytes = shrink ? shrink.aw * shrink.ah * 4 : Math.ceil(movie.width * movie.height * 1.5);
   const budget = chunked.budget || holdBudget();
   const picker = new ChunkPicker(chunks.n, chunks.t, { bytes: picBytes, budget, order: triage ? triage.order : null, hot: triage ? triage.hot : 0, runup });
@@ -381,6 +430,8 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
       ms: 0,
       t0: 0,
       failed: null,
+      // in its loop, picking work (only such a lane takes a chunk the rebalancing gives it)
+      running: false,
       // stretches handed to its decoder and not yet done, in order; how many of them feed the detector next
       stretches: [],
       feeding: 0,
@@ -442,7 +493,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
   };
 
   const total = Math.max(1, movie.frameCount);
-  const trace = { t: [], hazard: [], hazardRed: [], ext: [], lum: [], pattern: [] };
+  const trace = newTrace();
   let pushed = 0; // pictures the lanes have decoded for the detector
   let fed = 0; // and it has taken
   let heldBytes = 0;
@@ -524,7 +575,8 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
    */
   const soonest = (lane) => {
     const mine = rate(lane);
-    const others = lanes.filter((l) => l !== lane && !l.failed);
+    // (a lane that has left its loop picks nothing more: a chunk given back after it left must not wait for it)
+    const others = lanes.filter((l) => l !== lane && l.running && !l.failed);
     if (!mine || !others.length || others.some((l) => !rate(l))) return null;
     // when each lane will be free, and the lane each free chunk falls to
     const free = new Map(others.map((l) => [l, busyFor(l)]));
@@ -746,6 +798,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
   const laneLoop = async (lane) => {
     const t0 = now();
     if (!lane.t0) lane.t0 = t0;
+    lane.running = true;
     try {
       while (!stop() && !lane.failed) {
         const p = pick(lane);
@@ -770,6 +823,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
       halt(e);
       throw e;
     } finally {
+      lane.running = false;
       lane.ms += now() - t0;
       // whoever waits on this lane looks again
       changed();
@@ -778,16 +832,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
   };
 
   // the detector: every chunk in file order
-  const collect = () => {
-    for (const r of feeder.records()) {
-      trace.t.push(r.t);
-      trace.hazard.push(r.hazard);
-      trace.hazardRed.push(r.hazard_red);
-      trace.ext.push(Math.max(r.ext, r.ext_red));
-      trace.lum.push(r.lum);
-      trace.pattern.push(r.pattern);
-    }
-  };
+  const collect = () => addRecords(trace, feeder.records());
   const detect = async () => {
     feeder.reset();
     for (let c = 0; c < nc; c++) {
@@ -832,14 +877,16 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
       throw e;
     });
     let settled = await Promise.allSettled(lanes.map(laneLoop));
-    // chunks a built-in decoder gave back after the other lanes had finished
-    while (!stop() && picker.left > 0 && settled.every((r) => r.status === 'fulfilled') && lanes.some((l) => !l.failed)) settled = await Promise.allSettled([laneLoop(lanes.find((l) => !l.failed))]);
+    // chunks a built-in decoder gave back after the other lanes had finished: they all go on
+    while (!stop() && picker.left > 0 && settled.every((r) => r.status === 'fulfilled') && lanes.some((l) => !l.failed)) settled = await Promise.allSettled(lanes.filter((l) => !l.failed).map(laneLoop));
     const bad = settled.find((r) => r.status === 'rejected');
     if (bad) {
       await detecting.catch(() => {});
       throw bad.reason;
     }
     await detecting;
+    // (the detector stopped where the cancel found it: the scan saw part of the file)
+    if (cancel && cancel()) throw new Error('cancelled');
     if (!stop() && picker.left > 0) throw new Error('chunked scan: every decoder gave up');
   } catch (e) {
     if (!(e instanceof NotHoldable) || (cancel && cancel())) throw e;
@@ -853,30 +900,14 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
     r.chunked = { chunks: nc, chunkS, fallback };
     return r;
   }
-  const count = fed;
   const elapsed = now() - started;
   const what = `${movie.width}×${movie.height}, ${feeder.backend}, ${nc} chunks in order${triage ? `, ${looks.length} early looks` : ''}, ${nhw} lane${nhw === 1 ? '' : 's'} of the browser's decoder${pool ? ` + the built-in ×${pool.workers.length}` : ''}`;
-  profile.report(`scan of ${(movie.file && movie.file.name) || 'the file'} (${what})`, count, elapsed);
-  // kept for the debug report (the next job starts the profile afresh)
-  const profileText = profile.text(`scan (${what})`, count, elapsed);
-  const profileOps = profile.summary();
   const result = feeder.finish(false);
-  const vjson = JSON.stringify(result.violations);
-  const sections = JSON.parse(wasm.violations_to_sections(vjson, config, movie.tsMin, movie.tsMax, new Float64Array()));
-  const summary = JSON.parse(wasm.timeline_summary(JSON.stringify(result), movie.tsMin, movie.tsMax, 1.0));
   for (const l of lanes) setAside(l, false);
   const laneStats = lanes.map((l) => ({ kind: l.kind, workers: l.kind === 'built-in' ? pool.workers.length : 1, frames: l.frames, chunks: l.chunks, looks: l.looks, ms: l.ms, failed: l.failed, steals: l.steals, stolen: l.stolen, aside: Math.round(l.asideMs), fps: rate(l) }));
   return {
-    result,
-    sections,
-    summary,
-    trace,
-    frames: count,
-    elapsedMs: elapsed,
+    ...scanResult(env, movie, result, trace, fed, elapsed, what),
     segments: 1,
-    patternThresh: feeder.det.pattern_thresh(),
-    profileText,
-    profileOps,
     chunked: { chunks: nc, chunkS, order: triage ? 'triage' : 'file', hot: triage ? triage.order.slice(0, triage.hot) : [], taken: picker.log.slice(), looks, lanes: laneStats, budget, peak, steals, rebalanced: rebalancing, grown },
   };
 }
@@ -888,15 +919,11 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
  * (the first span's lead-in from its keyframe included). Spans are
  * { from, to, fromIndex } (seconds, and the sample the decode starts at).
  */
-export function decodeSpans(movie, from, to, k) {
+function decodeSpans(movie, from, to, k) {
   const v = movie.v;
-  const n = v.pts.length;
-  const start = movie.dx.sync_before(movie.video.index, Math.max(from, movie.tsMin));
+  const { startIdx: start, endIdx: end } = sampleRange(movie, from, to);
   const whole = [{ from, to, fromIndex: start }];
   if (k <= 1) return whole;
-  const endUs = to * 1e6;
-  let end = start;
-  while (end < n && !(v.dts[end] >= endUs && v.pts[end] >= endUs)) end++;
   const total = end - start;
   // not worth a second decoder for a couple of seconds of video
   if (total < 120) return whole;
@@ -932,7 +959,8 @@ export function decodeSpans(movie, from, to, k) {
  * With `spans` above one and `moreFeeders` (n => that many more detectors
  * like env.feeder), the range is cut at keyframes into spans decoded side by
  * side and joined in order: a picture's capture and pattern figures depend
- * on that picture alone, so the join is exact.
+ * on that picture alone, so the join is exact. A prepare that is cancelled
+ * or fails throws, and leaves `sec` as it was.
  */
 export async function prepareSection(env, movie, sec, { onProgress, cancel, spans = 1, moreFeeders = null } = {}) {
   const { wasm, config } = env;
@@ -981,7 +1009,12 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel, span
   const rawPer = joined('rawPer');
   const leadPts = joined('leadPts');
   const tailPts = joined('tailPts');
-  if (cache.len() === 0) throw new Error('Section decoded zero frames');
+  if (cache.len() === 0) {
+    cache.free();
+    lead.free();
+    tail.free();
+    throw new Error('Section decoded zero frames');
+  }
   // the section works on a sanitised timeline (timestamp anomalies bridged)
   const san = JSON.parse(wasm.sanitize_deltas(Float64Array.from(rawPts), JSON.parse(config).max_frame_gap));
   const relPts = san.times.map((t) => Math.round(t * 1e6) / 1e6);
@@ -1009,8 +1042,9 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel, span
 
 /**
  * Decode the spans of a prepare at the same time, span k on feeders[k];
- * returns each span's caches, times and pattern figures (freed again if
- * any span fails).
+ * returns each span's caches, times and pattern figures. When a span fails
+ * or the prepare is cancelled, it throws once every span has stopped, the
+ * caches freed again.
  */
 async function prepareSpans(env, movie, sec, plan, feeders, { onProgress, cancel }) {
   const { wasm } = env;
@@ -1030,11 +1064,15 @@ async function prepareSpans(env, movie, sec, plan, feeders, { onProgress, cancel
   const report = () => {
     if (onProgress) onProgress(parts.reduce((a, p) => a + p.count, 0));
   };
-  const runOne = async (k) => {
+  const runOne = async (k, stop) => {
     const f = feeders[k];
     const part = parts[k];
     const { from, to, fromIndex } = plan[k];
     f.reset();
+    const toTail = (rgba, t) => {
+      part.tail.push(rgba);
+      part.tailPts.push(Math.round((t - sec.start) * 1e6) / 1e6);
+    };
     const settle = () => {
       for (const r of f.records()) {
         const rgba = f.det.take_capture(r.index);
@@ -1048,10 +1086,12 @@ async function prepareSpans(env, movie, sec, plan, feeders, { onProgress, cancel
           part.rawPts.push(t - sec.start);
           part.rawPat.push(r.pattern || 0);
           part.rawPer.push(r.pattern_period || 0);
-        } else {
-          part.tail.push(rgba);
-          part.tailPts.push(Math.round((t - sec.start) * 1e6) / 1e6);
-        }
+          // a frame at the section's very end gives it its length, but is
+          // not one of its own (section_timeline): the export shows it
+          // straight after the section (walkEdited leaves a section there),
+          // so the check's run-out starts with it
+          if (t >= sec.end - 1e-9) toTail(rgba, t);
+        } else toTail(rgba, t);
       }
     };
     await decodeRange(
@@ -1065,13 +1105,15 @@ async function prepareSpans(env, movie, sec, plan, feeders, { onProgress, cancel
           report();
         }
       },
-      { cancel, raw: true, fromIndex, reader: k > 0 ? movie.reader.fork() : null, shrink: movie.shrinkInWorkers === false ? null : { aw: f.aw, ah: f.ah } }
+      { cancel: stop, raw: true, fromIndex, reader: k > 0 ? movie.reader.fork() : null, shrink: shrinkFor(movie, f) }
     );
     await f.drain();
     settle();
   };
   try {
-    await Promise.all(plan.map((_, k) => runOne(k)));
+    // (a span that fails stops the others before their caches are freed, and
+    // before prepareSection tries again on env.feeder, span 0's detector)
+    await together(plan.length, runOne, cancel);
   } catch (e) {
     for (const p of parts) {
       p.cache.free();
@@ -1083,8 +1125,23 @@ async function prepareSpans(env, movie, sec, plan, feeders, { onProgress, cancel
   return parts;
 }
 
+/** The times of the frames a prepared section shows (section_timeline's first n_out, rebased onto the first). */
 export function shownPts(wasm, sec) {
-  return Array.from(wasm.shown_pts(Float64Array.from(sec.pts), sec.start, sec.end));
+  return wasm.shown_pts(Float64Array.from(sec.pts), sec.start, sec.end);
+}
+
+/**
+ * A section as the export shows it under `edits` (its marks; null for
+ * none): its timeline (section_timeline), the times of the frames it
+ * shows, the edited sequence of them (display time and source ordinal of
+ * each slot) and the holds, all in section time. The check, the export and
+ * a neighbour's check of its edge all read it from here.
+ */
+export function sectionSequence(wasm, sec, edits, extS) {
+  const tl = JSON.parse(wasm.section_timeline(Float64Array.from(sec.pts), sec.start, sec.end));
+  const shown = Float64Array.from(tl.rel.slice(0, tl.n_out));
+  const marks = JSON.stringify(edits || {});
+  return { tl, shown, seq: JSON.parse(wasm.edited_sequence(shown, marks, extS)), holds: JSON.parse(wasm.section_holds(shown, marks, extS, tl.total)) };
 }
 
 /** Blur strength that takes a stripe pattern under the detector's swing. */
@@ -1138,11 +1195,20 @@ export function blendStrength(sec) {
   return sec.blendStrength == null ? BLEND_DEFAULT : sec.blendStrength;
 }
 
-/** A section's blend marks that apply (on its frames, at some strength), in order. */
-export function blendMarks(sec) {
+/** The blend `blend` names ({ marks, strength }: a suggestion's trial), else the section's own. */
+const blendOf = (sec, blend) => blend || { marks: sec.blend, strength: blendStrength(sec) };
+
+/** A section's blend marks that apply (on its frames, at some strength), in order; `blend`'s in place of its own. */
+export function blendMarks(sec, blend = null) {
   const n = sec.cache ? sec.cache.len() : sec.nFrames || 0;
-  if (!(blendStrength(sec) > 0)) return [];
-  return [...new Set(sec.blend || [])].filter((i) => i >= 0 && i < n).sort((a, b) => a - b);
+  const { marks, strength } = blendOf(sec, blend);
+  if (!(strength > 0)) return [];
+  return [...new Set(marks || [])].filter((i) => i >= 0 && i < n).sort((a, b) => a - b);
+}
+
+/** Whether a section has marks that change what it shows (stripes softened, frames blended, removed or held). */
+export function hasMarks(sec) {
+  return !!sec.soften || blendMarks(sec).length > 0 || Object.values(sec.edits || {}).some((e) => e.removed || e.extended);
 }
 
 /**
@@ -1185,17 +1251,21 @@ export function blendWeights(src, s) {
   return [1, 0, 0];
 }
 
-/** A section's frames with its blend marks applied (its own cache when it has none). */
-export function blendedFrames(sec) {
+/**
+ * A section's frames with its blend marks applied (its own cache when it
+ * has none), or `blend`'s ({ marks, strength }) in place of its own: one
+ * blended copy is kept, for the marks it was last asked for.
+ */
+export function blendedFrames(sec, blend = null) {
   if (!sec.cache) return sec.cache;
-  const marks = blendMarks(sec);
+  const marks = blendMarks(sec, blend);
   if (!marks.length) {
     if (sec.blendCache) sec.blendCache.free();
     sec.blendCache = null;
     sec.blendKey = null;
     return sec.cache;
   }
-  const s = blendStrength(sec);
+  const s = blendOf(sec, blend).strength;
   const key = `${sec.preparedAt}:${s}:${marks.join(',')}`;
   if (sec.blendCache && sec.blendKey === key) return sec.blendCache;
   if (sec.blendCache) sec.blendCache.free();
@@ -1206,12 +1276,16 @@ export function blendedFrames(sec) {
   return sec.blendCache;
 }
 
-/** The frames a check or suggestion should read: blended and softened as marked. */
-export function sectionFrames(sec) {
-  const frames = blendedFrames(sec);
+/**
+ * The frames a check or suggestion should read: blended and softened as
+ * marked (blended as `blend` says, a suggestion's trial, when given).
+ */
+function sectionFrames(sec, blend = null) {
+  const frames = blendedFrames(sec, blend);
   if (!frames || !sec.soften) return frames;
   const plan = softenPlan(sec);
   if (!plan) return frames;
+  // (blendKey names the marks and strength the frames were blended with, whoever asked)
   const key = `${plan.radius}:${sec.blendKey || sec.preparedAt}:${[...plan.frames].join(',')}`;
   if (sec.softCache && sec.softKey === key) return sec.softCache;
   if (sec.softCache) sec.softCache.free();
@@ -1232,7 +1306,7 @@ function sectionsIn(project, sec, tLo, tHi) {
 /** The last/first `seconds` of another section as the export will contain it. */
 function editedEdge(wasm, o, seconds, side, extS) {
   if (!o.prepared || !o.cache || !o.pts || !o.pts.length) return null;
-  const seq = JSON.parse(wasm.edited_sequence(Float64Array.from(shownPts(wasm, o)), JSON.stringify(o.edits || {}), extS));
+  const { seq } = sectionSequence(wasm, o, o.edits, extS);
   if (!seq.t.length) return null;
   const cache = sectionFrames(o);
   const idx = [];
@@ -1294,7 +1368,7 @@ function join(parts, dt) {
 }
 
 /** Run-up and run-out for a section's check, as the export will contain them. */
-export function sectionContext(env, project, sec, extS) {
+function sectionContext(env, project, sec, extS) {
   const { wasm, config } = env;
   const need = wasm.context_seconds(config);
   const notes = [];
@@ -1325,22 +1399,25 @@ export function sectionContext(env, project, sec, extS) {
   return { lead, tail, notes, nextAt };
 }
 
-/** The instant safety check for a section's (or the given) edits. */
-export async function checkSection(env, project, sec, edits, { extS = 1.0, onProgress } = {}) {
+/**
+ * The instant safety check for a section's (or the given) edits, and its
+ * blend marks (or `blend`'s, { marks, strength }: a suggestion's trial, the
+ * section left as it is). A cancel (`cancel()` true) makes it throw
+ * 'cancelled' before it starts.
+ */
+export async function checkSection(env, project, sec, edits, { extS = 1.0, onProgress, cancel = null, blend = null } = {}) {
   const { wasm, feeder } = env;
   // a turn for the page between checks (a suggestion runs dozens), never
   // during one: what a check reads stays put while it runs
   await breathe();
+  if (cancel && cancel()) throw new Error('cancelled');
   if (!sec.prepared || !sec.cache) throw new Error('Section not prepared');
-  const useEdits = edits || sec.edits || {};
   const ctx = sectionContext(env, project, sec, extS);
-  const shown = shownPts(wasm, sec);
-  const seq = JSON.parse(wasm.edited_sequence(Float64Array.from(shown), JSON.stringify(useEdits), extS));
+  const { tl, seq, holds } = sectionSequence(wasm, sec, edits || sec.edits, extS);
   // the frames after the section come after all of its holds, its last frame's too
-  const total = JSON.parse(wasm.section_timeline(Float64Array.from(sec.pts), sec.start, sec.end)).total;
-  const holds = JSON.parse(wasm.section_holds(Float64Array.from(shown), JSON.stringify(useEdits), extS, total));
+  const total = tl.total;
   const lastHold = holds.filter((h) => h.at >= total - 1e-9).reduce((sum, h) => sum + h.seconds, 0);
-  const frames = sectionFrames(sec);
+  const frames = sectionFrames(sec, blend);
   feeder.reset();
   let fed = 0;
   const count = ctx.lead.frames.length + seq.t.length + ctx.tail.frames.length;
@@ -1425,50 +1502,52 @@ export function keepJson(sec) {
  * ordinals or null; frames marked keep are never removed. The fewest
  * removals, once passing, let frames back into long runs of removed frames
  * at the safe picture rate (a frozen picture moves again), each try checked.
+ * A cancel (`cancel()` true) makes it, and the suggesters below, throw at
+ * the next check.
  */
-export async function suggestEdits(env, project, sec, prefer, only, { extS = 1.0, onProgress } = {}) {
+export async function suggestEdits(env, project, sec, prefer, only, { extS = 1.0, onProgress, cancel = null } = {}) {
   const { wasm, config } = env;
-  const shown = shownPts(wasm, sec);
-  const sug = new wasm.Suggester(Float64Array.from(shown), JSON.stringify(sec.edits || {}), prefer, only ? JSON.stringify(only) : undefined, keepJson(sec));
-  // the fewest removals end by letting frames back into long removed
-  // stretches at the rate that cannot fail by itself
-  const safe = wasm.safe_picture_rate(config);
-  if (prefer === 'fewest' && safe > 0) sug.thin_long_gaps(1 / safe);
-  const frames = sectionFrames(sec);
-  let step = JSON.parse(sug.step(frames, undefined));
-  let round = 0;
-  while (step.simulate) {
-    if (onProgress) onProgress(round);
-    const tried = await checkSection(env, project, sec, step.simulate, { extS });
-    step = JSON.parse(sug.step(frames, JSON.stringify(tried.raw)));
-    round++;
+  const sug = new wasm.Suggester(shownPts(wasm, sec), JSON.stringify(sec.edits || {}), prefer, only ? JSON.stringify(only) : undefined, keepJson(sec));
+  let step;
+  try {
+    // the fewest removals end by letting frames back into long removed
+    // stretches at the rate that cannot fail by itself
+    const safe = wasm.safe_picture_rate(config);
+    if (prefer === 'fewest' && safe > 0) sug.thin_long_gaps(1 / safe);
+    const frames = sectionFrames(sec);
+    step = JSON.parse(sug.step(frames, undefined));
+    let round = 0;
+    while (step.simulate) {
+      if (onProgress) onProgress(round);
+      const tried = await checkSection(env, project, sec, step.simulate, { extS, cancel });
+      step = JSON.parse(sug.step(frames, JSON.stringify(tried.raw)));
+      round++;
+    }
+  } finally {
+    sug.free();
   }
-  sug.free();
   // the verdict is the check of the marks as the section will have them: the
   // last one tried may have been taken back (a flash put back that failed,
   // frames let back into a long removed stretch), and what it hands back
   // then is an earlier set, whose check says nothing about the last
   const done = step.done;
   const marks = JSON.parse(wasm.apply_suggestion(JSON.stringify(sec.edits || {}), JSON.stringify(done.edits), only ? JSON.stringify(only) : undefined, keepJson(sec)));
-  const verdict = await checkSection(env, project, sec, marks, { extS });
+  const verdict = await checkSection(env, project, sec, marks, { extS, cancel });
   const note = done.safe && !verdict.safe ? `${done.note} Checked again as applied, though, it does not pass: see the verdict.` : done.note;
   return { ...done, note, verdict };
 }
 
 /** "Reduce FPS": thin to a rate from timestamps alone, then check. */
-export async function suggestFrameRate(env, project, sec, only, fps, { extS = 1.0 } = {}) {
+export async function suggestFrameRate(env, project, sec, only, fps, { extS = 1.0, cancel = null } = {}) {
   const { wasm, config } = env;
-  const shown = shownPts(wasm, sec);
-  const p = JSON.parse(
-    wasm.rate_proposal(config, Float64Array.from(shown), JSON.stringify(sec.edits || {}), only ? JSON.stringify(only) : undefined, fps == null ? undefined : fps, extS, keepJson(sec))
-  );
-  const verdict = await checkSection(env, project, sec, p.edits, { extS });
+  const p = JSON.parse(wasm.rate_proposal(config, shownPts(wasm, sec), JSON.stringify(sec.edits || {}), only ? JSON.stringify(only) : undefined, fps == null ? undefined : fps, extS, keepJson(sec)));
+  const verdict = await checkSection(env, project, sec, p.edits, { extS, cancel });
   const note = wasm.rate_note(JSON.stringify(p), verdict.safe);
   return { edits: p.removals, safe: verdict.safe, rounds: 1, fps: p.fps, safe_fps: p.safe_fps, guaranteed: p.guaranteed, note, verdict };
 }
 
 /** Each step of the frame-rate search keeps this share of the last rate. */
-export const RATE_STEP = 0.9;
+const RATE_STEP = 0.9;
 
 /**
  * The rates the frame-rate search tries, highest first: twice the
@@ -1496,7 +1575,7 @@ export function rateLadder(safe, sourceFps) {
  * pictures as it can. Returns the first rate that passes (or the last tried)
  * with the rates that failed before it.
  */
-export async function searchFrameRate(env, project, sec, only, { extS = 1.0, sourceFps = 30, onProgress } = {}) {
+export async function searchFrameRate(env, project, sec, only, { extS = 1.0, sourceFps = 30, onProgress, cancel = null } = {}) {
   const { wasm, config } = env;
   const safe = wasm.safe_picture_rate(config);
   const ladder = rateLadder(safe, sourceFps);
@@ -1504,7 +1583,7 @@ export async function searchFrameRate(env, project, sec, only, { extS = 1.0, sou
   let res = null;
   for (let i = 0; i < ladder.length; i++) {
     if (onProgress) onProgress(i / ladder.length, ladder[i]);
-    res = await suggestFrameRate(env, project, sec, only, ladder[i], { extS });
+    res = await suggestFrameRate(env, project, sec, only, ladder[i], { extS, cancel });
     if (res.safe) break;
     failed.push(ladder[i]);
   }
@@ -1529,75 +1608,65 @@ const BLEND_ROUNDS = 3;
  * flash that stays is at most 80% of what just passes. Removals within
  * reach (the selection, with "selection only") make way for it; holds and
  * keep marks stay, and frames marked keep are never blended. Resolves to
- * `{ edits, blend, strength, least, safe, note, verdict }`; the section's
- * own marks are as they were.
+ * `{ edits, blend, strength, least, safe, note, verdict }`; each check is
+ * handed the blend it tries, and the section's own marks are left alone.
  */
-export async function suggestBlend(env, project, sec, only, { extS = 1.0, onProgress } = {}) {
+export async function suggestBlend(env, project, sec, only, { extS = 1.0, onProgress, cancel = null } = {}) {
   const { wasm } = env;
   const reach = only ? new Set(only) : null;
   const inReach = (i) => !reach || reach.has(i);
   const edits = {};
   for (const [k, e] of Object.entries(sec.edits || {})) if (!(e.removed && inReach(+k))) edits[k] = e;
   const outside = (sec.blend || []).filter((i) => !inReach(i));
-  const shown = Float64Array.from(shownPts(wasm, sec));
-  const saved = { blend: sec.blend, blendStrength: sec.blendStrength };
+  const shown = shownPts(wasm, sec);
   let checks = 0;
-  const check = (marks, s) => {
-    sec.blend = marks;
-    sec.blendStrength = s;
+  const check = (marks, strength) => {
     if (onProgress) onProgress(checks++);
-    return checkSection(env, project, sec, edits, { extS });
+    return checkSection(env, project, sec, edits, { extS, cancel, blend: { marks, strength } });
   };
   const candidates = (verdict) => JSON.parse(wasm.blend_candidates(shown, JSON.stringify(verdict.raw), sec.cache, only ? JSON.stringify(only) : undefined, keepJson(sec), false)).frames;
   const pct = (s) => `${Math.round(s * 100)}%`;
   const removed = Object.keys(sec.edits || {}).length - Object.keys(edits).length;
-  try {
-    const s0 = blendStrength(sec);
-    const base = await check(outside, s0);
-    if (base.safe) return { edits, blend: outside, strength: s0, least: 0, safe: true, verdict: base, note: removed ? 'It passes with the removals taken off and nothing blended.' : 'It passes as it is: nothing to blend.' };
-    // the frames to blend: at full strength until it passes
-    const marks = new Set(outside);
-    let verdict = base;
-    for (let round = 0; round < BLEND_ROUNDS; round++) {
-      const before = marks.size;
-      for (const i of candidates(verdict)) marks.add(i);
-      if (marks.size === before) break;
-      verdict = await check([...marks].sort((a, b) => a - b), 1);
-      if (verdict.safe) break;
-    }
-    const list = [...marks].sort((a, b) => a - b);
-    if (!list.length) return { edits, blend: outside, strength: 1, least: 1, safe: false, verdict: base, note: 'Found no flashing frames to blend here. Try a removal suggestion, or mark frames with B.' };
-    if (!verdict.safe) {
-      return { edits, blend: list, strength: 1, least: 1, safe: false, verdict, note: `Even blended all the way, ${list.length} frames do not take the flashing out here. They are left marked at 100% to go on from; a removal suggestion may do better.` };
-    }
-    // the least strength that passes, in steps: lo fails, hi passes
-    const steps = Math.round(1 / BLEND_STEP);
-    let lo = 0;
-    let hi = steps;
-    let found = verdict;
-    while (hi - lo > 1) {
-      const mid = (lo + hi) >> 1;
-      const v = await check(list, mid / steps);
-      if (v.safe) {
-        hi = mid;
-        found = v;
-      } else lo = mid;
-    }
-    const least = hi / steps;
-    // room to spare: leave at most BLEND_ROOM of the flash that just passes
-    const chosen = Math.min(steps, Math.ceil((1 - BLEND_ROOM * (1 - least)) * steps - 1e-9));
-    let strength = chosen / steps;
-    if (chosen !== hi) {
-      const v = await check(list, strength);
-      if (v.safe) found = v;
-      else strength = least;
-    }
-    const note = `Blended ${list.length} frame${list.length === 1 ? '' : 's'} with the frames around ${list.length === 1 ? 'it' : 'them'} at ${pct(strength)} (${pct(least)} is the least that passes)${removed ? `, in place of ${removed} removal${removed === 1 ? '' : 's'}` : ''}: it passes, and no frame is taken out.`;
-    return { edits, blend: list, strength, least, safe: true, verdict: found, note };
-  } finally {
-    sec.blend = saved.blend;
-    sec.blendStrength = saved.blendStrength;
+  const s0 = blendStrength(sec);
+  const base = await check(outside, s0);
+  if (base.safe) return { edits, blend: outside, strength: s0, least: 0, safe: true, verdict: base, note: removed ? 'It passes with the removals taken off and nothing blended.' : 'It passes as it is: nothing to blend.' };
+  // the frames to blend: at full strength until it passes
+  const marks = new Set(outside);
+  let verdict = base;
+  for (let round = 0; round < BLEND_ROUNDS; round++) {
+    const before = marks.size;
+    for (const i of candidates(verdict)) marks.add(i);
+    if (marks.size === before) break;
+    verdict = await check([...marks].sort((a, b) => a - b), 1);
+    if (verdict.safe) break;
   }
+  const list = [...marks].sort((a, b) => a - b);
+  if (!list.length) return { edits, blend: outside, strength: 1, least: 1, safe: false, verdict: base, note: 'Found no flashing frames to blend here. Try a removal suggestion, or mark frames with B.' };
+  if (!verdict.safe) {
+    return { edits, blend: list, strength: 1, least: 1, safe: false, verdict, note: `Even blended all the way, ${list.length} frames do not take the flashing out here. They are left marked at 100% to go on from; a removal suggestion may do better.` };
+  }
+  // the least strength that passes, in steps: lo fails, hi passes
+  const steps = Math.round(1 / BLEND_STEP);
+  let lo = 0;
+  let hi = steps;
+  let found = verdict;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    const v = await check(list, mid / steps);
+    if (v.safe) {
+      hi = mid;
+      found = v;
+    } else lo = mid;
+  }
+  const least = hi / steps;
+  // room to spare: leave at most BLEND_ROOM of the flash that just passes
+  const chosen = Math.min(steps, Math.ceil((1 - BLEND_ROOM * (1 - least)) * steps - 1e-9));
+  let strength = chosen / steps;
+  if (chosen !== hi) {
+    const v = await check(list, strength);
+    if (v.safe) found = v;
+    else strength = least;
+  }
+  const note = `Blended ${list.length} frame${list.length === 1 ? '' : 's'} with the frames around ${list.length === 1 ? 'it' : 'them'} at ${pct(strength)} (${pct(least)} is the least that passes)${removed ? `, in place of ${removed} removal${removed === 1 ? '' : 's'}` : ''}: it passes, and no frame is taken out.`;
+  return { edits, blend: list, strength, least, safe: true, verdict: found, note };
 }
-
-export { tick };

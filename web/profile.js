@@ -21,24 +21,6 @@ class Profile {
     if (ms > o.max) o.max = ms;
   }
 
-  time(name, fn) {
-    const t0 = performance.now();
-    try {
-      return fn();
-    } finally {
-      this.add(name, performance.now() - t0);
-    }
-  }
-
-  async timeAsync(name, fn) {
-    const t0 = performance.now();
-    try {
-      return await fn();
-    } finally {
-      this.add(name, performance.now() - t0);
-    }
-  }
-
   note(key, value) {
     this.notes.set(key, value);
   }

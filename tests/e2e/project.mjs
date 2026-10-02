@@ -3,6 +3,8 @@
 // section deleted, and the file loaded back (sections, marks and the scan
 // return); the same video opened again as a new copy (another modified
 // time) finds its project; a project file for another video is turned down.
+// The page keeps one connection to the database, and a save whose
+// transaction fails as it commits settles all the same.
 //   node tests/e2e/project.mjs
 import { loadPlaywright } from './playwright.mjs';
 import fs from 'node:fs';
@@ -32,6 +34,15 @@ page.on('console', (m) => {
   if (process.env.E2E_VERBOSE) console.log('[browser]', m.type(), m.text());
 });
 page.on('dialog', (d) => d.accept());
+// how many connections the page opens to IndexedDB
+await page.addInitScript(() => {
+  const open = IDBFactory.prototype.open;
+  window.__dbOpens = 0;
+  IDBFactory.prototype.open = function (...args) {
+    window.__dbOpens++;
+    return open.apply(this, args);
+  };
+});
 const jobDone = (timeout = 300000) => page.waitForFunction(() => document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout });
 const jobStarted = () => page.waitForFunction(() => !document.querySelector('#jobbar').classList.contains('hidden'), null, { timeout: 30000 }).catch(() => {});
 const bannerText = () => page.evaluate(() => (document.querySelector('#banner').classList.contains('hidden') ? '' : document.querySelector('#bannerText').textContent));
@@ -99,6 +110,33 @@ try {
   await page.waitForFunction(() => /passes|fails/.test(document.querySelector('#wsVerdict').textContent), null, { timeout: 180000 });
   await jobDone();
   assert(await page.evaluate(() => window.__unflash.currentSection().prepared), 'the loaded section prepares when opened');
+  await page.evaluate(() => window.__unflash.state.project.save());
+  // every save and load so far through one connection (one each, never
+  // closed, they used to pile up)
+  results.dbOpens = await page.evaluate(() => window.__dbOpens);
+  assert(results.dbOpens === 1, 'the page opens the database once: ' + results.dbOpens);
+  // a save whose transaction fails as it commits (out of space, say: only
+  // its abort event tells) settles, a turn after the abort at the latest,
+  // rather than holding up whatever waits on it
+  results.abortedSave = await page.evaluate(async () => {
+    const proto = IDBObjectStore.prototype;
+    const put = proto.put;
+    let hung;
+    const afterAbort = new Promise((r) => (hung = r));
+    proto.put = function (...args) {
+      const req = put.apply(this, args);
+      const tx = this.transaction;
+      tx.addEventListener('abort', () => setTimeout(() => hung('still waiting a turn after the abort'), 0));
+      req.addEventListener('success', () => tx.abort());
+      return req;
+    };
+    try {
+      return await Promise.race([window.__unflash.state.project.save().then(() => 'settled'), afterAbort]);
+    } finally {
+      proto.put = put;
+    }
+  });
+  assert(results.abortedSave === 'settled', 'a save whose transaction aborts settles: ' + results.abortedSave);
   await page.evaluate(() => window.__unflash.state.project.save());
 
   // an export, kept on disk: after a reload the same video (a new copy of it)

@@ -683,7 +683,8 @@ the detector gets to them (about 150 KB each at 256×144). A `ChunkPicker`
 decides what each lane decodes next: the chunk the detector is on if
 nobody has it, else the next chunk nobody has, as long as the pictures
 held stay within a budget (96 MB for each GB of memory the browser reports,
-384 MB to 1 GB; 512 MB where it reports none; `?hold=MB` sets it). A lane
+384 to 768 MB, as browsers report 8 GB at most; 512 MB where it reports
+none; `?hold=MB` sets it). A lane
 with no room waits for the detector to free some, and the detector's own
 chunk never waits, so the lanes cannot all stop. On a real GPU the
 detector is far faster than the decoders (a few tens of microseconds of
@@ -971,7 +972,8 @@ cached at analysis resolution (256×144 for a 16:9 picture, whatever the
 source), three bytes a pixel, so a second of a 30 fps section costs about
 3.3 MB plus a fixed run-up and run-out of 6.5 s each side under the default
 profile. Cached sections are kept up to a budget scaled to the device's
-memory (a quarter to two-thirds of a gigabyte); older ones are dropped and
+memory (64 MB for each GB the browser reports, 192 to 512 MB; 256 MB where
+it reports none); older ones are dropped and
 prepared again when opened, and an export applies their marks all the same,
 from the frame times. WebAssembly memory never shrinks, so that budget is
 also the high-water mark a long session settles at.

@@ -485,7 +485,7 @@ export async function decodeRange(movie, startSec, endSec, onFrame, { cancel, ra
  * or after `endSec` (so the leading pictures of the next GOP, shown before
  * `endSec` but decoded after its sync sample, are included).
  */
-function sampleRange(movie, startSec, endSec, fromIndex = null) {
+export function sampleRange(movie, startSec, endSec, fromIndex = null) {
   const { pts, dts } = movie.v;
   const n = pts.length;
   const startIdx = fromIndex !== null && fromIndex !== undefined ? fromIndex : movie.dx.sync_before(movie.video.index, Math.max(startSec, movie.tsMin));

@@ -6,7 +6,7 @@ import { builtInFor } from './codecs.js';
 import { Movie, tick } from './media.js';
 import { createDetector, gpuAdapter } from './detector.js';
 import { profile } from './profile.js';
-import { scanMovie, scanChunks, CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, BLEND_DEFAULT } from './analysis.js';
+import { scanMovie, scanChunks, CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, hasMarks, BLEND_DEFAULT } from './analysis.js';
 import { Project, projectKey, dropCaches, lastSavedAt, projectFileText, readProjectFile, matchVideo } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, findPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
@@ -1153,8 +1153,8 @@ async function scan() {
           }
         },
       });
-      // a cancelled scan saw only part of the file: keep nothing of it
-      return cancelled() ? null : r;
+      // (a cancelled scan, which saw only part of the file, throws instead)
+      return r;
     } finally {
       if (state.scanning === found) state.scanning = null;
     }
@@ -1777,11 +1777,6 @@ function previewMeter(sec, k, t) {
   if (c.flagged && c.flagged.includes(k)) setVerdict('live-verdict bad', 'still failing here');
   else if (c.safe) setVerdict('live-verdict ok', 'passes the check');
   else setVerdict('live-verdict warn', 'fails elsewhere in the section');
-}
-
-/** Whether a section has marks that change what it shows. */
-function hasMarks(sec) {
-  return !!sec.soften || blendMarks(sec).length > 0 || Object.values(sec.edits || {}).some((e) => e.removed || e.extended);
 }
 
 /** The line above the player: what it shows, whether that passes, whether it is dimmed. */
@@ -3050,14 +3045,10 @@ async function doPrepare(sec) {
       moreFeeders: spareFeeders,
       onProgress: (n) => progress(Math.min(0.95, n / Math.max(1, (sec.end - sec.start + 2 * wasm.context_seconds(state.config)) * state.movie.fps)), `${n} frames decoded`),
     });
-    return !cancelled();
+    return true;
   });
-  if (!ok) {
-    // a cancelled prepare decoded only part of the section: forget it
-    dropCaches(sec);
-    renderAll();
-    return false;
-  }
+  // cancelled or failed: the section is as it was (a prepare changes it only once every frame is in)
+  if (!ok) return false;
   sec.check = null;
   renderAll();
   updateStatus();
@@ -3088,7 +3079,7 @@ async function doSuggest(prefer) {
   if (!sec || !sec.prepared) return;
   const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
   const what = prefer === 'fewest' ? 'fewest removals' : `keep ${prefer}`;
-  const res = await runJob(`Suggesting (${what})`, async (progress) => suggestEdits(state.env, state.project, sec, prefer, only, { extS: EXT_S, onProgress: (r) => progress(Math.min(0.95, 0.1 + r * 0.08), `check ${r + 1}`) }));
+  const res = await runJob(`Suggesting (${what})`, async (progress, cancelled) => suggestEdits(state.env, state.project, sec, prefer, only, { extS: EXT_S, cancel: cancelled, onProgress: (r) => progress(Math.min(0.95, 0.1 + r * 0.08), `check ${r + 1}`) }));
   if (!res) return;
   applySuggestion(sec, res, only);
   renderAll();
@@ -3101,7 +3092,7 @@ async function doSuggestBlend() {
   const sec = currentSection();
   if (!sec || !sec.prepared) return;
   const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
-  const res = await runJob('Suggesting (blend frames)', async (progress) => suggestBlend(state.env, state.project, sec, only, { extS: EXT_S, onProgress: (r) => progress(Math.min(0.95, 0.05 + r * 0.09), `check ${r + 1}`) }));
+  const res = await runJob('Suggesting (blend frames)', async (progress, cancelled) => suggestBlend(state.env, state.project, sec, only, { extS: EXT_S, cancel: cancelled, onProgress: (r) => progress(Math.min(0.95, 0.05 + r * 0.09), `check ${r + 1}`) }));
   if (!res) return;
   pushHistory(sec);
   sec.edits = res.edits;
@@ -3120,8 +3111,8 @@ async function doSuggestFps() {
   const sec = currentSection();
   if (!sec || !sec.prepared) return;
   const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
-  const res = await runJob('Reducing the frame rate', async (progress) =>
-    searchFrameRate(state.env, state.project, sec, only, { extS: EXT_S, sourceFps: state.movie.fps, onProgress: (p, r) => progress(p, `checking ${r} pictures/s`) })
+  const res = await runJob('Reducing the frame rate', async (progress, cancelled) =>
+    searchFrameRate(state.env, state.project, sec, only, { extS: EXT_S, sourceFps: state.movie.fps, cancel: cancelled, onProgress: (p, r) => progress(p, `checking ${r} pictures/s`) })
   );
   if (!res) return;
   applySuggestion(sec, res, only);
@@ -3139,7 +3130,7 @@ async function doSuggestFpsExact() {
   const v = parseFloat($('fpsInput').value);
   if (!(v > 0)) return toast('Type a rate, in pictures a second');
   const only = $('suggestSelOnly').checked && state.selection.size ? Array.from(state.selection) : null;
-  const res = await runJob(`Thinning to ${v} pictures/s`, async () => suggestFrameRate(state.env, state.project, sec, only, v, { extS: EXT_S }));
+  const res = await runJob(`Thinning to ${v} pictures/s`, async (progress, cancelled) => suggestFrameRate(state.env, state.project, sec, only, v, { extS: EXT_S, cancel: cancelled }));
   if (!res) return;
   applySuggestion(sec, res, only);
   sec.fpsFound = res.fps;
@@ -3727,7 +3718,7 @@ async function saveProjectFile() {
   if (!p || !state.movie) return;
   $('projectMenu').classList.add('hidden');
   await p.save();
-  const blob = new Blob([projectFileText(p, state.movie, state.movie.file)], { type: 'application/json' });
+  const blob = new Blob([projectFileText(p, state.movie)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = state.movie.name.replace(/\.[^.]+$/, '') + '.unflash.json';
@@ -3749,7 +3740,7 @@ async function loadProjectFile(f) {
   } catch (e) {
     return banner(e.message);
   }
-  const m = matchVideo(doc.video, state.movie, state.movie.file);
+  const m = matchVideo(doc.video, state.movie);
   if (!m.ok) return banner(m.why);
   const n = doc.saved.sections.length;
   const here = p.sections.length;
@@ -4186,7 +4177,7 @@ async function autoFixSection(sec, auto) {
   const env = state.env;
   const project = state.project;
   const ctxS = wasm.context_seconds(state.config);
-  const hadMarks = blendMarks(sec).length > 0 || Object.values(sec.edits || {}).some((e) => e.removed || e.extended);
+  const hadMarks = hasMarks(sec);
   if (!sec.prepared && !(await doPrepare(sec))) return null;
   const check = async () => {
     if (auto.stopped) return null;
@@ -4199,7 +4190,7 @@ async function autoFixSection(sec, auto) {
   const violations = (x) => x.violations || x.inside || [];
   let c = await check();
   if (!c) return null;
-  if (c.safe) return standing(hadMarks || sec.soften ? 'passes with the marks from before' : 'already passes');
+  if (c.safe) return standing(hadMarks ? 'passes with the marks from before' : 'already passes');
   const did = [];
   // stripes cannot be removed a frame at a time: soften them
   if (c.flag_patterns && violations(c).some((v) => v.kind === 'pattern') && !sec.soften && softenPlan(sec)) {
@@ -4216,15 +4207,15 @@ async function autoFixSection(sec, auto) {
   if (flashing) {
     const rounds = (progress) => (r) => progress(Math.min(0.95, 0.2 + r * 0.06), `check ${r + 1}`);
     const tries = [
-      ['fewest removals', (progress) => suggestEdits(env, project, sec, 'fewest', null, { extS: EXT_S, onProgress: rounds(progress) })],
-      ['keep dark', (progress) => suggestEdits(env, project, sec, 'dark', null, { extS: EXT_S, onProgress: rounds(progress) })],
-      ['keep light', (progress) => suggestEdits(env, project, sec, 'light', null, { extS: EXT_S, onProgress: rounds(progress) })],
-      ['reduce the frame rate', (progress) => searchFrameRate(env, project, sec, null, { extS: EXT_S, sourceFps: state.movie.fps, onProgress: (p, r) => progress(p, `checking ${r} pictures/s`) })],
+      ['fewest removals', (progress, cancel) => suggestEdits(env, project, sec, 'fewest', null, { extS: EXT_S, cancel, onProgress: rounds(progress) })],
+      ['keep dark', (progress, cancel) => suggestEdits(env, project, sec, 'dark', null, { extS: EXT_S, cancel, onProgress: rounds(progress) })],
+      ['keep light', (progress, cancel) => suggestEdits(env, project, sec, 'light', null, { extS: EXT_S, cancel, onProgress: rounds(progress) })],
+      ['reduce the frame rate', (progress, cancel) => searchFrameRate(env, project, sec, null, { extS: EXT_S, sourceFps: state.movie.fps, cancel, onProgress: (p, r) => progress(p, `checking ${r} pictures/s`) })],
     ];
     let last = null;
     for (const [label, run] of tries) {
       if (auto.stopped) return null;
-      const res = await runJob(`Fixing section #${sec.id}: ${label}`, (progress) => run(progress));
+      const res = await runJob(`Fixing section #${sec.id}: ${label}`, (progress, cancelled) => run(progress, cancelled));
       if (!res) return null;
       last = [label, res];
       if (res.safe) break;

@@ -3,10 +3,11 @@
 // decoded, each chunk of a scan (analysis.js scanChunks) gets a score for how
 // likely it is to hold flashing: a picture that changes all over costs an
 // encoder many bits, and encoders start a new GOP at a scene cut, which a
-// flash looks like to them. A scan takes the likeliest chunks first, so that
-// what flashes turns up early; what it finds does not depend on the order
-// (every frame is still decoded and checked, and the runs are joined
-// exactly), and the scores say nothing about what is safe.
+// flash looks like to them. A scan takes early looks at the likeliest chunks
+// first, so that what flashes turns up early; what it finds does not depend
+// on the order (every frame is still decoded and checked, by one detector
+// that takes them all in file order), and the scores say nothing about what
+// is safe.
 
 /** The value at quantile `q` (0..1) of `arr` (sorted in place). */
 function quantile(arr, q) {
@@ -31,7 +32,7 @@ function ranks(vals) {
 }
 
 /** The share of chunks taken first, by score (the rest go in file order). */
-export const HOT_SHARE = 0.25;
+const HOT_SHARE = 0.25;
 
 /** Keyframes under this many bytes a pixel count as flat pictures. */
 const FLAT_BYTES_PER_PIXEL = 0.002;
@@ -80,7 +81,8 @@ export function triageChunks(movie, chunks) {
         if (size[i] < flatBytes) flat++;
       } else rest.push(size[i]);
     }
-    const p75 = quantile(rest.slice(), 0.75);
+    // (sorted in place: the spikes are counted in any order)
+    const p75 = quantile(rest, 0.75);
     let spikes = 0;
     for (const s of rest) if (s > 3 * p75) spikes++;
     features.push({ bits: bytes / Math.max(1, b - a) / median, keys: keys / secs, spikes: spikes / secs, flat: flat / secs });
