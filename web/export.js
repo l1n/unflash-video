@@ -1,13 +1,13 @@
-// Export: the edited timeline back into an MP4. The frames no section
-// touches are copied from the source as they are, whole GOPs at a time,
-// without decoding or encoding ("smart cut"); the spans the sections touch
-// are decoded, edited and re-encoded with WebCodecs, several at once, each
-// from a keyframe the decoder can start at cold. When the encoder's codec
-// cannot share a track with the source's (or smart cut is off), the whole
-// video is re-encoded, still in parallel pieces. The sound is copied from
-// the source as it is, unless frames are held: then it is re-encoded with
-// silence under each held frame (see sound.js). The WASM muxer writes the
-// file.
+// Export: the edited timeline back into an MP4. The frames no section's
+// marks touch are copied from the source as they are, whole GOPs at a
+// time, without decoding or encoding ("smart cut"); the spans the marked
+// sections touch are decoded, edited and re-encoded with WebCodecs, several
+// at once, each from a keyframe the decoder can start at cold. When the
+// encoder's codec cannot share a track with the source's (or smart cut is
+// off), the whole video is re-encoded, still in parallel pieces. The sound
+// is copied from the source as it is, unless frames are held: then it is
+// re-encoded with silence under each held frame (see sound.js). The WASM
+// muxer writes the file.
 
 import { decodeRange, waker } from './media.js';
 import { profile } from './profile.js';
@@ -24,6 +24,101 @@ function avcLevel(w, h, fps) {
   if (mbs <= 22080 && rate <= 589824) return '32'; // 5.0
   if (mbs <= 36864 && rate <= 983040) return '33'; // 5.1
   return '34'; // 5.2
+}
+
+/**
+ * VP9's levels (the WebM project's table, as libvpx has it): level × 10,
+ * then the most luma samples a second, a picture's luma samples and its
+ * longer side.
+ */
+const VP9_LEVELS = [
+  [10, 829440, 36864, 512],
+  [11, 2764800, 73728, 768],
+  [20, 4608000, 122880, 960],
+  [21, 9216000, 245760, 1344],
+  [30, 20736000, 552960, 2048],
+  [31, 36864000, 983040, 2752],
+  [40, 83558400, 2228224, 4160],
+  [41, 160432128, 2228224, 4160],
+  [50, 311951360, 8912896, 8384],
+  [51, 588251136, 8912896, 8384],
+  [52, 1176502272, 8912896, 8384],
+  [60, 1176502272, 35651584, 16832],
+  [61, 2353004544, 35651584, 16832],
+  [62, 4706009088, 35651584, 16832],
+];
+
+/**
+ * AV1's levels (its specification, annex A.3): seq_level_idx, then
+ * MaxPicSize, MaxHSize, MaxVSize and MaxDisplayRate. (Levels 5.3 and 6.3
+ * differ from 5.2 and 6.2 only in the decode rate, which counts the frames
+ * not shown too; an encoder that hides none needs neither.)
+ */
+const AV1_LEVELS = [
+  [0, 147456, 2048, 1152, 4423680],
+  [1, 278784, 2816, 1584, 8363520],
+  [4, 665856, 4352, 2448, 19975680],
+  [5, 1065024, 5504, 3096, 31950720],
+  [8, 2359296, 6144, 3456, 70778880],
+  [9, 2359296, 6144, 3456, 141557760],
+  [12, 8912896, 8192, 4352, 267386880],
+  [13, 8912896, 8192, 4352, 534773760],
+  [14, 8912896, 8192, 4352, 1069547520],
+  [16, 35651584, 16384, 8704, 1069547520],
+  [17, 35651584, 16384, 8704, 2139095040],
+  [18, 35651584, 16384, 8704, 4278190080],
+];
+
+/**
+ * HEVC's levels (H.265 tables A.8 and A.9, the Main tier): general_level_idc
+ * (30 × the level), then MaxLumaPs and MaxLumaSr. Neither side of a picture
+ * may be more than √(8 × MaxLumaPs).
+ */
+const HEVC_LEVELS = [
+  [30, 36864, 552960],
+  [60, 122880, 3686400],
+  [63, 245760, 7372800],
+  [90, 552960, 16588800],
+  [93, 983040, 33177600],
+  [120, 2228224, 66846720],
+  [123, 2228224, 133693440],
+  [150, 8912896, 267386880],
+  [153, 8912896, 534773760],
+  [156, 8912896, 1069547520],
+  [180, 35651584, 1069547520],
+  [183, 35651584, 2139095040],
+  [186, 35651584, 4278190080],
+];
+
+/**
+ * The lowest VP9 level a `w`×`h` picture at `fps` fits, as its codec string
+ * has it ('21' for 2.1), as avcLevel finds H.264's (the highest when none
+ * does). The muxer writes it into the file's vpcC box as it is.
+ */
+export function vp9Level(w, h, fps) {
+  const size = w * h;
+  const fit = VP9_LEVELS.find(([, rate, pic, side]) => size <= pic && Math.max(w, h) <= side && size * fps <= rate);
+  return String((fit || VP9_LEVELS[VP9_LEVELS.length - 1])[0]);
+}
+
+/** The lowest AV1 level a `w`×`h` picture at `fps` fits: its seq_level_idx, two digits as an av01 codec string has it ('01' for 2.1). */
+export function av1Level(w, h, fps) {
+  const size = w * h;
+  const fit = AV1_LEVELS.find(([, pic, maxW, maxH, rate]) => size <= pic && w <= maxW && h <= maxH && size * fps <= rate);
+  return String((fit || AV1_LEVELS[AV1_LEVELS.length - 1])[0]).padStart(2, '0');
+}
+
+/**
+ * The lowest HEVC level a `w`×`h` picture at `fps` fits: its
+ * general_level_idc (63 for 2.1). The picture is counted as it is coded,
+ * in whole blocks of 8 by 8 (the smallest coding block HEVC has).
+ */
+export function hevcLevel(w, h, fps) {
+  const cw = Math.ceil(w / 8) * 8;
+  const ch = Math.ceil(h / 8) * 8;
+  const size = cw * ch;
+  const fit = HEVC_LEVELS.find(([, pic, rate]) => size <= pic && Math.max(cw, ch) <= Math.sqrt(8 * pic) && size * fps <= rate);
+  return (fit || HEVC_LEVELS[HEVC_LEVELS.length - 1])[0];
 }
 
 /** The family of a WebCodecs codec string, as codecs.js knows it ('h264', 'hevc', 'vp9', 'vp8', 'av1'), or 'other'. */
@@ -87,9 +182,9 @@ export async function encoderCandidates(width, height, fps, quality) {
     { label: 'H.264 (AVC)', config: { ...base, codec: `avc1.6400${level}`, avc: { format: 'avc' } } },
     { label: 'H.264 (AVC, Main)', config: { ...base, codec: `avc1.4D40${level}`, avc: { format: 'avc' } } },
     { label: 'H.264 (AVC, Baseline)', config: { ...base, codec: `avc1.42E0${level}`, avc: { format: 'avc' } } },
-    { label: 'VP9', config: { ...base, codec: 'vp09.00.10.08' } },
-    { label: 'AV1', config: { ...base, codec: 'av01.0.08M.08' } },
-    { label: 'H.265 (HEVC)', config: { ...base, codec: 'hvc1.1.6.L120.B0', hevc: { format: 'hevc' } } },
+    { label: 'VP9', config: { ...base, codec: `vp09.00.${vp9Level(width, height, fps)}.08` } },
+    { label: 'AV1', config: { ...base, codec: `av01.0.${av1Level(width, height, fps)}M.08` } },
+    { label: 'H.265 (HEVC)', config: { ...base, codec: `hvc1.1.6.L${hevcLevel(width, height, fps)}.B0`, hevc: { format: 'hevc' } } },
   ];
   const out = [];
   if (typeof VideoEncoder === 'undefined') return out;
@@ -303,17 +398,19 @@ export function sectionRenderPlan(env, movie, s, { edited = true } = {}) {
 }
 
 /**
- * The render plans of every section that was prepared once (it has frame
- * times), in order, its marks applied: marks were made against a section's
- * frame times, which outlive its frame cache (dropped to save memory, or not
- * rebuilt since the project was restored). A section without marks is in
- * too, and re-encoded as it is. Sections with marks but no frame times are
- * named in `warnings`: theirs cannot be applied.
+ * The render plans of the sections that have marks to apply (hasMarks) and
+ * were prepared once (they have frame times), in order: marks were made
+ * against a section's frame times, which outlive its frame cache (dropped
+ * to save memory, or not rebuilt since the project was restored). A section
+ * without marks is left out: its frames are copied where the export copies
+ * (re-encoded as they are, they would only lose quality), and go through as
+ * they are in a span re-encoded for another. Sections with marks but no
+ * frame times are named in `warnings`: theirs cannot be applied.
  */
 function sectionPlans(env, movie, project, warnings) {
   const sections = project
     .sectionsSorted()
-    .filter((s) => s.pts && s.pts.length)
+    .filter((s) => s.pts && s.pts.length && hasMarks(s))
     .map((s) => sectionRenderPlan(env, movie, s));
   const unprepared = project.sections.filter((s) => !(s.pts && s.pts.length) && hasMarks(s));
   if (unprepared.length) warnings.push(`Sections ${unprepared.map((s) => '#' + s.id).join(', ')} have marks but were never prepared; their marks were not applied. Prepare them and export again.`);
@@ -379,10 +476,11 @@ class CutPoints {
  * The plan of an export: pieces in file order, each either a copy of a run of
  * source samples (decode order `from`..`to`) or a span to decode, edit and
  * re-encode (`from` a keyframe, `startSec`..`endSec` in source time, with the
- * sections inside it). Smart cut needs the encoder's `codec` to be able to
- * share a track with the source's; otherwise everything is re-encoded, cut
- * into pieces at keyframes for the parallel workers. `spans` adds source
- * intervals to re-encode besides the sections' (tests).
+ * sections inside it whose marks it applies: see sectionPlans). Smart cut
+ * needs the encoder's `codec` to be able to share a track with the source's;
+ * otherwise everything is re-encoded, cut into pieces at keyframes for the
+ * parallel workers. `spans` adds source intervals to re-encode besides the
+ * sections' (tests).
  */
 export async function exportPlan(env, movie, project, { codec = null, smartCut = true, parallel = 0, spans = null } = {}) {
   const warnings = [];

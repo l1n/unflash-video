@@ -2,6 +2,8 @@
 // build.sh) as days of changes, each change with the time it went live, and
 // which of them a visitor coming back has not seen yet.
 
+import { stored, store } from './storage.js';
+
 const SEEN_KEY = 'unflash:changesSeen';
 /** Where the films of the changes are (whatsnew.mjs in the tests makes them). */
 const SHOTS = 'whatsnew/';
@@ -95,29 +97,18 @@ export async function loadChangelog(url = 'CHANGELOG.md') {
 
 /** The newest change this browser has been shown (ms), or null. */
 export function changesSeen() {
-  try {
-    const v = Number(localStorage.getItem(SEEN_KEY));
-    return v > 0 ? v : null;
-  } catch (e) {
-    return null;
-  }
+  const v = Number(stored(SEEN_KEY));
+  return v > 0 ? v : null;
 }
 
+/** The changes up to `at` (ms) have been shown here (with storage blocked, the notice comes back next time). */
 export function markChangesSeen(at) {
-  try {
-    localStorage.setItem(SEEN_KEY, String(at));
-  } catch (e) {
-    /* storage blocked: the notice comes back next time */
-  }
+  store(SEEN_KEY, String(at));
 }
 
 /** Whether the settings of an earlier visit are here (read it before this visit writes its own). */
 export function hadEarlierSettings() {
-  try {
-    return OLD_KEYS.some((k) => localStorage.getItem(k) !== null);
-  } catch (e) {
-    return false;
-  }
+  return OLD_KEYS.some((k) => stored(k) !== null);
 }
 
 /**

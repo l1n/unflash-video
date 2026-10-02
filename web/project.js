@@ -8,6 +8,15 @@ const STORE = 'projects';
 /** The kinds of violation a scan names a section for. */
 const KINDS = ['flash', 'red', 'extended', 'pattern'];
 
+/**
+ * Where the trace of a project's scan is kept: beside its record, under a
+ * key of its own (28 bytes a frame, 3-6 MB for an hour of video), so that
+ * the saves after every check and mark write the record alone. (A
+ * project's own key ends with its file's modified time, a number.)
+ */
+const traceKey = (key) => `${key}:trace`;
+const isTraceKey = (key) => typeof key === 'string' && key.endsWith(':trace');
+
 let opened = null;
 
 /**
@@ -55,11 +64,20 @@ async function idbGet(key) {
   });
 }
 
-async function idbPut(key, value) {
+/**
+ * `value` under `key`, and in the same transaction each `[key, value]` of
+ * `more` (a null value deletes its key): all of them are written, or none.
+ */
+async function idbPut(key, value, more = []) {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).put(value, key);
+    const store = tx.objectStore(STORE);
+    store.put(value, key);
+    for (const [k, v] of more) {
+      if (v == null) store.delete(k);
+      else store.put(v, k);
+    }
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
     // (a transaction that fails as it commits, out of space say, says so only by its abort)
@@ -67,7 +85,7 @@ async function idbPut(key, value) {
   });
 }
 
-/** `fn(key, value)` for every project saved in this browser. */
+/** `fn(key, value)` for every project saved in this browser (not the traces kept beside them). */
 async function idbEach(fn) {
   const db = await openDb();
   return new Promise((resolve, reject) => {
@@ -75,7 +93,7 @@ async function idbEach(fn) {
     req.onsuccess = () => {
       const cur = req.result;
       if (!cur) return resolve();
-      fn(cur.key, cur.value);
+      if (!isTraceKey(cur.key)) fn(cur.key, cur.value);
       cur.continue();
     };
     req.onerror = () => reject(req.error);
@@ -95,7 +113,7 @@ export async function lastSavedAt() {
 /**
  * The most recently saved project whose key starts with `prefix`, as
  * { key, value }, or null: the same file under another modified time (a
- * copy, a download again).
+ * copy, a download again). Never a trace (idbEach passes over those).
  */
 async function idbLatestLike(prefix) {
   let best = null;
@@ -144,30 +162,54 @@ export class Project {
     this.profile = 'wcag_ext';
     this.sections = [];
     this.nextId = 1;
-    this.scan = null; // { violations, summary, sections, frames, elapsedMs, profile }
+    this.scan = null; // { violations, summary, sections, frames, elapsedMs, profile, trace, ... }
     this.bounds = bounds;
     this.keyframes = keyframes;
     this.notifyMinutes = 0;
+    // the trace kept under traceKey(key) as far as this page knows (null:
+    // none; undefined: not known, so the next save writes it there or clears
+    // the key) and its stamp (the time of the save that wrote it)
+    this.traceKept = undefined;
+    this.traceAt = 0;
   }
 
   /**
    * The project saved in this browser for this file; when there is none
    * under its exact key, the latest saved for the same name and size (the
-   * file copied or downloaded again: `restoredFrom` says so).
+   * file copied or downloaded again: `restoredFrom` says so), its scan's
+   * trace with it.
    */
   static async load(key, bounds, keyframes) {
     const p = new Project(key, bounds, keyframes);
     try {
+      let from = key;
       let saved = await idbGet(key);
       if (!saved) {
         const prefix = projectKeyPrefix(key);
         const like = prefix ? await idbLatestLike(prefix) : null;
         if (like && like.value) {
           saved = like.value;
-          p.restoredFrom = like.key;
+          from = p.restoredFrom = like.key;
         }
       }
-      if (saved) p.restore(saved);
+      if (saved) {
+        p.restore(saved);
+        // the trace, from beside the record (a record saved before it had a
+        // key of its own holds it: the next save moves it out). Its stamp
+        // must be the one the record names: a trace saved there since, by
+        // another tab for a scan of its own, is not this scan's
+        if (p.scan && !p.scan.trace && saved.traceAt) {
+          const kept = await idbGet(traceKey(from));
+          if (kept && kept.at === saved.traceAt) {
+            p.scan.trace = kept.trace;
+            // (restored from another key, the first save puts it under this one)
+            if (from === key) {
+              p.traceKept = kept.trace;
+              p.traceAt = kept.at;
+            }
+          }
+        }
+      }
     } catch (e) {
       console.warn('could not load project', e);
     }
@@ -205,16 +247,36 @@ export class Project {
     this.nextId = Math.max(this.nextId, ...this.sections.map((s) => s.id + 1));
   }
 
+  /**
+   * Keep the project in this browser. The scan's trace goes under a key of
+   * its own with the first save after it changes (a scan, a project file
+   * loaded, a project restored from another key's), in the same transaction
+   * as the record, stamped with that save's time, which every record after
+   * it names (see load); a save after that writes the record alone.
+   */
   async save() {
+    const record = this.toSaved();
+    const trace = (this.scan && this.scan.trace) || null;
+    const fresh = trace !== this.traceKept;
+    const at = fresh ? record.savedAt : this.traceAt;
+    if (trace) record.traceAt = at;
     try {
-      await idbPut(this.key, this.toSaved());
+      await idbPut(this.key, record, fresh ? [[traceKey(this.key), trace && { at, trace }]] : []);
+      if (fresh) {
+        this.traceKept = trace;
+        this.traceAt = at;
+      }
     } catch (e) {
       console.warn('could not save project', e);
     }
   }
 
-  /** What is kept of the project: everything but the decoded frames. */
-  toSaved() {
+  /**
+   * What is kept of the project: everything but the decoded frames, and the
+   * scan without its trace unless `trace` (a project file carries it; this
+   * browser keeps it beside the record, see save).
+   */
+  toSaved({ trace = false } = {}) {
     const sections = this.sections.map((s) => ({
       id: s.id,
       start: s.start,
@@ -232,7 +294,12 @@ export class Project {
       soften: !!s.soften,
       pattern: s.pattern || null,
     }));
-    return { profile: this.profile, nextId: this.nextId, scan: this.scan, sections, savedAt: Date.now() };
+    let scan = this.scan;
+    if (scan && scan.trace && !trace) {
+      scan = { ...scan };
+      delete scan.trace;
+    }
+    return { profile: this.profile, nextId: this.nextId, scan, sections, savedAt: Date.now() };
   }
 
   section(id) {
@@ -373,7 +440,7 @@ function videoFingerprint(movie) {
  * per-frame trace, as base64 of their bytes).
  */
 export function projectFileText(project, movie) {
-  const doc = { kind: FILE_KIND, version: FILE_VERSION, saved: new Date().toISOString(), video: videoFingerprint(movie), project: project.toSaved() };
+  const doc = { kind: FILE_KIND, version: FILE_VERSION, saved: new Date().toISOString(), video: videoFingerprint(movie), project: project.toSaved({ trace: true }) };
   return JSON.stringify(doc, (k, v) => (ArrayBuffer.isView(v) && !(v instanceof DataView) ? { $typed: v.constructor.name, b64: toBase64(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) } : v));
 }
 

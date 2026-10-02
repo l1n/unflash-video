@@ -701,6 +701,27 @@ try {
   await page.keyboard.press('Escape');
   assert((await page.evaluate(() => getComputedStyle(document.querySelector('#welcome')).display)) === 'none', 'Esc closes the guide');
 
+  // --- a section with nothing to apply, prepared: the export copies it ----------
+  // (re-encoded as it is, it would only lose quality). 0.2 to 0.8 s is in the
+  // first GOP, frames 0 to 29, which the marked section's span leaves alone:
+  // it starts at the keyframe before 1.5 s, frame 30
+  const markedId = await page.evaluate(() => window.__unflash.state.project.sections[0].id);
+  await page.fill('#addStart', '0.2');
+  await page.fill('#addEnd', '0.8');
+  await page.click('#btnAddSection');
+  await page.waitForFunction(() => {
+    const s = window.__unflash.currentSection();
+    return s && Math.abs(s.start - 0.2) < 1e-6 && s.prepared;
+  }, null, { timeout: 120000 });
+  await idle(page);
+  await verdictReady(page);
+  results.unmarked = await page.evaluate(() => {
+    const s = window.__unflash.currentSection();
+    return { id: s.id, frames: s.nFrames, last: s.start + s.pts[s.pts.length - 1], verdict: document.querySelector('#wsVerdict').textContent };
+  });
+  assert(results.unmarked.frames > 10 && results.unmarked.last < 1 && results.unmarked.verdict === 'passes', 'a section with no flashing and no marks, before the keyframe at 1 s: ' + JSON.stringify(results.unmarked));
+  await page.keyboard.press('Escape');
+
   // --- export and verify -----------------------------------------------------
   await page.click('#btnExport');
   await page.waitForSelector('#exportModal', { state: 'visible' });
@@ -729,6 +750,27 @@ try {
   assert(/(\d+) copied from the source/.test(results.exportResult) && +results.exportResult.match(/(\d+) copied from the source/)[1] > 0, 'the export copies the untouched GOPs: ' + results.exportResult);
   assert(/(\d+) re-encoded/.test(results.exportResult) && +results.exportResult.match(/(\d+) re-encoded/)[1] > 0, 'and re-encodes the sections: ' + results.exportResult);
   assert(new RegExp(`; ${results.blend.marks} blended`).test(results.exportResult), `the export blends the ${results.blend.marks} frames marked B: ` + results.exportResult);
+  // the section without marks is copied, its GOP with it; only the marked one is planned
+  results.exportPlanned = await page.evaluate(() => {
+    const p = window.__unflash.state.exportPlan;
+    return { sections: p.sections.map((x) => x.sec.id), pieces: p.pieces.map((x) => `${x.kind} ${x.from}-${x.to}`) };
+  });
+  console.log('the export plan:', JSON.stringify(results.exportPlanned));
+  assert(/ 270 re-encoded/.test(results.exportResult) && / 30 copied from the source/.test(results.exportResult) && results.exportPlanned.pieces[0] === 'copy 0-30', 'frames 0 to 29, the section without marks among them, are copied as they are: ' + JSON.stringify([results.exportResult, results.exportPlanned]));
+  assert(results.exportPlanned.sections.join() === String(markedId), 'the plan has the marked section alone: ' + JSON.stringify(results.exportPlanned));
+  // the VP9 level the file declares is the one its pictures need: 2.1 for
+  // 640×360 at 30 fps, what flash.mp4 itself declares (the export said 1.0
+  // whatever its size), read back as any player reads it
+  results.exportCodec = await page.evaluate(async () => {
+    const wasm = await import('./pkg/unflash.js');
+    const { Movie } = await import('./media.js');
+    const blob = await (await fetch(document.querySelector('#exportDownload').href)).blob();
+    const m = await Movie.open(new File([blob], 'exported.mp4'), wasm);
+    const codec = m.video.codec;
+    m.close();
+    return { exported: codec, source: window.__unflash.state.movie.video.codec };
+  });
+  assert(results.exportCodec.exported === 'vp09.00.21.08' && results.exportCodec.source === 'vp09.00.21.08' && /with VP9 \(vp09\.00\.21\.08\)/.test(results.exportResult), 'the export declares VP9 level 2.1, as its source does: ' + JSON.stringify(results.exportCodec));
   const exported = await page.evaluate(async () => {
     const a = document.querySelector('#exportDownload');
     const blob = await (await fetch(a.href)).blob();
@@ -1621,17 +1663,103 @@ try {
 
   }
 
-  // ======== every route a picture can take to the GPU detector =============
+  // ======== every route a picture can take to the detector =================
   if (runs('routes')) {
   await cpuReferences(['cpuViolations']);
-  // ?route forces one: the frame itself (videoframe), its own YUV planes
-  // (yuv: what Firefox's WebGPU needs, and what the built-in decoder hands
-  // over), WebCodecs' RGBA conversion (rgba), a canvas blit (canvas) or
-  // canvas pixels (pixels). ?extsrc=none pretends WebGPU rejects the frame
-  // and the canvas, as Firefox's does, so the automatic choice must be to
-  // decode in workers, which copy each picture's planes off the page (raw).
-  // Each must find the same violations as the CPU scan, and the live
-  // monitor's <video> must work by its own routes.
+  // The CPU detector first (?cpu=1). By default its pictures come from the
+  // decode workers, made small there with the detector's own colour
+  // conversion and shrink; ?route forces the routes it can take on the
+  // page: the frame's own YUV planes (yuv), which it converts and shrinks
+  // as the workers do, WebCodecs' RGBA conversion (rgba) and a canvas's
+  // pixels (pixels). The last two are the browser's colour conversion,
+  // which is a code off the detector's own in a few values (flash.mp4:
+  // 14709 of its 33.2 million, in 30 of the 300 frames), and the same for
+  // both, now that the canvas hands over its pictures at their own size
+  // for the detector to make small (it made them small itself, with
+  // another filter, and the flash ended a frame early). Where the pictures
+  // are the same they must be so value for value, and every route must find
+  // exactly the violations the default one finds.
+  await ensurePage('cpu=1&auto=0');
+  await openFile('flash.mp4');
+  results.cpuRoutePictures = await page.evaluate(async () => {
+    const wasm = await import('./pkg/unflash.js');
+    const { createDetector } = await import('./detector.js');
+    const { Movie, decodeRange } = await import('./media.js');
+    const m = await Movie.open(new File([await (await fetch('clips/flash.mp4')).blob()], 'flash.mp4'), wasm);
+    const made = (route) => createDetector(wasm, window.__unflash.state.config, m.width, m.height, { preferGpu: false, route });
+    const dets = { yuv: await made('yuv'), rgba: await made('rgba'), pixels: await made('pixels'), workers: await made(null) };
+    // the picture a detector analysed last, as it analysed it
+    const last = (name) => dets[name].det.take_capture(dets[name].records().pop().index);
+    const differ = (a, b) => {
+      let n = 0;
+      for (let k = 0; k < a.length; k++) if ((k & 3) !== 3 && a[k] !== b[k]) n++;
+      return n;
+    };
+    // values that differ: yuv against the workers, pixels against rgba, and rgba against yuv
+    const n = { yuv: 0, pixels: 0, browser: 0, frames: 0 };
+    const own = new Map();
+    try {
+      await decodeRange(m, m.tsMin, m.tsMax + 1, async (frame, t) => {
+        const got = {};
+        for (const name of ['yuv', 'rgba', 'pixels']) {
+          await dets[name].videoFrame(frame.clone(), t, true);
+          got[name] = last(name);
+        }
+        frame.close();
+        own.set(t, got.yuv);
+        n.pixels += differ(got.pixels, got.rgba);
+        n.browser += differ(got.rgba, got.yuv);
+      });
+      const w = dets.workers;
+      await decodeRange(
+        m,
+        m.tsMin,
+        m.tsMax + 1,
+        async (pic, t) => {
+          await w.videoFrame(pic, t, true);
+          n.yuv += own.has(t) ? differ(own.get(t), last('workers')) : Infinity;
+          n.frames++;
+        },
+        { raw: true, workers: true, shrink: { aw: w.aw, ah: w.ah } }
+      );
+      return { routes: Object.values(dets).map((d) => d.route), frames: [own.size, n.frames], values: n.frames * w.aw * w.ah * 3, differ: { yuv: n.yuv, pixels: n.pixels, browser: n.browser } };
+    } finally {
+      for (const d of Object.values(dets)) d.det.free();
+      m.close();
+    }
+  });
+  console.log("the CPU detector's pictures by route:", JSON.stringify(results.cpuRoutePictures));
+  {
+    const p = results.cpuRoutePictures;
+    assert(p.routes.join() === 'yuv,rgba,pixels,raw' && p.frames.join() === '300,300', 'each route took every picture: ' + JSON.stringify(p));
+    assert(p.differ.yuv === 0, "the frame's own planes give the CPU detector the pictures the decode workers give it: " + JSON.stringify(p));
+    assert(p.differ.pixels === 0, "a canvas's pixels give it the pictures WebCodecs' RGBA conversion gives it: " + JSON.stringify(p));
+  }
+  for (const route of ['yuv', 'rgba', 'pixels']) {
+    await page.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0&route=${route}`);
+    await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+    await openFile('flash.mp4');
+    scan = await scanCurrent();
+    const violations = await page.evaluate(() => window.__unflash.lastScan.result.violations);
+    const taken = await page.evaluate(() => window.__unflash.state.env.feeder.route);
+    console.log(`cpu scan, pictures via ${route}:`, scan.ms, 'ms | route', taken, '|', JSON.stringify(violations));
+    assert(scan.status.includes('CPU') && taken === route, `?cpu=1&route=${route} must feed the CPU detector pictures as ${route}, not ${taken}`);
+    sameViolations(`the CPU detector's ${route} route against its default`, violations, results.cpuViolations);
+  }
+
+  // Then the GPU detector. ?route forces one: the frame itself (videoframe),
+  // its own YUV planes (yuv: what Firefox's WebGPU needs, and what the
+  // built-in decoder hands over), WebCodecs' RGBA conversion (rgba), a
+  // canvas blit (canvas) or canvas pixels (pixels). ?extsrc=none pretends
+  // WebGPU rejects the frame and the canvas, as Firefox's does, so the
+  // automatic choice must be to decode in workers, which copy each
+  // picture's planes off the page (raw). Each must find exactly the
+  // violations of the CPU scan, onsets, peaks and counts too, as each does
+  // on this clip, though not every route's pictures are the CPU detector's
+  // (measured on flash.mp4, the pictures the detector analyses: yuv, canvas
+  // and raw are the same, value for value; rgba and pixels, the browser's
+  // conversion, are a code off in 14709 of 33.2 million values). And the
+  // live monitor's <video> must work by its own routes.
   for (const [query, route, liveRoute] of [
     ['route=yuv', 'yuv', 'video'],
     ['route=rgba', 'rgba', 'video'],
@@ -1654,7 +1782,7 @@ try {
     console.log(`gpu scan, pictures via ${route}:`, scan.ms, 'ms |', scan.toast, '| route', taken, inWorkers ? '(decoded in workers)' : '', '|', JSON.stringify(violations));
     assert(taken === route, `?${query} must feed pictures as ${route}, not ${taken}`);
     assert(inWorkers === (route === 'raw'), `?${query}: decoding in workers only when WebGPU takes no frame and no route is forced`);
-    sameViolations(`the ${route} route against the CPU scan`, violations, results.cpuViolations, 0.05, ['start', 'end']);
+    sameViolations(`the ${route} route against the CPU scan`, violations, results.cpuViolations);
     results[`gpuScan_${route}`] = { ms: scan.ms, violations };
     // the live monitor feeds the <video> element by its own routes
     await page.check('#liveToggle');

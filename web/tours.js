@@ -9,6 +9,7 @@
 // guide has the whole tour again, and What's new a "show me" for each.
 
 import { Tour, stepShowable } from './tour.js';
+import { stored, store } from './storage.js';
 
 const GETTING_STARTED = ['start', 'video', 'section'];
 
@@ -149,19 +150,17 @@ const KEY = 'unflash:tours';
 
 function load() {
   try {
-    const v = JSON.parse(localStorage.getItem(KEY) || '{}');
+    const v = JSON.parse(stored(KEY) || '{}');
     return { plan: Array.isArray(v.plan) ? v.plan : [], done: v.done && typeof v.done === 'object' ? v.done : {} };
   } catch (e) {
+    // (what is kept there is not JSON, or not an object)
     return { plan: [], done: {} };
   }
 }
 
+/** Keep where the tours are (with storage blocked, they come again next time). */
 function save(s) {
-  try {
-    localStorage.setItem(KEY, JSON.stringify(s));
-  } catch (e) {
-    /* storage blocked: the tours come again next time */
-  }
+  store(KEY, JSON.stringify(s));
 }
 
 /**

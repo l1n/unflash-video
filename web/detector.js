@@ -209,10 +209,6 @@ export class Feeder {
     this.frameRoutes = route ? [route] : FRAME_ROUTES.slice();
     this.videoRoutes = route && VIDEO_ROUTES.includes(route) ? [route] : VIDEO_ROUTES.slice();
     this.submitted = []; // submit times of the GPU frames in flight (latency accounting)
-    if (backend === 'cpu') {
-      this.canvas = new OffscreenCanvas(this.aw, this.ah);
-      this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
-    }
   }
 
   get gpu() {
@@ -279,24 +275,24 @@ export class Feeder {
     return this.blitCanvas;
   }
 
-  /** The picture's pixels through a canvas: at full size for the GPU (it downsamples), at analysis size for the CPU. */
+  /**
+   * The picture's pixels through a canvas, at its own size: the detector
+   * makes them small as it makes every other route's (the CPU detector
+   * used to have the canvas draw them at its size, and the canvas's
+   * scaling, another filter than the detector's, gave other pictures:
+   * flash.mp4's flash ended a frame early).
+   */
   feedPixels(source, w, h, t, capture) {
     const t0 = performance.now();
-    let img;
-    if (this.gpu) {
-      if (!this.readCtx) {
-        this.readCanvas = new OffscreenCanvas(w, h);
-        this.readCtx = this.readCanvas.getContext('2d', { willReadFrequently: true });
-      } else if (this.readCanvas.width !== w || this.readCanvas.height !== h) {
-        this.readCanvas.width = w;
-        this.readCanvas.height = h;
-      }
-      this.readCtx.drawImage(source, 0, 0, w, h);
-      img = this.readCtx.getImageData(0, 0, w, h);
-    } else {
-      this.ctx.drawImage(source, 0, 0, this.aw, this.ah);
-      img = this.ctx.getImageData(0, 0, this.aw, this.ah);
+    if (!this.readCtx) {
+      this.readCanvas = new OffscreenCanvas(w, h);
+      this.readCtx = this.readCanvas.getContext('2d', { willReadFrequently: true });
+    } else if (this.readCanvas.width !== w || this.readCanvas.height !== h) {
+      this.readCanvas.width = w;
+      this.readCanvas.height = h;
     }
+    this.readCtx.drawImage(source, 0, 0, w, h);
+    const img = this.readCtx.getImageData(0, 0, w, h);
     profile.add('feed.pixels', performance.now() - t0);
     const t1 = performance.now();
     this.det.feed_rgba(img.data, img.width, img.height, t, capture);

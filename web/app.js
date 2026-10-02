@@ -16,6 +16,7 @@ import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notify
 import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay, wireShots, escapeHtml } from './changes.js';
 import { TourGuide, TOURS, PARTS } from './tours.js';
 import { watchPage, noteError, noteJob, noteFileName, debugReport } from './debug.js';
+import { stored, store } from './storage.js';
 
 /** The page's query: settings for tests and for trying things out (`?cpu=1`, `?segments=3`). */
 const QUERY = new URLSearchParams(location.search);
@@ -35,24 +36,6 @@ function onOff(name) {
 const BUILD = (new URL(import.meta.url).pathname.match(/\/v\/([^/]+)\/[^/]+$/) || [])[1] || QUERY.get('build') || null;
 
 const $ = (id) => document.getElementById(id);
-
-/** What this browser keeps under `key`, or null (nothing kept, or storage blocked). */
-function stored(key) {
-  try {
-    return localStorage.getItem(key);
-  } catch (e) {
-    return null;
-  }
-}
-
-/** Keep `value` under `key` in this browser (with storage blocked, the choice lasts the visit). */
-function store(key, value) {
-  try {
-    localStorage.setItem(key, value);
-  } catch (e) {
-    /* storage blocked */
-  }
-}
 
 /**
  * Bytes of decoded section frames kept in memory (older sections are dropped
@@ -1402,7 +1385,7 @@ function startLiveLoop() {
   player.requestVideoFrameCallback(step);
 }
 
-/** Pack a scan's per-frame trace into typed arrays (about 24 bytes a frame) for the project store. */
+/** Pack a scan's per-frame trace into typed arrays (28 bytes a frame) for the project store, which keeps it beside the project's record (Project.save). */
 function packTrace(tr) {
   return { t: Float64Array.from(tr.t), hazard: Uint32Array.from(tr.hazard), hazardRed: Uint32Array.from(tr.hazardRed), ext: Uint32Array.from(tr.ext), pattern: Uint32Array.from(tr.pattern), lum: Float32Array.from(tr.lum) };
 }

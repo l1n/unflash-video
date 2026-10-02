@@ -2,24 +2,24 @@
 // system notification when the browser allows one, and the tab's title
 // (which also shows a running job's progress).
 
+import { stored, store } from './storage.js';
+
 const KEY = 'unflash.alerts';
 const DEFAULTS = { beep: true, notify: false, after: 60 };
 
 export function loadAlertSettings() {
   try {
-    const s = JSON.parse(localStorage.getItem(KEY) || '{}');
+    const s = JSON.parse(stored(KEY) || '{}');
     return { ...DEFAULTS, ...s };
   } catch (e) {
+    // (what is kept there is not JSON)
     return { ...DEFAULTS };
   }
 }
 
+/** Keep the settings for the next visit (in a private window they last this one). */
 export function saveAlertSettings(s) {
-  try {
-    localStorage.setItem(KEY, JSON.stringify(s));
-  } catch (e) {
-    /* private window: the settings last for this visit */
-  }
+  store(KEY, JSON.stringify(s));
 }
 
 /**

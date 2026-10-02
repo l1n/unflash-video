@@ -7,8 +7,9 @@
 // whose record holds both streams' parameter sets. Also the full
 // re-encode, two spans two at a time, and encoders that hand over Annex B
 // with no record (a High-profile one's record must carry the High fields).
-// Then how an export ends when the later of two spans fails, and the sound
-// copied as it is (from flash.mp4: AAC beside VP9).
+// Then how an export ends when the later of two spans fails, the sound
+// copied as it is (from flash.mp4: AAC beside VP9), and the levels the VP9,
+// AV1 and HEVC encoders are asked for, against the tables of their specs.
 //   node tests/e2e/splice.mjs
 import path from 'node:path';
 import fs from 'node:fs';
@@ -26,10 +27,34 @@ watch(page, errors);
 await page.goto(`http://127.0.0.1:${port}/?auto=0&cpu=1`);
 await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
 
-const r = await page.evaluate(async () => {
+// a picture's size and frame rate, and the lowest level of each codec it
+// fits: VP9's by its luma samples a second, a picture's and its longer side
+// (the WebM project's table), AV1's seq_level_idx by MaxPicSize, MaxHSize,
+// MaxVSize and MaxDisplayRate (annex A.3), HEVC's general_level_idc by
+// MaxLumaPs, MaxLumaSr and a side of at most √(8 × MaxLumaPs) (tables A.8
+// and A.9; the picture in whole 8 × 8 blocks)
+const LEVELS = [
+  [640, 360, 30, '21', '01', 63], // 2.1 for all three (flash.mp4 declares VP9 2.1)
+  [320, 240, 30, '20', '00', 60], // 2.0 for all three
+  [640, 360, 60, '30', '04', 90], // more samples a second than 2.1 has: 3.0
+  [1280, 720, 30, '31', '05', 93], // 3.1
+  [1280, 720, 60, '40', '08', 120], // 4.0
+  [1920, 1080, 30, '40', '08', 120], // 4.0
+  [1920, 1080, 29.97, '40', '08', 120],
+  [1080, 1920, 30, '40', '08', 120], // upright: AV1's MaxVSize is 3456 at 4.0
+  [1920, 1080, 60, '41', '09', 123], // 4.1
+  [3840, 2160, 30, '50', '12', 150], // 5.0
+  [3840, 2160, 60, '51', '13', 153], // 5.1
+  [7680, 4320, 60, '61', '17', 183], // 6.1
+  [1400, 100, 30, '30', '00', 63], // VP9 2.1 takes 1344 a side; HEVC 2.1 √(8 × 245760) = 1402
+  [1410, 100, 30, '30', '00', 90], // (1416 coded: past HEVC 2.1's side too)
+  [100, 1200, 30, '21', '01', 63], // VP9 2.0 takes 960 a side, AV1 2.0 1152 down
+  [16384, 16384, 120, '62', '18', 186], // past every level: the highest
+];
+const r = await page.evaluate(async (LEVELS) => {
   const wasm = await import('./pkg/unflash.js');
   const { Movie, decodeRange } = await import('./media.js');
-  const { exportMovie, exportPlan } = await import('./export.js');
+  const { exportMovie, exportPlan, vp9Level, av1Level, hevcLevel } = await import('./export.js');
   const load = async (name) => {
     const blob = await (await fetch(`clips/${name}`)).blob();
     const m = await Movie.open(new File([blob], name, { type: 'video/mp4' }), wasm);
@@ -312,8 +337,9 @@ const r = await page.evaluate(async () => {
     }
     results.soundCopy = { ...copied, cancelled, readsBeforeStop: soundReads };
   }
+  results.levels = LEVELS.map(([w, h, fps]) => [vp9Level(w, h, fps), av1Level(w, h, fps), hevcLevel(w, h, fps)]);
   return { software, frames: ha.length, results };
-});
+}, LEVELS);
 console.log(JSON.stringify(r, null, 1));
 assert(r.software, 'this Chromium decodes H.264 with the built-in decoder, which the check needs');
 assert(r.frames === 40, 'splice_a has 40 frames');
@@ -358,5 +384,9 @@ const sc = r.results.soundCopy;
 assert(sc.mode === 'smart' && sc.copied > 0 && sc.sound && sc.pictures, 'the samples are copied byte for byte: ' + JSON.stringify(sc));
 assert(sc.runs < sc.packets && sc.soundReads === sc.runs, `the sound is copied a run of samples at a time: ${sc.soundReads} reads for ${sc.runs} runs of ${sc.packets} packets`);
 assert(sc.cancelled === 'cancelled' && sc.readsBeforeStop === 1, 'a cancel stops the copy of the sound: ' + JSON.stringify({ cancelled: sc.cancelled, reads: sc.readsBeforeStop }));
+LEVELS.forEach(([w, h, fps, vp9, av1, hevc], i) => {
+  const got = r.results.levels[i];
+  assert(JSON.stringify(got) === JSON.stringify([vp9, av1, hevc]), `${w}×${h} at ${fps} fps: VP9 ${vp9}, AV1 ${av1}, HEVC ${hevc}, not ${JSON.stringify(got)}`);
+});
 console.log('SPLICE OK');
 await close();
