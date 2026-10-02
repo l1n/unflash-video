@@ -5,9 +5,12 @@
 // decoder finds; and a hybrid scan of the VP9 clip, the browser's decoder
 // and the built-in one side by side in chunks, must give exactly what one
 // lane of the browser's decoder gives, the built-in decoder having decoded
-// part of it.
+// part of it. Then the workers of the built-in decoders, H.264's and the
+// decoders module's, in trouble: a job that fails, a video closed while
+// they decode, two samples at the same time.
 //   node tests/e2e/decoders.mjs        (after ./build.sh)
 import { loadPlaywright } from './playwright.mjs';
+import fs from 'node:fs';
 import path from 'node:path';
 import { serve } from './server.mjs';
 
@@ -107,6 +110,73 @@ try {
     const same = v.kind === w.kind && ['start', 'end', 'onset', 'peak', 'count'].every((k) => Math.abs(v[k] - w[k]) < 1e-6);
     assert(same, `violation ${i}: ${JSON.stringify(v)} (one lane) vs ${JSON.stringify(w)} (hybrid)`);
   });
+
+  // the built-in decoders' workers in trouble. A job whose samples can't be
+  // read is answered, and the pass fails with its error, where it used to
+  // wait for ever; the worker leaves the pool, and the video decodes again
+  // through a new one. A video closed while its pool decodes (another file
+  // opened while the frame viewer decodes) ends the pass, which also used
+  // to wait for ever. And two samples at the same time each keep their
+  // picture, in the workers and on the page (with H.264 the rest of their
+  // group of pictures was lost)
+  for (const name of ['flash_h264.mp4', 'flash_hevc.mp4']) {
+    const r = await page.evaluate(
+      async ([name, b64]) => {
+        const wasm = await import('./pkg/unflash.js');
+        const { Movie, decodeRange } = await import('./media.js');
+        const { SoftwarePool } = await import('./h264pool.js');
+        const file = new File([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], name);
+        const open = async () => {
+          const m = await Movie.open(file, wasm);
+          m.forceBuiltIn = true;
+          await m.decoderSupport();
+          return m;
+        };
+        // what a pass came to: its frames, its error, or (cut off here) none
+        const outcome = (p) => Promise.race([p.then((frames) => ({ frames }), (e) => ({ error: e.message })), new Promise((r) => setTimeout(() => r({ hung: true }), 30000))]);
+        const out = {};
+        {
+          const m = await open();
+          m.pool = await SoftwarePool.create(m, 2);
+          const workers = m.pool.workers.slice();
+          // every sample at a place in a transport stream with no streams
+          m.pool.movie = { ...m, ts: { packet: 188, size: file.size, tracks: [] }, v: { ...m.v, offset: m.v.offset.map(() => 2 ** 52) } };
+          out.failed = await outcome(m.pool.decodeRange(0, m.v.pts.length, m.tsMin, m.tsMax, (f) => f.close()));
+          out.left = m.pool.workers.filter((w) => workers.includes(w)).length;
+          m.pool.movie = m;
+          out.after = await outcome(decodeRange(m, m.tsMin, m.tsMax, (f) => f.close()));
+          m.close();
+        }
+        {
+          const m = await open();
+          m.pool = await SoftwarePool.create(m, 1);
+          let n = 0;
+          out.closed = await outcome(
+            decodeRange(m, m.tsMin, m.tsMax, (f) => {
+              f.close();
+              if (++n === 1) m.close();
+            })
+          );
+        }
+        {
+          const m = await open();
+          // the second and third samples (decode order) at one time: both are
+          // decoded before the fourth, which is shown before them, and wait for it
+          m.v.pts[2] = m.v.pts[1];
+          out.sameTime = await outcome(decodeRange(m, m.tsMin, m.tsMax, (f) => f.close()));
+          out.sameTimePage = await outcome(decodeRange(m, m.tsMin, m.tsMax, (f) => f.close(), { inline: true }));
+          m.close();
+        }
+        return out;
+      },
+      [name, fs.readFileSync(path.join(MEDIA, name)).toString('base64')]
+    );
+    console.log(`${name}, its built-in decoder's workers in trouble:`, JSON.stringify(r));
+    assert(/no stream for track 0/.test(r.failed.error || ''), `${name}: a job whose samples can't be read fails the pass with its error: ${JSON.stringify(r.failed)}`);
+    assert(r.left === 0 && r.after.frames === 300, `${name}: the workers whose jobs failed leave the pool, and the video decodes again: ${JSON.stringify(r)}`);
+    assert(r.closed.error === 'the decoder pool was closed', `${name}: a video closed while its pool decodes ends the pass: ${JSON.stringify(r.closed)}`);
+    assert(r.sameTime.frames === 300 && r.sameTimePage.frames === 300, `${name}: two samples at one time each keep their picture, in the workers and on the page: ${JSON.stringify([r.sameTime, r.sameTimePage])}`);
+  }
 
   if (errors.length) throw new Error('page errors:\n' + errors.join('\n'));
   console.log('DECODERS OK');

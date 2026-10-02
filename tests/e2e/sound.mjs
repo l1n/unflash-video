@@ -9,7 +9,8 @@
 // speakers (the browser as it comes: sound only after a click); its button
 // says "sound on" only while there is sound to be had: at ½× it plays at
 // 1× only, and where the browser holds its audio back or can't decode the
-// sound, the button says so. E-AC-3 sound (Dolby Digital Plus), which no
+// sound, the button says so; turned on while the player is paused, it
+// waits for it. E-AC-3 sound (Dolby Digital Plus), which no
 // browser's WebCodecs decodes, plays through the app's own decoder, and an
 // export with a held frame re-encodes it with the silence in place.
 //   node tests/e2e/sound.mjs
@@ -287,6 +288,16 @@ try {
   assert(Math.abs(pl.media - pl.soundMedia) < 0.2, `the sound keeps to the pictures' clock: ${pl.media} vs ${pl.soundMedia}`);
   await page.evaluate(() => window.__unflash.sectionPlayer.pause());
   assert(await page.evaluate(() => window.__unflash.sectionSound.sources.length === 0 && !window.__unflash.sectionSound.clock), 'a pause stops the sound');
+  // turned off and on again while paused, it waits for the player (it used to play at once)
+  results.onWhilePaused = await page.evaluate(async () => {
+    const s = window.__unflash.sectionSound;
+    await s.setOn(false);
+    await s.setOn(true);
+    await Promise.all(s.windows.values());
+    await new Promise((r) => setTimeout(r, 0));
+    return { sources: s.sources.length, clock: s.clock };
+  });
+  assert(results.onWhilePaused.sources === 0 && !results.onWhilePaused.clock, 'turned on while the player is paused, the sound waits for it: ' + JSON.stringify(results.onWhilePaused));
   await page.evaluate(() => window.__unflash.sectionPlayer.stop());
   await page.click('#btnPreviewSound');
   assert((await page.getAttribute('#btnPreviewSound', 'aria-pressed')) === 'false', 'and the button turns it off again');

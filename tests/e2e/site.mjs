@@ -109,7 +109,7 @@ try {
     console.log('build bbbb:', JSON.stringify(results.current), '|', r.support);
     assert(h264.builtIn === 'H.264' && hevc.builtIn === 'HEVC' && h264.violations > 0 && hevc.violations > 0, 'the built-in decoders load and scan, from the folder of the build: ' + JSON.stringify([h264, hevc]));
     assert(sound === 'function', 'the decoders module has the sound decoder');
-    assert(results.current.folders.join() === '/v/bbbb/' && seen.code.some((u) => u.endsWith('/softworker.js')) && seen.code.some((u) => u.endsWith('/h264worker.js')) && seen.code.some((u) => u.endsWith('unflash_decoders_bg.wasm')), 'every piece of code comes from v/bbbb/: ' + JSON.stringify(results.current.folders));
+    assert(results.current.folders.join() === '/v/bbbb/' && seen.code.some((u) => u.endsWith('/softworker.js')) && seen.code.some((u) => u.endsWith('unflash_decoders_bg.wasm')), 'every piece of code comes from v/bbbb/: ' + JSON.stringify(results.current.folders));
     assert(!seen.missing.length && !seen.errors.length, 'nothing missing, no errors: ' + JSON.stringify([seen.missing, seen.errors]));
     assert(/, build bbbb/.test(r.support) && /App .*, build bbbb/.test(r.report), 'the page and its debug report name the build');
     assert(!/newer version/.test(r.banner), 'the current build says nothing about a newer one: ' + r.banner);

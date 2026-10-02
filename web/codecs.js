@@ -1,20 +1,15 @@
 // The decoders built into the app, for the codecs a browser's WebCodecs may
-// lack: H.264 in the main WebAssembly module (h264worker.js), the others in
-// the decoders module (pkg-dec, softworker.js).
+// lack: H.264 in the main WebAssembly module, the others in the decoders
+// module (pkg-dec); each runs in the decode workers (softworker.js), or on
+// the page where they cannot run.
 
-/**
- * Whether this build has the decoders module (web/pkg-dec). Until it does,
- * only H.264 has a built-in decoder and everything else is left to WebCodecs.
- */
-export const DECODERS_MODULE = true;
-
-export const BUILT_IN = [
-  { id: 'h264', name: 'H.264', test: /^avc[13]/, module: 'main' },
-  { id: 'hevc', name: 'HEVC', test: /^(hev1|hvc1)/, module: 'decoders' },
-  { id: 'vp9', name: 'VP9', test: /^vp09/, module: 'decoders' },
-  { id: 'vp8', name: 'VP8', test: /^vp8/, module: 'decoders' },
-  { id: 'av1', name: 'AV1', test: /^av01/, module: 'decoders' },
-].filter((b) => b.module === 'main' || DECODERS_MODULE);
+const BUILT_IN = [
+  { id: 'h264', name: 'H.264', test: /^avc[13]/ },
+  { id: 'hevc', name: 'HEVC', test: /^(hev1|hvc1)/ },
+  { id: 'vp9', name: 'VP9', test: /^vp09/ },
+  { id: 'vp8', name: 'VP8', test: /^vp8/ },
+  { id: 'av1', name: 'AV1', test: /^av01/ },
+];
 
 /** The built-in decoder for a WebCodecs codec string, or null. */
 export function builtInFor(codec) {
@@ -23,7 +18,7 @@ export function builtInFor(codec) {
 
 let decoders = null;
 
-/** The decoders module (HEVC, VP9, VP8, AV1, and the AC-3 / E-AC-3 sound decoder), loaded on first use. */
+/** The decoders module (HEVC, VP9, VP8, AV1, and the AC-3 / E-AC-3 and DTS sound decoder), loaded on first use. */
 export function loadDecoders() {
   if (!decoders)
     decoders = (async () => {

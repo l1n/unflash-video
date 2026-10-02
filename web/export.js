@@ -9,11 +9,11 @@
 // silence under each held frame (see sound.js). The WASM muxer writes the
 // file.
 
-import { decodeRange, ChunkReader, orTimeout } from './media.js';
+import { decodeRange, waker } from './media.js';
 import { profile } from './profile.js';
 import { shownPts, softenPlan, blendMarks, blendStrength, blendSources, blendWeights } from './analysis.js';
 import { SoundRun, audioData, soundName } from './sound.js';
-import { noSoundDecoder, soundConfig, soundDecoderFor } from './audiodec.js';
+import { noSoundDecoder, soundChunk, soundConfig, soundDecoderFor } from './audiodec.js';
 
 function avcLevel(w, h, fps) {
   const mbs = Math.ceil(w / 16) * Math.ceil(h / 16);
@@ -364,7 +364,7 @@ class CutPoints {
     this.movie = movie;
     this.lenSize = avcLenSize; // 0: not H.264, every sync sample will do
     this.cache = new Map();
-    this.reader = movie.reader || new ChunkReader(movie.file, undefined, undefined, null, movie.ts);
+    this.reader = movie.reader;
   }
   async ok(i) {
     const v = this.movie.v;
@@ -684,18 +684,11 @@ class PieceEncoder {
     const { ctx, piece } = this;
     const { movie } = ctx;
     // woken by the encoder taking a frame or handing one back, not polled
-    // (a timer crawls in a hidden tab)
-    let wake = null;
-    const kick = () => {
-      if (wake) {
-        const w = wake;
-        wake = null;
-        w();
-      }
-    };
+    // (a timer crawls in a hidden tab; the one here is a safety net)
+    const { wait, wake } = waker(50);
     const enc = ctx.makeEncoder(ctx.chosen.config, {
       output: (chunk, meta) => {
-        kick();
+        wake();
         if (meta && meta.decoderConfig) {
           if (meta.decoderConfig.description) this.description = new Uint8Array(meta.decoderConfig.description.slice ? meta.decoderConfig.description.slice(0) : meta.decoderConfig.description);
           if (meta.decoderConfig.codec) this.codec = meta.decoderConfig.codec;
@@ -716,21 +709,14 @@ class PieceEncoder {
       },
       error: (e) => {
         this.error = e;
-        kick();
+        wake();
       },
     });
-    if ('ondequeue' in enc) enc.addEventListener('dequeue', kick);
+    if ('ondequeue' in enc) enc.addEventListener('dequeue', wake);
     let lastKey = -Infinity;
     let pending = null; // { frame, tUs } waiting for its duration
     const encodeOne = async (frame, tUs, durUs) => {
-      while (enc.encodeQueueSize > 8 && !this.error) {
-        await orTimeout(
-          new Promise((r) => {
-            wake = r;
-          }),
-          50
-        );
-      }
+      while (enc.encodeQueueSize > 8 && !this.error) await wait();
       if (this.error) throw this.error;
       const f = new VideoFrame(frame, { timestamp: tUs, duration: durUs });
       frame.close();
@@ -752,7 +738,7 @@ class PieceEncoder {
     };
     try {
       // a reader of its own: pieces decode at the same time as the writer copies
-      const walked = await walkEdited(movie, piece, emit, { cancel: ctx.cancel, reader: movie.reader ? movie.reader.fork() : null });
+      const walked = await walkEdited(movie, piece, emit, { cancel: ctx.cancel, reader: movie.reader.fork() });
       this.softened += walked.softened;
       this.blended += walked.blended;
       this.warnings.push(...walked.warnings);
@@ -873,7 +859,7 @@ async function exportOnce(env, movie, project, { encoder, quality, extS = 1.0, s
   const mx = new wasm.Muxer();
   await out.write(mx.start());
   const samples = []; // { pts, sync, size } in file order
-  const reader = movie.reader || new ChunkReader(movie.file, undefined, undefined, null, movie.ts);
+  const reader = movie.reader;
   const v = movie.v;
   const MAX_RUN = 8 * 1024 * 1024;
   // H.264: the track's parameter sets. With smart cut, the source's plus
@@ -1089,21 +1075,8 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
   let ecfg = await pick(at.sample_rate, channelsIn);
   if (!ecfg) return { warning: `${why}, and this browser has no encoder for its ${channelsIn} channels, ${without}.`, wrote: false };
   let error = null;
-  let wake = null;
-  const kick = () => {
-    if (wake) {
-      const w = wake;
-      wake = null;
-      w();
-    }
-  };
-  const settle = () =>
-    orTimeout(
-      new Promise((r) => {
-        wake = r;
-      }),
-      50
-    );
+  // woken by the decoder or the encoder (the timer a safety net)
+  const { wait, wake } = waker(50);
   const chunks = []; // encoded, waiting to be written
   const decoded = []; // decoded, waiting to be placed
   let outCfg = null;
@@ -1111,15 +1084,14 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
   const dec = new found.Decoder({
     output: (data) => {
       decoded.push(data);
-      kick();
+      wake();
     },
     error: (e) => {
       error = error || e;
-      kick();
+      wake();
     },
   });
   dec.configure(dcfg);
-  const prefix = at.prefix && at.prefix.length ? Uint8Array.from(at.prefix) : null;
   // the track is added once the encoder has said what it makes
   let track = -1;
   let rate = 0;
@@ -1161,11 +1133,11 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
               const b = new Uint8Array(chunk.byteLength);
               chunk.copyTo(b);
               chunks.push({ bytes: b, ts: chunk.timestamp, dur: chunk.duration || 0 });
-              kick();
+              wake();
             },
             error: (e) => {
               error = error || e;
-              kick();
+              wake();
             },
           });
           enc.configure(ecfg);
@@ -1186,16 +1158,9 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
       if (cancel && cancel()) throw new Error('cancelled');
       while ((dec.decodeQueueSize > 16 || (enc && enc.encodeQueueSize > 16)) && !error) {
         await place();
-        await settle();
+        await wait();
       }
-      let bytes = await reader.read(a.offset[i], a.size[i]);
-      if (prefix) {
-        const b = new Uint8Array(prefix.length + bytes.length);
-        b.set(prefix);
-        b.set(bytes, prefix.length);
-        bytes = b;
-      }
-      dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round((a.ptsTicks[i] * 1e6) / at.timescale), duration: Math.round((a.durTicks[i] * 1e6) / at.timescale), data: bytes.slice() }));
+      dec.decode(await soundChunk(movie, reader, i));
       await place();
       await flushOut(false);
       if (onProgress && i % 200 === 0) onProgress(i / a.offset.length);

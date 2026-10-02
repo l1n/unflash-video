@@ -21,9 +21,8 @@
 // 'yuv' | 'rgba' | 'bgra', data, width, height, timestamp, layout,
 // colorSpace, format, and with `shrink` shrunk: {from, copyMs, shrinkMs})
 // or {type:'frame', id, frame} (a VideoFrame that can't be copied,
-// transferred as it is); {type:'done', id, frames} | {type:'error', id,
-// message}.
-import { ChunkReader, yuvLayoutWords } from './media.js';
+// transferred as it is); {type:'done', id} | {type:'error', id, message}.
+import { ChunkReader, waker, yuvLayoutWords } from './media.js';
 
 // the WebAssembly module, loaded when a job first asks for small pictures
 let wasmReady = null;
@@ -36,29 +35,13 @@ let shrinkFailed = false;
 
 let credits = 0;
 let cancelled = false;
-let waiter = null;
 // buffers the page gave back, to be filled again: a few at most (a job
 // has at most `window` whole pictures out; a picture made small comes in a
 // buffer of its own, so those would otherwise pile up here, one a frame)
 const spare = [];
 const SPARE = 8;
-let timer = 0;
-const wake = () => {
-  if (waiter) {
-    const w = waiter;
-    waiter = null;
-    clearTimeout(timer);
-    w();
-  }
-};
-// woken by the decoder, a credit or a cancel; the timer is a safety net
-// only, cleared once the wait is over (one left running would wake a later
-// wait for nothing)
-const wait = () =>
-  new Promise((r) => {
-    waiter = r;
-    timer = setTimeout(wake, 100);
-  });
+// woken by the decoder, a credit or a cancel (the timer a safety net only)
+const { wait, wake } = waker(100);
 
 self.onmessage = (e) => {
   const m = e.data;
@@ -158,7 +141,7 @@ async function run(job) {
     }
   }
   // a window of its own over the file; a small file read whole
-  const reader = new ChunkReader(file, 8 * 1024 * 1024, 16 * 1024 * 1024, null, job.ts);
+  const reader = new ChunkReader(file, undefined, 16 * 1024 * 1024, null, job.ts);
   const queue = [];
   let error = null;
   const decoder = new VideoDecoder({
@@ -173,7 +156,6 @@ async function run(job) {
   });
   if ('ondequeue' in decoder) decoder.addEventListener('dequeue', wake);
   decoder.configure(config);
-  let frames = 0;
   // pictures out while there are credits for them
   const pump = async () => {
     while (queue.length && !cancelled && !error) {
@@ -185,7 +167,6 @@ async function run(job) {
       if (credits <= 0) return;
       credits--;
       await send(queue.shift(), id, shrink, wasm);
-      frames++;
     }
   };
   try {
@@ -225,7 +206,7 @@ async function run(job) {
       if (queue.length) await wait();
     }
     if (error) throw error;
-    self.postMessage({ type: 'done', id, frames });
+    self.postMessage({ type: 'done', id });
   } finally {
     while (queue.length) queue.shift().close();
     try {

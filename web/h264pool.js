@@ -1,21 +1,23 @@
 // Parallel decoding with a built-in decoder: the sample range is split into
 // groups of pictures at sync samples, each group goes to a Web Worker
-// (h264worker.js for H.264, softworker.js for HEVC, VP9, VP8 and AV1), and
-// the pictures come back in presentation order.
+// (softworker.js, which runs every one of them), and the pictures come
+// back in presentation order.
 //
 // Protocol (main -> worker): {type:'init', desc, codec} once; {type:'decode', id,
-// file, ts, offset, size, pts, minPts, maxPts} per group (samples in decode
-// order; only pictures with minPts <= pts < maxPts are sent back, so the
-// leading pictures of an open GOP come from the group that holds their
-// references); {type:'credit', n} after consuming n pictures (the worker
-// holds at most `window` unconsumed pictures; `reset: true` starts a pass
-// with exactly n); {type:'cancel'}.
+// file, ts, offset, size, pts, minPts, maxPts, shrink} per group (samples in
+// decode order; only pictures with minPts <= pts < maxPts are sent back, so
+// the leading pictures of an open GOP come from the group that holds their
+// references; `shrink`, {aw, ah} or null, has them made that small);
+// {type:'credit', n} after consuming n pictures (the worker holds at most
+// `window` unconsumed pictures; `reset: true` starts a pass with exactly
+// n); {type:'cancel'}.
 // Worker -> main: {type:'ready'} | {type:'error', message} |
 // {type:'frame', id, pic} (a transferred I420 picture record: data, width,
-// height, timestamp, colorSpace; or, for a job with `shrink` ({aw, ah}),
-// kind 'rgba' at that size) | {type:'done', id, emitted, damaged,
-// decodeMs, decoded}.
-import { rawPicture } from './media.js';
+// height, timestamp, colorSpace; or, for a job with `shrink`, kind 'rgba'
+// at that size) | {type:'done', id, damaged, decodeMs, decoded, error?},
+// which ends every job, `error` saying why one failed (the worker is then
+// stopped: after a trap its WebAssembly module is not to be trusted).
+import { breathe, rawPicture, shown, smallPicture, smallSize, waker } from './media.js';
 import { profile } from './profile.js';
 import { builtInFor } from './codecs.js';
 
@@ -27,36 +29,16 @@ export function defaultWorkerCount() {
   return Math.max(1, Math.min(6, cores - 1));
 }
 
-/** A picture a worker made the detector's size, shaped like a raw one for the Feeder. */
-function smallPicture(p) {
-  return {
-    raw: true,
-    kind: 'rgba',
-    format: 'RGBA',
-    codedWidth: p.width,
-    codedHeight: p.height,
-    displayWidth: p.width,
-    displayHeight: p.height,
-    timestamp: p.timestamp,
-    data: p.data,
-    damaged: !!p.damaged,
-    detail: `${p.from[0]}×${p.from[1]}, made ${p.width}×${p.height} by the built-in decoder`,
-    close() {},
-  };
-}
-
 /** A picture as a worker sent it: made small, or whole. */
 function workerPicture(p) {
-  if (p.kind === 'rgba') return smallPicture(p);
-  const pic = rawPicture(p.data, p.width, p.height, p.timestamp, p.colorSpace);
+  const pic = p.kind === 'rgba' ? smallPicture(p.data, p.width, p.height, p.timestamp, p.from[0], p.from[1]) : rawPicture(p.data, p.width, p.height, p.timestamp, p.colorSpace);
   pic.damaged = !!p.damaged;
   return pic;
 }
 
 /** A worker of the built-in decoder for `codec`, started; `ready` settles once it can decode. */
 function startWorker(movie, codec) {
-  const url = codec.id === 'h264' ? new URL('./h264worker.js', import.meta.url) : new URL('./softworker.js', import.meta.url);
-  const w = new Worker(url, { type: 'module' });
+  const w = new Worker(new URL('./softworker.js', import.meta.url), { type: 'module' });
   w.ready = new Promise((resolve, reject) => {
     const onMessage = (e) => {
       if (e.data.type === 'ready') {
@@ -125,7 +107,6 @@ export class SoftwarePool {
       return false;
     }
     this.workers.push(w);
-    this.grown = (this.grown || 0) + 1;
     if (this.joining) this.joining(w);
     return true;
   }
@@ -134,6 +115,8 @@ export class SoftwarePool {
     this.closed = true;
     for (const w of this.workers) w.terminate();
     this.workers = [];
+    // a pass under way ends: its workers will not answer
+    if (this.stopPass) this.stopPass();
   }
 
   /**
@@ -193,8 +176,7 @@ export class SoftwarePool {
       given = true;
       return { startIdx, endIdx, startSec, endSec };
     };
-    const { onProgress } = opts;
-    return this.decodeStretches(next, onFrame, { ...opts, onProgress: onProgress ? (k, n) => onProgress(k / n) : null });
+    return this.decodeStretches(next, onFrame, opts);
   }
 
   /**
@@ -208,14 +190,17 @@ export class SoftwarePool {
    * the workers at the seams, and `onStretchDone(stretch)` hears when the
    * last picture of a stretch has been handed on. With `strict`, a damaged
    * picture fails the pass instead of being handed on (the pictures before
-   * it have been). Returns the number of frames delivered.
+   * it have been); a job that failed fails it whatever `strict` says.
+   * Returns the number of frames delivered.
    */
-  async decodeStretches(next, onFrame, { cancel, onProgress, window, raw = false, fast = false, shrink = null, strict = false, onStretchDone = null } = {}) {
+  async decodeStretches(next, onFrame, { cancel, raw = false, shrink = null, strict = false, onStretchDone = null } = {}) {
     if (this.busy) throw new Error('the decoder pool is busy');
+    // (closed, or each of its workers stopped at an error)
+    if (!this.workers.length) throw new Error(this.closed ? 'the decoder pool was closed' : 'the decoder pool has no workers left');
     this.busy = true;
     // pictures made small (raw ones for the detector only) cost little to hold
-    const small = raw && shrink && shrink.aw > 0 && shrink.ah > 0 ? { aw: shrink.aw, ah: shrink.ah } : null;
-    if (!window) window = this.window(small);
+    const small = smallSize(raw, shrink);
+    const window = this.window(small);
     const { pts, offset, size } = this.movie.v;
     const groups = [];
     const out = [];
@@ -241,23 +226,18 @@ export class SoftwarePool {
     };
     let nextJob = 0;
     let inflight = 0;
-    let wakeResolve = null;
-    const wait = () => new Promise((r) => (wakeResolve = r));
-    const wake = () => {
-      if (wakeResolve) {
-        const r = wakeResolve;
-        wakeResolve = null;
-        r();
-      }
-    };
+    const { wait, wake } = waker();
+    // (close() ends the pass)
+    this.stopPass = wake;
     const assign = (w) => {
       if (nextJob >= groups.length && !more()) return;
       const k = nextJob++;
       const g = groups[k];
       out[k].worker = w;
       inflight++;
-      w.postMessage({ type: 'decode', id: k, file: this.movie.file, ts: this.movie.ts || null, offset: offset.slice(g.a, g.ext), size: size.slice(g.a, g.ext), pts: pts.slice(g.a, g.ext), minPts: g.minPts, maxPts: g.maxPts, fast: !!fast, shrink: small });
+      w.postMessage({ type: 'decode', id: k, file: this.movie.file, ts: this.movie.ts || null, offset: offset.slice(g.a, g.ext), size: size.slice(g.a, g.ext), pts: pts.slice(g.a, g.ext), minPts: g.minPts, maxPts: g.maxPts, shrink: small });
     };
+    const handlers = new Map(); // worker -> its listener for this pass
     const listen = (w) => {
       const h = (e) => {
         const m = e.data;
@@ -268,21 +248,25 @@ export class SoftwarePool {
           o.damaged = m.damaged;
           o.error = m.error || null;
           if (m.decoded) profile.add('sw.decode', m.decodeMs, m.decoded);
-          if (m.error) console.warn(`built-in ${this.codec.name} decoder:`, m.error);
           inflight--;
-          assign(w);
+          if (m.error) {
+            console.warn(`built-in ${this.codec.name} decoder:`, m.error);
+            // no more work for it: after a trap its module is not to be trusted
+            w.terminate();
+            this.workers = this.workers.filter((x) => x !== w);
+          } else assign(w);
         }
         wake();
       };
       w.addEventListener('message', h);
+      handlers.set(w, h);
       // this pass's window, whatever an earlier pass left unused
       w.postMessage({ type: 'credit', n: window, reset: true });
-      return h;
     };
-    const handlers = this.workers.map(listen);
+    this.workers.forEach(listen);
     // a worker the pool gains while this pass runs (grow) joins it
     this.joining = (w) => {
-      handlers.push(listen(w));
+      listen(w);
       assign(w);
     };
     let frames = 0;
@@ -303,14 +287,16 @@ export class SoftwarePool {
           if (o.queue.length) {
             const pic = o.queue.shift();
             const t = pic.timestamp / 1e6;
-            if (t >= g.startSec - 1e-6 && t < g.endSec - 1e-9) {
+            if (shown(t, g.startSec, g.endSec)) {
               if (strict && pic.damaged) throw new Error(`the built-in ${this.codec.name} decoder damaged the picture at ${t.toFixed(3)} s`);
               await onFrame(raw ? pic : pic.toVideoFrame(), t);
               frames++;
+              await breathe();
             }
             o.worker.postMessage({ type: 'credit', n: 1 });
           } else if (o.done) break;
           else {
+            if (this.closed) throw new Error('the decoder pool was closed');
             const tw = performance.now();
             await wait();
             profile.add('sw.wait', performance.now() - tw);
@@ -318,19 +304,20 @@ export class SoftwarePool {
         }
         if (stopped) break;
         damaged += o.damaged;
-        if (strict && o.damaged) throw new Error(o.error ? `the built-in decoder failed: ${o.error}` : `the built-in decoder damaged ${o.damaged} picture${o.damaged === 1 ? '' : 's'}`);
+        if (o.error || (strict && o.damaged)) throw new Error(o.error ? `the built-in decoder failed: ${o.error}` : `the built-in decoder damaged ${o.damaged} picture${o.damaged === 1 ? '' : 's'}`);
         if (g.last && onStretchDone) await onStretchDone(g.stretch);
-        if (onProgress) onProgress(k + 1, groups.length);
       }
     } finally {
-      // stop whatever is still running and take the workers back
+      // stop whatever is still running and take the workers back (a closed
+      // pool's are gone: nothing to wait for)
       exhausted = true;
       nextJob = groups.length;
       for (const w of this.workers) w.postMessage({ type: 'cancel' });
-      while (inflight > 0) await wait();
+      while (inflight > 0 && !this.closed) await wait();
       for (const o of out) o.queue.length = 0;
       this.joining = null;
-      this.workers.forEach((w, i) => w.removeEventListener('message', handlers[i]));
+      this.stopPass = null;
+      for (const [w, h] of handlers) w.removeEventListener('message', h);
       this.busy = false;
     }
     if (damaged) console.warn(`built-in ${this.codec.name} decoder: ${damaged} damaged pictures`);

@@ -250,6 +250,23 @@ try {
     const after = await page.evaluate(() => ({ hidden: document.querySelector('#frameViewer').classList.contains('hidden'), sel: [...window.__unflash.state.selection] }));
     assert(after.hidden && after.sel.length === 1 && after.sel[0] === 15, 'Esc closes the viewer and leaves frame 15 selected: ' + JSON.stringify(after));
     await page.keyboard.press('Escape');
+    // closed while it decodes, a viewer stops, keeps none of the pictures
+    // and says nothing (it used to throw, its pictures landing in the
+    // emptied cache)
+    const closed = await page.evaluate(async () => {
+      const u = window.__unflash;
+      const { FrameViewer } = await import('./viewer.js');
+      const v = new FrameViewer(document.createElement('canvas'));
+      v.show(u.state.movie, u.currentSection(), 10);
+      // (as its timer would)
+      const drawing = v.render();
+      v.clear();
+      let error = null;
+      await drawing.catch((e) => (error = e.message));
+      return { error, cached: v.cache.size };
+    });
+    console.log('the viewer closed while it decodes:', JSON.stringify(closed));
+    assert(!closed.error && closed.cached === 0, 'a viewer closed while it decodes stops, keeps nothing and throws nothing: ' + JSON.stringify(closed));
   }
   assert(results.verdictBefore.startsWith('fails'), 'the flashing section must fail before editing');
   assert(results.verdictBefore.includes('red flash'), 'the red flash must be named: ' + results.verdictBefore);

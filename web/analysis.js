@@ -83,7 +83,7 @@ export async function scanMovie(env, movie, { onProgress, onPartial = null, canc
     };
     let count = 0;
     // segments read different parts of the file: a window each
-    const reader = k > 0 && movie.reader ? movie.reader.fork() : null;
+    const reader = k > 0 ? movie.reader.fork() : null;
     await decodeRange(
       movie,
       k === 0 ? from : Math.max(movie.tsMin, from - runup),
@@ -385,7 +385,7 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
       stretches: [],
       feeding: 0,
       // lanes that decode on the page read different parts of the file: a window each
-      reader: !builtIn && movie.reader ? movie.reader.fork() : null,
+      reader: builtIn ? null : movie.reader.fork(),
       tested: false,
       // time spent decoding (ms; the pass under way from passT0), for its speed
       decodeMs: 0,
@@ -1065,7 +1065,7 @@ async function prepareSpans(env, movie, sec, plan, feeders, { onProgress, cancel
           report();
         }
       },
-      { cancel, raw: true, fromIndex, reader: k > 0 && movie.reader ? movie.reader.fork() : null, shrink: movie.shrinkInWorkers === false ? null : { aw: f.aw, ah: f.ah } }
+      { cancel, raw: true, fromIndex, reader: k > 0 ? movie.reader.fork() : null, shrink: movie.shrinkInWorkers === false ? null : { aw: f.aw, ah: f.ah } }
     );
     await f.drain();
     settle();

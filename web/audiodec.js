@@ -26,7 +26,7 @@ function builtInKind(codec) {
 }
 
 /** Whether the app has a decoder of its own for the sound `codec`. */
-export function builtInSound(codec) {
+function builtInSound(codec) {
   return !!builtInKind(codec);
 }
 
@@ -35,6 +35,25 @@ export function soundConfig(track, description) {
   const cfg = { codec: track.codec, sampleRate: track.sample_rate, numberOfChannels: track.channels };
   if (description && description.length) cfg.description = description;
   return cfg;
+}
+
+/**
+ * Sample `i` of the movie's sound as an EncodedAudioChunk, read through
+ * `reader` (its bytes as the track stores them, with what Matroska's header
+ * stripping took off each frame put back in front; the chunk keeps a copy
+ * of its own).
+ */
+export async function soundChunk(movie, reader, i) {
+  const at = movie.audio;
+  const a = movie.a;
+  let data = await reader.read(a.offset[i], a.size[i]);
+  if (at.prefix && at.prefix.length) {
+    const b = new Uint8Array(at.prefix.length + data.length);
+    b.set(at.prefix);
+    b.set(data, at.prefix.length);
+    data = b;
+  }
+  return new EncodedAudioChunk({ type: 'key', timestamp: Math.round((a.ptsTicks[i] * 1e6) / at.timescale), duration: Math.round((a.durTicks[i] * 1e6) / at.timescale), data });
 }
 
 /**
@@ -52,7 +71,7 @@ export async function canPlaySound(cfg) {
       /* not this way */
     }
   }
-  return builtInSound(cfg.codec) && typeof AudioData !== 'undefined' && typeof EncodedAudioChunk !== 'undefined';
+  return !!kind && typeof AudioData !== 'undefined' && typeof EncodedAudioChunk !== 'undefined';
 }
 
 /** Why the built-in decoder was not there, the last time it was wanted. */
@@ -194,7 +213,7 @@ export class PcmDecoder {
  * stereo). A chunk that won't decode at all goes to `error`; frames within
  * one that are damaged come out as silence.
  */
-export class BuiltInAudioDecoder {
+class BuiltInAudioDecoder {
   constructor({ output, error }) {
     this.output = output;
     this.error = error;

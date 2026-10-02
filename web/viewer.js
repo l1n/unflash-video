@@ -72,8 +72,8 @@ export class FrameViewer {
     } finally {
       this.busy = null;
     }
-    // asked for another while this one decoded
-    if (this.want !== w && !this.timer) this.show(this.want.movie, this.want.sec, this.want.i);
+    // asked for another while this one decoded (not cleared meanwhile)
+    if (this.want && this.want !== w && !this.timer) this.show(this.want.movie, this.want.sec, this.want.i);
   }
 
   /** The decoded picture nearest `t` (within half a frame), if there is one. */
@@ -94,14 +94,26 @@ export class FrameViewer {
   async fill(movie, t) {
     const w = this.canvas.width;
     const h = this.canvas.height;
-    await decodeRange(movie, Math.max(movie.tsMin, t - WINDOW_S), t + WINDOW_S, async (frame, ft) => {
-      try {
-        const us = Math.round(ft * 1e6);
-        if (!this.cache.has(us)) this.cache.set(us, await createImageBitmap(frame, { resizeWidth: w, resizeHeight: h, resizeQuality: 'high' }));
-      } finally {
-        frame.close();
-      }
-    });
+    // the viewer cleared meanwhile (a new file, the viewer closed): the
+    // decode stops, and its pictures are not kept
+    const gone = () => this.movie !== movie;
+    await decodeRange(
+      movie,
+      Math.max(movie.tsMin, t - WINDOW_S),
+      t + WINDOW_S,
+      async (frame, ft) => {
+        try {
+          const us = Math.round(ft * 1e6);
+          if (this.cache.has(us)) return;
+          const bmp = await createImageBitmap(frame, { resizeWidth: w, resizeHeight: h, resizeQuality: 'high' });
+          if (gone()) bmp.close();
+          else this.cache.set(us, bmp);
+        } finally {
+          frame.close();
+        }
+      },
+      { cancel: gone }
+    );
     // the pictures furthest from here go first
     if (this.cache.size > KEEP) {
       const keys = [...this.cache.keys()].sort((a, b) => Math.abs(b - t * 1e6) - Math.abs(a - t * 1e6));

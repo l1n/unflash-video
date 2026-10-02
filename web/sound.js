@@ -6,7 +6,7 @@
 // sound on the edited timeline by that list; the export encodes what it
 // makes, and the section player plays it.
 
-import { noSoundDecoder, soundConfig, soundDecoderFor } from './audiodec.js';
+import { noSoundDecoder, soundChunk, soundConfig, soundDecoderFor } from './audiodec.js';
 
 /**
  * The sound of the edited timeline as one unbroken run of samples, handed
@@ -165,7 +165,7 @@ export function audioData(planes, n, start, rate) {
 }
 
 /** Source second of output second `x` (the inverse of SoundRun.outTime); inside a hold's silence, the hold's moment. */
-export function sourceTime(holds, x) {
+function sourceTime(holds, x) {
   let held = 0;
   for (const h of holds) {
     if (x < h.at + held) break;
@@ -194,7 +194,7 @@ const CODEC_NAMES = [
 ];
 
 /** `codec` as people know it, with the codec string: "AAC, mp4a.40.2". */
-export function codecName(codec) {
+function codecName(codec) {
   const hit = CODEC_NAMES.find(([re]) => re.test(codec || ''));
   return hit ? `${hit[1]}, ${codec}` : codec || 'unknown';
 }
@@ -242,7 +242,8 @@ export class SectionSound {
     if (!on) {
       this.heldBack = false;
       this.changed();
-      return this.halt();
+      // (the clock is kept: turned on again, it plays from where the player is)
+      return this.quiet();
     }
     if (!this.ctx) {
       this.ctx = new AudioContext({ latencyHint: 'playback' });
@@ -254,6 +255,7 @@ export class SectionSound {
       });
     }
     await this.wake();
+    // (only while the player plays: paused or stopped, it has no clock)
     if (this.base) this.follow(this.base, this.speed);
   }
 
@@ -316,7 +318,7 @@ export class SectionSound {
         return;
       }
     }
-    this.halt();
+    this.quiet();
     this.base = base;
     this.speed = speed;
     if (!this.on || !this.ctx || speed !== 1 || !this.plan || !this.plan.movie.audio) return;
@@ -327,8 +329,14 @@ export class SectionSound {
     });
   }
 
-  /** Stop the sound (a pause, a stop, the end of a pass). */
+  /** Stop the sound (a pause, a stop, the end of a pass) until the player's clock runs again. */
   halt() {
+    this.base = null;
+    this.quiet();
+  }
+
+  /** Stop what is playing. */
+  quiet() {
     this.gen++;
     this.clock = null;
     for (const s of this.sources) {
@@ -384,8 +392,9 @@ export class SectionSound {
       k++;
       w = await this._window(k);
       if (gen !== this.gen) return;
-      // (only this window and the next are kept)
-      for (const i of this.windows.keys()) if (i < k - 1) this.windows.delete(i);
+      // (only this window and the one before, still playing, are kept: a
+      // jump back leaves none decoded ahead)
+      for (const i of this.windows.keys()) if (i < k - 1 || i > k) this.windows.delete(i);
     }
   }
 
@@ -428,8 +437,7 @@ export class SectionSound {
     const found = await soundDecoderFor(cfg);
     if (!found) throw new Error(noSoundDecoder(at.codec, `this video's sound (${codecName(at.codec)})`));
     this.builtIn = found.builtIn ? found.name : '';
-    const reader = movie.reader ? movie.reader.fork() : null;
-    const prefix = at.prefix && at.prefix.length ? Uint8Array.from(at.prefix) : null;
+    const reader = movie.reader.fork();
     let buffer = null;
     let run = null;
     let error = null;
@@ -462,16 +470,7 @@ export class SectionSound {
     });
     try {
       dec.configure(cfg);
-      for (let i = first; i < last && !error; i++) {
-        let bytes = reader ? await reader.read(a.offset[i], a.size[i]) : new Uint8Array(await movie.file.slice(a.offset[i], a.offset[i] + a.size[i]).arrayBuffer());
-        if (prefix) {
-          const b = new Uint8Array(prefix.length + bytes.length);
-          b.set(prefix);
-          b.set(bytes, prefix.length);
-          bytes = b;
-        }
-        dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round((a.ptsTicks[i] * 1e6) / at.timescale), duration: Math.round((a.durTicks[i] * 1e6) / at.timescale), data: bytes.slice() }));
-      }
+      for (let i = first; i < last && !error; i++) dec.decode(await soundChunk(movie, reader, i));
       if (!error) await dec.flush();
     } finally {
       try {
@@ -479,7 +478,7 @@ export class SectionSound {
       } catch (e) {
         /* closed */
       }
-      if (reader && reader.release) reader.release();
+      reader.release();
     }
     if (error) throw error;
     if (!run) return null;
