@@ -891,6 +891,18 @@
    "violations": 0
   }
  },
+ "unmarked-copied": {
+  "w": 720,
+  "h": 450,
+  "seconds": 10.4,
+  "alt": "A one-minute film with two sections prepared: the first fixed, the second opened and left as it was. The export dialog's plan re-encodes one span, around the first, and copies every other frame, the second section's included.",
+  "sha256": "9bcc3c4a0fd45c3fc1ed72e43046ba8b613ad1b057e072b098096aed7b58ed58",
+  "checked": {
+   "profile": "strict",
+   "frames": 314,
+   "violations": 0
+  }
+ },
  "verify-sections": {
   "w": 720,
   "h": 450,

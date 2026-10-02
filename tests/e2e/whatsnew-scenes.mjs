@@ -86,6 +86,27 @@ const RACE = {
 export const SCENES = [
   // ======== 2026-10-02 ==========================================================
   {
+    name: 'unmarked-copied',
+    alt: "A one-minute film with two sections prepared: the first fixed, the second opened and left as it was. The export dialog's plan re-encodes one span, around the first, and copies every other frame, the second section's included.",
+    query: Q,
+    async setup(d) {
+      await fixedSection(d, 'flash-minute.mp4');
+      // the second section prepared and checked, no marks made in it
+      await d.section(2);
+      await hideToast(d);
+    },
+    view: (d) => d.around(['#sectionList', '#btnExport'], 8),
+    async play(d) {
+      await d.point('#sectionList', { dy: 0.3, ms: 600 });
+      await d.wait(1800);
+      await d.click('#btnExport', { after: 0 });
+      await d.until(() => !document.querySelector('#btnDoExport').disabled);
+      await d.camera('#exportModal .modal-box', { pad: 6, ms: 700 });
+      await d.point('#exportPlan', { dx: 0.3, ms: 600 });
+      await d.wait(3200);
+    },
+  },
+  {
     name: 'cancel',
     alt: 'A failing section of 247 frames is prepared again, and the job cancelled halfway: Unflash says it was cancelled, and the section keeps its 247 frames and its verdict.',
     query: Q,
