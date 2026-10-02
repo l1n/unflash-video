@@ -1178,7 +1178,7 @@ function describePlan(plan, movie, softened, blended = []) {
   let text;
   if (plan.mode === 'smart') {
     text = plan.spans
-      ? `${plan.spans} span${plan.spans === 1 ? '' : 's'} around the sections (${secs(plan.encodedSeconds)}, ${plan.encoded} frames) ${plan.spans === 1 ? 'is' : 'are'} decoded and re-encoded${plan.parallel > 1 && plan.spans > 1 ? `, ${Math.min(plan.parallel, plan.spans)} at a time` : ''}; the other ${plan.copied} frames are copied from the source as they are`
+      ? `${plan.spans} span${plan.spans === 1 ? '' : 's'} around the marked sections (${secs(plan.encodedSeconds)}, ${plan.encoded} frames) ${plan.spans === 1 ? 'is' : 'are'} decoded and re-encoded${plan.parallel > 1 && plan.spans > 1 ? `, ${Math.min(plan.parallel, plan.spans)} at a time` : ''}; the other ${plan.copied} frames are copied from the source as they are`
       : `Nothing to re-encode: all ${plan.copied} frames are copied from the source as they are`;
   } else {
     const why = !smartCutSetting() ? 'smart cut is off' : plan.copyable ? 'the file does not start at a keyframe' : `${movie.video.codec.split('.')[0]} frames cannot be copied into a track of this encoder's codec`;

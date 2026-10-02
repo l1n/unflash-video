@@ -275,9 +275,9 @@ shows; the section player and the export blend the decoded frames on a
 canvas the same way. Where something moves between the frames, a blended
 frame shows it twice, faintly (a ghost), which is the price of keeping the
 frame.
-7. **Export**: the spans around the sections are re-encoded in the browser
-   with the edits applied, several at a time; every GOP no section touches
-   is copied from the source as it is, and so is the audio, unless frames
+7. **Export**: the spans around the marked sections are re-encoded in the
+   browser with the edits applied, several at a time; every GOP no marked
+   section touches is copied from the source as it is, and so is the audio, unless frames
    are held (**E**): then the sound is re-encoded with a second of silence
    under each held frame (see below). *Save as* names the file (the
    video's name with *.unflashed* to start with); Chrome and Edge then ask
@@ -762,8 +762,9 @@ the last two with Firefox's own lanes.
 An export used to decode and re-encode every frame of the file. Almost all
 of them are frames no section touches, and those are now **copied from the
 source as they are**, whole GOPs at a time, with neither a decoder nor an
-encoder in the way: a smart cut. Only the spans around the sections are
-decoded, edited and re-encoded, from the last IDR picture before a section
+encoder in the way: a smart cut. Only the spans around the sections with
+marks are decoded, edited and re-encoded (a section left as it was is
+copied like the rest), from the last IDR picture before a section
 to the first one after it (for H.264 the sync samples are read to make sure
 they are IDR pictures, since an open-GOP I picture is marked as a sync
 sample too but the B pictures after it lean on what came before). Each span

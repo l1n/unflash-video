@@ -149,7 +149,7 @@ export function formatInfo(cand, movie) {
   const copies = family === src && (family === 'h264' || family === 'vp9');
   const name = familyName(cand.config.codec);
   const how = copies
-    ? 'Only the stretches around your sections are re-encoded; everything else is copied from your file as it is (fast, and no quality lost outside the sections).'
+    ? 'Only the stretches around the sections you marked are re-encoded; everything else is copied from your file as it is (fast, and no quality lost anywhere else).'
     : `Your file is ${familyName(movie.video.codec)}, so every frame is re-encoded (slower, and a little quality is lost everywhere).`;
   const short = family === 'h264' ? 'plays everywhere' : family === 'vp9' ? 'browsers and VLC' : family === 'av1' ? 'smallest, slow, newer players' : family === 'hevc' ? 'small, Apple devices' : '';
   return { family, name, copies, label: `${name}: ${short}${copies ? ', copies what you did not edit' : ''}`, note: `${name} ${FAMILY_WHERE[family] ? `${FAMILY_WHERE[family]}. ` : ''}${how}` };

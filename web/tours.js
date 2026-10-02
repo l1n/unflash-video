@@ -45,7 +45,7 @@ export const TOURS = {
       { target: '.chart-box', title: 'The flashing, charted', html: 'How much of the picture flashes, around the playhead: the bars are flashing faster than the limit (the dashed line), the blue line flashing at the limit rate, which is what extended flashes are made of. Point at it for the numbers; click it to play from there.' },
       { target: '#playerBox', title: 'The player', html: 'Dimmed and small to start with (the switches above it change that). Tick <b>live monitor</b> in the header for a meter over the picture: how much of it is flashing, frame by frame.' },
       { target: '#btnProject', title: 'Your work is kept', html: 'Sections and marks are kept in this browser as you work, and come back when you open the same video again. <b>Project…</b> saves them to a file, to keep or to carry to another computer.' },
-      { target: '#btnExport', title: 'Export', html: 'Once the sections pass, <b>Export…</b> writes the fixed video (only the stretches around the sections are re-encoded) and <b>Verify</b> scans what it wrote.' },
+      { target: '#btnExport', title: 'Export', html: 'Once the sections pass, <b>Export…</b> writes the fixed video (only the stretches around the sections you marked are re-encoded) and <b>Verify</b> scans what it wrote.' },
     ],
   },
   section: {
