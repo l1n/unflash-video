@@ -238,8 +238,8 @@ pub struct SoundDecoder {
 
 enum Sound {
     // (boxed: the decoders' states differ in size, about 20 and 5 KB)
-    Ac3(Box<unflash_ac3::Decoder>),
-    Dts(Box<unflash_dts::Decoder>),
+    Ac3(Box<unflash_sound::ac3::Decoder>),
+    Dts(Box<unflash_sound::dts::Decoder>),
 }
 
 #[wasm_bindgen]
@@ -248,8 +248,8 @@ impl SoundDecoder {
     #[wasm_bindgen(constructor)]
     pub fn new(codec: &str) -> Result<SoundDecoder, JsValue> {
         let dec = match codec {
-            "ac3" => Sound::Ac3(Box::new(unflash_ac3::Decoder::new(unflash_ac3::Output::Stereo))),
-            "dts" => Sound::Dts(Box::new(unflash_dts::Decoder::new(unflash_dts::Output::Stereo))),
+            "ac3" => Sound::Ac3(Box::new(unflash_sound::ac3::Decoder::new(unflash_sound::Output::Stereo))),
+            "dts" => Sound::Dts(Box::new(unflash_sound::dts::Decoder::new(unflash_sound::Output::Stereo))),
             other => return Err(js_err(format!("there is no built-in sound decoder for {other}"))),
         };
         Ok(SoundDecoder { dec, out: Vec::new(), samples: 0, rate: 0 })

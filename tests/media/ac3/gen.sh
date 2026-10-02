@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test streams for the AC-3 / E-AC-3 decoder (crates/unflash-ac3): short
+# Test streams for the AC-3 / E-AC-3 decoder (crates/unflash-sound): short
 # ffmpeg encodes of synthetic signals in every channel layout ffmpeg's
 # encoders take, at 32, 44.1 and 48 kHz and several bit rates. Each
 # channel has its own content (a tone at its own frequency, a sweep, noise

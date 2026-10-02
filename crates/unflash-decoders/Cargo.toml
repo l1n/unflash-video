@@ -18,5 +18,4 @@ wasm-bindgen = "0.2.128"
 serde_json.workspace = true
 console_error_panic_hook = "0.1"
 unflash-hevc = { path = "../unflash-hevc" }
-unflash-ac3 = { path = "../unflash-ac3" }
-unflash-dts = { path = "../unflash-dts" }
+unflash-sound = { path = "../unflash-sound" }

@@ -2,10 +2,10 @@
 // the codec; otherwise one built into the app, behind the same interface, so
 // that the section player's sound and the export's re-encode use either the
 // same way. The app's own: AC-3 and E-AC-3 (Dolby Digital, Dolby Digital
-// Plus) and DTS, which no browser's WebCodecs decodes (crates/unflash-ac3
-// and crates/unflash-dts, in the decoders module; their sound comes mixed
-// down to stereo), and PCM in every form (big and little endian, 8 to 32
-// bits, float, G.711), read here.
+// Plus) and DTS, which no browser's WebCodecs decodes (crates/unflash-sound
+// in the decoders module; their sound comes mixed down to stereo), and PCM
+// in every form (big and little endian, 8 to 32 bits, float, G.711), read
+// here.
 
 import { loadDecoders } from './codecs.js';
 

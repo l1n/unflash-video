@@ -1,15 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/unflash-ac3",
     "crates/unflash-av1",
     "crates/unflash-core",
     "crates/unflash-decoders",
-    "crates/unflash-dts",
     "crates/unflash-gpu",
     "crates/unflash-h264",
     "crates/unflash-hevc",
     "crates/unflash-mp4",
+    "crates/unflash-sound",
     "crates/unflash-vp8",
     "crates/unflash-vp9",
     "crates/unflash-wasm",

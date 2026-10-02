@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test streams for the DTS core decoder (crates/unflash-dts): short
+# Test streams for the DTS core decoder (crates/unflash-sound): short
 # ffmpeg encodes (its dca encoder) of synthetic signals in every channel
 # layout the encoder takes (mono, stereo, 2/2, 3/2 with and without LFE),
 # at 22.05, 32, 44.1 and 48 kHz and several bit rates, with and without

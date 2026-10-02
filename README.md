@@ -844,8 +844,7 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 | `crates/unflash-hevc` | the built-in HEVC decoder (Main, Main 10; 4:2:0, 4:0:0) |
 | `crates/unflash-vp9` | the built-in VP9 decoder (profiles 0 and 2) |
 | `crates/unflash-vp8` | the built-in VP8 decoder |
-| `crates/unflash-ac3` | the built-in AC-3 and E-AC-3 sound decoder (Dolby Digital, Dolby Digital Plus), written to ATSC A/52 |
-| `crates/unflash-dts` | the built-in DTS sound decoder (the core of DTS Coherent Acoustics, which DTS-HD streams carry too), written to ETSI TS 102 114 |
+| `crates/unflash-sound` | the built-in sound decoders: AC-3 and E-AC-3 (Dolby Digital, Dolby Digital Plus), written to ATSC A/52, and DTS (the core of DTS Coherent Acoustics, which DTS-HD streams carry too), written to ETSI TS 102 114 |
 | `crates/unflash-decoders` | the `wasm-bindgen` API of the built-in HEVC, VP9, VP8 and AV1 decoders and of the AC-3 / E-AC-3 and DTS sound decoders: a module of its own, loaded when a file needs one |
 | `crates/unflash-av1` | AV1 decoding (8- and 10-bit, film grain applied) into 8-bit 4:2:0 pictures: a small wrapper over rav1d, bit-exact with ffmpeg's libdav1d |
 | `third_party/rav1d` | rav1d 1.1.0, the Rust port of dav1d (BSD-2-Clause), without its assembly and patched to build for wasm32 (see its `UNFLASH.md`) |
@@ -898,9 +897,9 @@ cargo run --release -p unflash-vp8 --example conformance -- dir    # the libvpx 
 bash tests/media/av1/gen.sh               # AV1 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libaom, libsvtav1, librav1e, libdav1d)
 cargo run --release -p unflash-av1 --example compare -- file.mkv   # decode an AV1 track, diff every picture against ffmpeg's libdav1d, time it
 bash tests/media/ac3/gen.sh               # AC-3 / E-AC-3 decoder test streams, from ffmpeg's encoders (the tests compare with ffmpeg's decoder when it is installed)
-cargo run --release -p unflash-ac3 --example fate -- dir   # AC-3 and E-AC-3 files (ffmpeg's FATE samples) against ffmpeg's decode
+cargo run --release -p unflash-sound --example fate -- ac3 dir   # AC-3 and E-AC-3 files (ffmpeg's FATE samples) against ffmpeg's decode
 bash tests/media/dts/gen.sh               # DTS decoder test streams, from ffmpeg's encoder (the tests compare with ffmpeg's decoder when it is installed)
-cargo run --release -p unflash-dts --example fate -- dir   # DTS and DTS-HD files (ffmpeg's FATE samples) against ffmpeg's decode of their core
+cargo run --release -p unflash-sound --example fate -- dts dir   # DTS and DTS-HD files (ffmpeg's FATE samples) against ffmpeg's decode of their core
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
 node tests/e2e/tour.mjs                   # the guided tour, on a first visit and after an update

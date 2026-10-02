@@ -1134,13 +1134,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7c4ceeeca15c8384bbc3e011dbd8fccb7f068a440b752b7d9b32ceb0ca0e2e8"
 
 [[package]]
-name = "unflash-ac3"
-version = "0.1.0"
-dependencies = [
- "unflash-mp4",
-]
-
-[[package]]
 name = "unflash-av1"
 version = "0.1.0"
 dependencies = [
@@ -1166,19 +1159,14 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "serde_json",
- "unflash-ac3",
  "unflash-av1",
  "unflash-core",
- "unflash-dts",
  "unflash-hevc",
+ "unflash-sound",
  "unflash-vp8",
  "unflash-vp9",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "unflash-dts"
-version = "0.1.0"
 
 [[package]]
 name = "unflash-gpu"
@@ -1216,6 +1204,13 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "unflash-sound"
+version = "0.1.0"
+dependencies = [
+ "unflash-mp4",
 ]
 
 [[package]]
