@@ -24,7 +24,8 @@ pub struct Frame {
     pub v: Vec<u8>,
     /// The stream's bit depth.
     pub bit_depth: u8,
-    /// The planes at full precision when the bit depth is above 8.
+    /// The planes at full precision when the bit depth is above 8 and the
+    /// decoder was asked for them ([`Decoder::set_keep_deep`]).
     pub y16: Option<Vec<u16>>,
     pub u16: Option<Vec<u16>>,
     pub v16: Option<Vec<u16>>,
@@ -280,8 +281,9 @@ fn crop<P: Sample, T>(plane: &Plane<P>, (x0, y0, w, h): (usize, usize, usize, us
     out
 }
 
-/// Crop and convert a picture for output.
-fn to_frame<P: Sample>(pic: &Picture<P>, sps: &Sps, pts: f64, damaged: bool) -> Frame {
+/// Crop and convert a picture for output (and keep it at full precision
+/// too when it is deeper than 8 bits and `keep_deep` asks for that).
+fn to_frame<P: Sample>(pic: &Picture<P>, sps: &Sps, pts: f64, damaged: bool, keep_deep: bool) -> Frame {
     let (l, _, t, _) = sps.conf_win;
     let (w, h) = sps.cropped_size();
     let (w, h, l, t) = (w as usize, h as usize, l as usize, t as usize);
@@ -295,7 +297,7 @@ fn to_frame<P: Sample>(pic: &Picture<P>, sps: &Sps, pts: f64, damaged: bool) -> 
         (1 | 2, false) => vec![128; cw * ch],
         _ => crop(&pic.planes[c], areas[c], |s| ((s.get() as u32 + round) >> shift).min(255) as u8),
     });
-    let planes16: Option<[Vec<u16>; 3]> = deep.then(|| {
+    let planes16: Option<[Vec<u16>; 3]> = (deep && keep_deep).then(|| {
         std::array::from_fn(|c| match (c, chroma) {
             (1 | 2, false) => vec![1 << (bd - 1); cw * ch],
             _ => crop(&pic.planes[c], areas[c], |s| s.get() as u16),
@@ -366,6 +368,8 @@ pub struct Decoder {
     layout: Option<(Rc<Sps>, Rc<Pps>, Rc<Layout>)>,
     core: Cores,
     check_hashes: bool,
+    /// Deeper pictures come out at full precision too (`set_keep_deep`).
+    keep_deep: bool,
     out: Vec<Frame>,
     rbsp: Vec<u8>,
     /// The header of the last independent slice segment of the picture.
@@ -394,6 +398,7 @@ impl Decoder {
             layout: None,
             core: Cores::None,
             check_hashes: false,
+            keep_deep: false,
             out: Vec::new(),
             rbsp: Vec::new(),
             prev_hdr: None,
@@ -455,6 +460,16 @@ impl Decoder {
     /// every picture costs time).
     pub fn set_check_hashes(&mut self, check: bool) {
         self.check_hashes = check;
+    }
+
+    /// Give pictures deeper than 8 bits at full precision too
+    /// ([`Frame::y16`] and the others) besides the rounded 8-bit planes
+    /// every picture has: for comparing with another decoder at that depth,
+    /// as the tests do. Off by default (they stay None), since the app
+    /// reads only the 8-bit planes, and the copy is about 6 MB a picture
+    /// at 10-bit 1080p.
+    pub fn set_keep_deep(&mut self, keep: bool) {
+        self.keep_deep = keep;
     }
 
     /// Decode one container sample (one access unit of length-prefixed NAL
@@ -526,8 +541,8 @@ impl Decoder {
     }
 
     fn finish_picture(&mut self) {
-        let check = self.check_hashes;
-        let frame = with_core!(&mut self.core, c => c.finish_picture(check).map(|f| to_frame(&f.pic, &f.sps, f.pts, f.damaged)), None);
+        let (check, keep_deep) = (self.check_hashes, self.keep_deep);
+        let frame = with_core!(&mut self.core, c => c.finish_picture(check).map(|f| to_frame(&f.pic, &f.sps, f.pts, f.damaged, keep_deep)), None);
         self.out.extend(frame);
     }
 

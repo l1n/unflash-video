@@ -50,6 +50,8 @@ fn decode(data: &[u8], keep_going: bool) -> Option<Decoded> {
         Ok(d) => d,
         Err(e) => return Some(Decoded { per_sample: Vec::new(), damaged: 0, error: Some(e) }),
     };
+    // (libvpx's MD5s of a deeper vector are of its 16-bit samples)
+    dec.set_keep_deep(true);
     let mut out = Decoded { per_sample: Vec::new(), damaged: 0, error: None };
     for s in samples(data)? {
         match dec.decode(s, 0.0) {

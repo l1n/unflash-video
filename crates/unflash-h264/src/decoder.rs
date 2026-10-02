@@ -201,9 +201,11 @@ impl Decoder {
 
     fn new_picture_starts(&self, hdr: &SliceHeader, sps: &Sps) -> bool {
         let Some(cur) = &self.cur else { return true };
-        // a parameter set re-sent with another size: the picture's tables
-        // are the old size's
-        if self.active_sps.as_ref().is_some_and(|a| (a.width_mbs, a.height_mbs) != (sps.width_mbs, sps.height_mbs)) {
+        // a parameter set re-sent changed (another size, or the same size
+        // with other content): the picture was started with the old one,
+        // whose size its tables have, so the slice belongs to the next
+        // picture (it never decodes with a mix of the two)
+        if self.active_sps.as_ref() != Some(sps) {
             return true;
         }
         let prev = &cur.hdr;
@@ -292,15 +294,32 @@ impl Decoder {
     }
 
     fn start_picture(&mut self, sps: &Sps, hdr: &SliceHeader, pts: f64) {
-        if self.active_sps.as_ref().map_or(true, |a| a.id != sps.id || a.width_mbs != sps.width_mbs || a.height_mbs != sps.height_mbs) {
-            // a new sequence: references from the old one are useless
-            if !hdr.is_idr() {
-                self.dpb.clear();
-            }
+        // another sequence parameter set, or the active one's id sent again
+        // with other content (cropping, order counts, reference counts and
+        // the rest: the whole set is compared): it takes effect here, so
+        // the picture's order count, reference marking and cropping all
+        // come from it. A set re-sent unchanged, as encoders do before
+        // every IDR picture, changes nothing.
+        if self.active_sps.as_ref() != Some(sps) {
+            // (a first field still waiting for its second goes out with its
+            // own sequence's cropping)
             if let Some(p) = self.pending.take() {
                 self.output_unpaired(p);
             }
-            self.pool.clear();
+            // References and spare buffers of another size are useless. A
+            // change that keeps the size keeps the references: a conforming
+            // stream activates a new set only at an IDR picture, which
+            // empties the buffer below anyway, so this decides only for
+            // streams that change it elsewhere. Their references still fit
+            // (the same size is the same format here), so at worst the
+            // pictures predict from them wrongly, where dropping them would
+            // conceal every picture up to the next IDR; ffmpeg's decoder
+            // keeps them too (it drops them only when the size, format,
+            // aspect ratio or colour matrix changes).
+            if self.active_sps.as_ref().is_none_or(|a| (a.width_mbs, a.height_mbs) != (sps.width_mbs, sps.height_mbs)) {
+                self.dpb.clear();
+                self.pool.clear();
+            }
             self.active_sps = Some(sps.clone());
         }
         let (wm, hm) = (sps.width_mbs as usize, sps.height_mbs as usize);
@@ -778,5 +797,38 @@ pub(crate) mod tests {
         assert_eq!(dec.sps().unwrap().cropped_size(), (48, 32));
         assert_eq!(frames.iter().map(|f| (f.crop, f.damaged)).collect::<Vec<_>>(), [((0, 0, 30, 28), false)]);
         assert_eq!(dec.flush().unwrap().map(|f| f.crop), Some((0, 0, 48, 32)));
+    }
+
+    #[test]
+    fn a_sequence_sent_again_changed_takes_effect_at_its_idr() {
+        // the second IDR picture comes with the set of the same id and size
+        // cropped another way, and a later P picture with that set again,
+        // unchanged: every frame from that IDR on is cropped the new way
+        // (the old set stayed active until its id or size changed)
+        let first = Seq { crop: [0, 1, 0, 2], ..Seq::default() };
+        let second = Seq { crop: [1, 0, 2, 0], ..Seq::default() };
+        let idr = |seq: &Seq, idr_pic_id| slice_nal(seq, &Slice { idr: true, idr_pic_id, intra: true, mbs: 4, ..Slice::default() });
+        let p = |seq: &Seq, frame_num| slice_nal(seq, &Slice { frame_num, mbs: 4, ..Slice::default() });
+        let samples = [vec![sps_nal(&first), pps_nal(), idr(&first, 0)], vec![p(&first, 1)], vec![sps_nal(&second), pps_nal(), idr(&second, 1)], vec![p(&second, 1)], vec![sps_nal(&second), p(&second, 2)]];
+        let mut dec = Decoder::new();
+        let frames: Vec<_> = samples.iter().map(|s| dec.decode_sample(&sample(s), 0.0).unwrap().expect("a frame for each sample")).collect();
+        let (old, new) = ((0, 0, 30, 28), (2, 4, 30, 28));
+        assert_eq!(frames.iter().map(|f| (f.crop, f.damaged)).collect::<Vec<_>>(), [(old, false), (old, false), (new, false), (new, false), (new, false)]);
+    }
+
+    #[test]
+    fn a_sequence_changed_at_a_p_picture_keeps_the_references() {
+        // a stream that sends its set again cropped another way before a P
+        // picture (only an IDR picture may change it): the cropping takes
+        // effect there, and the picture still predicts from the frame
+        // before it, which has its size (without it, its slice has no
+        // reference to predict from)
+        let first = Seq { crop: [0, 1, 0, 2], ..Seq::default() };
+        let second = Seq { crop: [1, 0, 2, 0], ..Seq::default() };
+        let idr = slice_nal(&first, &Slice { idr: true, intra: true, mbs: 4, ..Slice::default() });
+        let p = slice_nal(&second, &Slice { frame_num: 1, mbs: 4, ..Slice::default() });
+        let mut dec = Decoder::new();
+        let frames = [dec.decode_sample(&sample(&[sps_nal(&first), pps_nal(), idr]), 0.0), dec.decode_sample(&sample(&[sps_nal(&second), p]), 1.0)];
+        assert_eq!(frames.map(|f| f.unwrap().map(|f| (f.crop, f.damaged))), [Some(((0, 0, 30, 28), false)), Some(((2, 4, 30, 28), false))]);
     }
 }

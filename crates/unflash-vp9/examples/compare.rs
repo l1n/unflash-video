@@ -34,6 +34,7 @@ fn main() {
     let max: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
     let data = std::fs::read(&path).unwrap();
     let mut dec = Decoder::new(&[]).unwrap();
+    dec.set_keep_deep(true);
     let mut frames = Vec::new();
     let t0 = std::time::Instant::now();
     for (i, (s, pts)) in samples(&data).iter().enumerate() {

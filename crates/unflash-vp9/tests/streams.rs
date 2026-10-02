@@ -27,6 +27,8 @@ fn samples(data: &[u8]) -> Vec<(&[u8], f64)> {
 fn check(file: &str) {
     let data = std::fs::read(media(file)).expect("run tests/media/vp9/gen.sh");
     let mut dec = Decoder::new(&[]).unwrap();
+    // (ffmpeg's MD5s of a deeper stream are of its 16-bit samples)
+    dec.set_keep_deep(true);
     let mut got = Vec::new();
     for (sample, pts) in samples(&data) {
         let frames = dec.decode(sample, pts).unwrap_or_else(|e| panic!("{file}: {e} at pts {pts}"));
@@ -107,4 +109,30 @@ fn odd_sizes() {
 fn scaled_references() {
     check("resize.ivf");
     check("resize_odd.ivf");
+}
+
+/// The full-precision planes come only when asked for (the app reads the
+/// 8-bit ones alone); the 8-bit planes are the same either way, and are the
+/// full-precision ones rounded.
+#[test]
+fn deep_frames_carry_rounded_eight_bit_planes() {
+    for file in ["p2_10bit.ivf", "p2_12bit.ivf"] {
+        let data = std::fs::read(media(file)).expect("run tests/media/vp9/gen.sh");
+        let (mut plain, mut deep) = (Decoder::new(&[]).unwrap(), Decoder::new(&[]).unwrap());
+        deep.set_keep_deep(true);
+        for (sample, pts) in samples(&data) {
+            let (a, b) = (plain.decode(sample, pts).unwrap(), deep.decode(sample, pts).unwrap());
+            assert_eq!(a.len(), b.len(), "{file}");
+            for (p, f) in a.iter().zip(&b) {
+                assert!(p.y16.is_none() && p.u16.is_none() && p.v16.is_none(), "{file}: 16-bit planes nobody asked for");
+                assert!(p.y == f.y && p.u == f.u && p.v == f.v, "{file}: the 8-bit planes differ");
+                let shift = f.bit_depth as u32 - 8;
+                for (full, rounded) in [(&f.y16, &f.y), (&f.u16, &f.u), (&f.v16, &f.v)] {
+                    let full = full.as_ref().unwrap();
+                    assert_eq!(full.len(), rounded.len());
+                    assert!(full.iter().zip(rounded).all(|(&h, &l)| ((h as u32 + (1 << (shift - 1))) >> shift).min(255) as u8 == l), "{file}: not rounded");
+                }
+            }
+        }
+    }
 }

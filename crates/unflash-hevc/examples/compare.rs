@@ -29,6 +29,7 @@ fn main() {
     let annexb = !path.ends_with(".mp4") && !path.ends_with(".mkv");
     if annexb {
         let mut dec = Decoder::new(&[]).unwrap();
+        dec.set_keep_deep(true);
         match dec.decode_annexb(&data, 0.0) {
             Ok(f) => frames.extend(f),
             Err(e) => println!("error: {e}"),
@@ -38,6 +39,7 @@ fn main() {
         let movie = parse_bytes(&data).unwrap();
         let track = movie.video().unwrap();
         let mut dec = Decoder::new(track.description.as_deref().unwrap_or(&[])).unwrap();
+        dec.set_keep_deep(true);
         for (i, s) in track.samples.iter().enumerate() {
             let bytes = &data[s.offset as usize..(s.offset + s.size as u64) as usize];
             match dec.decode(bytes, s.pts as f64) {

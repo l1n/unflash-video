@@ -76,6 +76,8 @@ fn picture_hashes(data: &[u8]) -> usize {
 fn decode(data: &[u8]) -> Result<(Vec<String>, usize, u8), Error> {
     let mut dec = Decoder::new(&[])?;
     dec.set_check_hashes(true);
+    // (ffmpeg's MD5s of a deeper stream are of its 16-bit samples)
+    dec.set_keep_deep(true);
     let mut frames = dec.decode_annexb(data, 0.0)?;
     frames.extend(dec.flush()?);
     let damaged = frames.iter().filter(|f| f.damaged).count();

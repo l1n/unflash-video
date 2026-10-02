@@ -23,10 +23,12 @@ fn samples(name: &str) -> (Vec<u8>, Vec<(Vec<u8>, f64)>) {
     (track.description.clone().unwrap(), samples)
 }
 
-/// Decode a file; every picture in presentation order.
-fn decode(name: &str) -> Result<Vec<Frame>, Error> {
+/// Decode a file; every picture in presentation order (deeper ones at full
+/// precision too with `keep_deep`).
+fn decode(name: &str, keep_deep: bool) -> Result<Vec<Frame>, Error> {
     let (config, samples) = samples(name);
     let mut dec = Decoder::new(&config)?;
+    dec.set_keep_deep(keep_deep);
     let mut frames = Vec::new();
     for (bytes, pts) in &samples {
         let got = dec.decode(bytes, *pts)?;
@@ -43,7 +45,8 @@ fn expected(name: &str) -> Vec<String> {
 }
 
 fn check(name: &str) {
-    let got = decode(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+    // (ffmpeg's MD5s of a deeper stream are of its 16-bit samples)
+    let got = decode(name, true).unwrap_or_else(|e| panic!("{name}: {e}"));
     let want = expected(name);
     assert_eq!(got.len(), want.len(), "{name}: frame count");
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -119,7 +122,7 @@ fn main10_weighted_lossless() {
 
 #[test]
 fn monochrome() {
-    let got = decode("mono").unwrap();
+    let got = decode("mono", false).unwrap();
     let want = expected("mono");
     assert_eq!(got.len(), want.len(), "mono: frame count");
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -130,10 +133,17 @@ fn monochrome() {
     }
 }
 
+/// The full-precision planes come only when asked for (the app reads the
+/// 8-bit ones alone), and the 8-bit planes are the same either way.
 #[test]
 fn ten_bit_frames_carry_rounded_eight_bit_planes() {
-    for f in decode("main10").unwrap() {
-        assert_eq!(f.bit_depth, 10);
+    let plain = decode("main10", false).unwrap();
+    let deep = decode("main10", true).unwrap();
+    assert_eq!(plain.len(), deep.len());
+    for (p, f) in plain.iter().zip(&deep) {
+        assert_eq!((p.bit_depth, f.bit_depth), (10, 10));
+        assert!(p.y16.is_none() && p.u16.is_none() && p.v16.is_none());
+        assert!(p.y == f.y && p.u == f.u && p.v == f.v);
         let y16 = f.y16.as_ref().unwrap();
         assert_eq!(y16.len(), f.y.len());
         assert!(y16.iter().zip(&f.y).all(|(&h, &l)| ((h + 2) >> 2).min(255) as u8 == l));

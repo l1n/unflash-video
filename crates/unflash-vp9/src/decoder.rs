@@ -25,7 +25,8 @@ pub struct Frame {
     pub u: Vec<u8>,
     pub v: Vec<u8>,
     pub bit_depth: u8,
-    /// The planes at full precision, when `bit_depth` is above 8.
+    /// The planes at full precision, when `bit_depth` is above 8 and the
+    /// decoder was asked for them ([`Decoder::set_keep_deep`]).
     pub y16: Option<Vec<u16>>,
     pub u16: Option<Vec<u16>>,
     pub v16: Option<Vec<u16>>,
@@ -55,10 +56,10 @@ impl Stored {
         }
     }
 
-    fn to_frame(&self, pts: f64) -> Frame {
+    fn to_frame(&self, pts: f64, keep_deep: bool) -> Frame {
         match self {
             Stored::Low(f) => frame_from_low(f, pts),
-            Stored::High(f) => frame_from_high(f, pts),
+            Stored::High(f) => frame_from_high(f, pts, keep_deep),
         }
     }
 }
@@ -126,6 +127,8 @@ pub struct Decoder {
     /// The size and show_frame of the last decoded frame (compute_image_size).
     last_size: Option<(u32, u32)>,
     last_show_frame: bool,
+    /// Deeper frames come out at full precision too (`set_keep_deep`).
+    keep_deep: bool,
 }
 
 impl Decoder {
@@ -148,7 +151,17 @@ impl Decoder {
             pool16: Vec::new(),
             last_size: None,
             last_show_frame: false,
+            keep_deep: false,
         })
+    }
+
+    /// Give 10 and 12-bit frames at full precision too ([`Frame::y16`] and
+    /// the others) besides the rounded 8-bit planes every frame has: for
+    /// comparing with another decoder at that depth, as the tests do. Off
+    /// by default (they stay None), since the app reads only the 8-bit
+    /// planes, and the copy is about 6 MB a frame at 10-bit 1080p.
+    pub fn set_keep_deep(&mut self, keep: bool) {
+        self.keep_deep = keep;
     }
 
     /// Decode one container sample (a frame, or a superframe holding several
@@ -185,7 +198,7 @@ impl Decoder {
         let fh = parse_uncompressed_header(data, &mut self.state, &ref_sizes)?;
         if fh.show_existing_frame {
             let slot = self.slots[fh.frame_to_show].as_ref().ok_or(Error::Bitstream("frame to show is missing"))?;
-            out.push(slot.to_frame(pts));
+            out.push(slot.to_frame(pts, self.keep_deep));
             return Ok(fh.uncompressed_size);
         }
         let end = fh.uncompressed_size + fh.compressed_size;
@@ -363,7 +376,7 @@ impl Decoder {
             }
         }
         if fh.show_frame {
-            out.push(T::wrap(cur.clone()).to_frame(pts));
+            out.push(T::wrap(cur.clone()).to_frame(pts, self.keep_deep));
         }
         if let Ok(f) = Rc::try_unwrap(cur) {
             T::pool(self).push(f);
@@ -531,20 +544,30 @@ fn frame_from_low(f: &FrameBuf<u8>, pts: f64) -> Frame {
     }
 }
 
-fn frame_from_high(f: &FrameBuf<u16>, pts: f64) -> Frame {
-    let shift = f.bit_depth as u32 - 8;
-    let narrow = |v: &[u16]| v.iter().map(|&s| ((s as u32 + (1 << (shift - 1))) >> shift).min(255) as u8).collect::<Vec<u8>>();
-    let (y, u, v) = (visible(&f.planes[0]), visible(&f.planes[1]), visible(&f.planes[2]));
+/// The visible part of a deeper plane, tightly packed and rounded to 8 bits.
+fn visible_rounded(p: &crate::frame::Plane<u16>, bit_depth: u8) -> Vec<u8> {
+    let shift = bit_depth as u32 - 8;
+    let mut out = Vec::with_capacity(p.width * p.height);
+    for row in p.data.chunks(p.stride).take(p.height) {
+        out.extend(row[..p.width].iter().map(|&s| ((s as u32 + (1 << (shift - 1))) >> shift).min(255) as u8));
+    }
+    out
+}
+
+/// A deeper frame: its planes rounded straight from the frame's rows, and
+/// copied out at full precision as well only when `keep_deep` asks.
+fn frame_from_high(f: &FrameBuf<u16>, pts: f64, keep_deep: bool) -> Frame {
+    let deep = |p| keep_deep.then(|| visible(p));
     Frame {
         width: f.width,
         height: f.height,
-        y: narrow(&y),
-        u: narrow(&u),
-        v: narrow(&v),
+        y: visible_rounded(&f.planes[0], f.bit_depth),
+        u: visible_rounded(&f.planes[1], f.bit_depth),
+        v: visible_rounded(&f.planes[2], f.bit_depth),
         bit_depth: f.bit_depth,
-        y16: Some(y),
-        u16: Some(u),
-        v16: Some(v),
+        y16: deep(&f.planes[0]),
+        u16: deep(&f.planes[1]),
+        v16: deep(&f.planes[2]),
         pts,
         damaged: f.damaged,
         bt709: is_bt709(f.color_space, f.height),
