@@ -1676,18 +1676,24 @@ try {
   // 14709 of its 33.2 million, in 30 of the 300 frames), and the same for
   // both, now that the canvas hands over its pictures at their own size
   // for the detector to make small (it made them small itself, with
-  // another filter, and the flash ended a frame early). Where the pictures
-  // are the same they must be so value for value, and every route must find
-  // exactly the violations the default one finds.
+  // another filter, and the flash ended a frame early). The live monitor's
+  // <video> goes by yuv too, a VideoFrame of the picture on screen
+  // converted as the decoder's are (the one Chromium makes here names no
+  // colour space), else by pixels. Where the pictures are the same they
+  // must be so value for value, and every route must find exactly the
+  // violations the default one finds.
   await ensurePage('cpu=1&auto=0');
   await openFile('flash.mp4');
   results.cpuRoutePictures = await page.evaluate(async () => {
     const wasm = await import('./pkg/unflash.js');
     const { createDetector } = await import('./detector.js');
     const { Movie, decodeRange } = await import('./media.js');
-    const m = await Movie.open(new File([await (await fetch('clips/flash.mp4')).blob()], 'flash.mp4'), wasm);
+    const blob = await (await fetch('clips/flash.mp4')).blob();
+    const m = await Movie.open(new File([blob], 'flash.mp4'), wasm);
     const made = (route) => createDetector(wasm, window.__unflash.state.config, m.width, m.height, { preferGpu: false, route });
-    const dets = { yuv: await made('yuv'), rgba: await made('rgba'), pixels: await made('pixels'), workers: await made(null) };
+    const dets = { yuv: await made('yuv'), rgba: await made('rgba'), pixels: await made('pixels'), workers: await made(null), video: await made(null) };
+    // (the live monitor's: the decoder's colour space, as the app reads it for it)
+    dets.video.decoderColorSpace = window.__unflash.state.liveFeeder.decoderColorSpace;
     // the picture a detector analysed last, as it analysed it
     const last = (name) => dets[name].det.take_capture(dets[name].records().pop().index);
     const differ = (a, b) => {
@@ -1695,9 +1701,11 @@ try {
       for (let k = 0; k < a.length; k++) if ((k & 3) !== 3 && a[k] !== b[k]) n++;
       return n;
     };
-    // values that differ: yuv against the workers, pixels against rgba, and rgba against yuv
-    const n = { yuv: 0, pixels: 0, browser: 0, frames: 0 };
+    // values that differ: yuv against the workers and the <video>, pixels against rgba, and rgba against yuv
+    const n = { yuv: 0, video: 0, pixels: 0, browser: 0, frames: 0, shown: 0 };
+    // the yuv route's pictures, by frame (flash.mp4 has 30 a second)
     const own = new Map();
+    const v = document.createElement('video');
     try {
       await decodeRange(m, m.tsMin, m.tsMax + 1, async (frame, t) => {
         const got = {};
@@ -1706,7 +1714,7 @@ try {
           got[name] = last(name);
         }
         frame.close();
-        own.set(t, got.yuv);
+        own.set(Math.round(t * 30), got.yuv);
         n.pixels += differ(got.pixels, got.rgba);
         n.browser += differ(got.rgba, got.yuv);
       });
@@ -1717,13 +1725,30 @@ try {
         m.tsMax + 1,
         async (pic, t) => {
           await w.videoFrame(pic, t, true);
-          n.yuv += own.has(t) ? differ(own.get(t), last('workers')) : Infinity;
+          n.yuv += own.has(Math.round(t * 30)) ? differ(own.get(Math.round(t * 30)), last('workers')) : Infinity;
           n.frames++;
         },
         { raw: true, workers: true, shrink: { aw: w.aw, ah: w.ah } }
       );
-      return { routes: Object.values(dets).map((d) => d.route), frames: [own.size, n.frames], values: n.frames * w.aw * w.ah * 3, differ: { yuv: n.yuv, pixels: n.pixels, browser: n.browser } };
+      // each picture of the video on a <video>, as the live monitor reads it
+      v.muted = true;
+      v.src = URL.createObjectURL(blob);
+      await new Promise((resolve, reject) => {
+        v.onloadeddata = resolve;
+        v.onerror = () => reject(new Error('the <video> cannot play flash.mp4'));
+      });
+      for (let k = 0; k < own.size; k++) {
+        await new Promise((resolve) => {
+          v.addEventListener('seeked', resolve, { once: true });
+          v.currentTime = (k + 0.5) / 30;
+        });
+        await dets.video.videoElement(v, k / 30, true);
+        n.video += own.has(k) ? differ(own.get(k), last('video')) : Infinity;
+        n.shown++;
+      }
+      return { routes: Object.values(dets).map((d) => d.route), frames: [own.size, n.frames, n.shown], values: n.frames * w.aw * w.ah * 3, differ: { yuv: n.yuv, video: n.video, pixels: n.pixels, browser: n.browser } };
     } finally {
+      URL.revokeObjectURL(v.src);
       for (const d of Object.values(dets)) d.det.free();
       m.close();
     }
@@ -1731,12 +1756,17 @@ try {
   console.log("the CPU detector's pictures by route:", JSON.stringify(results.cpuRoutePictures));
   {
     const p = results.cpuRoutePictures;
-    assert(p.routes.join() === 'yuv,rgba,pixels,raw' && p.frames.join() === '300,300', 'each route took every picture: ' + JSON.stringify(p));
+    assert(p.routes.join() === 'yuv,rgba,pixels,raw,yuv' && p.frames.join() === '300,300,300', 'each route took every picture: ' + JSON.stringify(p));
     assert(p.differ.yuv === 0, "the frame's own planes give the CPU detector the pictures the decode workers give it: " + JSON.stringify(p));
+    assert(p.differ.video === 0, 'and the pictures the <video> shows, as the live monitor reads them: ' + JSON.stringify(p));
     assert(p.differ.pixels === 0, "a canvas's pixels give it the pictures WebCodecs' RGBA conversion gives it: " + JSON.stringify(p));
   }
-  for (const route of ['yuv', 'rgba', 'pixels']) {
-    await page.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0&route=${route}`);
+  for (const [route, liveRoute] of [
+    ['yuv', 'yuv'],
+    ['rgba', 'yuv'],
+    ['pixels', 'pixels'],
+  ]) {
+    await page.goto(`http://127.0.0.1:${port}/?cpu=1&auto=0&route=${route}&monitor=detect`);
     await page.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
     await openFile('flash.mp4');
     scan = await scanCurrent();
@@ -1745,6 +1775,16 @@ try {
     console.log(`cpu scan, pictures via ${route}:`, scan.ms, 'ms | route', taken, '|', JSON.stringify(violations));
     assert(scan.status.includes('CPU') && taken === route, `?cpu=1&route=${route} must feed the CPU detector pictures as ${route}, not ${taken}`);
     sameViolations(`the CPU detector's ${route} route against its default`, violations, results.cpuViolations);
+    // the live monitor, stepped through the flashing a frame at a time (as below)
+    await page.check('#liveToggle');
+    const liveSeen = new Set();
+    for (let k = 75; k <= 180; k++) liveSeen.add(await page.evaluate((k) => window.__unflash.liveStep((k + 0.5) / 30), k));
+    const live = await page.evaluate(() => ({ route: window.__unflash.state.liveFeeder.route, ms: window.__unflash.state.liveFeeder.busyNs / 1e6 / Math.max(1, window.__unflash.state.liveFeeder.fed) }));
+    console.log(`live monitor with ?cpu=1&route=${route}:`, [...liveSeen], '| route', live.route, `| ${live.ms.toFixed(2)} ms a picture`);
+    assert([...liveSeen].some((s) => /^flashing|violations? so far/.test(s)), `the CPU live monitor must report the flashing with ?route=${route}: ` + JSON.stringify([...liveSeen]));
+    assert(live.route === liveRoute, `the CPU live monitor must feed the <video> as ${liveRoute} with ?route=${route}, not ${live.route}`);
+    await page.uncheck('#liveToggle');
+    await page.evaluate(() => document.querySelector('#player').pause());
   }
 
   // Then the GPU detector. ?route forces one: the frame itself (videoframe),

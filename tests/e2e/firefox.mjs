@@ -11,8 +11,11 @@
 // the first goes on; a section prepares, checks and is fixed by a Suggest
 // button; in a scan in chunks, the built-in decoder takes over the
 // chunks Firefox's slow lanes hold up, with the same result, and, rebalanced,
-// sets the slow lanes aside and grows into their cores; and a transport
-// stream is read as ffmpeg reads it, scanned, and its AC-3 sound decoded.
+// sets the slow lanes aside and grows into their cores; a transport
+// stream is read as ffmpeg reads it, scanned, and its AC-3 sound decoded;
+// and the CPU detector's live monitor reports the flashing in the player,
+// by whichever route Firefox's <video> allows (it makes BGRA VideoFrames,
+// not the 4:2:0 ones the yuv route copies: pixels).
 //   FIREFOX=/path/to/firefox node tests/e2e/firefox.mjs
 // (puppeteer-core found locally or globally: npm install -g puppeteer-core)
 import { execSync } from 'node:child_process';
@@ -56,9 +59,18 @@ function same(name, r, w) {
 
 try {
   // --- the CPU detector's reading of the clip, for the GPU's to match --------
-  const cpu = await newPage('cpu=1&auto=0&hybrid=0');
+  const cpu = await newPage('cpu=1&auto=0&hybrid=0&monitor=detect');
   await openClip(cpu);
   results.cpu = await scan(cpu);
+  // the live monitor on the CPU detector, stepped through the flashing a frame at a time
+  await cpu.click('#liveToggle');
+  await cpu.waitForFunction(() => window.__unflash.state.live.on);
+  const liveSeen = new Set();
+  for (let k = 75; k <= 180; k++) liveSeen.add(await cpu.evaluate((k) => window.__unflash.liveStep((k + 0.5) / 30), k));
+  results.live = { seen: [...liveSeen], route: await cpu.evaluate(() => window.__unflash.state.liveFeeder.route) };
+  console.log('the CPU live monitor:', JSON.stringify(results.live));
+  assert(results.live.seen.some((s) => /^flashing|violations? so far/.test(s)), 'the CPU live monitor reports the flashing: ' + JSON.stringify(results.live));
+  assert(['yuv', 'pixels'].includes(results.live.route), "it reads the player's pictures by a route the CPU detector has: " + results.live.route);
   await cpu.close();
   const kinds = results.cpu.violations.map((v) => v.kind);
   assert(kinds.includes('flash') && kinds.includes('red'), 'the clip flashes, and red: ' + JSON.stringify(results.cpu.violations));

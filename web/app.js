@@ -3,7 +3,7 @@
 import init, * as wasm from './pkg/unflash.js';
 import { defaultWorkerCount, SoftwarePool } from './h264pool.js';
 import { builtInFor } from './codecs.js';
-import { Movie } from './media.js';
+import { Movie, decodeRange } from './media.js';
 import { createDetector, gpuAdapter } from './detector.js';
 import { profile } from './profile.js';
 import { scanMovie, scanChunks, CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, hasMarks, BLEND_DEFAULT } from './analysis.js';
@@ -949,11 +949,37 @@ async function makeDetectors(movie, config, progress = null) {
   try {
     if (progress) progress(0.8, `${feeder.backend} detector at ${feeder.aw}×${feeder.ah}`);
     const live = await createDetector(wasm, config, movie.width, movie.height, { ...detectorSettings(), batch: 1 });
+    // (the player's pictures, converted as the decoder's are)
+    live.decoderColorSpace = () => decoderColorSpace(movie);
     return { config, feeder, live };
   } catch (e) {
     feeder.det.free();
     throw e;
   }
+}
+
+const decoderColorSpaces = new WeakMap();
+
+/**
+ * The colour space the decoder gives `movie`'s pictures, as a scan sees
+ * them ({} when it names none), or null when its first picture cannot be
+ * decoded: what the live monitor converts the player's pictures by. Read
+ * off the first picture, once a video, when first asked.
+ */
+function decoderColorSpace(movie) {
+  if (!decoderColorSpaces.has(movie)) decoderColorSpaces.set(movie, firstColorSpace(movie).catch(() => null));
+  return decoderColorSpaces.get(movie);
+}
+
+async function firstColorSpace(movie) {
+  let found = null;
+  // (a reader of its own: a scan may be reading the file meanwhile)
+  const take = async (pic) => {
+    if (!found) found = (pic.colorSpace && pic.colorSpace.toJSON ? pic.colorSpace.toJSON() : pic.colorSpace) || {};
+    pic.close();
+  };
+  await decodeRange(movie, movie.tsMin, movie.tsMin + 0.001, take, { reader: movie.reader.fork() });
+  return found;
 }
 
 /** Free detectors `made` (makeDetectors) that were never put to use. */
@@ -1365,15 +1391,9 @@ function startLiveLoop() {
     if (state.live.fromScan) {
       monitorFromScan(meta.mediaTime);
     } else {
-      const det = feeder.det;
       feeder.poll();
-      if (det.can_submit()) {
-        try {
-          feeder.videoElementNow(player, meta.mediaTime, false);
-        } catch (e) {
-          console.warn(e);
-        }
-      }
+      // (a picture the yuv route still copies holds the next back, as a full GPU does)
+      if (feeder.videoReady()) feeder.videoElementNow(player, meta.mediaTime, false).then(drainLive, (e) => console.warn(e));
       drainLive();
     }
     if (!player.paused && !player.ended) player.requestVideoFrameCallback(step);

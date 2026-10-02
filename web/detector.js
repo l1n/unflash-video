@@ -189,8 +189,10 @@ class SourceProbe {
 
 /** The routes a VideoFrame can take to the detector, best first. */
 const FRAME_ROUTES = ['videoframe', 'yuv', 'rgba', 'canvas', 'pixels'];
-/** The routes the live monitor's <video> element can take. */
+/** The routes the live monitor's <video> element can take to the GPU detector, best first. */
 const VIDEO_ROUTES = ['video', 'canvas', 'pixels'];
+/** The routes it can take to the CPU detector, best first. */
+const CPU_VIDEO_ROUTES = ['yuv', 'pixels'];
 
 /** Feeds pictures of any kind into a Detector with back-pressure. */
 export class Feeder {
@@ -207,8 +209,15 @@ export class Feeder {
     this.route = ''; // how the last picture reached the detector
     this.reported = '';
     this.frameRoutes = route ? [route] : FRAME_ROUTES.slice();
-    this.videoRoutes = route && VIDEO_ROUTES.includes(route) ? [route] : VIDEO_ROUTES.slice();
+    const videoRoutes = backend === 'webgpu' ? VIDEO_ROUTES : CPU_VIDEO_ROUTES;
+    this.videoRoutes = route && videoRoutes.includes(route) ? [route] : videoRoutes.slice();
     this.submitted = []; // submit times of the GPU frames in flight (latency accounting)
+    // () => a promise of the colour space the decoder gives the pictures of
+    // the video a <video> plays (the app sets it for the live monitor's
+    // detector: see feedVideoYuv), and whether a <video>'s picture is on
+    // its way in (the yuv route copies it first)
+    this.decoderColorSpace = null;
+    this.videoBusy = false;
   }
 
   get gpu() {
@@ -299,8 +308,12 @@ export class Feeder {
     profile.add('feed.upload', performance.now() - t1);
   }
 
-  /** The frame's own 4:2:0 planes (I420 / NV12), converted by the detector. False when the frame cannot give them. */
-  async feedYuv(frame, w, h, t, capture) {
+  /**
+   * The frame's own 4:2:0 planes (I420 / NV12), converted by the detector
+   * by `colorSpace` (the frame's own unless given). False when the frame
+   * cannot give them.
+   */
+  async feedYuv(frame, w, h, t, capture, colorSpace = frame.colorSpace) {
     const fmt = frame.format;
     if (fmt !== 'I420' && fmt !== 'I420A' && fmt !== 'NV12') return false;
     const size = frame.allocationSize();
@@ -309,7 +322,7 @@ export class Feeder {
     const planes = await frame.copyTo(this.yuvBuf);
     profile.add('feed.copyTo', performance.now() - t0);
     if (!planes || planes.length < (fmt === 'NV12' ? 2 : 3)) return false;
-    const layout = yuvLayoutWords(fmt, planes, frame.colorSpace, h);
+    const layout = yuvLayoutWords(fmt, planes, colorSpace, h);
     const t1 = performance.now();
     this.det.feed_yuv(this.yuvBuf.subarray(0, size), w, h, layout, t, capture);
     profile.add('feed.upload', performance.now() - t1);
@@ -476,8 +489,55 @@ export class Feeder {
     this.poll();
   }
 
-  /** Feed the current picture of a <video> without waiting (the live monitor: the caller checked can_submit). */
-  videoElementNow(video, t, capture = false) {
+  /**
+   * The <video>'s picture as a VideoFrame, its own 4:2:0 planes copied out
+   * for the CPU detector to convert and make small: a third of the time
+   * drawing it on a canvas and reading its pixels back takes at 1080p, so
+   * that the live monitor watches nearly every picture of a 30 fps video
+   * rather than one in three. They are the planes the decoder gives a scan,
+   * but a VideoFrame made of a <video> may name no colour space, or another
+   * one (Chromium: none for VP9, BT.601 for VP8 where its decoder says
+   * BT.709): converted by the decoder's (`decoderColorSpace`), they are the
+   * very pictures a scan sees. Throws, for the route to be dropped, when
+   * the browser makes no such VideoFrame (Firefox makes BGRA ones, which
+   * cost it more to copy than its canvas does) or the decoder's colours
+   * are not known.
+   */
+  async feedVideoYuv(video, t, capture) {
+    const frame = new VideoFrame(video, { timestamp: Math.round(t * 1e6) });
+    try {
+      if (!['I420', 'I420A', 'NV12'].includes(frame.format)) throw new Error(`its pictures are ${frame.format || 'opaque'}`);
+      const colorSpace = this.decoderColorSpace ? await this.decoderColorSpace() : null;
+      if (!colorSpace) throw new Error("the colours of the video's decoder are not known");
+      const w = frame.visibleRect ? frame.visibleRect.width : frame.codedWidth;
+      const h = frame.visibleRect ? frame.visibleRect.height : frame.codedHeight;
+      if (!(await this.feedYuv(frame, w, h, t, capture, colorSpace))) throw new Error('its planes could not be copied');
+    } finally {
+      frame.close();
+    }
+  }
+
+  /** Whether a picture of a <video> can go in now: there is room, and the last one is not still on its way (the yuv route copies it first). */
+  videoReady() {
+    return !this.videoBusy && this.det.can_submit();
+  }
+
+  /**
+   * Feed the current picture of a <video> without waiting for room (the
+   * live monitor: the caller asked videoReady()). Resolves once it is in:
+   * at once, but by the yuv route, once its planes are copied.
+   */
+  async videoElementNow(video, t, capture = false) {
+    this.videoBusy = true;
+    try {
+      await this.feedVideo(video, t, capture);
+    } finally {
+      this.videoBusy = false;
+    }
+  }
+
+  /** The current picture of a <video>, by the first route that works here. */
+  async feedVideo(video, t, capture) {
     const t0 = performance.now();
     const w = video.videoWidth;
     const h = video.videoHeight;
@@ -485,6 +545,7 @@ export class Feeder {
     let done = false;
     while (routes.length && !done) {
       const route = routes[0];
+      let detail = '';
       try {
         switch (route) {
           case 'video':
@@ -507,6 +568,10 @@ export class Feeder {
             this.det.feed_canvas(canvas, t, capture);
             break;
           }
+          case 'yuv':
+            await this.feedVideoYuv(video, t, capture);
+            detail = this.yuvDetail;
+            break;
           default:
             this.feedPixels(video, w, h, t, capture);
             break;
@@ -515,7 +580,7 @@ export class Feeder {
         this.dropRoute(routes, route, e && e.message ? e.message : e);
         continue;
       }
-      this.setRoute(route);
+      this.setRoute(route, detail);
       done = true;
     }
     if (!done) throw new Error('no way to feed the video to the detector in this browser');
@@ -528,7 +593,7 @@ export class Feeder {
 
   async videoElement(video, t, capture = false) {
     await this.waitSlot();
-    this.videoElementNow(video, t, capture);
+    await this.videoElementNow(video, t, capture);
     this.poll();
   }
 
