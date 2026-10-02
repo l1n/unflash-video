@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Deserialize;
-use unflash_mp4::demux::{Movie, TrackKind};
+use unflash_mp4::demux::{parse_bytes, Movie, TrackKind};
 use unflash_mp4::mux::{Muxer, TrackDesc};
-use unflash_mp4::{Demuxer, Track};
+use unflash_mp4::Track;
 
 #[derive(Deserialize)]
 struct Packets {
@@ -50,14 +50,7 @@ fn adler32(b: &[u8]) -> u32 {
 fn parse(data: &[u8], chunk: Option<u64>) -> Movie {
     let mut d = match chunk {
         // the sniffing front end, as the app uses it
-        None => {
-            let mut d = Demuxer::new(data.len() as u64);
-            while let Some((off, len)) = d.need() {
-                let end = (off + len).min(data.len() as u64);
-                d.feed(off, &data[off as usize..end as usize]).unwrap();
-            }
-            return d.into_movie().expect("a movie");
-        }
+        None => return parse_bytes(data).unwrap(),
         Some(c) => unflash_mp4::mkv::MkvDemuxer::with_chunk(data.len() as u64, c),
     };
     while let Some((off, len)) = d.need() {
@@ -168,7 +161,7 @@ fn remux(name: &str, data: &[u8], movie: &Movie) {
     let (moov, (patch_at, patch)) = mx.finish().unwrap();
     out[patch_at as usize..patch_at as usize + 8].copy_from_slice(&patch);
     out.extend_from_slice(&moov);
-    let back = unflash_mp4::demux::parse_bytes(&out).unwrap_or_else(|e| panic!("{name}: our MP4 does not parse: {e}"));
+    let back = parse_bytes(&out).unwrap_or_else(|e| panic!("{name}: our MP4 does not parse: {e}"));
     assert_eq!(back.video().unwrap().codec, v.codec, "{name}: video codec after the copy");
     if let Some(a) = audio {
         assert_eq!(back.audio().unwrap().codec, a.codec.replace("mp4a.6B", "mp3"), "{name}: audio codec after the copy");

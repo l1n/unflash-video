@@ -582,17 +582,12 @@ struct TrackSummary {
     kind: TrackKind,
     fourcc: String,
     codec: String,
-    description: Option<Vec<u8>>,
     timescale: u32,
     width: u32,
     height: u32,
     sample_rate: u32,
     channels: u32,
     samples: usize,
-    keyframes: usize,
-    duration_secs: f64,
-    first_pts_secs: f64,
-    last_pts_secs: f64,
     /// What the edit list adds to the composition times (negative for a
     /// media_time that skips into the track): the `pts` columns have it
     /// applied, so a sample's composition time in the file is pts -
@@ -634,10 +629,6 @@ impl Demuxer {
         self.inner.is_done()
     }
 
-    pub fn bytes_read(&self) -> f64 {
-        self.inner.bytes_read() as f64
-    }
-
     /// How far through reading the index, 0 to 1 (a Matroska file is read
     /// through, an MP4 only at its index).
     pub fn progress(&self) -> f64 {
@@ -662,17 +653,12 @@ impl Demuxer {
                 kind: t.kind,
                 fourcc: t.fourcc.clone(),
                 codec: t.codec.clone(),
-                description: t.description.clone(),
                 timescale: t.timescale,
                 width: t.width,
                 height: t.height,
                 sample_rate: t.sample_rate,
                 channels: t.channels,
                 samples: t.samples.len(),
-                keyframes: t.samples.iter().filter(|s| s.sync).count(),
-                duration_secs: t.duration_secs(),
-                first_pts_secs: t.samples.iter().map(|s| s.pts).min().map(|p| t.to_secs(p)).unwrap_or(0.0),
-                last_pts_secs: t.samples.iter().map(|s| s.pts).max().map(|p| t.to_secs(p)).unwrap_or(0.0),
                 edit_shift: t.edit_shift,
                 frame_duration: t.frame_duration,
                 prefix: t.prefix.clone(),
@@ -683,10 +669,7 @@ impl Demuxer {
             })
             .collect();
         Ok(serde_json::json!({
-            "timescale": m.timescale,
-            "duration_secs": m.duration_secs,
             "fragmented": m.fragmented,
-            "brands": m.brands,
             "format": m.format,
             "packet_size": m.packet_size,
             "tracks": tracks,
@@ -708,7 +691,8 @@ impl Demuxer {
     }
 
     /// One column of a track's sample table: `offset`, `size`, `pts_us`,
-    /// `dts_us`, `duration_us`, `pts_secs` or `sync` (0/1).
+    /// `dts_us`, `duration_us`, `pts_ticks`, `dts_ticks`, `duration_ticks` or
+    /// `sync` (0/1).
     pub fn sample_table(&self, index: u32, field: &str) -> Result<Vec<f64>, JsValue> {
         let t = self.track(index)?;
         let v: Vec<f64> = match field {
@@ -717,7 +701,6 @@ impl Demuxer {
             "pts_us" => t.samples.iter().map(|s| t.to_us(s.pts) as f64).collect(),
             "dts_us" => t.samples.iter().map(|s| t.to_us(s.dts) as f64).collect(),
             "duration_us" => t.samples.iter().map(|s| t.to_us(s.duration as i64) as f64).collect(),
-            "pts_secs" => t.samples.iter().map(|s| t.to_secs(s.pts)).collect(),
             "pts_ticks" => t.samples.iter().map(|s| s.pts as f64).collect(),
             "dts_ticks" => t.samples.iter().map(|s| s.dts as f64).collect(),
             "duration_ticks" => t.samples.iter().map(|s| s.duration as f64).collect(),
@@ -783,10 +766,6 @@ impl Muxer {
         self.inner.add_sample(track as usize, dts as i64, pts as i64, duration as u32, sync, size as u32).map_err(js_err)
     }
 
-    pub fn position(&self) -> f64 {
-        self.inner.position() as f64
-    }
-
     /// The `moov` box to append. Afterwards `patch_offset()` / `patch_bytes()`
     /// say which 8 bytes of the head to overwrite.
     pub fn finish(&mut self) -> Result<Vec<u8>, JsValue> {
@@ -815,12 +794,6 @@ impl Default for Muxer {
 #[wasm_bindgen]
 pub fn audio_sample_entry(codec: &str, description: &[u8], sample_rate: u32, channels: u32) -> Result<Vec<u8>, JsValue> {
     unflash_mp4::entry::encoded_audio_entry(codec, description, sample_rate, channels).map_err(js_err)
-}
-
-#[wasm_bindgen]
-pub fn codec_of_entry(entry: &[u8]) -> Result<String, JsValue> {
-    let c = unflash_mp4::mux::codec_of_entry(entry).map_err(js_err)?;
-    Ok(serde_json::json!({ "codec": c.codec, "description": c.description }).to_string())
 }
 
 // ---- detector --------------------------------------------------------------

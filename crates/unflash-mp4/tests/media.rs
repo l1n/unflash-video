@@ -68,15 +68,7 @@ fn demux_matches_ffprobe() {
         let data = std::fs::read(&f).unwrap();
         let movie = parse_bytes(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
         let video = movie.video().unwrap_or_else(|| panic!("{name}: no video track"));
-        eprintln!(
-            "{name}: {}x{} {} ({} samples, fragmented={}, brands={:?})",
-            video.width,
-            video.height,
-            video.codec,
-            video.samples.len(),
-            movie.fragmented,
-            movie.brands
-        );
+        eprintln!("{name}: {}x{} {} ({} samples, fragmented={})", video.width, video.height, video.codec, video.samples.len(), movie.fragmented);
         assert_eq!((video.width, video.height), (64, 48), "{name}: dimensions");
         if name.starts_with("h264") {
             assert!(video.codec.starts_with("avc1."), "{name}: codec {}", video.codec);

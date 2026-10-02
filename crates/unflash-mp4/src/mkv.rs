@@ -11,10 +11,10 @@
 //! stripping are handled; damaged data is skipped to the next cluster.
 
 use crate::codec::{av1_codec, avc_codec, hevc_codec};
-use crate::demux::{Movie, Sample, Track, TrackKind};
+use crate::demux::{pcm_codec, rescale, Movie, PcmForm, Sample, Track, TrackKind};
 use crate::entry;
-use crate::mux::write_video_entry;
-use crate::reader::Writer;
+use crate::mux::{dts_from_cts, write_video_entry};
+use crate::reader::{Bits, Writer};
 use crate::Error;
 
 const EBML_HEADER: u32 = 0x1A45_DFA3;
@@ -23,7 +23,6 @@ const SEGMENT: u32 = 0x1853_8067;
 const SEEK_HEAD: u32 = 0x114D_9B74;
 const INFO: u32 = 0x1549_A966;
 const TIMESTAMP_SCALE: u32 = 0x2A_D7B1;
-const DURATION: u32 = 0x4489;
 const TRACKS: u32 = 0x1654_AE6B;
 const TRACK_ENTRY: u32 = 0xAE;
 const TRACK_NUMBER: u32 = 0xD7;
@@ -56,7 +55,6 @@ const CLUSTER_TIMESTAMP: u32 = 0xE7;
 const SIMPLE_BLOCK: u32 = 0xA3;
 const BLOCK_GROUP: u32 = 0xA0;
 const BLOCK: u32 = 0xA1;
-const BLOCK_DURATION: u32 = 0x9B;
 const REFERENCE_BLOCK: u32 = 0xFB;
 const CUES: u32 = 0x1C53_BB6B;
 const CHAPTERS: u32 = 0x1043_A770;
@@ -143,8 +141,10 @@ fn children(data: &[u8]) -> Result<Vec<(u32, &[u8])>, Error> {
         let Some(Some((id, il))) = read_id(&data[p..]) else { return Err(format!("damaged element at +{p}")) };
         let Some(Some((size, sl))) = read_vint(&data[p + il..]) else { return Err(format!("damaged element size at +{p}")) };
         let body = p + il + sl;
+        // (compared as u64: a size of 4 GB or more would be cut short as a 32-bit usize)
         let end = match size {
-            Some(s) => body.checked_add(s as usize).filter(|&e| e <= data.len()).ok_or_else(|| format!("element {id:#x} overruns its parent"))?,
+            Some(s) if s <= (data.len() - body) as u64 => body + s as usize,
+            Some(_) => return Err(format!("element {id:#x} overruns its parent")),
             None => data.len(),
         };
         out.push((id, &data[body..end]));
@@ -204,7 +204,6 @@ struct Group {
     track: u64,
     frames: Vec<Frame>,
     referenced: bool,
-    duration: Option<u64>,
 }
 
 /// Byte-range driven Matroska parser: `need()` -> read that range ->
@@ -216,12 +215,9 @@ pub struct MkvDemuxer {
     pos: u64,
     want: Option<(u64, u64)>,
     stack: Vec<Open>,
-    bytes_read: u64,
     doc_type: String,
     /// Nanoseconds per timestamp tick.
     scale: u64,
-    /// Ticks.
-    duration: Option<f64>,
     tracks: Vec<MkvTrack>,
     cluster_ts: i64,
     group: Option<Group>,
@@ -256,10 +252,8 @@ impl MkvDemuxer {
             pos: 0,
             want: None,
             stack: Vec::new(),
-            bytes_read: 0,
             doc_type: "matroska".into(),
             scale: 1_000_000,
-            duration: None,
             tracks: Vec::new(),
             cluster_ts: 0,
             group: None,
@@ -290,10 +284,6 @@ impl MkvDemuxer {
         self.done
     }
 
-    pub fn bytes_read(&self) -> u64 {
-        self.bytes_read
-    }
-
     /// How far through the file the parse has got, 0 to 1.
     pub fn progress(&self) -> f64 {
         if self.done || self.file_size == 0 {
@@ -311,15 +301,11 @@ impl MkvDemuxer {
         self.movie
     }
 
+    /// Serve the bytes of the last `need()` range: from its offset, at least
+    /// its length (which [`crate::Demuxer::feed`] sees to).
     pub fn feed(&mut self, offset: u64, data: &[u8]) -> Result<(), Error> {
-        let Some((want_off, want_len)) = self.want else {
-            return Err("demuxer is not waiting for data".into());
-        };
-        if offset != want_off || (data.len() as u64) < want_len {
-            return Err(format!("expected {want_len} bytes at {want_off}, got {} at {offset}", data.len()));
-        }
-        self.bytes_read += want_len;
-        let data = &data[..want_len as usize];
+        // (the bytes asked for, of what may be more)
+        let data = &data[..self.want.map_or(0, |(_, n)| n as usize).min(data.len())];
         loop {
             match self.step(offset, data)? {
                 Step::Go => continue,
@@ -401,7 +387,8 @@ impl MkvDemuxer {
                         return Ok(Step::Stop);
                     }
                     self.pos = end_of_data.saturating_sub(3).max(self.pos + 1);
-                    return Ok(Step::More(0));
+                    // (a read can be shorter than the ID it looks for)
+                    return Ok(Step::More(4));
                 }
             }
         }
@@ -489,6 +476,11 @@ impl MkvDemuxer {
                 self.pos = body;
             }
             (Some(CLUSTER), CLUSTER_TIMESTAMP) => {
+                // (an unsigned integer of 8 bytes at most: anything else is
+                // damage, not a reason to give up on the file)
+                if size.is_none_or(|s| s > 8) {
+                    return Ok(self.damaged_here());
+                }
                 let Some(b) = whole()? else { return Ok(Step::More(hl + size.unwrap_or(0))) };
                 self.cluster_ts = uint(b) as i64;
                 self.pos = end;
@@ -528,13 +520,6 @@ impl MkvDemuxer {
                 self.stack.push(Open { id: BLOCK_GROUP, end });
                 self.group = Some(Group::default());
                 self.pos = body;
-            }
-            (Some(BLOCK_GROUP), BLOCK_DURATION) => {
-                let Some(b) = whole()? else { return Ok(Step::More(hl + size.unwrap_or(0))) };
-                if let Some(g) = self.group.as_mut() {
-                    g.duration = Some(uint(b));
-                }
-                self.pos = end;
             }
             (Some(BLOCK_GROUP), REFERENCE_BLOCK) => {
                 if let Some(g) = self.group.as_mut() {
@@ -587,10 +572,8 @@ impl MkvDemuxer {
 
     fn parse_info(&mut self, b: &[u8]) -> Result<(), Error> {
         for (id, v) in children(b)? {
-            match id {
-                TIMESTAMP_SCALE => self.scale = uint(v).max(1),
-                DURATION => self.duration = Some(float(v)),
-                _ => {}
+            if id == TIMESTAMP_SCALE {
+                self.scale = uint(v).max(1);
             }
         }
         Ok(())
@@ -802,11 +785,7 @@ impl MkvDemuxer {
         if self.tracks.is_empty() {
             return Err(if self.seen_segment { "no tracks found in this Matroska file".into() } else { "not a Matroska file (no segment found)".into() });
         }
-        let doc = self.doc_type.clone();
-        let mut movie = Movie { timescale: 1000, duration_secs: 0.0, fragmented: false, brands: vec![doc.clone()], format: doc, tracks: Vec::new(), packet_size: 0 };
-        if let Some(d) = self.duration {
-            movie.duration_secs = d * self.scale as f64 / 1e9;
-        }
+        let mut movie = Movie { format: self.doc_type.clone(), ..Default::default() };
         // video first, then audio, then the rest; within a kind the default track first
         let mut order: Vec<usize> = (0..self.tracks.len()).collect();
         let rank = |t: &MkvTrack| -> (u8, u8, u8) {
@@ -825,7 +804,6 @@ impl MkvDemuxer {
             let t = std::mem::take(&mut self.tracks[i]);
             movie.tracks.push(build_track(t, self.scale));
         }
-        movie.duration_secs = movie.tracks.iter().map(|t| t.duration_secs()).fold(movie.duration_secs, f64::max);
         self.movie = Some(movie);
         Ok(())
     }
@@ -859,35 +837,28 @@ struct Setup {
 
 /// VP9's profile and bit depth from the head of a key frame.
 fn vp9_frame_info(h: &[u8]) -> Option<(u8, u8)> {
-    let mut bits = h.iter().flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1));
-    let mut u = |n: u32| -> Option<u32> {
-        let mut v = 0u32;
-        for _ in 0..n {
-            v = (v << 1) | bits.next()? as u32;
-        }
-        Some(v)
-    };
-    if u(2)? != 2 {
+    let mut r = Bits::new(h);
+    if r.u(2)? != 2 {
         return None;
     }
-    let lo = u(1)?;
-    let hi = u(1)?;
+    let lo = r.u(1)?;
+    let hi = r.u(1)?;
     let profile = (hi << 1) | lo;
     if profile == 3 {
-        u(1)?;
+        r.skip(1)?;
     }
-    if u(1)? == 1 {
+    if r.flag()? {
         return None; // show_existing_frame
     }
-    let frame_type = u(1)?;
-    u(2)?; // show_frame, error_resilient_mode
+    let frame_type = r.u(1)?;
+    r.skip(2)?; // show_frame, error_resilient_mode
     if frame_type != 0 {
         return None;
     }
-    if u(24)? != 0x49_8342 {
+    if r.u(24)? != 0x49_8342 {
         return None;
     }
-    let depth = if profile >= 2 { if u(1)? == 1 { 12 } else { 10 } } else { 8 };
+    let depth = if profile >= 2 { if r.flag()? { 12 } else { 10 } } else { 8 };
     Some((profile as u8, depth))
 }
 
@@ -950,7 +921,7 @@ fn setup(t: &MkvTrack, fps: f64, ts_timescale: u32) -> Setup {
                 match av1_codec(&t.private) {
                     Ok(c) => {
                         s.codec = c.codec;
-                        s.description = Some(t.private.clone());
+                        s.description = c.description;
                     }
                     Err(_) => s.codec = "av01.0.08M.08".into(),
                 }
@@ -1123,20 +1094,10 @@ fn setup(t: &MkvTrack, fps: f64, ts_timescale: u32) -> Setup {
             s.description = Some(t.private.clone());
         }
         "A_PCM/INT/LIT" | "A_PCM/INT/BIG" | "A_PCM/FLOAT/IEEE" => {
-            // (WebCodecs' names, little endian; the app's own for big endian and 64-bit float)
+            // (Matroska's float is little endian, its 8-bit integers unsigned)
             let bytes = (t.bit_depth / 8).max(1);
-            s.codec = match (id, t.bit_depth) {
-                ("A_PCM/FLOAT/IEEE", 32) => "pcm-f32".into(),
-                ("A_PCM/FLOAT/IEEE", 64) => "pcm-f64".into(),
-                ("A_PCM/INT/LIT" | "A_PCM/INT/BIG", 8) => "pcm-u8".into(),
-                ("A_PCM/INT/LIT", 16) => "pcm-s16".into(),
-                ("A_PCM/INT/LIT", 24) => "pcm-s24".into(),
-                ("A_PCM/INT/LIT", 32) => "pcm-s32".into(),
-                ("A_PCM/INT/BIG", 16) => "pcm-s16be".into(),
-                ("A_PCM/INT/BIG", 24) => "pcm-s24be".into(),
-                ("A_PCM/INT/BIG", 32) => "pcm-s32be".into(),
-                _ => format!("{id} ({} bit)", t.bit_depth),
-            };
+            let form = PcmForm { bits: t.bit_depth, float: id == "A_PCM/FLOAT/IEEE", le: id != "A_PCM/INT/BIG", signed: t.bit_depth > 8 };
+            s.codec = pcm_codec(form).map(String::from).unwrap_or_else(|| format!("{id} ({} bit)", t.bit_depth));
             s.packet = PacketLength::Pcm(bytes * s.channels);
         }
         _ => {}
@@ -1144,7 +1105,7 @@ fn setup(t: &MkvTrack, fps: f64, ts_timescale: u32) -> Setup {
     s
 }
 
-fn build_track(t: MkvTrack, scale: u64) -> Track {
+fn build_track(mut t: MkvTrack, scale: u64) -> Track {
     let kind = match t.kind {
         1 => TrackKind::Video,
         2 => TrackKind::Audio,
@@ -1157,7 +1118,8 @@ fn build_track(t: MkvTrack, scale: u64) -> Track {
     if kind == TrackKind::Video {
         ts_timescale = ts_timescale.max(1_000_000);
     }
-    let mut frames = t.frames.clone();
+    // (setup() doesn't look at the frames)
+    let mut frames = std::mem::take(&mut t.frames);
     fill_laced_times(&mut frames, t.default_duration);
     if kind == TrackKind::Video {
         snap_to_frame_grid(&mut frames, t.default_duration, scale);
@@ -1171,7 +1133,7 @@ fn build_track(t: MkvTrack, scale: u64) -> Track {
     }
     let fps = frame_rate(&frames, t.default_duration);
     let s = setup(&t, fps, ts_timescale);
-    let ticks = |ns: i64| -> i64 { ((ns as i128 * s.timescale as i128 + if ns >= 0 { 500_000_000 } else { -500_000_000 }) / 1_000_000_000) as i64 };
+    let ticks = |ns: i64| rescale(ns, 1_000_000_000, s.timescale as i64);
     let mut samples: Vec<Sample> = frames.iter().map(|f| Sample { offset: f.offset, size: f.size, dts: 0, pts: ticks(f.ts), duration: 0, sync: f.key }).collect();
     let nominal = if t.default_duration > 0 { ticks(t.default_duration as i64).max(1) as u32 } else { 0 };
     match kind {
@@ -1179,7 +1141,7 @@ fn build_track(t: MkvTrack, scale: u64) -> Track {
         TrackKind::Audio => audio_timing(&mut samples, &frames, &s, nominal),
         TrackKind::Other => {}
     }
-    let mut unreadable = t.unreadable.clone();
+    let mut unreadable = t.unreadable;
     if kind == TrackKind::Video && !t.strip.is_empty() {
         unreadable = Some("stored with header stripping".into());
     }
@@ -1199,13 +1161,13 @@ fn build_track(t: MkvTrack, scale: u64) -> Track {
         sample_rate: s.rate,
         channels: s.channels,
         sample_entry: if unreadable.is_some() { Vec::new() } else { s.entry },
-        edit_shift: 0,
         samples: if unreadable.is_some() && kind == TrackKind::Video { Vec::new() } else { samples },
         frame_duration,
-        prefix: t.strip.clone(),
-        name: t.name.clone(),
-        language: t.language.clone(),
+        prefix: t.strip,
+        name: t.name,
+        language: t.language,
         note: unreadable.map(|u| format!("{} is {u}, which Unflash cannot read", t.codec_id)).unwrap_or(s.note),
+        ..Default::default()
     }
 }
 
@@ -1286,29 +1248,19 @@ fn frame_rate(frames: &[Frame], default_duration: u64) -> f64 {
 }
 
 /// Matroska stores presentation times; decode times are the sorted
-/// presentation times moved back by the largest reordering, and a frame
-/// lasts until the next one is shown.
+/// presentation times moved back by the largest reordering, each lasting
+/// to the next (as an MP4's and a transport stream's do), the last the
+/// stated frame duration or else the usual gap.
 fn video_timing(samples: &mut [Sample], nominal: u32) {
-    let n = samples.len();
-    if n == 0 {
-        return;
-    }
-    let mut sorted: Vec<i64> = samples.iter().map(|s| s.pts).collect();
+    let pts: Vec<i64> = samples.iter().map(|s| s.pts).collect();
+    let mut sorted = pts.clone();
     sorted.sort_unstable();
-    let shift = samples.iter().enumerate().map(|(i, s)| sorted[i] - s.pts).max().unwrap_or(0).max(0);
     let mut gaps: Vec<i64> = sorted.windows(2).map(|w| w[1] - w[0]).filter(|&g| g > 0).collect();
     gaps.sort_unstable();
-    let typical = if nominal > 0 { nominal as i64 } else { gaps.get(gaps.len() / 2).copied().unwrap_or(1) };
-    // presentation order: each frame's duration runs to the next picture
-    let mut by_pts: Vec<usize> = (0..n).collect();
-    by_pts.sort_by_key(|&i| (samples[i].pts, i));
-    for k in 0..n {
-        let i = by_pts[k];
-        let d = if k + 1 < n { samples[by_pts[k + 1]].pts - samples[i].pts } else { typical };
-        samples[i].duration = d.max(if k + 1 < n { 0 } else { 1 }) as u32;
-    }
-    for (i, s) in samples.iter_mut().enumerate() {
-        s.dts = sorted[i] - shift;
+    let last = if nominal > 0 { nominal } else { gaps.get(gaps.len() / 2).map_or(1, |&g| g.min(u32::MAX as i64) as u32) };
+    for (s, (dts, duration)) in samples.iter_mut().zip(dts_from_cts(&pts, last)) {
+        s.dts = dts;
+        s.duration = duration;
     }
 }
 
@@ -1352,6 +1304,9 @@ fn audio_timing(samples: &mut [Sample], frames: &[Frame], s: &Setup, nominal: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (not read: a block's duration says nothing the times don't)
+    const BLOCK_DURATION: u32 = 0x9B;
 
     /// A tiny EBML writer for building test files.
     fn el(id: u32, body: &[u8]) -> Vec<u8> {
@@ -1490,6 +1445,22 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_cluster_timestamp_is_skipped() {
+        // the second cluster's timestamp has the "unknown" size, which only a
+        // master element can have: damage, passed over to the next cluster
+        let c1 = [u(CLUSTER_TIMESTAMP, 0), simple_block(1, 0, 0x80, &[1, 2, 3])].concat();
+        let c2 = [vec![0xe7, 0xff, 0x21], simple_block(1, 0, 0x80, &[4, 5])].concat();
+        let c3 = [u(CLUSTER_TIMESTAMP, 80), simple_block(1, 0, 0x80, &[6, 7, 8, 9])].concat();
+        let seg = [el(INFO, &u(TIMESTAMP_SCALE, 1_000_000)), el(TRACKS, &vp8_track()), el(CLUSTER, &c1), el(CLUSTER, &c2), el(CLUSTER, &c3)].concat();
+        let file = [header("webm"), el(SEGMENT, &seg)].concat();
+        for chunk in [None, Some(13), Some(1)] {
+            let m = parse_all(&file, chunk);
+            let got: Vec<(i64, u32)> = m.video().unwrap().samples.iter().map(|s| (s.pts, s.size)).collect();
+            assert_eq!(got, vec![(0, 3), (80_000, 4)], "chunk {chunk:?}");
+        }
+    }
+
+    #[test]
     fn b_frames_get_decode_times() {
         // I0 P3 B1 B2 in decode order (presentation 0, 100, 33, 66 ms)
         let c = [u(CLUSTER_TIMESTAMP, 0), simple_block(1, 0, 0x80, &[0]), simple_block(1, 100, 0, &[1]), simple_block(1, 33, 0, &[2]), simple_block(1, 66, 0, &[3])].concat();
@@ -1504,8 +1475,9 @@ mod tests {
             assert!(d <= p);
         }
         assert!(dts.windows(2).all(|w| w[1] > w[0]));
+        // each lasts to the next decode time; the last the usual gap
         let durs: Vec<u32> = v.samples.iter().map(|s| s.duration).collect();
-        assert_eq!(durs, vec![33_000, 33_000, 33_000, 34_000]);
+        assert_eq!(durs, vec![33_000, 33_000, 34_000, 33_000]);
     }
 
     #[test]

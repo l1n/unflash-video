@@ -4,6 +4,8 @@
 //! string, the bit depths, where a picture and a field pair begin), and the
 //! decoder setup records (avcC, hvcC) built from the parameter sets.
 
+use crate::reader::Bits;
+
 /// The RBSP of a NAL unit: its emulation prevention bytes taken out.
 pub fn rbsp(nal: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(nal.len());
@@ -19,59 +21,11 @@ pub fn rbsp(nal: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Exp-Golomb and fixed-length fields, most significant bit first.
-struct Bits<'a> {
-    b: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Bits<'a> {
-    fn new(b: &'a [u8]) -> Self {
-        Bits { b, at: 0 }
-    }
-    fn bit(&mut self) -> Option<u32> {
-        let byte = *self.b.get(self.at / 8)?;
-        let v = (byte >> (7 - self.at % 8)) & 1;
-        self.at += 1;
-        Some(v as u32)
-    }
-    fn u(&mut self, n: usize) -> Option<u32> {
-        let mut v = 0u32;
-        for _ in 0..n {
-            v = (v << 1) | self.bit()?;
-        }
-        Some(v)
-    }
-    fn flag(&mut self) -> Option<bool> {
-        Some(self.bit()? == 1)
-    }
-    fn skip(&mut self, n: usize) -> Option<()> {
-        self.at += n;
-        (self.at <= self.b.len() * 8).then_some(())
-    }
-    fn ue(&mut self) -> Option<u32> {
-        let mut zeros = 0;
-        while self.bit()? == 0 {
-            zeros += 1;
-            if zeros > 31 {
-                return None;
-            }
-        }
-        Some(((1u64 << zeros) - 1 + self.u(zeros)? as u64) as u32)
-    }
-    fn se(&mut self) -> Option<i32> {
-        let k = self.ue()? as i64;
-        Some(if k & 1 == 1 { (k + 1) / 2 } else { -(k / 2) } as i32)
-    }
-}
-
 /// What an H.264 sequence parameter set says that a container needs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AvcSps {
     pub id: u32,
     pub profile: u8,
-    pub compat: u8,
-    pub level: u8,
     pub chroma_format: u32,
     pub bit_depth_luma: u32,
     pub bit_depth_chroma: u32,
@@ -101,8 +55,8 @@ pub fn parse_avc_sps(nal: &[u8]) -> Option<AvcSps> {
     let r = rbsp(nal.get(1..)?);
     let mut b = Bits::new(&r);
     let profile = b.u(8)? as u8;
-    let compat = b.u(8)? as u8;
-    let level = b.u(8)? as u8;
+    // (the constraint flags and the level: an avcC copies them from the SPS's bytes)
+    b.skip(16)?;
     let id = b.ue()?;
     let (mut chroma, mut separate, mut depth_luma, mut depth_chroma) = (1, false, 8, 8);
     if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
@@ -160,7 +114,7 @@ pub fn parse_avc_sps(nal: &[u8]) -> Option<AvcSps> {
     let fields = 2 - frame_mbs_only as u32;
     let width = (width_mbs * 16).saturating_sub(sub_w * (crop[0] + crop[1]));
     let height = (fields * height_units * 16).saturating_sub(sub_h * fields * (crop[2] + crop[3]));
-    Some(AvcSps { id, profile, compat, level, chroma_format: chroma, bit_depth_luma: depth_luma, bit_depth_chroma: depth_chroma, width, height, log2_max_frame_num, frame_mbs_only, separate_colour_plane: separate })
+    Some(AvcSps { id, profile, chroma_format: chroma, bit_depth_luma: depth_luma, bit_depth_chroma: depth_chroma, width, height, log2_max_frame_num, frame_mbs_only, separate_colour_plane: separate })
 }
 
 /// (pps id, sps id) of an H.264 PPS NAL unit.
@@ -173,8 +127,6 @@ pub fn avc_pps_ids(nal: &[u8]) -> Option<(u32, u32)> {
 /// The start of an H.264 slice header, as far as a container cares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AvcSlice {
-    pub first_mb: u32,
-    pub pps_id: u32,
     pub frame_num: u32,
     /// A field picture: Some(bottom).
     pub field: Option<bool>,
@@ -185,7 +137,7 @@ pub struct AvcSlice {
 pub fn avc_slice(nal: &[u8], sps_for: impl Fn(u32) -> Option<AvcSps>) -> Option<AvcSlice> {
     let r = rbsp(nal.get(1..)?);
     let mut b = Bits::new(&r);
-    let first_mb = b.ue()?;
+    b.ue()?; // first_mb_in_slice
     b.ue()?; // slice_type
     let pps_id = b.ue()?;
     let sps = sps_for(pps_id)?;
@@ -194,7 +146,7 @@ pub fn avc_slice(nal: &[u8], sps_for: impl Fn(u32) -> Option<AvcSps>) -> Option<
     }
     let frame_num = b.u(sps.log2_max_frame_num as usize)?;
     let field = if !sps.frame_mbs_only && b.flag()? { Some(b.flag()?) } else { None };
-    Some(AvcSlice { first_mb, pps_id, frame_num, field })
+    Some(AvcSlice { frame_num, field })
 }
 
 /// Whether an H.264 SEI NAL unit holds a recovery point (a picture that
@@ -247,6 +199,18 @@ pub fn avcc(sps: &[&[u8]], pps: &[&[u8]], info: &AvcSps) -> Vec<u8> {
         v.push(0);
     }
     v
+}
+
+/// An avcC for one SPS and one PPS (NAL units, each with its header byte),
+/// with the chroma format and bit depths a High profile's record carries
+/// after the sets; None when they are not an SPS and a PPS, or the SPS
+/// can't be read.
+pub fn avcc_record(sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> {
+    if sps.first()? & 0x1f != 7 || pps.first()? & 0x1f != 8 {
+        return None;
+    }
+    let info = parse_avc_sps(sps)?;
+    Some(avcc(&[sps], &[pps], &info))
 }
 
 /// What an HEVC sequence parameter set says that a container needs.
@@ -363,7 +327,7 @@ mod tests {
         // x264, High 4:2:0 8-bit, 1920x1080 (1088 coded, cropped by 8)
         let sps = [0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xc8, 0x3c, 0x60, 0xc6, 0x58];
         let s = parse_avc_sps(&sps).unwrap();
-        assert_eq!((s.profile, s.level, s.width, s.height, s.chroma_format, s.bit_depth_luma, s.frame_mbs_only), (100, 40, 1920, 1080, 1, 8, true));
+        assert_eq!((s.profile, s.width, s.height, s.chroma_format, s.bit_depth_luma, s.frame_mbs_only), (100, 1920, 1080, 1, 8, true));
         let rec = avcc(&[&sps], &[&[0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0]], &s);
         assert_eq!(&rec[..6], &[1, 0x64, 0x00, 0x28, 0xff, 0xe1]);
         assert_eq!(&rec[rec.len() - 4..], &[0xfd, 0xf8, 0xf8, 0]);
@@ -377,6 +341,23 @@ mod tests {
         let s = parse_avc_sps(&sps).unwrap();
         assert_eq!((s.profile, s.width, s.height), (66, 1920, 1080));
         assert_eq!(avcc(&[&sps], &[&[0x68, 0xce, 0x0f, 0xc8]], &s).len(), 6 + 2 + sps.len() + 1 + 2 + 4);
+    }
+
+    #[test]
+    fn avcc_from_one_sps_and_one_pps() {
+        // x264, High 4:2:0 8-bit: the record ends with its chroma format and bit depths
+        let sps = [0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xc8, 0x3c, 0x60, 0xc6, 0x58];
+        let pps = [0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0];
+        let want = [&[1, 0x64, 0x00, 0x28, 0xff, 0xe1, 0, 27][..], &sps, &[1, 0, 6], &pps, &[0xfd, 0xf8, 0xf8, 0]].concat();
+        assert_eq!(avcc_record(&sps, &pps), Some(want));
+        // Constrained Baseline: no tail
+        let sps = [0x67, 0x42, 0xc0, 0x28, 0xda, 0x01, 0xe0, 0x08, 0x9f, 0x97, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xf1, 0x83, 0x2a];
+        let pps = [0x68, 0xce, 0x0f, 0xc8];
+        assert_eq!(avcc_record(&sps, &pps), Some([&[1, 0x42, 0xc0, 0x28, 0xff, 0xe1, 0, 25][..], &sps, &[1, 0, 4], &pps].concat()));
+        // the sets the wrong way round, an SPS cut short, nothing
+        assert_eq!(avcc_record(&pps, &sps), None);
+        assert_eq!(avcc_record(&sps[..3], &pps), None);
+        assert_eq!(avcc_record(&[], &[]), None);
     }
 
     #[test]

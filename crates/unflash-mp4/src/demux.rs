@@ -1,22 +1,23 @@
 //! The demuxer: a byte-range state machine that finds the `moov` (and any
 //! `moof`) boxes, then expands the sample tables.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::codec::{from_sample_entry, CodecInfo};
 use crate::reader::{box_header, for_each_box, fourcc_str, Reader};
 use crate::Error;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrackKind {
     Video,
     Audio,
+    #[default]
     Other,
 }
 
 /// One sample (an encoded frame or audio packet).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sample {
     /// Absolute byte offset in the file.
     pub offset: u64,
@@ -30,7 +31,7 @@ pub struct Sample {
     pub sync: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Track {
     pub id: u32,
     pub kind: TrackKind,
@@ -53,19 +54,38 @@ pub struct Track {
     pub samples: Vec<Sample>,
     /// Nominal ticks per sample (a video frame, an audio packet), 0 when
     /// the file does not say.
-    #[serde(default)]
     pub frame_duration: u32,
     /// Bytes every sample starts with that the file leaves out (Matroska
     /// header stripping): put them back in front of each sample read.
-    #[serde(default)]
     pub prefix: Vec<u8>,
-    #[serde(default)]
     pub name: String,
-    #[serde(default)]
     pub language: String,
     /// Why the track cannot be used, when it cannot.
-    #[serde(default)]
     pub note: String,
+}
+
+/// `v` ticks of a clock of `from` a second as ticks of one of `to`, to the
+/// nearest (halves away from zero).
+pub(crate) fn rescale(v: i64, from: i64, to: i64) -> i64 {
+    let x = v as i128 * to as i128;
+    let half = from as i128 / 2;
+    ((x + if x >= 0 { half } else { -half }) / from as i128) as i64
+}
+
+/// Ticks from the first presentation time to the end of the last sample
+/// (0 for none).
+pub(crate) fn span(samples: &[Sample]) -> i64 {
+    let mut lo = i64::MAX;
+    let mut hi = i64::MIN;
+    for s in samples {
+        lo = lo.min(s.pts);
+        hi = hi.max(s.pts + s.duration as i64);
+    }
+    if lo == i64::MAX {
+        0
+    } else {
+        hi - lo
+    }
 }
 
 impl Track {
@@ -77,23 +97,11 @@ impl Track {
     }
     pub fn to_us(&self, ticks: i64) -> i64 {
         // exact where the timescale divides 1e6, correctly rounded otherwise
-        let ts = self.timescale as i128;
-        let v = ticks as i128 * 1_000_000;
-        ((v + if v >= 0 { ts / 2 } else { -(ts / 2) }) / ts) as i64
+        rescale(ticks, self.timescale as i64, 1_000_000)
     }
     /// Duration from the first pts to the end of the last sample, seconds.
     pub fn duration_secs(&self) -> f64 {
-        let mut lo = i64::MAX;
-        let mut hi = i64::MIN;
-        for s in &self.samples {
-            lo = lo.min(s.pts);
-            hi = hi.max(s.pts + s.duration as i64);
-        }
-        if lo == i64::MAX {
-            0.0
-        } else {
-            (hi - lo) as f64 / self.timescale as f64
-        }
+        span(&self.samples) as f64 / self.timescale as f64
     }
     /// Whether an MP4 can carry the track's samples as they are: it has a
     /// sample entry for them, and they are not uncompressed sound (whose
@@ -104,7 +112,7 @@ impl Track {
     /// Presentation times of sync samples, seconds, ascending.
     pub fn keyframe_times(&self) -> Vec<f64> {
         let mut v: Vec<f64> = self.samples.iter().filter(|s| s.sync).map(|s| s.pts as f64 / self.timescale as f64).collect();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.sort_by(f64::total_cmp);
         v
     }
     /// Index (decode order) of the last sync sample whose pts is at or
@@ -121,20 +129,15 @@ impl Track {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Movie {
-    pub timescale: u32,
-    pub duration_secs: f64,
     pub fragmented: bool,
-    pub brands: Vec<String>,
     /// The container: `mp4`, `matroska`, `webm` or `mpegts`.
-    #[serde(default)]
     pub format: String,
     pub tracks: Vec<Track>,
     /// A transport stream's packet size (188, 192 or 204): its samples'
     /// offsets are places a reader follows its packets from (see
     /// [`crate::ts`]). 0 for the other containers.
-    #[serde(default)]
     pub packet_size: u32,
 }
 
@@ -161,7 +164,7 @@ enum Stage {
 pub struct Demuxer {
     file_size: u64,
     inner: Inner,
-    sniffed: u64,
+    bytes_read: u64,
 }
 
 enum Inner {
@@ -203,13 +206,14 @@ fn foreign(b: &[u8]) -> Option<(&'static str, &'static str)> {
 
 impl Demuxer {
     pub fn new(file_size: u64) -> Self {
-        Demuxer { file_size, inner: Inner::Sniff, sniffed: 0 }
+        Demuxer { file_size, inner: Inner::Sniff, bytes_read: 0 }
     }
 
     /// The (offset, length) the parser needs next, or `None` when done.
     pub fn need(&self) -> Option<(u64, u64)> {
         match &self.inner {
-            Inner::Sniff => (self.file_size > 0).then(|| (0, SNIFF_LEN.min(self.file_size))),
+            // (an empty file too: none of its bytes, to be told it holds no movie)
+            Inner::Sniff => Some((0, SNIFF_LEN.min(self.file_size))),
             Inner::Mp4(d) => d.need(),
             Inner::Mkv(d) => d.need(),
             Inner::Ts(d) => d.need(),
@@ -218,7 +222,7 @@ impl Demuxer {
 
     pub fn is_done(&self) -> bool {
         match &self.inner {
-            Inner::Sniff => self.file_size == 0,
+            Inner::Sniff => false,
             Inner::Mp4(d) => d.is_done(),
             Inner::Mkv(d) => d.is_done(),
             Inner::Ts(d) => d.is_done(),
@@ -227,13 +231,7 @@ impl Demuxer {
 
     /// Bytes requested so far.
     pub fn bytes_read(&self) -> u64 {
-        self.sniffed
-            + match &self.inner {
-                Inner::Sniff => 0,
-                Inner::Mp4(d) => d.bytes_read(),
-                Inner::Mkv(d) => d.bytes_read(),
-                Inner::Ts(d) => d.bytes_read(),
-            }
+        self.bytes_read
     }
 
     /// How far through the work of reading the index the parser is, 0 to
@@ -264,23 +262,40 @@ impl Demuxer {
         }
     }
 
+    /// Serve the bytes of the last `need()` range: `data` must start at the
+    /// requested offset and cover the requested length (extra is fine).
     pub fn feed(&mut self, offset: u64, data: &[u8]) -> Result<(), Error> {
+        let Some((want_off, want_len)) = self.need() else {
+            return Err("demuxer is not waiting for data".into());
+        };
+        if offset != want_off || (data.len() as u64) < want_len {
+            return Err(format!("expected {want_len} bytes at {want_off}, got {} at {offset}", data.len()));
+        }
+        self.bytes_read += want_len;
         match &mut self.inner {
             Inner::Sniff => {
-                self.sniffed += data.len() as u64;
-                if data.len() >= 4 && data[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
-                    self.inner = Inner::Mkv(crate::mkv::MkvDemuxer::new(self.file_size));
+                self.inner = if data.len() >= 4 && data[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+                    Inner::Mkv(crate::mkv::MkvDemuxer::new(self.file_size))
+                } else if matches!(data.get(4..8), Some(b"ftyp" | b"moov" | b"mdat" | b"free" | b"skip" | b"wide" | b"styp")) {
+                    // (an MP4's first box, whose bytes after it could pass for
+                    // a transport stream's packets)
+                    Inner::Mp4(Mp4Demuxer::new(self.file_size))
                 } else if let Some((packet, first)) = crate::ts::sniff(data) {
-                    self.inner = Inner::Ts(crate::ts::TsDemuxer::new(self.file_size, packet, first));
+                    Inner::Ts(crate::ts::TsDemuxer::new(self.file_size, packet, first))
                 } else if let Some((what, advice)) = foreign(data) {
                     return Err(format!("This is {what}. Unflash reads MP4, MOV, M4V, MKV, WebM and MPEG transport stream (.ts, .m2ts, .mts) files. {advice}"));
                 } else {
-                    self.inner = Inner::Mp4(Mp4Demuxer::new(self.file_size));
+                    Inner::Mp4(Mp4Demuxer::new(self.file_size))
+                };
+                if let Inner::Mp4(d) = &mut self.inner {
+                    if d.is_done() {
+                        // a file too short to hold a box: it has no moov
+                        d.finish()?;
+                    }
                 }
-                let _ = offset;
                 Ok(())
             }
-            Inner::Mp4(d) => d.feed(offset, data),
+            Inner::Mp4(d) => d.feed(data),
             Inner::Mkv(d) => d.feed(offset, data),
             Inner::Ts(d) => d.feed(offset, data),
         }
@@ -307,19 +322,20 @@ impl Demuxer {
 
 /// The MP4 / QuickTime parser behind [`Demuxer`].
 #[derive(Clone, Debug)]
-pub struct Mp4Demuxer {
+struct Mp4Demuxer {
     file_size: u64,
     at: u64,
     stage: Stage,
     want: Option<(u64, u64)>,
-    ftyp: Option<Vec<u8>>,
     moov: Option<Vec<u8>>,
     moofs: Vec<(u64, Vec<u8>)>,
     movie: Option<Movie>,
-    bytes_read: u64,
 }
 
 const HEADER_PEEK: u64 = 32;
+/// The most a box read whole (`moov`, `moof`) may take: a ten-hour film's
+/// `moov` is some 60 MB.
+const MAX_INDEX: u64 = 256 << 20;
 
 impl Mp4Demuxer {
     pub fn new(file_size: u64) -> Self {
@@ -328,11 +344,9 @@ impl Mp4Demuxer {
             at: 0,
             stage: Stage::Header,
             want: None,
-            ftyp: None,
             moov: None,
             moofs: Vec::new(),
             movie: None,
-            bytes_read: 0,
         };
         d.request_header();
         d
@@ -357,30 +371,22 @@ impl Mp4Demuxer {
         self.stage == Stage::Done
     }
 
-    /// Bytes requested so far (to show how little of the file was read).
-    pub fn bytes_read(&self) -> u64 {
-        self.bytes_read
-    }
-
-    /// Serve the bytes of the last `need()` range. `data` must start at the
-    /// requested offset and cover the requested length (extra is fine).
-    pub fn feed(&mut self, offset: u64, data: &[u8]) -> Result<(), Error> {
-        let Some((want_off, want_len)) = self.want else {
-            return Err("demuxer is not waiting for data".into());
-        };
-        if offset != want_off || (data.len() as u64) < want_len {
-            return Err(format!("expected {want_len} bytes at {want_off}, got {} at {offset}", data.len()));
-        }
-        self.bytes_read += want_len;
+    /// Serve the bytes of the last `need()` range (from its offset, at least
+    /// its length: [`Demuxer::feed`] sees to that).
+    pub fn feed(&mut self, data: &[u8]) -> Result<(), Error> {
         match self.stage {
             Stage::Header => {
                 let h = box_header(data)?;
                 let size = h.size.unwrap_or(self.file_size - self.at);
-                if size < h.header_len || self.at + size > self.file_size {
+                // (the file holds the header's 8 bytes from `at`: no overflow)
+                if size < h.header_len || size > self.file_size - self.at {
                     return Err(format!("box {} at {} has an impossible size {size}", fourcc_str(&h.kind), self.at));
                 }
                 match &h.kind {
-                    b"moov" | b"moof" | b"ftyp" => {
+                    b"moov" | b"moof" => {
+                        if size > MAX_INDEX {
+                            return Err(format!("box {} at {} is {size} bytes, too big for an index", fourcc_str(&h.kind), self.at));
+                        }
                         if (data.len() as u64) >= size {
                             self.take_body(h.kind, &data[..size as usize]);
                             self.advance(size);
@@ -408,7 +414,6 @@ impl Mp4Demuxer {
         match &kind {
             b"moov" => self.moov = Some(whole.to_vec()),
             b"moof" => self.moofs.push((self.at, whole.to_vec())),
-            b"ftyp" => self.ftyp = Some(whole.to_vec()),
             _ => {}
         }
     }
@@ -428,28 +433,17 @@ impl Mp4Demuxer {
 
     fn finish(&mut self) -> Result<(), Error> {
         let moov = self.moov.as_ref().ok_or("no moov box found (not an MP4 file?)")?;
-        let mut movie = parse_moov(moov)?;
-        if let Some(ftyp) = &self.ftyp {
-            let mut r = Reader::new(&ftyp[8..]);
-            if let Ok(major) = r.fourcc() {
-                movie.brands.push(fourcc_str(&major));
-            }
-            let _ = r.u32();
-            while let Ok(b) = r.fourcc() {
-                movie.brands.push(fourcc_str(&b));
-            }
-        }
+        let (mut movie, trex) = parse_moov(moov, self.file_size)?;
         if !self.moofs.is_empty() {
             movie.fragmented = true;
             let mut next_dts: Vec<i64> = movie.tracks.iter().map(|t| t.samples.last().map(|s| s.dts + s.duration as i64).unwrap_or(0)).collect();
             for (off, moof) in &self.moofs {
-                apply_moof(&mut movie, *off, moof, &mut next_dts)?;
+                apply_moof(&mut movie, &trex, self.file_size, *off, moof, &mut next_dts)?;
             }
         }
         for t in &mut movie.tracks {
             finish_track(t);
         }
-        movie.duration_secs = movie.tracks.iter().map(|t| t.duration_secs()).fold(movie.duration_secs, f64::max);
         self.movie = Some(movie);
         Ok(())
     }
@@ -511,11 +505,11 @@ struct TrakParts {
 /// The form of uncompressed sound: bits per sample, float, little endian,
 /// signed (8-bit sound can be either).
 #[derive(Clone, Copy, Debug)]
-struct PcmForm {
-    bits: u32,
-    float: bool,
-    le: bool,
-    signed: bool,
+pub(crate) struct PcmForm {
+    pub(crate) bits: u32,
+    pub(crate) float: bool,
+    pub(crate) le: bool,
+    pub(crate) signed: bool,
 }
 
 /// What an audio sample entry says about its samples beyond the codec.
@@ -531,9 +525,13 @@ struct SoundDesc {
     flags: u32,
 }
 
-fn parse_moov(moov: &[u8]) -> Result<Movie, Error> {
+/// The movie the `moov` box describes (a file of `file_size` bytes), and
+/// the defaults its `trex` boxes give fragments, by track.
+fn parse_moov(moov: &[u8], file_size: u64) -> Result<(Movie, Vec<(u32, Trex)>), Error> {
     let body = &moov[box_header(moov)?.header_len as usize..];
-    let mut movie = Movie { timescale: 1000, duration_secs: 0.0, fragmented: false, brands: vec![], format: "mp4".into(), tracks: vec![], packet_size: 0 };
+    let mut movie = Movie { format: "mp4".into(), ..Default::default() };
+    // (the movie's clock: its edit lists' durations are in it)
+    let mut timescale = 1000;
     let mut traks: Vec<TrakParts> = Vec::new();
     let mut trex: Vec<(u32, Trex)> = Vec::new();
     for_each_box(body, |kind, b, _| {
@@ -541,17 +539,8 @@ fn parse_moov(moov: &[u8]) -> Result<Movie, Error> {
             b"mvhd" => {
                 let mut r = Reader::new(b);
                 let (v, _) = r.version_flags()?;
-                if v == 1 {
-                    r.skip(16)?;
-                    movie.timescale = r.u32()?;
-                    let d = r.u64()?;
-                    movie.duration_secs = d as f64 / movie.timescale.max(1) as f64;
-                } else {
-                    r.skip(8)?;
-                    movie.timescale = r.u32()?;
-                    let d = r.u32()?;
-                    movie.duration_secs = if d == u32::MAX { 0.0 } else { d as f64 / movie.timescale.max(1) as f64 };
-                }
+                r.skip(if v == 1 { 16 } else { 8 })?;
+                timescale = r.u32()?;
             }
             b"trak" => traks.push(parse_trak(b)?),
             b"mvex" => {
@@ -601,31 +590,24 @@ fn parse_moov(moov: &[u8]) -> Result<Movie, Error> {
             sample_rate: tp.sample_rate,
             channels: tp.channels,
             sample_entry: tp.entry,
-            edit_shift: 0,
-            samples: Vec::new(),
-            frame_duration: 0,
-            prefix: Vec::new(),
-            name: String::new(),
-            language: String::new(),
-            note: String::new(),
+            ..Default::default()
         };
-        track.edit_shift = edit_shift(&tp.elst, movie.timescale, track.timescale);
+        track.edit_shift = edit_shift(&tp.elst, timescale, track.timescale);
         if track.kind == TrackKind::Audio && track.sample_rate == 0 {
             // (a rate the entry can't hold, and no 'srat': the track's clock is its rate)
             track.sample_rate = track.timescale;
+        }
+        // (a sample takes a byte at least: a count the file can't hold would
+        // only ask for memory there is not)
+        if tp.stbl.sample_count as u64 * tp.stbl.fixed_size.max(1) as u64 > file_size {
+            return Err(format!("track {} lists more samples than the file holds", tp.id));
         }
         // uncompressed sound whose tables count each sample frame (sized as
         // one frame, or as a byte in QuickTime's older files): in packets
         track.samples = if tp.pcm_frame > 0 && tp.stbl.fixed_size != 0 && tp.stbl.fixed_size <= tp.pcm_frame { expand_pcm(&tp.stbl, tp.pcm_frame)? } else { expand_samples(&tp.stbl)? };
         movie.tracks.push(track);
     }
-    // stash trex defaults for fragments on the track (by id) via a side table
-    TREX.with(|t| *t.borrow_mut() = trex);
-    Ok(movie)
-}
-
-thread_local! {
-    static TREX: std::cell::RefCell<Vec<(u32, Trex)>> = const { std::cell::RefCell::new(Vec::new()) };
+    Ok((movie, trex))
 }
 
 fn edit_shift(elst: &[(i64, i64)], movie_ts: u32, track_ts: u32) -> i64 {
@@ -829,12 +811,11 @@ fn parse_stbl(stbl: &[u8], tp: &mut TrakParts) -> Result<(), Error> {
                 }
             }
             b"ctts" => {
-                let (v, _) = r.version_flags()?;
+                r.version_flags()?;
                 let n = r.u32()?;
                 for _ in 0..n {
-                    let c = r.u32()?;
-                    let o = if v == 1 { r.i32()? as i64 } else { r.u32()? as i64 };
-                    tp.stbl.ctts.push((c, o));
+                    // (signed in version 0 too, as some writers make them and ffmpeg reads them)
+                    tp.stbl.ctts.push((r.u32()?, r.i32()? as i64));
                 }
             }
             b"stsc" => {
@@ -901,7 +882,8 @@ fn parse_stbl(stbl: &[u8], tp: &mut TrakParts) -> Result<(), Error> {
             b"stss" => {
                 r.version_flags()?;
                 let n = r.u32()?;
-                let mut v = Vec::with_capacity(n as usize);
+                // (not sized by the count: the box holds as many as it holds)
+                let mut v = Vec::new();
                 for _ in 0..n {
                     v.push(r.u32()?);
                 }
@@ -925,14 +907,10 @@ fn expand_samples(s: &Stbl) -> Result<Vec<Sample>, Error> {
             s.sizes.get(i).copied().unwrap_or(0)
         }
     };
-    // durations / dts
+    // durations / dts (a run's count may be far past the samples)
     let mut dur = Vec::with_capacity(n);
     for &(count, delta) in &s.stts {
-        for _ in 0..count {
-            if dur.len() < n {
-                dur.push(delta);
-            }
-        }
+        dur.extend(std::iter::repeat_n(delta, (count as usize).min(n - dur.len())));
     }
     while dur.len() < n {
         dur.push(dur.last().copied().unwrap_or(1));
@@ -940,11 +918,7 @@ fn expand_samples(s: &Stbl) -> Result<Vec<Sample>, Error> {
     // composition offsets
     let mut cts = Vec::with_capacity(n);
     for &(count, off) in &s.ctts {
-        for _ in 0..count {
-            if cts.len() < n {
-                cts.push(off);
-            }
-        }
+        cts.extend(std::iter::repeat_n(off, (count as usize).min(n - cts.len())));
     }
     while cts.len() < n {
         cts.push(0);
@@ -954,19 +928,8 @@ fn expand_samples(s: &Stbl) -> Result<Vec<Sample>, Error> {
     if s.chunk_offsets.is_empty() || s.stsc.is_empty() {
         return Err("stbl without chunk offsets".into());
     }
-    let nchunks = s.chunk_offsets.len();
     let mut sample = 0usize;
-    for (ci, &coff) in s.chunk_offsets.iter().enumerate() {
-        let chunk_no = (ci + 1) as u32;
-        // samples per chunk for this chunk: the last stsc entry with first_chunk <= chunk_no
-        let mut spc = s.stsc[0].1;
-        for &(first, count, _) in &s.stsc {
-            if first <= chunk_no {
-                spc = count;
-            } else {
-                break;
-            }
-        }
+    for (coff, spc) in chunks(s) {
         let mut pos = coff;
         for _ in 0..spc {
             if sample >= n {
@@ -979,7 +942,6 @@ fn expand_samples(s: &Stbl) -> Result<Vec<Sample>, Error> {
         if sample >= n {
             break;
         }
-        let _ = nchunks;
     }
     while offsets.len() < n {
         // more samples than the chunk table accounts for: clamp
@@ -1005,6 +967,20 @@ fn expand_samples(s: &Stbl) -> Result<Vec<Sample>, Error> {
         dts += dur[i] as i64;
     }
     Ok(out)
+}
+
+/// Each chunk's offset and how many samples it holds: the count of the
+/// last sample-to-chunk run that starts at or before it (the first run's
+/// for a chunk before them all), the runs walked once for all the chunks.
+fn chunks(s: &Stbl) -> impl Iterator<Item = (u64, u32)> + '_ {
+    let mut run = 0;
+    s.chunk_offsets.iter().enumerate().map(move |(ci, &off)| {
+        let no = ci as u32 + 1;
+        while run + 1 < s.stsc.len() && s.stsc[run].0 <= no && s.stsc[run + 1].0 <= no {
+            run += 1;
+        }
+        (off, s.stsc[run].1)
+    })
 }
 
 /// Frames of uncompressed sound in a packet (43 ms at 48 kHz).
@@ -1045,16 +1021,7 @@ fn expand_pcm(s: &Stbl, frame_bytes: u32) -> Result<Vec<Sample>, Error> {
     let mut out = Vec::new();
     let mut done = 0u64;
     let mut dts = 0i64;
-    for (ci, &coff) in s.chunk_offsets.iter().enumerate() {
-        let chunk_no = (ci + 1) as u32;
-        let mut spc = s.stsc[0].1;
-        for &(first, count, _) in &s.stsc {
-            if first <= chunk_no {
-                spc = count;
-            } else {
-                break;
-            }
-        }
+    for (coff, spc) in chunks(s) {
         let mut frames = (spc as u64).min(n - done) as u32;
         done += frames as u64;
         let mut pos = coff;
@@ -1109,7 +1076,7 @@ fn pcm_layout(fourcc: &[u8; 4], sd: &SoundDesc, channels: u32, children: &[u8]) 
 /// The codec string of a form of PCM: WebCodecs' where it has one
 /// (`pcm-s16` and the like, little endian), else named alike by the app
 /// (`pcm-s16be`, `pcm-f64`).
-fn pcm_codec(f: PcmForm) -> Option<&'static str> {
+pub(crate) fn pcm_codec(f: PcmForm) -> Option<&'static str> {
     Some(match (f.bits, f.float, f.le) {
         (8, false, _) => {
             if f.signed {
@@ -1133,7 +1100,7 @@ fn pcm_codec(f: PcmForm) -> Option<&'static str> {
 }
 
 /// Whether `codec` is uncompressed sound (the PCM codec strings, G.711).
-pub fn is_pcm(codec: &str) -> bool {
+fn is_pcm(codec: &str) -> bool {
     codec.starts_with("pcm-") || codec == "ulaw" || codec == "alaw"
 }
 
@@ -1147,9 +1114,10 @@ fn finish_track(t: &mut Track) {
 
 // ---- fragments ---------------------------------------------------------------
 
-fn apply_moof(movie: &mut Movie, moof_offset: u64, moof: &[u8], next_dts: &mut [i64]) -> Result<(), Error> {
+/// Add the samples of a `moof` (at `moof_offset` in a file of `file_size`
+/// bytes) to the movie's tracks, with the `trex` defaults by track.
+fn apply_moof(movie: &mut Movie, trex: &[(u32, Trex)], file_size: u64, moof_offset: u64, moof: &[u8], next_dts: &mut [i64]) -> Result<(), Error> {
     let body = &moof[box_header(moof)?.header_len as usize..];
-    let trex_all = TREX.with(|t| t.borrow().clone());
     let mut prev_traf_end: Option<u64> = None;
     for_each_box(body, |kind, traf, _| {
         if &kind != b"traf" {
@@ -1161,7 +1129,7 @@ fn apply_moof(movie: &mut Movie, moof_offset: u64, moof: &[u8], next_dts: &mut [
         let (_, flags) = r.version_flags()?;
         let track_id = r.u32()?;
         let ti = movie.tracks.iter().position(|t| t.id == track_id).ok_or("traf for unknown track")?;
-        let trex = trex_all.iter().find(|(id, _)| *id == track_id).map(|(_, t)| t.clone()).unwrap_or_default();
+        let trex = trex.iter().find(|(id, _)| *id == track_id).map(|(_, t)| t.clone()).unwrap_or_default();
         let mut base: Option<u64> = None;
         if flags & 0x1 != 0 {
             base = Some(r.u64()?);
@@ -1190,8 +1158,13 @@ fn apply_moof(movie: &mut Movie, moof_offset: u64, moof: &[u8], next_dts: &mut [
                 return Ok(());
             }
             let mut r = Reader::new(trun);
-            let (v, tf) = r.version_flags()?;
+            let (_, tf) = r.version_flags()?;
             let count = r.u32()?;
+            // (samples whose sizes the run doesn't list, each a byte at least:
+            // a count the file can't hold would only ask for memory there is not)
+            if tf & 0x200 == 0 && count as u64 * def_size.max(1) as u64 > file_size {
+                return Err(format!("track {track_id} lists more samples than the file holds"));
+            }
             if tf & 0x1 != 0 {
                 data_pos = (base as i64 + r.i32()? as i64) as u64;
             }
@@ -1206,15 +1179,8 @@ fn apply_moof(movie: &mut Movie, moof_offset: u64, moof: &[u8], next_dts: &mut [
                 } else {
                     def_flags
                 };
-                let cto = if tf & 0x800 != 0 {
-                    if v == 0 {
-                        r.u32()? as i64
-                    } else {
-                        r.i32()? as i64
-                    }
-                } else {
-                    0
-                };
+                // (signed in version 0 too, as for ctts)
+                let cto = if tf & 0x800 != 0 { r.i32()? as i64 } else { 0 };
                 let sync = fl & 0x10000 == 0;
                 track.samples.push(Sample { offset: data_pos, size: sz, dts, pts: dts + cto, duration: d, sync });
                 data_pos += sz as u64;
@@ -1227,4 +1193,102 @@ fn apply_moof(movie: &mut Movie, moof_offset: u64, moof: &[u8], next_dts: &mut [
         prev_traf_end = Some(end);
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        [&(8 + body.len() as u32).to_be_bytes()[..], &kind[..], body].concat()
+    }
+
+    /// A full box of version 0 (flags `flags`) whose body is 32-bit words.
+    fn full(kind: &[u8; 4], flags: u32, words: &[u32]) -> Vec<u8> {
+        bx(kind, &[flags].iter().chain(words).flat_map(|w| w.to_be_bytes()).collect::<Vec<u8>>())
+    }
+
+    /// The `moov` of an MP4 of one track (timed text: its sample entry is a
+    /// bare box) whose sample table holds `tables` besides the entry.
+    fn moov(tables: &[Vec<u8>]) -> Vec<u8> {
+        let tkhd = full(b"tkhd", 1, &[[0, 0, 1].as_slice(), &[0; 17]].concat());
+        let mdhd = full(b"mdhd", 0, &[0, 0, 1000]);
+        let hdlr = full(b"hdlr", 0, &[0, u32::from_be_bytes(*b"text")]);
+        let stsd = bx(b"stsd", &[&[0, 0, 0, 0, 0, 0, 0, 1][..], &bx(b"tx3g", &[])].concat());
+        let stbl = bx(b"stbl", &[&[stsd][..], tables].concat().concat());
+        let mdia = bx(b"mdia", &[mdhd, hdlr, bx(b"minf", &stbl)].concat());
+        bx(b"moov", &bx(b"trak", &[tkhd, mdia].concat()))
+    }
+
+    #[test]
+    fn counts_the_file_cannot_hold_are_refused() {
+        // (each made a tiny file ask for gigabytes: a sync sample table
+        // sized by its count, and fixed-size samples or a fragment's run
+        // with no sizes of their own expanded to billions)
+        let stss = moov(&[full(b"stss", 0, &[u32::MAX])]);
+        assert!(parse_bytes(&stss).is_err());
+        let stsz = moov(&[full(b"stsz", 0, &[1, u32::MAX]), full(b"stsc", 0, &[1, 1, 1, 1]), full(b"stco", 0, &[1, 100])]);
+        let e = parse_bytes(&stsz).unwrap_err();
+        assert!(e.contains("more samples than the file holds"), "{e}");
+        let traf = bx(b"traf", &[full(b"tfhd", 0, &[1]), full(b"trun", 0, &[u32::MAX])].concat());
+        let e = parse_bytes(&[moov(&[]), bx(b"moof", &traf)].concat()).unwrap_err();
+        assert!(e.contains("more samples than the file holds"), "{e}");
+    }
+
+    #[test]
+    fn long_runs_in_the_tables_take_no_time() {
+        // a thousand runs of four billion durations for one sample: the
+        // durations were counted out one by one past the sample count (for
+        // hours in a debug build; a release build skips most of the count)
+        let s = Stbl { stts: vec![(u32::MAX, 1); 1000], stsc: vec![(1, 1, 1)], fixed_size: 4, sample_count: 1, chunk_offsets: vec![100], ..Default::default() };
+        assert_eq!(expand_samples(&s).unwrap(), vec![Sample { offset: 100, size: 4, dts: 0, pts: 0, duration: 1, sync: true }]);
+    }
+
+    #[test]
+    fn chunk_runs_are_walked_once() {
+        // as many sample-to-chunk runs as chunks: each chunk looked through
+        // the runs from the first (a minute for these)
+        let n = 500_000u32;
+        let s = Stbl { stts: vec![(n, 1)], stsc: (1..=n).map(|c| (c, 1, 1)).collect(), fixed_size: 2, sample_count: n, chunk_offsets: (0..n as u64).map(|c| c * 2).collect(), ..Default::default() };
+        let v = expand_samples(&s).unwrap();
+        assert_eq!((v.len(), v[n as usize - 1].offset, v[n as usize - 1].dts), (n as usize, 2 * (n as u64 - 1), n as i64 - 1));
+    }
+
+    #[test]
+    fn a_size_that_wraps_round_is_refused() {
+        // after a 24-byte ftyp, a box whose 64-bit size took the read position
+        // back to the start of the file, and so round again for ever
+        let file = [bx(b"ftyp", &[0; 16]), [&[0, 0, 0, 1][..], b"free", &(u64::MAX - 23).to_be_bytes()].concat()].concat();
+        let e = parse_bytes(&file).unwrap_err();
+        assert!(e.contains("impossible size"), "{e}");
+    }
+
+    #[test]
+    fn negative_composition_offsets_in_version_0() {
+        // (signed by the standard only from version 1, but some writers put
+        // them in version 0, and ffmpeg reads them as signed)
+        let tables = [full(b"stts", 0, &[1, 2, 1000]), full(b"ctts", 0, &[2, 1, 1000, 1, 0xffff_fc18]), full(b"stsc", 0, &[1, 1, 2, 1]), full(b"stsz", 0, &[4, 2]), full(b"stco", 0, &[1, 100])];
+        let m = parse_bytes(&moov(&tables)).unwrap();
+        assert_eq!(m.tracks[0].samples.iter().map(|s| (s.dts, s.pts)).collect::<Vec<_>>(), vec![(0, 1000), (1000, 0)]);
+        let traf = bx(b"traf", &[full(b"tfhd", 0x20000, &[1]), full(b"trun", 0x201 | 0x800, &[2, 0, 4, 1000, 4, 0xffff_fc18])].concat());
+        let m = parse_bytes(&[moov(&[]), bx(b"moof", &traf)].concat()).unwrap();
+        assert_eq!(m.tracks[0].samples.iter().map(|s| s.pts - s.dts).collect::<Vec<_>>(), vec![1000, -1000]);
+    }
+
+    #[test]
+    fn an_mp4_that_looks_like_a_transport_stream() {
+        // a box full of 0x47, the transport stream's sync byte
+        let tables = [full(b"stts", 0, &[1, 1, 1000]), full(b"stsc", 0, &[1, 1, 1, 1]), full(b"stsz", 0, &[4, 1]), full(b"stco", 0, &[1, 100])];
+        let file = [bx(b"ftyp", b"isom\0\0\0\0isom"), bx(b"free", &[0x47; 1000]), moov(&tables)].concat();
+        let m = parse_bytes(&file).unwrap();
+        assert_eq!((m.format.as_str(), m.tracks[0].samples.len()), ("mp4", 1));
+    }
+
+    #[test]
+    fn too_short_for_a_box() {
+        for file in [&[][..], &[0; 4][..]] {
+            let e = parse_bytes(file).unwrap_err();
+            assert!(e.contains("no moov box"), "{} bytes: {e}", file.len());
+        }
+    }
 }

@@ -8,8 +8,7 @@
 //! `finish()` returns the `moov` to append and the 8 bytes to patch into the
 //! `mdat` header.
 
-use crate::codec::CodecInfo;
-use crate::demux::TrackKind;
+use crate::demux::{span, Sample, TrackKind};
 use crate::reader::Writer;
 use crate::Error;
 
@@ -33,20 +32,13 @@ pub enum TrackDesc {
     Copy { kind: TrackKind, sample_entry: Vec<u8>, timescale: u32, width: u32, height: u32 },
 }
 
-#[derive(Clone, Copy, Debug)]
-struct MuxSample {
-    offset: u64,
-    size: u32,
-    dts: i64,
-    pts: i64,
-    duration: u32,
-    sync: bool,
-}
-
 struct MuxTrack {
     desc: TrackDesc,
-    samples: Vec<MuxSample>,
+    samples: Vec<Sample>,
 }
+
+/// The 8 bytes to write over the file head at an offset (the `mdat`'s size).
+pub type Patch = (u64, [u8; 8]);
 
 pub struct Muxer {
     tracks: Vec<MuxTrack>,
@@ -100,25 +92,19 @@ impl Muxer {
             return Err("call start() first".into());
         }
         let t = self.tracks.get_mut(track).ok_or("no such track")?;
-        t.samples.push(MuxSample { offset: self.pos, size, dts, pts, duration, sync });
+        t.samples.push(Sample { offset: self.pos, size, dts, pts, duration, sync });
         self.pos += size as u64;
         Ok(())
     }
 
-    /// Bytes written so far, including the head.
-    pub fn position(&self) -> u64 {
-        self.pos
-    }
-
     /// The `moov` box to append, and the `(offset, bytes)` to overwrite in
     /// the already-written head so the `mdat` size is right.
-    pub fn finish(&self) -> Result<(Vec<u8>, (u64, [u8; 8])), Error> {
+    pub fn finish(&self) -> Result<(Vec<u8>, Patch), Error> {
         if !self.started {
             return Err("call start() first".into());
         }
         let mdat_size = self.pos - self.mdat_at;
         let patch = (self.mdat_at + 8, mdat_size.to_be_bytes());
-        let movie_ts = 1000u32;
         let mut max_dur_ms = 0u64;
         for t in &self.tracks {
             max_dur_ms = max_dur_ms.max(track_duration_ms(t));
@@ -129,7 +115,7 @@ impl Muxer {
         let at = w.begin_full_box(b"mvhd", 1, 0);
         w.u64(0);
         w.u64(0);
-        w.u32(movie_ts);
+        w.u32(1000); // the movie's timescale: its durations are milliseconds
         w.u64(max_dur_ms);
         w.u32(0x00010000); // rate
         w.u16(0x0100); // volume
@@ -141,7 +127,7 @@ impl Muxer {
         w.u32(self.tracks.len() as u32 + 1);
         w.end_box(at);
         for (i, t) in self.tracks.iter().enumerate() {
-            write_trak(&mut w, t, i as u32 + 1, movie_ts)?;
+            write_trak(&mut w, t, i as u32 + 1)?;
         }
         w.end_box(moov);
         Ok((w.buf, patch))
@@ -155,17 +141,7 @@ fn track_timescale(t: &MuxTrack) -> u32 {
 }
 
 fn track_duration_ticks(t: &MuxTrack) -> u64 {
-    let mut lo = i64::MAX;
-    let mut hi = i64::MIN;
-    for s in &t.samples {
-        lo = lo.min(s.pts);
-        hi = hi.max(s.pts + s.duration as i64);
-    }
-    if lo == i64::MAX {
-        0
-    } else {
-        (hi - lo).max(0) as u64
-    }
+    span(&t.samples).max(0) as u64
 }
 
 fn track_duration_ms(t: &MuxTrack) -> u64 {
@@ -173,7 +149,7 @@ fn track_duration_ms(t: &MuxTrack) -> u64 {
     (track_duration_ticks(t) as u128 * 1000 / ts) as u64
 }
 
-fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32, movie_ts: u32) -> Result<(), Error> {
+fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32) -> Result<(), Error> {
     let ts = track_timescale(t);
     let (kind, width, height) = match &t.desc {
         TrackDesc::Video { width, height, .. } => (TrackKind::Video, *width, *height),
@@ -191,7 +167,7 @@ fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32, movie_ts: u32) -> Result<()
     w.u64(0);
     w.u32(id);
     w.u32(0);
-    w.u64(dur_ms * movie_ts as u64 / 1000);
+    w.u64(dur_ms);
     w.zeros(8);
     w.u16(0); // layer
     w.u16(0); // alternate group
@@ -212,7 +188,7 @@ fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32, movie_ts: u32) -> Result<()
         let edts = w.begin_box(b"edts");
         let at = w.begin_full_box(b"elst", 1, 0);
         w.u32(1);
-        w.u64(dur_ms * movie_ts as u64 / 1000);
+        w.u64(dur_ms);
         w.u64(media_start as u64);
         w.i16(1);
         w.i16(0);
@@ -464,31 +440,6 @@ fn synth_vpcc(codec: &str) -> Vec<u8> {
     let depth: u8 = parts.get(3).and_then(|p| p.parse().ok()).unwrap_or(8);
     // profile, level, bitDepth(4)|chromaSubsampling(3)|fullRange(1), primaries, transfer, matrix, codecInitializationDataSize(2)
     vec![profile, level, (depth << 4) | (1 << 1), 1, 1, 1, 0, 0]
-}
-
-/// The codec info a copied track needs is already in its sample entry; this
-/// helper lets a caller re-derive it (e.g. to configure a decoder for
-/// verification of an exported file).
-pub fn codec_of_entry(entry: &[u8]) -> Result<CodecInfo, Error> {
-    let h = crate::reader::box_header(entry)?;
-    let body = &entry[h.header_len as usize..];
-    // skip the fixed fields the way the demuxer does, guessing kind by fourcc
-    let children = match &h.kind {
-        b"mp4a" | b"Opus" | b"fLaC" | b"ac-3" | b"ec-3" | b".mp3" => {
-            let mut r = crate::reader::Reader::new(body);
-            r.skip(6 + 2)?;
-            let version = r.u16()?;
-            r.skip(2 + 4 + 2 + 2 + 2 + 2 + 4)?;
-            if version == 1 {
-                r.skip(16)?;
-            } else if version == 2 {
-                r.skip(36)?;
-            }
-            r.rest()
-        }
-        _ => &body[78.min(body.len())..],
-    };
-    crate::codec::from_sample_entry(&h.kind, children)
 }
 
 #[cfg(test)]

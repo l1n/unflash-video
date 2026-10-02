@@ -9,8 +9,8 @@
 //!
 //! Nothing here decodes media.
 
-pub mod annexb;
-pub mod codec;
+mod annexb;
+mod codec;
 pub mod demux;
 pub mod entry;
 pub mod ivf;
@@ -19,6 +19,7 @@ pub mod mux;
 mod reader;
 pub mod ts;
 
+pub use annexb::avcc_record;
 pub use demux::{Demuxer, Movie, Sample, Track, TrackKind};
 pub use mux::{Muxer, TrackDesc};
 

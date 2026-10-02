@@ -18,8 +18,8 @@
 //!
 //! A sample's bytes are spread over packets, so its `offset` is not a file
 //! offset but a place: [`TS_BASE`] + track × [`TS_TRACK`] + 256 × the file
-//! offset of the packet (its sync byte) that holds the sample's first byte
-//! + that byte's index in the packet. A reader starts there and follows
+//! offset of the packet (its sync byte) that holds the sample's first byte +
+//! that byte's index in the packet. A reader starts there and follows
 //! the stream's packets (PES headers skipped) for `size` bytes: as they
 //! are for sound, NAL units given lengths instead of start codes for video
 //! ([`read_sample`]; the app's is web/ts.js).
@@ -32,19 +32,19 @@ use std::collections::BTreeMap;
 
 use crate::annexb::{self, AvcSps, HevcSps};
 use crate::codec::{avc_codec, hevc_codec};
-use crate::demux::{Movie, Sample, Track, TrackKind};
+use crate::demux::{pcm_codec, rescale, Movie, PcmForm, Sample, Track, TrackKind};
 use crate::entry;
 use crate::mux::write_video_entry;
-use crate::reader::Writer;
+use crate::reader::{Bits, Writer};
 use crate::Error;
 
 /// What to do with video this reader can't hand to a decoder.
 const CONVERT: &str = "Convert it first, for example with HandBrake or `ffmpeg -i input -c:v libx264 -c:a copy output.mkv`.";
 
 /// Where the places of samples begin: above any file offset.
-pub const TS_BASE: u64 = 1 << 52;
+const TS_BASE: u64 = 1 << 52;
 /// The span of places of one track.
-pub const TS_TRACK: u64 = 1 << 47;
+const TS_TRACK: u64 = 1 << 47;
 /// Bytes asked for at a time.
 const CHUNK: u64 = 4 << 20;
 const SYNC: u8 = 0x47;
@@ -55,7 +55,7 @@ const CLOCK: i64 = 90_000;
 
 /// Whether a file's first bytes are a transport stream's: its packet size
 /// and where its first sync byte is.
-pub fn sniff(b: &[u8]) -> Option<(u64, u64)> {
+pub(crate) fn sniff(b: &[u8]) -> Option<(u64, u64)> {
     for size in [188usize, 192, 204] {
         for first in 0..size {
             if first + 3 * size >= b.len() {
@@ -72,7 +72,7 @@ pub fn sniff(b: &[u8]) -> Option<(u64, u64)> {
 /// A packet's header, as far as following a stream goes: its PID, whether a
 /// PES (or a section) starts in it, and where its payload starts (188 when
 /// it has none).
-pub fn packet_head(p: &[u8]) -> (u16, bool, usize) {
+fn packet_head(p: &[u8]) -> (u16, bool, usize) {
     let pid = ((p[1] as u16 & 0x1f) << 8) | p[2] as u16;
     let pusi = p[1] & 0x40 != 0;
     let afc = (p[3] >> 4) & 3;
@@ -489,40 +489,6 @@ struct Frame {
     samples: u32,
 }
 
-const AC3_SIZES: [[u16; 3]; 19] = [
-    [64, 69, 96],
-    [80, 87, 120],
-    [96, 104, 144],
-    [112, 121, 168],
-    [128, 139, 192],
-    [160, 174, 240],
-    [192, 208, 288],
-    [224, 243, 336],
-    [256, 278, 384],
-    [320, 348, 480],
-    [384, 417, 576],
-    [448, 487, 672],
-    [512, 557, 768],
-    [640, 696, 960],
-    [768, 835, 1152],
-    [896, 975, 1344],
-    [1024, 1114, 1536],
-    [1152, 1253, 1728],
-    [1280, 1393, 1920],
-];
-
-fn dolby_channels(acmod: u8, lfe: bool) -> u32 {
-    [2u32, 1, 2, 3, 3, 4, 4, 5][acmod as usize & 7] + lfe as u32
-}
-
-fn bits(b: &[u8], at: usize, n: usize) -> u32 {
-    let mut v = 0;
-    for i in at..at + n {
-        v = (v << 1) | ((b[i / 8] >> (7 - i % 8)) & 1) as u32;
-    }
-    v
-}
-
 impl Sound {
     /// Header bytes to read a frame by.
     fn head_len(self) -> usize {
@@ -572,42 +538,7 @@ impl Sound {
                 let blocks = (h[6] & 3) as u32 + 1;
                 (total > skip).then_some(FrameHead { total, skip, samples: 1024 * blocks, merge: false, rate, channels: if channels == 0 { 2 } else if channels == 7 { 8 } else { channels } })
             }
-            Sound::Dolby => {
-                let bsid = h[5] >> 3;
-                if bsid <= 10 {
-                    let fscod = (h[4] >> 6) as usize;
-                    let code = (h[4] & 0x3f) as usize;
-                    if fscod == 3 || code >= 38 {
-                        return None;
-                    }
-                    let words = AC3_SIZES[code / 2][fscod] as u32 + if fscod == 1 { (code & 1) as u32 } else { 0 };
-                    let acmod = h[6] >> 5;
-                    // lfeon follows acmod and the mix levels that acmod has
-                    let mut at = 6 * 8 + 3;
-                    if acmod & 1 != 0 && acmod != 1 {
-                        at += 2;
-                    }
-                    if acmod & 4 != 0 {
-                        at += 2;
-                    }
-                    if acmod == 2 {
-                        at += 2;
-                    }
-                    let lfe = bits(h, at, 1) == 1;
-                    Some(FrameHead { total: words * 2, skip: 0, samples: 1536, merge: false, rate: [48000, 44100, 32000][fscod], channels: dolby_channels(acmod, lfe) })
-                } else if (11..=16).contains(&bsid) {
-                    let strmtyp = h[2] >> 6;
-                    let substream = (h[2] >> 3) & 7;
-                    let total = ((((h[2] & 7) as u32) << 8) | h[3] as u32) * 2 + 2;
-                    let fscod = h[4] >> 6;
-                    let (rate, blocks) = if fscod == 3 { ([24000, 22050, 16000].get(((h[4] >> 4) & 3) as usize).copied()?, 6) } else { ([48000, 44100, 32000][fscod as usize], [1, 2, 3, 6][((h[4] >> 4) & 3) as usize]) };
-                    let acmod = (h[4] >> 1) & 7;
-                    let lfe = h[4] & 1 == 1;
-                    Some(FrameHead { total, skip: 0, samples: 256 * blocks, merge: strmtyp == 1 || substream != 0, rate, channels: dolby_channels(acmod, lfe) })
-                } else {
-                    None
-                }
-            }
+            Sound::Dolby => entry::dolby_frame(h).map(|d| FrameHead { total: d.bytes, skip: 0, samples: d.samples, merge: d.follows, rate: d.rate, channels: d.channels }),
             Sound::Mpa => {
                 let (rate, channels, samples) = entry::mpeg_audio_frame(h)?;
                 let version = (h[1] >> 3) & 3;
@@ -639,8 +570,13 @@ impl Sound {
             Sound::Dts => {
                 if h[0] == 0x64 {
                     // a DTS-HD extension substream: with the core frame before it
-                    let long = bits(h, 42, 1) == 1;
-                    let total = if long { bits(h, 55, 20) } else { bits(h, 51, 16) } + 1;
+                    // (its size after the sync word, user data, index and a flag
+                    // for the long fields, and the header's size)
+                    let mut r = Bits::new(h);
+                    r.skip(42)?;
+                    let long = r.flag()?;
+                    r.skip(if long { 12 } else { 8 })?;
+                    let total = r.u(if long { 20 } else { 16 })? + 1;
                     return Some(FrameHead { total, skip: 0, samples: 0, merge: true, rate: 0, channels: 0 });
                 }
                 let (rate, channels, samples, total) = entry::dts_frame(h)?;
@@ -894,7 +830,7 @@ enum Slot {
 
 /// The transport stream reader behind [`crate::Demuxer`]: `need()` ->
 /// read that range -> `feed()`, until `movie()` is `Some`.
-pub struct TsDemuxer {
+pub(crate) struct TsDemuxer {
     file_size: u64,
     packet: u64,
     /// The next packet's sync byte.
@@ -902,7 +838,6 @@ pub struct TsDemuxer {
     want: Option<(u64, u64)>,
     /// A sync byte found after a loss, whose next packet's is still to be seen.
     unconfirmed: Option<u64>,
-    bytes_read: u64,
     slots: Vec<Slot>,
     sections: BTreeMap<u16, Vec<u8>>,
     streams: Vec<Stream>,
@@ -910,7 +845,6 @@ pub struct TsDemuxer {
     hdmv: bool,
     /// The file's first time: what a stream's first is unwrapped near.
     first_time: Option<i64>,
-    resyncs: u32,
     movie: Option<Movie>,
 }
 
@@ -925,13 +859,11 @@ impl TsDemuxer {
             at: first,
             want: None,
             unconfirmed: None,
-            bytes_read: 0,
             slots,
             sections: BTreeMap::new(),
             streams: Vec::new(),
             hdmv: packet == 192,
             first_time: None,
-            resyncs: 0,
             movie: None,
         };
         d.ask();
@@ -950,10 +882,6 @@ impl TsDemuxer {
         self.movie.is_some()
     }
 
-    pub fn bytes_read(&self) -> u64 {
-        self.bytes_read
-    }
-
     pub fn progress(&self) -> f64 {
         if self.movie.is_some() {
             1.0
@@ -970,16 +898,12 @@ impl TsDemuxer {
         self.movie
     }
 
+    /// Serve the bytes of the last `need()` range: from its offset, at least
+    /// its length (which [`crate::Demuxer::feed`] sees to).
     pub fn feed(&mut self, offset: u64, data: &[u8]) -> Result<(), Error> {
-        let Some((want_off, want_len)) = self.want else {
-            return Err("demuxer is not waiting for data".into());
-        };
-        if offset != want_off || (data.len() as u64) < want_len {
-            return Err(format!("expected {want_len} bytes at {want_off}, got {} at {offset}", data.len()));
-        }
-        self.bytes_read += want_len;
-        let data = &data[..want_len as usize];
-        let end = offset + want_len;
+        // (the bytes asked for, of what may be more)
+        let data = &data[..self.want.map_or(0, |(_, n)| n as usize).min(data.len())];
+        let end = offset + data.len() as u64;
         let mut pos = self.at;
         while pos + TS <= end {
             let i = (pos - offset) as usize;
@@ -996,7 +920,6 @@ impl TsDemuxer {
                 self.unconfirmed = None;
             }
             if lost {
-                self.resyncs += 1;
                 match resync(data, offset, pos, self.packet, self.file_size) {
                     Ok(q) => pos = q,
                     Err(q) => {
@@ -1224,15 +1147,20 @@ impl TsDemuxer {
             }
         }
         if self.streams.is_empty() {
-            return Err(if self.slots.iter().any(|s| *s == Slot::Pmt) { "this transport stream has no video or sound this reader knows".into() } else { "no program found in this transport stream (no PAT/PMT)".into() });
+            return Err(if self.slots.contains(&Slot::Pmt) { "this transport stream has no video or sound this reader knows".into() } else { "no program found in this transport stream (no PAT/PMT)".into() });
         }
-        // the file's start: the earliest time of a sample
+        // the file's start: the earliest time of a sample (video's with the
+        // clock's jumps closed up, as its samples' times will be)
         let mut start = i64::MAX;
         for s in &self.streams {
             match &s.es {
                 Es::Video(v) => {
-                    if let Some(p) = v.aus.iter().skip_while(|a| !a.sync).filter_map(|a| a.pts).min() {
-                        start = start.min(p);
+                    let (aus, dts, offsets, _) = video_times(v, 0);
+                    // (a stream that gives no time has none to say)
+                    if aus.iter().any(|a| a.dts.is_some()) {
+                        if let Some(p) = dts.iter().zip(&offsets).map(|(d, o)| d + o).min() {
+                            start = start.min(p);
+                        }
                     }
                 }
                 Es::Sound(a) => {
@@ -1254,7 +1182,7 @@ impl TsDemuxer {
             _ => 3,
         };
         order.sort_by_key(|&k| rank(&self.streams[k]));
-        let mut movie = Movie { timescale: CLOCK as u32, duration_secs: 0.0, fragmented: false, brands: vec![], format: "mpegts".into(), tracks: Vec::new(), packet_size: self.packet as u32 };
+        let mut movie = Movie { format: "mpegts".into(), packet_size: self.packet as u32, ..Default::default() };
         for (n, k) in order.into_iter().enumerate() {
             let base = TS_BASE + (n as u64).min(31) * TS_TRACK;
             let s = &self.streams[k];
@@ -1265,7 +1193,6 @@ impl TsDemuxer {
             };
             movie.tracks.push(track);
         }
-        movie.duration_secs = movie.tracks.iter().map(|t| t.duration_secs()).fold(0.0, f64::max);
         self.movie = Some(movie);
         Ok(())
     }
@@ -1317,32 +1244,34 @@ fn median(v: &mut [i64]) -> i64 {
 }
 
 fn blank_track(s: &Stream, kind: TrackKind, note: &str) -> Track {
-    Track {
-        id: s.pid as u32,
-        kind,
-        fourcc: String::new(),
-        codec: format!("stream type {:#04x}", s.stream_type),
-        description: None,
-        timescale: CLOCK as u32,
-        width: 0,
-        height: 0,
-        sample_rate: 0,
-        channels: 0,
-        sample_entry: Vec::new(),
-        edit_shift: 0,
-        samples: Vec::new(),
-        frame_duration: 0,
-        prefix: Vec::new(),
-        name: String::new(),
-        language: s.language.clone(),
-        note: note.to_string(),
+    Track { id: s.pid as u32, kind, codec: format!("stream type {:#04x}", s.stream_type), timescale: CLOCK as u32, language: s.language.clone(), note: note.to_string(), ..Default::default() }
+}
+
+/// A video stream's pictures from the first that decoding can start at;
+/// their decode times, in order (a missing one a step after the one before,
+/// or for the first the first time there is, else `none`; jumps of the
+/// clock closed up); how much later each is shown; and the step (the usual
+/// time between pictures).
+fn video_times(v: &VideoEs, none: i64) -> (Vec<&Au>, Vec<i64>, Vec<i64>, i64) {
+    let aus: Vec<&Au> = v.aus.iter().skip_while(|a| !a.sync).filter(|a| a.size > 0).collect();
+    let mut deltas: Vec<i64> = aus.windows(2).filter_map(|w| Some(w[1].dts? - w[0].dts?)).filter(|&d| d > 0).collect();
+    let step = median(&mut deltas).max(1);
+    let first = aus.iter().find_map(|a| a.dts).unwrap_or(none);
+    let mut dts: Vec<i64> = Vec::with_capacity(aus.len());
+    for a in &aus {
+        let d = a.dts.unwrap_or_else(|| dts.last().map(|p| p + step).unwrap_or(first));
+        dts.push(d);
     }
+    let offsets: Vec<i64> = aus.iter().map(|a| a.pts.map(|p| p - a.dts.unwrap_or(p)).unwrap_or(0)).collect();
+    let steps = vec![step; dts.len()];
+    close_jumps(&mut dts, &steps, 10 * CLOCK);
+    (aus, dts, offsets, step)
 }
 
 fn video_track(s: &Stream, v: &VideoEs, base: u64, start: i64) -> Track {
     let mut t = blank_track(s, TrackKind::Video, "");
     // decoding starts at a picture that can be decoded on its own
-    let aus: Vec<&Au> = v.aus.iter().skip_while(|a| !a.sync).filter(|a| a.size > 0).collect();
+    let (aus, dts, offsets, step) = video_times(v, start);
     let setup = if v.hevc {
         v.hevc_sps.first().map(|(sps, info)| {
             let vps: Vec<&[u8]> = v.hevc_vps.iter().map(|x| &x[..]).collect();
@@ -1373,17 +1302,6 @@ fn video_track(s: &Stream, v: &VideoEs, base: u64, start: i64) -> Track {
         t.sample_entry = w.buf;
     }
     t.description = Some(rec);
-    // times: decode times in order (those missing, a step on), jumps closed up
-    let mut deltas: Vec<i64> = aus.windows(2).filter_map(|w| Some(w[1].dts? - w[0].dts?)).filter(|&d| d > 0).collect();
-    let step = median(&mut deltas).max(1);
-    let mut dts: Vec<i64> = Vec::with_capacity(aus.len());
-    for a in &aus {
-        let d = a.dts.unwrap_or_else(|| dts.last().map(|p| p + step).unwrap_or(start));
-        dts.push(d);
-    }
-    let offsets: Vec<i64> = aus.iter().map(|a| a.pts.map(|p| p - a.dts.unwrap_or(p)).unwrap_or(0)).collect();
-    let steps = vec![step; dts.len()];
-    close_jumps(&mut dts, &steps, 10 * CLOCK);
     for (i, a) in aus.iter().enumerate() {
         let d = dts[i] - start;
         let duration = if i + 1 < dts.len() { (dts[i + 1] - dts[i]).clamp(1, u32::MAX as i64) } else { step };
@@ -1437,11 +1355,11 @@ fn sound_track(s: &Stream, a: &SoundEs, base: u64, start: i64) -> Track {
             t.fourcc = t.codec.clone();
         }
         Sound::Lpcm => {
-            t.codec = if head[3] >> 6 == 1 { "pcm-s16be".into() } else { "pcm-s24be".into() };
+            t.codec = pcm_codec(PcmForm { bits: if head[3] >> 6 == 1 { 16 } else { 24 }, float: false, le: false, signed: true }).unwrap_or_default().into();
         }
     }
     // times: a PES's time and the samples since, in the track's own clock
-    let mut ticks: Vec<i64> = a.frames.iter().map(|f| ((f.anchor - start) as i128 * rate as i128 + CLOCK as i128 / 2).div_euclid(CLOCK as i128) as i64 + f.since as i64).collect();
+    let mut ticks: Vec<i64> = a.frames.iter().map(|f| rescale(f.anchor - start, CLOCK, rate as i64) + f.since as i64).collect();
     let steps: Vec<i64> = a.frames.iter().map(|f| f.samples as i64).collect();
     close_jumps(&mut ticks, &steps, 10 * rate as i64);
     for (i, f) in a.frames.iter().enumerate() {
@@ -1755,6 +1673,20 @@ mod tests {
     }
 
     #[test]
+    fn the_clock_steps_back() {
+        // a recording across a discontinuity: the clock starts again from 0
+        // after two pictures (closed up, the pictures follow on; the file
+        // starts at the first, not hours in at the least time it gives)
+        let mut m = Mux::new(188);
+        m.tables(&[(0x1b, 0x100)]);
+        for (k, t) in [500_000_000i64, 500_003_600, 0, 3600].into_iter().enumerate() {
+            m.pes(0x100, 0xe0, Some(t), &au(k == 0, 300, 1), 100);
+        }
+        let movie = parse(&m.out, None);
+        assert_eq!(movie.tracks[0].samples.iter().map(|s| s.pts).collect::<Vec<_>>(), vec![0, 3600, 7200, 10800]);
+    }
+
+    #[test]
     fn dolby_frames_and_dependent_substreams() {
         // AC-3, 48 kHz, 5.1 at 448 kbit/s (1792 bytes), as two PES of three frames
         let mut m = Mux::new(188);
@@ -1829,7 +1761,7 @@ mod tests {
             w.push(true);
             w.push(bottom);
             w.push(true);
-            while w.len() % 8 != 0 {
+            while !w.len().is_multiple_of(8) {
                 w.push(false);
             }
             let mut b = vec![0, 0, 1, if idr { 0x65 } else { 0x41 }];

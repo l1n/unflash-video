@@ -14,17 +14,13 @@ pub struct CodecInfo {
     pub description: Option<Vec<u8>>,
 }
 
-fn hex2(v: u8) -> String {
-    format!("{v:02X}")
-}
-
 /// `avc1.PPCCLL` from an AVCDecoderConfigurationRecord.
 pub fn avc_codec(avcc: &[u8]) -> Result<CodecInfo, Error> {
     if avcc.len() < 4 {
         return Err("avcC too short".into());
     }
     Ok(CodecInfo {
-        codec: format!("avc1.{}{}{}", hex2(avcc[1]), hex2(avcc[2]), hex2(avcc[3])),
+        codec: format!("avc1.{:02X}{:02X}{:02X}", avcc[1], avcc[2], avcc[3]),
         description: Some(avcc.to_vec()),
     })
 }
