@@ -1,7 +1,7 @@
 // The detector, wrapped so the rest of the app does not care whether it runs
 // on the GPU or the CPU, nor by which route a picture reaches it.
 
-import { orTimeout, yuvLayoutWords } from './media.js';
+import { orTimeout, yuvLayoutWords } from './frames.js';
 import { profile } from './profile.js';
 
 /**

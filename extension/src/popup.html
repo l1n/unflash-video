@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unflash</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<header>
+  <img src="icons/icon-32.png" alt="" width="20" height="20">
+  <h1>Unflash</h1>
+  <label class="switch" title="Guard videos (Alt+Shift+U)">
+    <input type="checkbox" id="enabled">
+    <span></span>
+  </label>
+</header>
+
+<section id="status" class="status" aria-live="polite">
+  <p id="statusLine">…</p>
+  <p id="statusDetail" class="detail"></p>
+</section>
+
+<label class="row site">
+  <input type="checkbox" id="site">
+  <span>Guard videos on <b id="host">this site</b></span>
+</label>
+
+<fieldset>
+  <legend>When a video flashes</legend>
+  <label class="row"><input type="radio" name="mode" value="hold"><span><b>Hold the picture</b> from before the flashing until it stops</span></label>
+  <label class="row"><input type="radio" name="mode" value="dim"><span><b>Dim</b> the video while it flashes</span></label>
+  <label class="row"><input type="radio" name="mode" value="pause"><span><b>Pause</b> the video</span></label>
+  <label class="row"><input type="radio" name="mode" value="warn"><span><b>Only say so</b>, over the video</span></label>
+</fieldset>
+
+<label class="field">
+  <span>Step in</span>
+  <select id="sensitivity">
+    <option value="early">at the first flash</option>
+    <option value="balanced">at the second (recommended)</option>
+    <option value="limit">only past the limit</option>
+  </select>
+</label>
+
+<details>
+  <summary>More</summary>
+  <label class="field">
+    <span>Limits</span>
+    <select id="profile">
+      <option value="wcag_ext">WCAG, with flashing at the limit and stripes</option>
+      <option value="wcag">WCAG 2.2 only</option>
+      <option value="strict">Strict (more margin)</option>
+    </select>
+  </label>
+  <label class="field">
+    <span>Detector</span>
+    <select id="detector">
+      <option value="auto">Automatic</option>
+      <option value="gpu">Graphics card (WebGPU)</option>
+      <option value="cpu">Processor</option>
+    </select>
+  </label>
+  <label class="row"><input type="checkbox" id="badge"><span>Say over the video what was done</span></label>
+</details>
+
+<p class="note">This reduces risk. It is not a guarantee: the first moment of flashing is seen before it can be stopped, and some videos (protected films, video from another site) cannot be read.</p>
+
+<script type="module" src="popup.js"></script>
+</body>
+</html>

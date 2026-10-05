@@ -49,6 +49,14 @@ pointer.
 `main` by the [Pages workflow](.github/workflows/pages.yml). It is a static
 site: the video never leaves your machine.
 
+**As a browser extension:** [`extension/`](extension/README.md) runs the
+same detector on any video as you watch it (YouTube and the rest, any
+HTML5 `<video>`), and when one starts flashing it holds the last calm
+picture over it (or dims or pauses it) until the flashing has stopped for a
+second. It has no lookahead, so the first moment of flashing is seen; to make
+a video safe from its first frame, scan and fix it here. Chrome, Edge and
+Firefox; `node extension/build.mjs` after `./build.sh`.
+
 **What's new:** [CHANGELOG.md](CHANGELOG.md), in plain words, newest first.
 `build.sh` puts a copy beside the page, and the app shows someone coming
 back the changes made since their last visit (on the start page, and

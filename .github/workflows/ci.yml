@@ -116,6 +116,56 @@ jobs:
           name: web
           path: web/
 
+  extension:
+    # the browser extension (extension/), made from the build's WebAssembly
+    # and loaded unpacked into headless Chromium; its packages kept
+    name: Browser extension
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
+      - name: Playwright's Chromium, from the cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ env.PLAYWRIGHT_VERSION }}-chromium-${{ runner.os }}
+      - name: Playwright
+        run: |
+          npm install -g "playwright@$PLAYWRIGHT_VERSION"
+          npx "playwright@$PLAYWRIGHT_VERSION" install chromium
+          node --input-type=module -e "import { loadPlaywright } from './tests/e2e/playwright.mjs'; const { chromium } = await loadPlaywright(); await (await chromium.launch()).close();" || npx "playwright@$PLAYWRIGHT_VERSION" install-deps chromium
+      # (the test's flashing clip)
+      - name: ffmpeg
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: ffmpeg
+          version: 1
+      - name: ffmpeg works
+        run: bash .github/cached-packages.sh 'ffmpeg -version' ffmpeg
+      - name: Build the extension
+        run: node extension/build.mjs
+      - name: The extension guards a page's videos (headless Chromium)
+        run: node extension/test/e2e.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension
+          path: |
+            extension/build/*.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: extension-test-output
+          path: extension/build/test/
+          if-no-files-found: ignore
+
   web:
     # the browser suites in parts, side by side, on the one build (see
     # tests/e2e/run.mjs --part; `others` runs the suites of their own)

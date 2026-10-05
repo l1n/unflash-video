@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Unflash: video flash guard",
+  "short_name": "Unflash",
+  "version": "0.1.0",
+  "description": "Hides the flashing in any web video as it plays (YouTube and the rest) before it can trigger a seizure: Unflash's WCAG flash and red-flash detector, run on every picture.",
+  "icons": { "16": "icons/icon-16.png", "32": "icons/icon-32.png", "48": "icons/icon-48.png", "128": "icons/icon-128.png" },
+  "action": {
+    "default_title": "Unflash",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/icon-16.png", "32": "icons/icon-32.png" }
+  },
+  "background": { "service_worker": "background.js", "type": "module" },
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["guard.js", "settings.js", "lib/*.js", "pkg/*"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "commands": {
+    "toggle-guard": {
+      "suggested_key": { "default": "Alt+Shift+U" },
+      "description": "Turn the video guard on or off"
+    }
+  }
+}
