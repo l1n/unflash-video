@@ -26,6 +26,7 @@ async function render() {
   $('site').disabled = !host || !s.enabled;
   for (const r of document.querySelectorAll('input[name=mode]')) r.checked = r.value === s.mode;
   $('sensitivity').value = s.sensitivity;
+  $('lookahead').value = String(s.lookahead);
   $('profile').value = s.profile;
   $('detector').value = s.detector;
   $('badge').checked = s.badge;
@@ -48,6 +49,8 @@ async function render() {
   else if (st.videos) line = `Watching ${st.videos} video${st.videos === 1 ? '' : 's'}${st.events ? `: flashing stopped ${st.events} time${st.events === 1 ? '' : 's'}` : ': no flashing so far'}.`;
   else line = 'No video playing on this page.';
   if (st.videos && s.enabled) detail = `${st.backend === 'webgpu' ? 'On the graphics card' : 'On the processor'} · ${st.msPerFrame.toFixed(1)} ms a picture`;
+  if (st.ahead && s.enabled) detail += ` · ${s.lookahead} s ahead`;
+  if (st.onTime && s.enabled) detail += `${detail ? ' · ' : ''}${st.onTime} video${st.onTime === 1 ? '' : 's'} shown as ${st.onTime === 1 ? 'it plays' : 'they play'}: click the page to let its sound be delayed`;
   if (st.unreadable) detail += `${detail ? ' · ' : ''}${st.unreadable} video${st.unreadable === 1 ? '' : 's'} from another site cannot be read here`;
   $('statusLine').textContent = line;
   $('statusDetail').textContent = detail;
@@ -65,6 +68,7 @@ $('site').addEventListener('change', async (e) => {
 });
 for (const r of document.querySelectorAll('input[name=mode]')) r.addEventListener('change', () => saveSettings({ mode: r.value }));
 for (const id of ['sensitivity', 'profile', 'detector']) $(id).addEventListener('change', (e) => saveSettings({ [id]: e.target.value }));
+$('lookahead').addEventListener('change', (e) => saveSettings({ lookahead: Number(e.target.value) }));
 $('badge').addEventListener('change', (e) => saveSettings({ badge: e.target.checked }));
 
 api.storage.onChanged.addListener(() => render());

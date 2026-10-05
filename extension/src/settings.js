@@ -9,6 +9,10 @@ export const DEFAULTS = {
   // what happens when a video starts flashing: hold the last picture from
   // before the flashing over it, dim it, pause it, or only say so
   mode: 'hold',
+  // seconds the video is shown late, so that its flashing is found before
+  // it is seen (its sound as late); 0 reacts as it plays, the first moment
+  // of flashing seen
+  lookahead: 1,
   // how soon: 'early' at the first flash (two big changes of brightness in
   // a second), 'balanced' at the second swing after it, 'limit' only once
   // the flashing breaks the profile's limit

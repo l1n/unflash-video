@@ -50,11 +50,11 @@ pointer.
 site: the video never leaves your machine.
 
 **As a browser extension:** [`extension/`](extension/README.md) runs the
-same detector on any video as you watch it (YouTube and the rest, any
-HTML5 `<video>`), and when one starts flashing it holds the last calm
-picture over it (or dims or pauses it) until the flashing has stopped for a
-second. It has no lookahead, so the first moment of flashing is seen; to make
-a video safe from its first frame, scan and fix it here. Chrome, Edge and
+same detector on any video you watch (YouTube and the rest, any HTML5
+`<video>`). It shows the video a second late, with its sound delayed to
+match, so each stretch of flashing is found before it is seen. From its
+start, the flashing is replaced by the last calm picture before it (or
+dimmed, or the video is paused). Chrome, Edge and
 Firefox; `node extension/build.mjs` after `./build.sh`.
 
 **What's new:** [CHANGELOG.md](CHANGELOG.md), in plain words, newest first.

@@ -25,6 +25,8 @@ export function summary(frames) {
   const all = Object.values(frames);
   return {
     videos: all.reduce((a, s) => a + (s.videos || 0), 0),
+    ahead: all.reduce((a, s) => a + (s.ahead || 0), 0),
+    onTime: all.reduce((a, s) => a + (s.onTime || 0), 0),
     unreadable: all.reduce((a, s) => a + (s.unreadable || 0), 0),
     events: all.reduce((a, s) => a + (s.events || 0), 0),
     active: all.some((s) => s.active),

@@ -1,5 +1,6 @@
 // The extension in headless Chromium: loaded unpacked from extension/build/chrome,
-// it guards a page's videos as they play.
+// it guards a page's videos as they play: looking ahead (none of the
+// flashing is ever on screen, read off screenshots), and reacting as it plays.
 //   ./build.sh && node extension/build.mjs && node extension/test/e2e.mjs
 //
 // The videos: a canvas played through a <video> (calm, then 3 s of a whole
@@ -11,6 +12,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { CHROMIUM_ARGS, loadPlaywright } from '../../tests/e2e/playwright.mjs';
 
@@ -36,6 +38,29 @@ if (!fs.existsSync(CLIP)) {
     '-vf', "geq=lum='if(between(T,2,5), if(lt(mod(N,8),4),16,235), 96+20*sin(T))':cb=128:cr=128",
     '-c:v', 'libvpx-vp9', '-b:v', '300k', '-deadline', 'realtime', '-cpu-used', '8', CLIP]);
 }
+// the same with a sound track (a tone), for the sound delayed with the pictures
+const CLIP_SOUND = path.join(OUT, 'flash-sound.webm');
+if (!fs.existsSync(CLIP_SOUND)) {
+  execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', CLIP, '-f', 'lavfi', '-i', 'sine=f=440:d=8', '-c:v', 'copy', '-c:a', 'libopus', '-shortest', CLIP_SOUND]);
+}
+
+/** The colour of a 1×1 PNG (a screenshot of one pixel): [r, g, b]. */
+function pngPixel(buf) {
+  let pos = 8;
+  let type = 6;
+  const idat = [];
+  while (pos < buf.length) {
+    const len = buf.readUInt32BE(pos);
+    const name = buf.toString('latin1', pos + 4, pos + 8);
+    if (name === 'IHDR') type = buf[pos + 8 + 9];
+    if (name === 'IDAT') idat.push(buf.subarray(pos + 8, pos + 8 + len));
+    pos += 12 + len;
+  }
+  // (one pixel: whatever its row's filter, it has no neighbours, so the bytes are the pixel's)
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  assert(type === 2 || type === 6, `a PNG of colour type ${type}`);
+  return [raw[1], raw[2], raw[3]];
+}
 
 const PAGE = `<!doctype html><meta charset="utf-8"><title>flash test</title>
 <style>body{margin:0;background:#222} .box{position:relative;width:640px;height:360px;margin:20px} video{width:100%;height:100%;display:block;background:#000}</style>
@@ -59,16 +84,16 @@ window.startCanvas = () => {
   draw();
   return v.play();
 };
-window.startFile = (src) => { const v = document.getElementById('v'); v.src = src; return v.play(); };
+window.startFile = (src, sound = false) => { const v = document.getElementById('v'); v.muted = !sound; v.src = src; return v.play(); };
 window.overlay = () => !!document.querySelector('unflash-overlay');
 window.filter = () => document.getElementById('v').style.filter;
 </script>`;
 
 function server(host) {
   const srv = http.createServer((req, res) => {
-    if (req.url.startsWith('/flash.webm')) {
+    if (req.url.startsWith('/flash')) {
       res.setHeader('content-type', 'video/webm');
-      fs.createReadStream(CLIP).pipe(res);
+      fs.createReadStream(req.url.startsWith('/flash-sound') ? CLIP_SOUND : CLIP).pipe(res);
       return;
     }
     res.setHeader('content-type', 'text/html');
@@ -135,9 +160,77 @@ try {
     return on.length ? [on[0].t, on[on.length - 1].t] : null;
   };
 
+  /**
+   * Play `start` and read the middle of the video, as the page shows it,
+   * as often as screenshots can be taken, for `seconds`: [{ t, rgb }].
+   */
+  async function look(start, seconds) {
+    await page.goto(site.url + '/');
+    await page.evaluate(start);
+    const samples = [];
+    const t0 = Date.now();
+    while (Date.now() - t0 < seconds * 1000) {
+      const png = await page.screenshot({ clip: { x: 340, y: 200, width: 1, height: 1 } });
+      samples.push({ t: (Date.now() - t0) / 1000, rgb: pngPixel(png) });
+    }
+    return samples;
+  }
+  // the flashing's two colours as they are (dimmed, they are about 22 and 67)
+  const flashLike = ([r, g, b]) => (r < 12 && g < 12 && b < 12) || (r > 225 && g > 225 && b > 225);
+  const calmLike = ([r, g, b]) => b > r + 10 && b > 70 && b < 160;
+  const seen = (samples, from, to, test) => samples.filter((x) => x.t >= from && x.t <= to && test(x.rgb));
+
+  // A. looking ahead, holding: the canvas flashing from 2.5 s to 5.5 s, shown
+  // a second late; none of its flashing is ever on screen
+  await setSettings({ mode: 'hold', sensitivity: 'balanced', detector: 'cpu', lookahead: 1, badge: true, enabled: true, disabledSites: [] });
+  let px = await look(() => window.startCanvas(), 9.5);
+  let bad = seen(px, 0.5, 9.5, flashLike);
+  console.log(`look ahead, hold: ${px.length} looks, ${bad.length} with flashing on screen${bad.length ? ': ' + bad.slice(0, 5).map((x) => `${x.t.toFixed(2)} s rgb(${x.rgb})`).join(', ') : ''}`);
+  assert(px.length > 40, `only ${px.length} looks at the screen`);
+  assert(!bad.length, 'flashing was on screen while looking ahead');
+  assert(seen(px, 4, 6, calmLike).length > 5, 'the calm picture was not held over the flashing');
+  assert(seen(px, 7.6, 9.5, calmLike).length > 3, 'the video did not come back after the flashing');
+  let st = await tabStatus();
+  console.log('  status:', JSON.stringify(st));
+  assert(Object.values(st).some((f) => f.ahead >= 1 && f.events >= 1), 'not reported as looking ahead, or no flashing reported');
+
+  // B. looking ahead, dimming: the file; its flashing only ever dimmed
+  await setSettings({ mode: 'dim' });
+  px = await look(() => window.startFile('/flash.webm'), 8.5);
+  bad = seen(px, 0.5, 8.5, flashLike);
+  const dimmedAhead = seen(px, 3, 6, ([r, g, b]) => Math.abs(r - b) < 12 && r < 90);
+  console.log(`look ahead, dim: ${px.length} looks, ${bad.length} with flashing on screen, ${dimmedAhead.length} dimmed`);
+  assert(!bad.length, `flashing was on screen while looking ahead: ${bad.map((x) => `${x.t.toFixed(2)} s rgb(${x.rgb})`).join(', ')}`);
+  assert(dimmedAhead.length > 5, 'the flashing was not dimmed');
+
+  // C. with sound: the sound is delayed as much, so the pictures are shown late too
+  await setSettings({ mode: 'hold' });
+  await page.goto(site.url + '/');
+  await page.evaluate(() => window.startFile('/flash-sound.webm', true));
+  await page.waitForTimeout(2500);
+  st = await tabStatus();
+  console.log('  with sound, status:', JSON.stringify(st));
+  assert(Object.values(st).some((f) => f.ahead >= 1 && !f.onTime), 'a video with sound was not shown late');
+
+  // D. looking ahead, pausing: paused before any of the flashing is shown
+  await setSettings({ mode: 'pause', badge: true });
+  px = await look(() => window.startCanvas(), 6);
+  bad = seen(px, 0.5, 6, flashLike);
+  const pausedAhead = await page.evaluate(() => document.getElementById('v').paused);
+  console.log(`look ahead, pause: ${px.length} looks, ${bad.length} with flashing on screen, paused ${pausedAhead}`);
+  assert(!bad.length && pausedAhead, 'paused looking ahead, flashing was seen, or it was not paused');
+
+  // E. the same canvas without looking ahead: the looks do catch flashing on screen
+  await setSettings({ mode: 'hold', lookahead: 0 });
+  px = await look(() => window.startCanvas(), 6);
+  bad = seen(px, 0.5, 6, flashLike);
+  console.log(`as it plays, hold: ${px.length} looks, ${bad.length} with flashing on screen (its first moment)`);
+  assert(bad.length > 0, 'the looks see no flashing even without looking ahead: they prove nothing');
+
+  // the rest react as the video plays
   // 1. hold: a canvas flashing from 2.5 s to 5.5 s (on the CPU, which
   // answers at once: SwiftShader's WebGPU answers most of a second late)
-  await setSettings({ mode: 'hold', sensitivity: 'balanced', detector: 'cpu', badge: true, enabled: true, disabledSites: [] });
+  await setSettings({ mode: 'hold', sensitivity: 'balanced', detector: 'cpu', lookahead: 0, badge: true, enabled: true, disabledSites: [] });
   let s = await run(() => window.startCanvas(), 8.5, 3.5);
   let held = span(s, 'overlay');
   console.log(`hold, canvas: held ${held ? held.map((x) => x.toFixed(2)).join('–') + ' s' : 'never'}`);
@@ -148,7 +241,7 @@ try {
   // the calm picture (a grey blue, hsl(200±10, 20%, 40%)), not black or white
   console.log(`  the middle of the video while held: rgb(${shot})`);
   assert(shot && shot[2] > shot[0] + 10 && shot[2] > 70 && shot[2] < 160, `the held picture is not the calm one: rgb(${shot})`);
-  let st = await tabStatus();
+  st = await tabStatus();
   console.log('  status:', JSON.stringify(st));
   assert(Object.values(st).some((f) => f.events >= 1 && f.videos >= 1), 'the toolbar was not told');
 

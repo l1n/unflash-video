@@ -34,6 +34,16 @@
 </fieldset>
 
 <label class="field">
+  <span>Look ahead</span>
+  <select id="lookahead">
+    <option value="0.5">0.5 s</option>
+    <option value="1">1 s (recommended)</option>
+    <option value="2">2 s</option>
+    <option value="0">off: react as it plays</option>
+  </select>
+</label>
+
+<label class="field">
   <span>Step in</span>
   <select id="sensitivity">
     <option value="early">at the first flash</option>
@@ -63,7 +73,7 @@
   <label class="row"><input type="checkbox" id="badge"><span>Say over the video what was done</span></label>
 </details>
 
-<p class="note">This reduces risk. It is not a guarantee: the first moment of flashing is seen before it can be stopped, and some videos (protected films, video from another site) cannot be read.</p>
+<p class="note">Looking ahead, videos are shown (with their sound) a moment late, so that flashing is found before it is seen. This reduces risk. It is not a guarantee: some videos (protected films, video from another site) cannot be read, and without looking ahead the first moment of flashing is seen.</p>
 
 <script type="module" src="popup.js"></script>
 </body>

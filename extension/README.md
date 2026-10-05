@@ -1,23 +1,31 @@
 # Unflash for the browser: the video flash guard
 
 A browser extension that runs Unflash's detector on every video you watch
-as it plays (YouTube, Vimeo, Twitch, news sites, an embedded player, any
-HTML5 `<video>`). When a video starts flashing, it hides the flashing until
-it has stopped for a second. It looks at each picture as it is shown, and
-nothing leaves your machine.
+(YouTube, Vimeo, Twitch, news sites, an embedded player, any HTML5
+`<video>`), and keeps its flashing off the screen. Nothing leaves your
+machine.
 
-**This reduces risk. It is not a guarantee.** It has no lookahead: it
-judges each picture as the video shows it, so the first moment of
-flashing (one or two swings of brightness, about a tenth of a second at
-the default setting) is on screen before the guard steps in. If you need a
-video to be safe from its first frame, scan and fix it with the web app.
-See [Limitations](#limitations).
+It **looks ahead**. The video is shown a second late (0.5 or 2 s if you
+prefer), with its sound delayed the same amount. Each picture is judged
+as the video plays, so by the time a picture is due, the detector has
+already seen the second that follows it. A stretch of flashing is
+found before its first picture is shown, and from its start it is replaced
+by the last calm picture before it (or dimmed, or the video is paused). None
+of the flashing reaches the screen. The test shows this: it reads the screen
+throughout a video that flashes for three seconds, and never sees a flashing
+picture. Reacting as the video plays instead (lookahead off), the same test
+does see the first moment of flashing.
+
+**This reduces risk. It is not a guarantee.** See
+[Limitations](#limitations).
 
 ## What it does
 
 For each `<video>` that plays and is shown at least 96×54 px:
 
-1. Each picture goes to the detector as it is shown, and is timed by the
+1. Each picture is copied (at the size it is shown, at most 720p) and goes
+   to the detector as the video plays. The copy is shown over the video
+   when it is due, `lookahead` seconds later. Each picture is timed by the
    wall clock rather than the video's own clock: a video played at twice
    the speed flashes twice as fast for whoever watches it.
 2. The guard counts **swings**: a large enough part of the picture
@@ -32,22 +40,31 @@ For each `<video>` that plays and is shown at least 96×54 px:
    - *only past the limit*: once the detector finds flashing that breaks the
      profile's limit (more than 3 flashes a second over enough of the picture),
      or flashing at the limit under the default profile.
-4. Then it does what you chose:
-   - **Hold the picture** (the default). It keeps a small copy of a picture
-     every tenth of a second, and shows the last one from at least 0.3 s
-     before the first swing over the video until the flashing stops. This is
-     the same idea as the web app's fix (a calm frame held in place of the
-     flashing ones), done as the video plays. The video and its sound keep
-     playing underneath. If no calm picture was kept from that long before,
-     or the video is full screen on its own, where nothing can go over it,
-     the video is dimmed instead.
-   - **Dim**: a CSS filter (`contrast(0.5) brightness(0.35) saturate(0.2)`)
-     that keeps any swing of brightness under WCAG's 0.1 and washes the red
-     out of red flashes.
-   - **Pause**: pauses the video, and says why until you play it again.
-   - **Only say so**: a badge over the video, nothing more.
-5. The video comes back a second after the last swing that kept the
-   flashing going.
+4. The flashing is taken to start 0.3 s before its first counted swing (a
+   swing is counted a little after it starts, and the change before it may
+   have been too small to count), and to end a second after the last swing
+   that kept it going. With a 1 s lookahead, at the default sensitivity,
+   that stretch is known before its first picture is due: flashing at
+   the limit (3 flashes a second, a swing every sixth of a second) makes its
+   third swing about a third of a second after its first.
+5. The pictures in that stretch are shown as you chose:
+   - **Hold the picture** (the default): the last picture from before the
+     stretch, in place of each of its pictures. This is what the web app's
+     fix does (a calm frame held in place of the flashing ones). The sound
+     goes on.
+   - **Dim**: each picture with a filter (`contrast(0.5) brightness(0.35)
+     saturate(0.2)`) that keeps any swing of brightness under WCAG's 0.1 and
+     washes the red out of red flashes.
+   - **Pause**: the video is paused as soon as the flashing is found, and
+     the last calm picture stays on screen until you play it again.
+   - **Only say so**: a badge over the video, nothing more. With lookahead,
+     it comes up before the flashing does.
+
+Without lookahead (or where it can't be used, see below), the same happens
+as the video plays: the hold uses a small picture kept every tenth of a
+second, and the dim and blur go on the video itself. The first moment of
+flashing (two or three swings, about a tenth of a second at the default
+sensitivity) is on screen before the guard steps in.
 
 Hazardous **stripe patterns**, which the default profile flags, are blurred
 while they are on screen (in every mode but *Only say so*).
@@ -57,6 +74,22 @@ shows **!** while it is being stopped. Its popup has the settings: on or
 off (also **Alt+Shift+U**), on or off for the site you are on (the tab's
 site, which covers the players it embeds), the mode, the sensitivity, the
 profile (the web app's three) and the detector.
+
+### When it can't look ahead
+
+The late copy goes over the video, so the video is shown as it plays
+(the guard reacting, not looking ahead) when:
+
+- the video is **full screen on its own**, or in **picture-in-picture**,
+  where nothing can go over it (a player that puts its whole frame full
+  screen, as YouTube does, is fine);
+- its **sound can't be delayed**. The sound is taken through Web Audio
+  (`createMediaElementSource` and a `DelayNode`). A page that has had no
+  click or key yet may not start sound, so a video with sound is shown on
+  time until you click the page (the popup says so). A muted video, such as
+  an autoplaying preview, is shown late at once. A page that takes the
+  element's sound into its own Web Audio graph keeps it, and its video is
+  shown on time.
 
 ## How it runs
 
@@ -82,6 +115,11 @@ The guard watches a video only while it plays, through
 `requestVideoFrameCallback` (with an animation-frame fallback). It lets go
 when the video leaves the page, and starts its detector afresh after ten
 minutes without a swing, since the detector keeps every picture's numbers.
+
+Looking ahead, the copies are kept for the lookahead and a little more,
+drawn at the size the video is shown, at most 1280×720 (about 3.7 MB each:
+110 MB of graphics memory for a 30 fps video a second ahead, twice that at
+60 fps). The one due is drawn every animation frame.
 
 What goes over the video is an element put right after it, in the same
 container. It covers the video and stays under the player's own controls and
@@ -116,7 +154,13 @@ canvas through a `<video>` (calm, then 3 s of the whole picture flashing at
 7.5 flashes a second, then calm) and a WebM made by ffmpeg the same way. The
 test checks that:
 
-- the hold starts within the first few tenths of a second of the flashing,
+- looking ahead, the middle of the video, read off screenshots as fast as
+  they can be taken (over a hundred looks), never shows the flashing:
+  holding (the calm picture shown instead), dimming (only dimmed), or
+  pausing (paused before any of it). The same looks without lookahead do
+  catch the flashing's first moment, so the looks can see it;
+- a video with sound is shown late, its sound delayed;
+- reacting as it plays: the hold starts within the first few tenths of a second of the flashing,
   shows the calm picture from before it (the middle pixel is read off a
   screenshot), and ends within a second of the flashing's end;
 - dim dims, then puts the video's own filter back;
@@ -127,8 +171,19 @@ test checks that:
 
 ## Limitations
 
-- **No lookahead.** The first flash or two are seen before the guard steps
-  in. It cannot know what the next picture will be.
+- **Looking ahead costs a second.** Everything you do to the video (play,
+  pause, seek) shows a second later. Captions, which the player draws
+  itself, run a second early. A live stream is a second further behind.
+- **A video longer in flashing before it is found than the lookahead** is
+  seen from where it is found: the *only past the limit* sensitivity waits
+  for more than three flashes in a second, which a 0.5 s lookahead may not
+  cover. The defaults (1 s, *at the second*) do.
+- **Without lookahead** (switched off, or not possible: see above) the
+  first flash or two are seen before the guard steps in.
+- A player that uses **the browser's own controls** (`<video controls>`)
+  has them covered by the late copy while looking ahead. They still take
+  clicks and keys. YouTube, Vimeo, Twitch and most sites draw their own,
+  which stay on top.
 - **Pictures it cannot read**: a video from another site sent without CORS
   headers (the browser keeps its pixels from the page; the popup says how
   many such videos there are), and DRM-protected video (Netflix, Disney+,
@@ -138,9 +193,9 @@ test checks that:
 - Videos inside a **closed shadow root**, or drawn on a canvas by the page
   rather than shown in a `<video>`, are not seen.
 - **Holding a picture** stops the motion while the sound goes on, as the web
-  app's fix does. The held picture is a copy at most 640 pixels wide.
-- A detector per playing video costs memory (the WebAssembly, 2.7 MB, once
-  per page or frame that plays a video, and about 15 MB of kept pictures
-  per video in *hold* mode) and some time per picture.
+  app's fix does.
+- A detector per playing video costs memory: the WebAssembly (2.7 MB) once
+  per page or frame that plays a video, the copies kept to look ahead (see
+  above), and some time per picture.
 - Not yet tested in Firefox or Safari. Safari would need the extension
   converted with Xcode's `safari-web-extension-converter`.
