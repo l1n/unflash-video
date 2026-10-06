@@ -89,6 +89,33 @@ window.overlay = () => !!document.querySelector('unflash-overlay');
 window.filter = () => document.getElementById('v').style.filter;
 </script>`;
 
+// YouTube's player, as far as the guard can tell: the video streamed through
+// Media Source Extensions from a blob: URL, absolutely placed in a container
+// inside the player, the player's own controls (a bar at the bottom) drawn
+// over it by a later sibling
+const YT_PAGE = `<!doctype html><meta charset="utf-8"><title>yt-like</title>
+<style>
+body{margin:0;background:#0f0f0f}
+#movie_player{position:relative;width:640px;height:360px;margin:20px;overflow:hidden;background:#000}
+.html5-video-container{position:relative;z-index:10}
+video.html5-main-video{position:absolute;left:0;top:0;width:640px;height:360px;object-fit:contain}
+.ytp-chrome-bottom{position:absolute;left:12px;right:12px;bottom:0;height:40px;z-index:60;background:rgb(200,0,0)}
+</style>
+<div id="movie_player"><div class="html5-video-container"><video class="html5-main-video" muted playsinline></video></div><div class="ytp-chrome-bottom"></div></div>
+<script>
+window.startMse = async () => {
+  const v = document.querySelector('video');
+  const ms = new MediaSource();
+  v.src = URL.createObjectURL(ms);
+  await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
+  const sb = ms.addSourceBuffer('video/webm; codecs="vp9"');
+  sb.appendBuffer(await (await fetch('/flash.webm')).arrayBuffer());
+  await new Promise((r) => sb.addEventListener('updateend', r, { once: true }));
+  ms.endOfStream();
+  return v.play();
+};
+</script>`;
+
 function server(host) {
   const srv = http.createServer((req, res) => {
     if (req.url.startsWith('/flash')) {
@@ -97,7 +124,7 @@ function server(host) {
       return;
     }
     res.setHeader('content-type', 'text/html');
-    res.end(PAGE);
+    res.end(req.url.startsWith('/yt') ? YT_PAGE : PAGE);
   });
   return new Promise((r) => srv.listen(0, host, () => r({ srv, url: `http://${host}:${srv.address().port}` })));
 }
@@ -226,6 +253,28 @@ try {
   bad = seen(px, 0.5, 6, flashLike);
   console.log(`as it plays, hold: ${px.length} looks, ${bad.length} with flashing on screen (its first moment)`);
   assert(bad.length > 0, 'the looks see no flashing even without looking ahead: they prove nothing');
+
+  // F. a YouTube-like player: MSE, the video placed in its container, the
+  // controls over it; looking ahead, holding, none of the flashing is seen,
+  // and the controls stay on top of the late copy
+  await setSettings({ mode: 'hold', lookahead: 1 });
+  await page.goto(site.url + '/yt');
+  await page.evaluate(() => window.startMse());
+  const ytLooks = [];
+  const yt0 = Date.now();
+  while (Date.now() - yt0 < 8500) {
+    const mid = pngPixel(await page.screenshot({ clip: { x: 340, y: 180, width: 1, height: 1 } }));
+    const bar = pngPixel(await page.screenshot({ clip: { x: 340, y: 360, width: 1, height: 1 } }));
+    ytLooks.push({ t: (Date.now() - yt0) / 1000, rgb: mid, bar });
+  }
+  await page.screenshot({ path: path.join(OUT, 'yt-like.png') });
+  bad = seen(ytLooks, 0.5, 8.5, flashLike);
+  const barHidden = ytLooks.filter((x) => !(x.bar[0] > 150 && x.bar[1] < 60 && x.bar[2] < 60));
+  st = await tabStatus();
+  console.log(`YouTube-like (MSE): ${ytLooks.length} looks, ${bad.length} with flashing on screen, controls covered in ${barHidden.length}; status ${JSON.stringify(st)}`);
+  assert(Object.values(st).some((f) => f.ahead >= 1 && f.events >= 1), 'the MSE video was not guarded looking ahead');
+  assert(!bad.length, 'flashing was on screen in the YouTube-like player');
+  assert(!barHidden.length, "the late copy covered the player's controls");
 
   // the rest react as the video plays
   // 1. hold: a canvas flashing from 2.5 s to 5.5 s (on the CPU, which

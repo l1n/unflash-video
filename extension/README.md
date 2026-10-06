@@ -160,6 +160,10 @@ test checks that:
   pausing (paused before any of it). The same looks without lookahead do
   catch the flashing's first moment, so the looks can see it;
 - a video with sound is shown late, its sound delayed;
+- in a page laid out like YouTube's player (the video streamed through
+  Media Source Extensions from a `blob:` URL, placed in its container, the
+  player's controls over it), no flashing is seen, and the late copy stays
+  under the controls;
 - reacting as it plays: the hold starts within the first few tenths of a second of the flashing,
   shows the calm picture from before it (the middle pixel is read off a
   screenshot), and ends within a second of the flashing's end;
