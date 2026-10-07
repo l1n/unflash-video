@@ -3980,21 +3980,42 @@ async function verifyExport() {
  */
 async function verifyBlob(blob, holds = null) {
   const res = await runJob('Verifying the exported file', async (progress, cancelled) => {
-    const m = await Movie.open(blob, wasm);
-    const feeder = await makeFeeder(m.width, m.height);
-    m.decodeInWorkers = decodeWorkersSetting(feeder);
-    m.shrinkInWorkers = shrinkSetting();
+    // decoded as the video itself is: by WebCodecs where the browser says it
+    // can, else by the built-in decoder; and by the built-in decoder again
+    // when WebCodecs refuses the file after all (Firefox: "The given encoding
+    // is not supported")
+    const scan = async (builtIn) => {
+      const m = await Movie.open(blob, wasm);
+      let feeder = null;
+      try {
+        m.forceBuiltIn = builtIn;
+        const decode = await m.decoderSupport();
+        if (!decode.supported) throw new Error(`The exported file cannot be decoded here: ${decode.reason}`);
+        feeder = await makeFeeder(m.width, m.height);
+        m.decodeInWorkers = decodeWorkersSetting(feeder);
+        m.shrinkInWorkers = shrinkSetting();
+        return await scanWithPlan({ wasm, config: state.config, feeder }, m, {
+          cancel: cancelled,
+          segments: m.software && !(SEGMENTS > 0) ? 1 : scanSegments(),
+          forceSegments: SEGMENTS > 0,
+          makeFeeder: () => makeFeeder(m.width, m.height),
+          onProgress: (p, _t, count, ms) => progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps${m.software ? ` (built-in ${m.builtIn.name} decoder)` : ''}`),
+        });
+      } catch (e) {
+        if (e && typeof e === 'object') e.retry = !m.software && !!builtInFor(m.video.codec);
+        throw e;
+      } finally {
+        if (feeder) feeder.det.free();
+        m.close();
+      }
+    };
+    const forced = onOff('builtin') === true;
     try {
-      return await scanWithPlan({ wasm, config: state.config, feeder }, m, {
-        cancel: cancelled,
-        segments: scanSegments(),
-        forceSegments: SEGMENTS > 0,
-        makeFeeder: () => makeFeeder(m.width, m.height),
-        onProgress: (p, _t, count, ms) => progress(p, `${count} frames · ${(count / (ms / 1000)).toFixed(0)} fps`),
-      });
-    } finally {
-      feeder.det.free();
-      m.close();
+      return await scan(forced);
+    } catch (e) {
+      if (forced || !(e && e.retry) || cancelled()) throw e;
+      console.warn('[unflash] verify: the browser could not decode the export, so the built-in decoder reads it:', e && e.message ? e.message : e);
+      return await scan(true);
     }
   });
   if (!res) return null;
