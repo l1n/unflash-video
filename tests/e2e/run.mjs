@@ -1195,6 +1195,17 @@ try {
   results.h264Verdict = await page.textContent('#wsVerdict');
   console.log('h264 section verdict:', results.h264Verdict);
   assert(results.h264Verdict.startsWith('fails'), 'the H.264 section fails before editing: ' + results.h264Verdict);
+  // a saved H.264 file is verified through the same decoder: WebCodecs
+  // without H.264 refused it ("The given encoding is not supported")
+  {
+    await job(page, () => page.setInputFiles('#verifyFileInput', path.join(MEDIA, 'flash_h264.mp4')), 600000);
+    await noBanner(page);
+    await page.waitForFunction(() => /flash_h264\.mp4: .*re-scanned/.test(document.querySelector('#exportResult').textContent), null, { timeout: 30000 });
+    results.h264VerifySaved = (await page.textContent('#exportResult')).split('flash_h264.mp4: ').pop();
+    console.log('h264 verify of a saved file:', results.h264VerifySaved);
+    assert(/Fails WCAG/.test(results.h264VerifySaved), 'the saved H.264 file is re-scanned and its flash found: ' + results.h264VerifySaved);
+    await page.click('#btnCloseExport');
+  }
 
   // --- debug info: a report to paste into a message, naming no files -----------
   await page.click('#btnDebug');
