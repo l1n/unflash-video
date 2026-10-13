@@ -102,6 +102,24 @@ fn counter_transition(ring_f: u32, open_f: u32, last_f: u32, pend_t_f: u32, i: u
     return pol;
 }
 
+// counter_transition without the opening times (the close calls' counter
+// keeps none).
+fn warn_transition(i: u32, n: u32, pend_pol: u32, pol: u32, now: u32, pair: u32) -> u32 {
+    let opposite = select(UP, DN, pol == UP);
+    let pend_t = state[F_WARN_PEND_T * n + i];
+    if (pend_pol == opposite && age(now, pend_t) <= pair) {
+        for (var s = K - 1u; s > 0u; s = s - 1u) {
+            state[(F_WARN_RING + s) * n + i] = state[(F_WARN_RING + s - 1u) * n + i];
+        }
+        state[F_WARN_RING * n + i] = now;
+        state[F_WARN_LAST * n + i] = now;
+        state[F_WARN_PEND_T * n + i] = never(now);
+        return 0u;
+    }
+    state[F_WARN_PEND_T * n + i] = now;
+    return pol;
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -133,7 +151,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             state[(F_GEN_OPEN + s) * n + i] = nv;
             state[(F_RED_RING + s) * n + i] = nv;
             state[(F_RED_OPEN + s) * n + i] = nv;
+            state[(F_WARN_RING + s) * n + i] = nv;
         }
+        state[F_WARN_LAST * n + i] = nv;
+        state[F_WARN_PEND_T * n + i] = nv;
         state[F_GEN_LAST * n + i] = nv;
         state[F_GEN_PEND_T * n + i] = nv;
         state[F_RED_LAST * n + i] = nv;
@@ -156,7 +177,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             state[(F_GEN_OPEN + s) * n + i] = sat_time(now, state[(F_GEN_OPEN + s) * n + i]);
             state[(F_RED_RING + s) * n + i] = sat_time(now, state[(F_RED_RING + s) * n + i]);
             state[(F_RED_OPEN + s) * n + i] = sat_time(now, state[(F_RED_OPEN + s) * n + i]);
+            state[(F_WARN_RING + s) * n + i] = sat_time(now, state[(F_WARN_RING + s) * n + i]);
         }
+        state[F_WARN_LAST * n + i] = sat_time(now, state[F_WARN_LAST * n + i]);
+        state[F_WARN_PEND_T * n + i] = sat_time(now, state[F_WARN_PEND_T * n + i]);
         state[F_GEN_LAST * n + i] = sat_time(now, state[F_GEN_LAST * n + i]);
         state[F_GEN_PEND_T * n + i] = sat_time(now, state[F_GEN_PEND_T * n + i]);
         state[F_RED_LAST * n + i] = sat_time(now, state[F_RED_LAST * n + i]);
@@ -226,6 +250,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var mask = 0u;
     let kf = params.k_fail - 1u;
     let ke = params.k_ext - 1u;
+    let kw = params.k_warn - 1u;
+    let warn = params.warn_enabled != 0u;
 
     // --- general flashes --------------------------------------------------
     {
@@ -249,6 +275,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // --- close calls: general flashes at the stricter swing ---------------
+    if (warn) {
+        let wq_up = lo.rev_up && (lo.sext - lo.sbase) >= params.warn_swing && lo.sbase < params.dark;
+        let wq_dn = lo.rev_dn && (lo.sbase - lo.sext) >= params.warn_swing && lo.sext < params.dark;
+        var pend_pol = (flags >> WARN_PEND_SHIFT) & DIR_MASK;
+        if (wq_up || wq_dn) {
+            pend_pol = warn_transition(i, n, pend_pol, select(DN, UP, wq_up), now, params.pair);
+        }
+        flags = (flags & ~(DIR_MASK << WARN_PEND_SHIFT)) | (pend_pol << WARN_PEND_SHIFT);
+        let fresh = age(now, state[F_WARN_LAST * n + i]) <= params.fresh;
+        if (fresh && age(now, state[(F_WARN_RING + kw) * n + i]) < params.rate) {
+            mask = mask | MASK_WARN_GEN;
+        }
+    }
+
     // --- red flashes ------------------------------------------------------
     {
         var pend_pol = (flags >> RED_PEND_SHIFT) & DIR_MASK;
@@ -268,6 +309,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         pixout[2u * n + i] = onset;
         if (ext_s) {
             mask = mask | MASK_EXT_RED;
+        }
+        // (a red transition does not depend on the swing: the close call
+        // reads the same ring at the stricter rate)
+        if (warn && fresh && age(now, state[(F_RED_RING + kw) * n + i]) < params.rate) {
+            mask = mask | MASK_WARN_RED;
         }
     }
 

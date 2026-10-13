@@ -45,8 +45,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let gx = geo[GEO_GXS + t];
     var sl = 0.0;
     var sv = 0.0;
-    var cnt: array<u32, 8>;
-    for (var k = 0u; k < 8u; k = k + 1u) {
+    var cnt: array<u32, MASK_BITS>;
+    for (var k = 0u; k < MASK_BITS; k = k + 1u) {
         cnt[k] = 0u;
     }
     var og = 0u;
@@ -56,7 +56,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         sl = sl + bitcast<f32>(inputs[idx]);
         sv = sv + bitcast<f32>(inputs[n + idx]);
         let m = pixout[idx];
-        for (var k = 0u; k < 8u; k = k + 1u) {
+        for (var k = 0u; k < MASK_BITS; k = k + 1u) {
             cnt[k] = cnt[k] + ((m >> k) & 1u);
         }
         og = max(og, pixout[n + idx]);
@@ -65,9 +65,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let base = (y * ngx + t) * CELL_WORDS;
     rowwin[base + 0u] = bitcast<u32>(sl);
     rowwin[base + 1u] = bitcast<u32>(sv);
-    for (var k = 0u; k < 8u; k = k + 1u) {
+    for (var k = 0u; k < MASK_BITS; k = k + 1u) {
         rowwin[base + 2u + k] = cnt[k];
     }
-    rowwin[base + 10u] = og;
-    rowwin[base + 11u] = orr;
+    rowwin[base + 2u + MASK_BITS] = og;
+    rowwin[base + 3u + MASK_BITS] = orr;
 }

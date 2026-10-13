@@ -1461,8 +1461,8 @@ mod tests {
         assert_eq!(rgba.finish(false).unwrap(), want_rgb.finish(false).unwrap());
     }
 
-    /// A partial verdict is the whole verdict's violations, flags and frame
-    /// counts under the same names, without the events: the page reads
+    /// A partial verdict is the whole verdict's violations, warnings, flags
+    /// and frame counts under the same names, without the events: the page reads
     /// either alike (its `reports` and `counts` look at the flags by name).
     #[test]
     fn partial_verdict_is_the_verdict_less_its_events() {
@@ -1476,7 +1476,7 @@ mod tests {
         let part: serde_json::Value = serde_json::from_str(&det.partial_verdict().unwrap()).unwrap();
         assert!(!full["violations"].as_array().unwrap().is_empty() && !full["events"].as_array().unwrap().is_empty(), "{full}");
         let part = part.as_object().unwrap();
-        assert_eq!(part.keys().map(|k| k.as_str()).collect::<Vec<_>>(), ["flag_extended", "flag_patterns", "frames", "held", "violations"]);
+        assert_eq!(part.keys().map(|k| k.as_str()).collect::<Vec<_>>(), ["flag_extended", "flag_patterns", "frames", "held", "violations", "warnings"]);
         for (k, v) in part {
             assert_eq!(v, &full[k], "{k}");
         }

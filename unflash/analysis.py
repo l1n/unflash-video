@@ -202,6 +202,26 @@ class Violation:
 
 
 @dataclass
+class FlashWarning:
+    """Flashing the profile lets pass, but only just. Never a failure.
+
+    level "limit": flashing at the limit rate (every failure criterion
+    except the rate), for less than an extended flash would need, or under
+    a profile that does not report extended flashes. level "strict": what
+    only the stricter profile's thresholds would fail."""
+    start: float
+    end: float
+    level: str             # "limit" | "strict"
+    kind: str              # "flash" | "red": which of the two was wider
+    count: float = 0.0     # area over the level's threshold, at its worst
+    peak: float = None     # the worst moment
+
+    def __post_init__(self):
+        if self.peak is None:
+            self.peak = self.start
+
+
+@dataclass
 class AnalysisResult:
     events: list = field(default_factory=list)         # TransitionEvent
     violations: list = field(default_factory=list)     # Violation
@@ -211,6 +231,7 @@ class AnalysisResult:
     frame_stats: dict = field(default_factory=dict)    # arrays for UI charts
     flag_extended: bool = False   # profile treats extended flashes as
                                   # violations to fix, not just advisories
+    warnings: list = field(default_factory=list)       # FlashWarning
 
     @property
     def wcag_safe(self):
@@ -235,6 +256,7 @@ class AnalysisResult:
             "duration": self.duration,
             "anomalies": self.anomalies,
             "violations": [asdict(v) for v in self.violations],
+            "warnings": [asdict(w) for w in self.warnings],
             "events": [{"t": e.t, "polarity": e.polarity, "kind": e.kind,
                         "area": e.area} for e in self.events],
         }
@@ -529,6 +551,26 @@ class FlashDetector:
         # `limit` per second" fails, "at least `limit` per second" sustained
         # is an extended flash (3/s under exact WCAG, 2/s under strict).
         self.ext_rate = max(1, int(np.ceil(cfg.flash_limit)))
+        # close calls at the stricter thresholds: the same tests, with a
+        # flash counter of their own (a smaller swing qualifies more
+        # transitions, which pairs them differently) and window means of
+        # their own (the mean has to swing by the smaller swing over the
+        # smaller area). Red transitions don't depend on the swing, so red
+        # reads the red counter's ring at the stricter rate.
+        # (only where they are stricter: a stricter rate needs fewer flashes
+        # in a second, which the rings already kept hold)
+        self.warn_k = max(1, int(np.floor(cfg.warn_flash_limit)) + 1)
+        self.warn = (bool(cfg.warnings) and self.warn_k <= self.flash_red.K
+                     and cfg.warn_swing <= cfg.swing_threshold)
+        if self.warn:
+            self.warn_area = max(1, int(round(cfg.warn_area_fraction * self.ww * self.wh)))
+            self.flash_warn = _FlashCounter(shape, cfg.warn_flash_limit)
+            self.warn_mean_swing = max(0.02, cfg.warn_swing * cfg.warn_area_fraction)
+            self.warn_mean_swing_red = float(np.float32(RED_LEAST_SWING) * np.float32(cfg.warn_area_fraction))
+            self.wtrack_gen = _ExtremaTracker(self.warn_mean_swing * 0.3)
+            self.wtrack_red = _ExtremaTracker(float(np.float32(self.warn_mean_swing_red) * np.float32(0.3)))
+            self.wflash_gen = _FlashCounter(gshape, cfg.warn_flash_limit)
+            self.wflash_red = _FlashCounter(gshape, cfg.warn_flash_limit)
         self.events = []          # strobing moments (area-qualified)
         self._last_event_tc = {"general": -1e12, "red": -1e12}
         self._above = {"general": False, "red": False}
@@ -544,6 +586,8 @@ class FlashDetector:
         self.stat_ext = array("i")       # area strobing at the permitted
                                          # rate (extended flash)
         self.stat_ext_red = array("i")
+        self.stat_warn = array("i")      # area strobing at the stricter
+        self.stat_warn_red = array("i")  # thresholds (close calls)
         # internal-clock time of the earliest transition still feeding the
         # failure window on this frame (0 when the frame is not strobing)
         self.stat_haz_onset = array("d")
@@ -626,6 +670,9 @@ class FlashDetector:
             # long still passage must not carry an old run across it
             for tr in (self.lum, self.red, self.mtrack_gen, self.mtrack_red):
                 tr.settle(tc)
+            if self.warn:
+                self.wtrack_gen.settle(tc)
+                self.wtrack_red.settle(tc)
             self.stat_t.append(t)
             self.stat_tc.append(tc)
             self.stat_lum.append(self.stat_lum[-1])
@@ -636,6 +683,8 @@ class FlashDetector:
             self.stat_haz_red.append(0)
             self.stat_ext.append(0)
             self.stat_ext_red.append(0)
+            self.stat_warn.append(0)
+            self.stat_warn_red.append(0)
             self.stat_haz_onset.append(tc)
             self.stat_haz_red_onset.append(tc)
             self.n += 1
@@ -676,6 +725,23 @@ class FlashDetector:
             ru2 & ((re2 - rb2) >= self.mean_swing_red), 1, tc)
         self.mflash_red.transitions(
             rd2 & ((rb2 - re2) >= self.mean_swing_red), -1, tc)
+
+        warn_g = warn_r = 0
+        if self.warn:
+            fresh_w = cfg.area_accum_window
+            coh_w = max(fresh_w, 0.2)
+            wq_up = rev_up & ((ext - base) >= cfg.warn_swing) & \
+                (base < cfg.dark_threshold)
+            wq_dn = rev_dn & ((base - ext) >= cfg.warn_swing) & \
+                (ext < cfg.dark_threshold)
+            self.flash_warn.transitions(wq_up, 1, tc)
+            self.flash_warn.transitions(wq_dn, -1, tc)
+            mu, md, mb, me, _, _ = self.wtrack_gen.feed(mL.astype(np.float32), tc)
+            self.wflash_gen.transitions(mu & ((me - mb) >= self.warn_mean_swing), 1, tc)
+            self.wflash_gen.transitions(md & ((mb - me) >= self.warn_mean_swing), -1, tc)
+            ru2, rd2, rb2, re2, _, _ = self.wtrack_red.feed(mV.astype(np.float32), tc)
+            self.wflash_red.transitions(ru2 & ((re2 - rb2) >= self.warn_mean_swing_red), 1, tc)
+            self.wflash_red.transitions(rd2 & ((rb2 - re2) >= self.warn_mean_swing_red), -1, tc)
 
         # --- flashes: per-pixel rate + concurrent area + coherent mean ------
         haz = haz_red = 0
@@ -735,6 +801,25 @@ class FlashDetector:
                 haz, ext_g, haz_onset = best, ext_best, best_onset
             else:
                 haz_red, ext_r, haz_red_onset = best, ext_best, best_onset
+            # close call at the stricter thresholds: the failure test with
+            # the stricter swing, area, rate and window mean
+            if self.warn:
+                warn_best = 0
+                if kind == "general":
+                    wstrobe = self.flash_warn.strobing(tc, fresh_w)
+                    wmflash = self.wflash_gen
+                else:
+                    wstrobe = counter.strobing(tc, fresh_w, rate=self.warn_k)
+                    wmflash = self.wflash_red
+                if wstrobe.any():
+                    wcounts = self._window_sums(wstrobe)
+                    wcoh = wmflash.strobing(tc, max(fresh_w, 0.2))
+                    if wcoh.any():
+                        warn_best = int(np.where(wcoh, wcounts, 0).max())
+                if kind == "general":
+                    warn_g = warn_best
+                else:
+                    warn_r = warn_best
 
         # pooled transition areas: chart statistics only
         self.pool_gen.add(q_up, 1, tc)
@@ -759,6 +844,8 @@ class FlashDetector:
         self.stat_haz_red.append(haz_red)
         self.stat_ext.append(ext_g)
         self.stat_ext_red.append(ext_r)
+        self.stat_warn.append(warn_g)
+        self.stat_warn_red.append(warn_r)
         self.stat_haz_onset.append(haz_onset)
         self.stat_haz_red_onset.append(haz_red_onset)
         self.n += 1
@@ -786,6 +873,7 @@ class FlashDetector:
             self.stat_haz_red, self.stat_haz_red_onset, "red")
         res.violations += self._extended_violations()
         res.violations.sort(key=lambda v: v.start)
+        res.warnings = self._warnings(res.violations)
         return res
 
     def _to_native(self, tcs):
@@ -825,6 +913,54 @@ class FlashDetector:
                 out.append(cur)
             cur_end_tc = tc
         return out
+
+    def _warning_spans(self, gen, red, thresh, level):
+        """Frames where either area reaches `thresh`, joined where they are
+        under a second apart (as failures are)."""
+        out = []
+        cur = None
+        cur_end_tc = None
+        for i in range(self.n):
+            a = max(gen[i], red[i])
+            if a < thresh:
+                continue
+            t, tc = self.stat_t[i], self.stat_tc[i]
+            sev = round(a / thresh, 2)
+            kind = "red" if red[i] > gen[i] else "flash"
+            if cur is not None and tc - cur_end_tc <= 1.0:
+                cur.end = max(cur.end, t)
+                if sev > cur.count:
+                    cur.count, cur.peak, cur.kind = sev, t, kind
+            else:
+                cur = FlashWarning(t, t, level, kind, sev, peak=t)
+                out.append(cur)
+            cur_end_tc = tc
+        return out
+
+    def _warnings(self, violations):
+        """Close calls: flashing at the limit rate that is not part of a
+        failure or a reported extended flash, then (quieter) what fails only
+        the stricter thresholds and is not already one of those. A warning
+        overlapping a louder report is dropped: the louder one already
+        marks the place."""
+        cfg = self.cfg
+        if self.n == 0 or not self.warn:
+            return []
+        louder = [((v.onset if v.onset is not None else v.start), v.end)
+                  for v in violations
+                  if v.kind != "extended" or cfg.flag_extended]
+
+        def clear(w, spans):
+            return not any(w.start <= e and w.end >= s for s, e in spans)
+
+        limit = [w for w in self._warning_spans(
+            self.stat_ext, self.stat_ext_red, self.area_thresh, "limit")
+            if clear(w, louder)]
+        louder += [(w.start, w.end) for w in limit]
+        strict = [w for w in self._warning_spans(
+            self.stat_warn, self.stat_warn_red, self.warn_area, "strict")
+            if clear(w, louder)]
+        return sorted(limit + strict, key=lambda w: w.start)
 
     def _extended_violations(self):
         """ITC/Ofcom-style extended flash: flashing that meets every failure

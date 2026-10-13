@@ -11,11 +11,11 @@ use wide::{f32x8, i32x8, u32x8, CmpGe, CmpGt, CmpLe, CmpLt};
 
 use crate::grid::{
     MASK_EXT_GEN, MASK_EXT_RED, MASK_POOL_GEN_DN, MASK_POOL_GEN_UP, MASK_POOL_RED_DN, MASK_POOL_RED_UP,
-    MASK_STROBE_GEN, MASK_STROBE_RED,
+    MASK_STROBE_GEN, MASK_STROBE_RED, MASK_WARN_GEN, MASK_WARN_RED,
 };
 use crate::pixel::{
     run_range_scalar, FramePlanes, KernelParams, PixelOutputs, PixelState, DIR_MASK, DN, GEN_PEND_SHIFT,
-    LUM_DIR_SHIFT, POOL_GEN_SHIFT, POOL_RED_SHIFT, RED_DIR_SHIFT, RED_PEND_SHIFT, UP,
+    LUM_DIR_SHIFT, POOL_GEN_SHIFT, POOL_RED_SHIFT, RED_DIR_SHIFT, RED_PEND_SHIFT, UP, WARN_PEND_SHIFT,
 };
 use crate::lut::{QU, QV, SAT_BIT};
 use crate::time::AGE_MAX;
@@ -191,6 +191,50 @@ fn counter8(
     bl_u(flash, u32x8::splat(0), bl_u(rest, pol, pend_pol))
 }
 
+/// [`counter8`] without the opening times (the close calls' counter keeps
+/// none).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn warn_counter8(
+    ring: &mut [u32],
+    last: &mut [u32],
+    pend_t: &mut [u32],
+    n: usize,
+    k: usize,
+    i: usize,
+    pend_pol: u32x8,
+    q_up: u32x8,
+    q_dn: u32x8,
+    now: u32x8,
+    pair: u32x8,
+) -> u32x8 {
+    let up = u32x8::splat(UP);
+    let dn = u32x8::splat(DN);
+    let q = q_up | q_dn;
+    if q.none() {
+        return pend_pol;
+    }
+    let pol = bl_u(q_up, up, dn);
+    let opposite = bl_u(q_up, dn, up);
+    let pt = ld_u(pend_t, i);
+    let flash = q & pend_pol.cmp_eq(opposite) & age_le(now, pt, pair);
+    let rest = q & !flash;
+    if flash.any() {
+        let mut s = k - 1;
+        while s > 0 {
+            let r_prev = ld_u(ring, (s - 1) * n + i);
+            let r_cur = ld_u(ring, s * n + i);
+            st_u(ring, s * n + i, bl_u(flash, r_prev, r_cur));
+            s -= 1;
+        }
+        st_u(ring, i, bl_u(flash, now, ld_u(ring, i)));
+        st_u(last, i, bl_u(flash, now, ld_u(last, i)));
+    }
+    let never = now - u32x8::splat(AGE_MAX);
+    st_u(pend_t, i, bl_u(flash, never, bl_u(rest, now, pt)));
+    bl_u(flash, u32x8::splat(0), bl_u(rest, pol, pend_pol))
+}
+
 /// Eight-lane version of [`run_range_scalar`] over the whole frame.
 pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParams, out: &mut PixelOutputs) {
     let n = st.n;
@@ -219,7 +263,10 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
                 sat_field(&mut st.gen_open, s * n + i);
                 sat_field(&mut st.red_ring, s * n + i);
                 sat_field(&mut st.red_open, s * n + i);
+                sat_field(&mut st.warn_ring, s * n + i);
             }
+            sat_field(&mut st.warn_last, i);
+            sat_field(&mut st.warn_pend_t, i);
             sat_field(&mut st.gen_last, i);
             sat_field(&mut st.gen_pend_t, i);
             sat_field(&mut st.red_last, i);
@@ -268,6 +315,9 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
     let pool = u32x8::splat(p.pool);
     let kf = p.k_fail as usize - 1;
     let ke = p.k_ext as usize - 1;
+    let kw = p.k_warn as usize - 1;
+    let warn = p.warn_enabled != 0;
+    let warn_swing = f32x8::splat(p.warn_swing);
     let dir_mask = u32x8::splat(DIR_MASK);
     let up = u32x8::splat(UP);
     let dn = u32x8::splat(DN);
@@ -333,6 +383,18 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
             mask = mask | (strobe & u32x8::splat(MASK_STROBE_GEN)) | (ext_s & u32x8::splat(MASK_EXT_GEN));
         }
 
+        // --- close calls: general flashes at the stricter swing ----------
+        if warn {
+            let wq_up = lo.rev_up & fm((lo.sext - lo.sbase).cmp_ge(warn_swing)) & fm(lo.sbase.cmp_lt(dark));
+            let wq_dn = lo.rev_dn & fm((lo.sbase - lo.sext).cmp_ge(warn_swing)) & fm(lo.sext.cmp_lt(dark));
+            let pend_pol = (flags >> WARN_PEND_SHIFT) & dir_mask;
+            let pend_pol = warn_counter8(&mut st.warn_ring, &mut st.warn_last, &mut st.warn_pend_t, n, k, i, pend_pol, wq_up, wq_dn, now, pair);
+            flags = (flags & !(dir_mask << WARN_PEND_SHIFT)) | (pend_pol << WARN_PEND_SHIFT);
+            let fresh_m = age_le(now, ld_u(&st.warn_last, i), fresh);
+            let ws = fresh_m & age_lt(now, ld_u(&st.warn_ring, kw * n + i), rate);
+            mask = mask | (ws & u32x8::splat(MASK_WARN_GEN));
+        }
+
         // --- red flashes ------------------------------------------------
         {
             let pend_pol = (flags >> RED_PEND_SHIFT) & dir_mask;
@@ -344,6 +406,10 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
             let onset = bl_u(strobe, now - ld_u(&st.red_open, kf * n + i), zero);
             st_u(&mut out.onset_red, i, onset);
             mask = mask | (strobe & u32x8::splat(MASK_STROBE_RED)) | (ext_s & u32x8::splat(MASK_EXT_RED));
+            if warn {
+                let ws = fresh_m & age_lt(now, ld_u(&st.red_ring, kw * n + i), rate);
+                mask = mask | (ws & u32x8::splat(MASK_WARN_RED));
+            }
         }
 
         // --- pooled transition areas ------------------------------------
@@ -387,7 +453,14 @@ mod tests {
 
     #[test]
     fn simd_matches_scalar_bit_for_bit() {
-        for cfg in [Profile::WcagExt.config(), Profile::Strict.config(), DetectorConfig { flash_limit: 1.0, ..Default::default() }] {
+        for cfg in [
+            Profile::WcagExt.config(),
+            Profile::Wcag.config(),
+            Profile::Strict.config(),
+            DetectorConfig { flash_limit: 1.0, ..Default::default() },
+            // close calls with a swing the noise alone crosses
+            DetectorConfig { warn_swing: 0.03, ..Default::default() },
+        ] {
             let n = 1003; // not a multiple of 8: exercises the scalar tail
             let geom = GridGeometry::new(&cfg, 17, 59);
             let k = cfg.k_fail() as usize;

@@ -438,6 +438,15 @@ mod tests {
             } else if (13.0..14.0).contains(&t) {
                 // a held picture
                 f = vec![100u8; n * 3];
+            } else if (2.0..4.0).contains(&t) {
+                // a close call: two seconds at the limit rate
+                let c = if ((t * 6.0).floor() as i64) % 2 == 0 { 30 } else { 200 };
+                f.iter_mut().for_each(|p| *p = c);
+            } else if (18.5..20.0).contains(&t) {
+                // a quieter one: the limit rate at a swing only the stricter
+                // thresholds count (relative luminance 0.30 against 0.39)
+                let c = if ((t * 6.0).floor() as i64) % 2 == 0 { 149 } else { 168 };
+                f.iter_mut().for_each(|p| *p = c);
             }
             f
         };
@@ -448,6 +457,8 @@ mod tests {
         }
         let want = seq.finish();
         assert!(want.violations.iter().any(|v| v.kind == ViolationKind::Flash) && want.violations.iter().any(|v| v.kind == ViolationKind::Red), "{:?}", want.violations);
+        use crate::temporal::WarningLevel;
+        assert!(want.warnings.iter().any(|w| w.level == WarningLevel::Limit) && want.warnings.iter().any(|w| w.level == WarningLevel::Strict), "{:?}", want.warnings);
 
         let seam = 10.0;
         let runup = context_seconds(&cfg);
@@ -476,6 +487,9 @@ mod tests {
         }
         assert_eq!(got.events.len(), want.events.len(), "events");
         assert_eq!(got.violations, want.violations);
+        assert_eq!(got.frame_stats.warn, want.frame_stats.warn);
+        assert_eq!(got.frame_stats.warn_red, want.frame_stats.warn_red);
+        assert_eq!(got.warnings, want.warnings);
         assert_eq!(got.safe(), want.safe());
     }
 

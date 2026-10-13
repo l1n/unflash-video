@@ -52,7 +52,7 @@ const ROWS: &str = include_str!("shaders/rows.wgsl");
 const GATHER: &str = include_str!("shaders/gather.wgsl");
 
 const OUT_HEADER: usize = 8;
-const CELL_WORDS: usize = 12;
+const CELL_WORDS: usize = 14;
 const GEO_WORDS: usize = 8 + 64 + 64 + 4;
 const GEO_MAX_POS: usize = 64;
 const GEO_PAT_R: usize = 136;
