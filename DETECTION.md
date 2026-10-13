@@ -246,7 +246,7 @@ of a verdict's signature: a scan made before close calls existed stays
 valid, and has none until it is made again.
 
 On a 23-minute anime episode already cleaned to pass, close calls came to
-63 at the limit and 18 strict only, most of them single moments just over
+61 at the limit and 20 strict only, most of them single moments just over
 their area; the dense ones are the flash-cut montages that are a viewer's
 reason for asking.
 
