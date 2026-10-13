@@ -29,6 +29,10 @@ flash_hevc.mp4  the flash clip as HEVC (open GOPs, B-frames): the built-in
              HEVC decoder, in a browser without one.
 flash_vp8.webm  the flash clip as VP8 in WebM.
 flash_av1.mp4   the flash clip as AV1.
+closecall.mp4  close calls, which pass: 3 Hz flashing from 2 to 4 s (at the
+             limit, too short to be an extended flash), then from 6.5 to
+             8.5 s the same rate at a swing only the stricter profile
+             counts (relative luminance 0.30 against 0.39).
 bursts.mp4   three bursts of five quick flashes (white and near-white,
              0.3 s), a second apart, from 3 s: each burst fails by itself,
              so every one has to go.
@@ -167,6 +171,19 @@ def bursts_frames(secs=8.0):
         yield f
 
 
+def closecall_frames(secs=10.0):
+    n = int(secs * FPS)
+    for i in range(n):
+        t = i / FPS
+        f = scene(i)
+        phase = int(t * 6) % 2
+        if 2.0 <= t < 4.0:
+            f[...] = 30 if phase == 0 else 200
+        elif 6.5 <= t < 8.5:
+            f[...] = 149 if phase == 0 else 168
+        yield f
+
+
 def stripes_frames(secs=10.0):
     """Stationary high-contrast gratings: 8 px light / 8 px dark bars, so
     well over five pairs cover the whole picture and the bars survive the
@@ -202,6 +219,8 @@ if __name__ == "__main__":
     encode("flash_vp8.webm", flash_frames(), "vp8", 10)
     encode("flash_av1.mp4", flash_frames(), "av1", 10)
     encode("bursts.mp4", bursts_frames(), "vp9", 8)
+    encode("closecall.mp4", closecall_frames(), "vp9", 10)
+    encode("closecall_h264.mp4", closecall_frames(), "h264", 10)
     # the same pictures in Matroska / WebM, in transport streams, with their
     # sound as E-AC-3, PCM and DTS, and with two sound tracks
     for src, dst, args in [

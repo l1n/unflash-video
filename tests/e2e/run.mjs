@@ -915,6 +915,31 @@ try {
   scan = await scanCurrent();
   console.log('steady:', scan.toast);
   assert(scan.toast.includes('No flashing'), 'the steady file must be clean');
+  assert(!(await page.$('.close-calls')), 'and has no close calls');
+
+  // --- close calls: flashing that passes, but only just. Two seconds at
+  // the limit rate (too short for an extended flash), then the limit rate
+  // at a swing only the stricter profile counts: both pass, both are
+  // pointed out (the second more quietly), and a section made for one
+  // lists it with its frames
+  await openFile('closecall.mp4');
+  scan = await scanCurrent();
+  results.closeCalls = await page.evaluate(() => window.__unflash.lastScan.result.warnings);
+  console.log('close calls:', scan.toast, JSON.stringify(results.closeCalls));
+  assert(!scan.violations.length && scan.toast.includes('No flashing') && scan.toast.includes('2 close calls'), 'close calls pass, and the scan says so: ' + scan.toast);
+  const [atLimit, strictOnly] = results.closeCalls;
+  assert(results.closeCalls.length === 2 && atLimit.level === 'limit' && strictOnly.level === 'strict', 'one at the limit, one only the stricter profile fails: ' + JSON.stringify(results.closeCalls));
+  assert(atLimit.start > 2 && atLimit.end < 4.2 && strictOnly.start > 6.5 && strictOnly.end < 8.7, 'each where its flashing is: ' + JSON.stringify(results.closeCalls));
+  await page.click('.close-calls > summary');
+  const rows = await page.$$eval('.close-call', (els) => els.map((e) => ({ strict: e.classList.contains('strict'), text: e.innerText, title: e.title })));
+  assert(rows.length === 2 && !rows[0].strict && rows[1].strict && /at the limit/.test(rows[0].text) && /extended flash/.test(rows[0].title), 'listed under the whole video: ' + JSON.stringify(rows));
+  await page.click('.close-call button.small');
+  await verdictReady(page);
+  await idle(page);
+  const cc = await page.evaluate(() => ({ verdict: document.querySelector('#wsVerdict').textContent, findings: document.querySelector('#wsFindings').innerText, sec: { start: window.__unflash.currentSection().start, end: window.__unflash.currentSection().end } }));
+  assert(cc.verdict === 'passes' && /Close call/.test(cc.findings) && cc.sec.start < atLimit.start - 1 && cc.sec.end > atLimit.end, 'its section passes and lists it: ' + JSON.stringify({ verdict: cc.verdict, findings: cc.findings, start: cc.sec.start, end: cc.sec.end }));
+  await page.click('#wsFindings button[data-close]');
+  assert((await page.evaluate(() => window.__unflash.state.selection.size)) > 30, 'and selects its frames');
 
   // --- bursts that each fail by themselves: the fewest removals try putting
   // some back, which fails, and hand back the removal that took every one
@@ -1087,6 +1112,8 @@ try {
   scan = await scanCurrent();
   console.log('extended (wcag):', scan.toast);
   assert(scan.toast.includes('No flashing'), 'under exact WCAG the 3 Hz file passes');
+  // (exact WCAG reports no extended flashes: the eight seconds at the limit are a close call)
+  assert(scan.toast.includes('1 close call'), 'and is pointed out as a close call: ' + scan.toast);
 
   // --- red flash with no luminance change: a red-flash failure (and, kept up
   // for six seconds, an extended flash under the default profile), never a

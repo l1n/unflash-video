@@ -84,6 +84,31 @@ const RACE = {
 };
 
 export const SCENES = [
+  {
+    name: 'close-calls',
+    alt: 'A video that passes is scanned: "No flashing found", and 2 close calls. Unfolded under the whole video, one is at the limit (3 flashes inside a second, too short to be an extended flash) and one only the stricter profile fails, both marked along the top of the timeline and the chart; "section" makes a section around the first, which passes and lists the close call with its frames.',
+    query: QA,
+    setup: (d) => d.open('closecall.mp4'),
+    view: { x: 0, y: 0, width: 1024, height: 640 },
+    async play(d) {
+      await d.click('#btnScan');
+      await d.idle();
+      await hideToast(d);
+      await d.camera({ x: 0, y: 70, width: 1024, height: 640 }, { ms: 900 });
+      await d.click('.close-calls > summary', { after: 900 });
+      await d.point('.close-call', { dx: 0.4, ms: 600 });
+      await d.wait(1600);
+      await d.point('.close-call.strict', { dx: 0.4, ms: 500 });
+      await d.wait(1200);
+      await d.click('.close-call button.small', { after: 0 });
+      await d.verdict();
+      await hideToast(d);
+      await toTop(d, '.ws-head');
+      await d.camera(await d.around(['.ws-head', '#wsFindings'], 8), { ms: 900 });
+      await d.point('#wsFindings .finding.close', { dx: 0.3, ms: 600 });
+      await d.wait(2600);
+    },
+  },
   // ======== 2026-10-02 ==========================================================
   {
     name: 'unmarked-copied',

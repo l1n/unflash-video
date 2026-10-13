@@ -18,6 +18,7 @@ check also passes when you re-scan the exported file.
 - [Applying a 1024x768 rule to other shapes](#applying-a-1024x768-rule-to-other-shapes)
 - [Calibration](#calibration)
 - [Extended flashes](#extended-flashes)
+- [Close calls](#close-calls)
 - [Regular patterns](#regular-patterns)
 - [The three profiles](#the-three-profiles)
 - [The safe frame rate](#the-safe-frame-rate)
@@ -200,6 +201,55 @@ section or exported file whose only remaining problems are extended flashes
 still passes WCAG, and Unflash says so while still marking it unsafe under
 the active profile.
 
+## Close calls
+
+A close call is flashing that passes, but only just. It is a warning, never
+a failure: no verdict, section, suggestion or export check reads one. The
+scan lists them, marks them along the top of the timeline and the chart,
+and offers a section around each; a section's check lists those over its
+own frames. There are two levels.
+
+- **At the limit.** The building block of an extended flash: every failure
+  criterion (swing, dark state, concurrency, area, window-mean coherence)
+  at exactly 3 flashes inside a second instead of more. Where that comes to
+  an extended flash, or a failure, it is reported as one; what is left is
+  too short for one (or, under *Exact WCAG only*, which reports no extended
+  flashes, any length). WCAG allows it, which is why it passes, and it is
+  also as close as anything can come to failing.
+- **Strict only** (quieter). What the *Stricter than WCAG* profile alone
+  would fail: the failure test at its thresholds (0.08 swing, a fifth of
+  the window, more than 2 flashes a second) and nothing louder.
+
+Frames that qualify are joined into one close call where they are under a
+second apart, as failures are. A close call overlapping anything louder (a
+failure, a reported extended flash, or for the quieter level a close call
+at the limit) is dropped: the louder report already marks the place. Its
+severity is its area over its own level's threshold.
+
+The stricter level is measured in the same pass as everything else. A
+smaller swing qualifies more transitions, which pairs them into flashes
+differently, so it has a general flash counter of its own per pixel (the
+rings without opening times), two more mask bits, and window means of its
+own (the mean has to swing by 0.08 × 1/5 over the window, at most 3
+flashes a second before it fails). Red transitions don't depend on the
+swing, so the red counter's ring is read once more, at the stricter rate.
+What it cannot match exactly is the held-frame test, whose bar scales with
+the swing: a frame the WCAG thresholds call a re-show is not looked at,
+where the stricter profile itself would look. That frame moved less than
+half a WCAG swing over a tenth of a flash's area, so it changes the
+severity at most a little: on a real episode, 3.57 against the stricter
+profile's own 3.58.
+
+Under the *Stricter than WCAG* profile there are no close calls (it fails
+all of them). The `warn*` settings change no verdict, so they are left out
+of a verdict's signature: a scan made before close calls existed stays
+valid, and has none until it is made again.
+
+On a 23-minute anime episode already cleaned to pass, close calls came to
+63 at the limit and 18 strict only, most of them single moments just over
+their area; the dense ones are the flash-cut montages that are a viewer's
+reason for asking.
+
 ## Regular patterns
 
 Flashing is not the only photosensitive trigger. The Ofcom guidance (and
@@ -271,11 +321,11 @@ without being regular gratings are outside it.
 The profile is chosen in the header and used by every check, render verdict
 and verification.
 
-| Profile | WCAG thresholds | Extended flashes | Regular patterns |
-|---|---|---|---|
-| **WCAG + extended flashes + stripe patterns** (default) | exact | reported as violations: they get their own work sections labeled *extended flash*, count in the verdict, and Suggest tries to clear them | reported as violations with sections labeled *stripes*; soften clears them |
-| **Exact WCAG only** | exact | not detected or reported at all | not reported |
-| **Stricter than WCAG** | tighter: 0.08 swing, 1/5 area, 2 flashes/s | not reported separately, because this profile already fails at 3 flashes/s | reported |
+| Profile | WCAG thresholds | Extended flashes | Regular patterns | Close calls |
+|---|---|---|---|---|
+| **WCAG + extended flashes + stripe patterns** (default) | exact | reported as violations: they get their own work sections labeled *extended flash*, count in the verdict, and Suggest tries to clear them | reported as violations with sections labeled *stripes*; soften clears them | both levels, as warnings |
+| **Exact WCAG only** | exact | not detected or reported at all | not reported | both levels, as warnings (sustained flashing at the limit included) |
+| **Stricter than WCAG** | tighter: 0.08 swing, 1/5 area, 2 flashes/s | not reported separately, because this profile already fails at 3 flashes/s | reported | none: it fails them |
 
 ## The safe frame rate
 

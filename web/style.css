@@ -10,6 +10,8 @@
   --fg: #e4e4e4; --fg2: #8f8f8f; --lit: #e4e4e4; --lit-fg: #0d0d0d;
   /* what the detector found, and what a mark does */
   --flash: #e8a33c; --red: #e04fb0; --pat: #3fc1c9; --ext: #7f9bff; --held: #4f8cff; --blend: #a782ff; --sel: #ffd84f;
+  /* close calls: flashing that passes, but only just */
+  --close: #c8b88a;
   /* tallies */
   --ok: #3dbb6a; --bad: #e0503f; --warn: #e8a33c;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace;
@@ -101,6 +103,17 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 .badge.kind-flash { border-color: var(--flash); color: var(--flash); }
 .badge.kind-red { border-color: var(--red); color: var(--red); }
 .badge.kind-pattern, .badge.pat { border-color: var(--pat); color: var(--pat); }
+.badge.close { border-color: var(--close); color: var(--close); }
+/* the close calls under the whole video in the section list */
+.close-calls { border-bottom: 1px solid var(--line); font-size: 11px; }
+.close-calls > summary { padding: 4px 10px 4px 12px; cursor: pointer; color: var(--close); list-style-position: inside; }
+.close-calls > summary:hover { background: var(--bg3); }
+.close-calls .cc-note { padding: 0 10px 4px 12px; color: var(--fg2); }
+.close-call { display: flex; gap: 6px; align-items: baseline; padding: 2px 10px 2px 12px; border-left: 3px solid var(--close); margin-left: 12px; }
+.close-call.strict { border-left-style: dashed; color: var(--fg2); }
+.close-call .cc-time { color: var(--fg); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; font-variant-numeric: tabular-nums; background: none; border: 0; padding: 0; font-size: 11px; text-transform: none; letter-spacing: 0; }
+.close-call .cc-what { flex: 1; }
+.close-call button.small { font-size: 10px; padding: 0 5px; }
 
 /* ---- the player and the chart ---- */
 #stage { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: auto; }
@@ -181,6 +194,8 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 .finding.red { border-left-color: var(--red); }
 .finding.extended { border-left-color: var(--ext); }
 .finding.pattern { border-left-color: var(--pat); }
+.finding.close { border-left-color: var(--close); }
+.finding.close.strict { border-left-style: dashed; color: var(--fg2); }
 .finding .how { color: var(--fg2); font-size: 11px; margin-top: 2px; }
 .finding button { margin-left: 8px; }
 

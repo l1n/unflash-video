@@ -87,6 +87,7 @@ const state = {
   // seconds of the whole video the chart shows around the playhead (0: all of it)
   chartSpan: 30,
   changes: null, // what's new: { log, newest, seen } (see initChanges)
+  closeCallsOpen: false, // the close calls under the whole video are unfolded
 };
 
 let sectionPlayer = null;
@@ -335,6 +336,51 @@ function toggleMenu(id) {
 
 const KIND_LABEL = { flash: 'flash', red: 'red flash', extended: 'extended flash', pattern: 'stripes' };
 
+/**
+ * The close calls of the scan (flashing that passes, but only just), in
+ * time order: none for a scan made before there were any, or under another
+ * profile than the one in use.
+ */
+function closeCalls(scan) {
+  if (!scan || !Array.isArray(scan.warnings) || scan.sig !== wasm.config_signature(state.config)) return [];
+  // (numbers and names only: a scan can come from a project file, and these go into the page as HTML)
+  return scan.warnings
+    .map((w) => ({ start: Number(w.start), end: Number(w.end), count: Number(w.count), peak: Number(w.peak), level: w.level === 'strict' ? 'strict' : 'limit', kind: w.kind === 'red' ? 'red' : 'flash' }))
+    .filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && Number.isFinite(w.count));
+}
+
+/** " 3 close calls: see under the whole video." for a scan that has any. */
+function closeCallNote(scan) {
+  const n = closeCalls(scan).length;
+  return n ? ` ${n} close call${n === 1 ? ', which passes' : 's, which pass'} but only just: see under the whole video.` : '';
+}
+
+/** A close call in a few words, for the list: its level, and for one at the limit how much of the screen. */
+function closeCallLabel(w) {
+  const red = w.kind === 'red' ? 'red, ' : '';
+  return w.level === 'strict' ? `${red}stricter profile only` : `${red}at the limit · ${w.count.toFixed(1)}× area`;
+}
+
+/**
+ * A close call in words: what it is, and why it passes (`extended`: the
+ * profile reports extended flashes, so this one was too short for one).
+ */
+function closeCallText(w, extended) {
+  const what = w.kind === 'red' ? 'Red flashing' : 'Flashing';
+  if (w.level === 'strict') return `${what} only the stricter profile fails: more than 2 flashes a second, counting fainter flashes (a 0.08 swing) and smaller ones (a fifth of the window) than WCAG does.`;
+  const why = extended ? 'at WCAG\'s limit, not over it, and it stops too soon to be an extended flash (5 s)' : 'at WCAG\'s limit, not over it';
+  return `${what} 3 times inside a second over ${w.count.toFixed(1)}× the area WCAG counts: ${why}.`;
+}
+
+/** The stretch a section made for close call `w` covers: the flashing that adds up to it starts up to a second before. */
+function closeCallSpan(w) {
+  const [lo, hi] = state.project.bounds;
+  let a = Math.max(lo, w.start - 1 - 1.5);
+  let b = Math.min(hi, w.end + 1.5);
+  if (b - a < 2) b = Math.min(hi, a + 2);
+  return [a, b];
+}
+
 // The page's colours and type, for the canvases: style.css keeps them
 // (:root), so the timeline and the charts draw in the same palette as the
 // rest of the page.
@@ -342,7 +388,7 @@ const ink = (() => {
   const cs = getComputedStyle(document.documentElement);
   const v = (k) => cs.getPropertyValue(`--${k}`).trim();
   const out = {};
-  for (const k of ['bg', 'line2', 'fg', 'fg2', 'flash', 'red', 'pat', 'ext', 'held', 'blend', 'sel', 'ok', 'bad']) out[k] = v(k);
+  for (const k of ['bg', 'line2', 'fg', 'fg2', 'flash', 'red', 'pat', 'ext', 'held', 'blend', 'sel', 'ok', 'bad', 'close']) out[k] = v(k);
   const mono = v('mono');
   out.font = (px) => `${px}px ${mono}`;
   return out;
@@ -1301,6 +1347,8 @@ async function scan() {
   const np = counted.filter((v) => v.kind === 'pattern').length;
   project.scan = {
     violations: res.result.violations,
+    // close calls: shown, never counted (none under the stricter profile)
+    warnings: (res.result.warnings || []).map((w) => ({ start: w.start, end: w.end, level: w.level, kind: w.kind, count: w.count, peak: w.peak })),
     summary: res.summary,
     frames: res.frames,
     elapsedMs: res.elapsedMs,
@@ -1334,7 +1382,7 @@ async function scan() {
   toast(
     n
       ? `${n} violation${n === 1 ? '' : 's'} found${np ? ` (${np} regular pattern${np === 1 ? '' : 's'}, ${n - np} flash)` : ''}, ${added} new section${added === 1 ? '' : 's'} added (${fps} fps).`
-      : `No flashing${res.result.flag_patterns ? ' or hazardous patterns' : ''} found in ${res.frames} frames.`,
+      : `No flashing${res.result.flag_patterns ? ' or hazardous patterns' : ''} found in ${res.frames} frames.${closeCallNote(project.scan)}`,
     6000
   );
   return res;
@@ -2019,6 +2067,14 @@ function drawTimeline(dragSpan = null) {
   // the baseline the trace stands on
   g.fillStyle = ink.line2;
   g.fillRect(0, H - 24, W, 1);
+  // close calls, along the top edge: at the limit full height, the
+  // stricter profile's only fainter and thinner
+  for (const w of closeCalls(state.project.scan)) {
+    const x0 = x(w.start);
+    const strict = w.level === 'strict';
+    g.fillStyle = strict ? tint(ink.close, 0.5) : ink.close;
+    g.fillRect(x0 - 1, 0, Math.max(3, x(w.end) - x0 + 2), strict ? 2 : 4);
+  }
   // what a running scan has found so far (dashed: its edges may still move)
   const provisional = state.scanning ? state.scanning.violations : null;
   if (provisional && provisional.length) {
@@ -2138,6 +2194,7 @@ function renderSectionList() {
   whole.innerHTML = `<div class="sec-title">Whole video ${st ? st.badge : ''}</div><div class="sec-times">${fmt(lo)} – ${fmt(hi)}${st ? ` · ${st.text}` : ''}</div>`;
   whole.addEventListener('click', openWholeVideo);
   list.appendChild(whole);
+  renderCloseCalls(list);
   for (const s of state.project.sectionsSorted()) {
     const el = document.createElement('div');
     el.className = 'sec-item' + (state.current === s.id ? ' current' : '');
@@ -2158,6 +2215,56 @@ function renderSectionList() {
     none.textContent = st && st.safe ? 'No sections: the scan found nothing to fix. To look at a stretch anyway, drag over it on the timeline.' : 'No sections yet. Scan the video, or drag on the timeline.';
     list.appendChild(none);
   }
+}
+
+/**
+ * The scan's close calls, folded under the whole video: each one's time
+ * (a click plays from just before it), what it is, and a button that
+ * makes a section around it, to look at it frame by frame or mark it.
+ */
+function renderCloseCalls(list) {
+  const scan = state.project.scan;
+  const calls = closeCalls(scan);
+  const fresh = scan && scan.sig === wasm.config_signature(state.config);
+  // a scan from before there were close calls (none are looked for under the stricter profile)
+  if (!calls.length) {
+    if (fresh && !Array.isArray(scan.warnings) && JSON.parse(state.config).warnings !== false) {
+      const note = document.createElement('div');
+      note.className = 'close-calls';
+      note.innerHTML = `<div class="cc-note">Scanned before Unflash pointed out close calls: scan again to see them.</div>`;
+      list.appendChild(note);
+    }
+    return;
+  }
+  const box = document.createElement('details');
+  box.className = 'close-calls';
+  box.open = !!state.closeCallsOpen;
+  box.addEventListener('toggle', () => (state.closeCallsOpen = box.open));
+  const strict = calls.filter((w) => w.level === 'strict').length;
+  const limit = calls.length - strict;
+  const parts = [limit ? `${limit} at the limit` : '', strict ? `${strict} only the stricter profile fails` : ''].filter(Boolean).join(', ');
+  box.innerHTML = `<summary title="Flashing that passes, but only just. Nothing here counts against the video.">${calls.length} close call${calls.length === 1 ? '' : 's'} (${parts})</summary><div class="cc-note">Flashing that passes, but only just: nothing needs doing. Some viewers are sensitive to it. Hover over one for what it is; <i>section</i> opens it frame by frame, to mark its frames if you want it gone.</div>`;
+  calls.forEach((w) => {
+    const row = document.createElement('div');
+    row.className = 'close-call' + (w.level === 'strict' ? ' strict' : '');
+    row.title = closeCallText(w, !!scan.flag_extended);
+    row.innerHTML = `<button class="cc-time" title="Play from just before it">${fmt(w.start)}</button><span class="cc-what">${closeCallLabel(w)}</span><button class="small" title="Make a section around it, to look at it frame by frame">section</button>`;
+    const [timeBtn, secBtn] = row.querySelectorAll('button');
+    timeBtn.addEventListener('click', () => {
+      if (state.current != null) openWholeVideo();
+      $('player').currentTime = Math.max(state.project.bounds[0], w.start - 1.5);
+      drawTimeline();
+      drawChart();
+    });
+    secBtn.addEventListener('click', () => {
+      const [a, b] = closeCallSpan(w);
+      const o = state.project.sectionsSorted().find((x) => x.end > a && x.start < b);
+      if (o) return openSection(o.id);
+      addSection(a, b);
+    });
+    box.appendChild(row);
+  });
+  list.appendChild(box);
 }
 
 function renderAll() {
@@ -2332,8 +2439,14 @@ function wireWorkspace() {
   $('wsFindings').addEventListener('click', (e) => {
     const go = e.target.closest('button[data-open-section]');
     if (go) return openSection(+go.dataset.openSection);
-    const b = e.target.closest('button[data-finding]');
     const sec = currentSection();
+    const cb = e.target.closest('button[data-close]');
+    if (cb && sec && sec.check) {
+      const f = closeFindings(sec)[+cb.dataset.close];
+      if (f) selectFrames(f.frames, f.label);
+      return;
+    }
+    const b = e.target.closest('button[data-finding]');
     if (!b || !sec || !sec.check) return;
     const f = findings(sec)[+b.dataset.finding];
     if (f) selectFrames(f.frames, f.label);
@@ -2552,6 +2665,25 @@ function findings(sec) {
   return out;
 }
 
+/**
+ * The close calls inside a checked section, like findings: what passes,
+ * but only just. The flashing that adds up to one starts up to a second
+ * before it, so its frames run from then.
+ */
+function closeFindings(sec) {
+  const c = sec.check;
+  if (!c || c.stale || !c.seq || !c.seq.t || !c.warnings) return [];
+  const out = [];
+  for (const raw of c.warnings) {
+    const w = { ...raw, count: Number(raw.count), level: raw.level === 'strict' ? 'strict' : 'limit', kind: raw.kind === 'red' ? 'red' : 'flash' };
+    const v = { start: w.start, end: w.end, onset: w.start - 1, kind: 'flash', count: w.count, peak: w.peak };
+    const frames = framesOf(c.seq.t, v);
+    if (!frames.length) continue;
+    out.push({ w, frames, first: frames[0], last: frames[frames.length - 1], label: `the close call at frames ${frames[0]}–${frames[frames.length - 1]}` });
+  }
+  return out;
+}
+
 /** The frames of a checked sequence (times `t`) that violation `v` covers, in order (editing::flagged_frames, for the one). */
 function framesOf(t, v) {
   return Array.from(wasm.flagged_frames(Float64Array.from(t), JSON.stringify([v])));
@@ -2654,8 +2786,9 @@ function renderFindings(sec) {
   const box = $('wsFindings');
   const list = sec.prepared ? findings(sec) : [];
   const runUp = sec.prepared ? runUpFlashing(sec) : [];
-  box.classList.toggle('hidden', !list.length && !runUp.length);
-  if (!list.length && !runUp.length) {
+  const close = sec.prepared ? closeFindings(sec) : [];
+  box.classList.toggle('hidden', !list.length && !runUp.length && !close.length);
+  if (!list.length && !runUp.length && !close.length) {
     box.innerHTML = '';
     return;
   }
@@ -2680,7 +2813,12 @@ function renderFindings(sec) {
     const fix = near.length ? `It is fixed there: nothing in this section's frames can clear it.` : `Nothing in this section's frames can clear it: widen this section back over it, or add a section there.`;
     return `<div class="finding ${v.kind} run-up"><b>${label(v.kind)} before this section</b>, from ${atLeast(sec.check, v)}${(-v.start).toFixed(1)} s before it ${what}, ${where}${openButton(near[0])}<div class="how">${fix} This section's verdict leaves it out.</div></div>`;
   });
-  box.innerHTML = own.join('') + before.join('');
+  const calls = close.map((f, k) => {
+    const strict = f.w.level === 'strict';
+    const fix = 'It passes, so nothing needs doing. To take it out, remove (R, F), hold or blend (B) frames in it by hand and check again: Suggest works on what fails, which this does not.';
+    return `<div class="finding close${strict ? ' strict' : ''}"><b>Close call</b>, frames ${f.first}–${f.last} (${dur(f)}). ${closeCallText(f.w, !!sec.check.flag_extended)}<button class="small" data-close="${k}">select these frames</button><div class="how">${fix}</div></div>`;
+  });
+  box.innerHTML = own.join('') + before.join('') + calls.join('');
 }
 
 function describeFailure(sec, c) {
@@ -3327,8 +3465,10 @@ function scanStatus() {
   const frames = Number(s.frames);
   const n = Number(s.counted);
   const kinds = `flashing${s.flag_extended ? ' (extended flashes included)' : ''}${s.flag_patterns ? ' or stripe patterns' : ''}`;
-  if (s.safe) return { badge: '<span class="badge safe">nothing found</span>', text: `✓ no ${kinds} found in ${frames} frames`, safe: true, kinds };
-  return { badge: `<span class="badge unsafe">${n} found</span>`, text: `${n} violation${n === 1 ? '' : 's'} found in ${frames} frames` };
+  const cc = closeCalls(s).length;
+  const close = cc ? `; ${cc} close call${cc === 1 ? '' : 's'}` : '';
+  if (s.safe) return { badge: '<span class="badge safe">nothing found</span>', text: `✓ no ${kinds} found in ${frames} frames${close}`, safe: true, kinds };
+  return { badge: `<span class="badge unsafe">${n} found</span>`, text: `${n} violation${n === 1 ? '' : 's'} found in ${frames} frames${close}` };
 }
 
 function drawChart() {
@@ -3522,6 +3662,18 @@ function drawVideoChart(g, W, H) {
     const x0 = Math.max(0, x(v.start));
     g.fillRect(x0, 2, Math.max(2, Math.min(W, x(v.end)) - x0), 7);
   }
+  // close calls: outlined (dashed for the stricter profile's only)
+  const close = state.scanning ? [] : closeCalls(scan);
+  g.save();
+  g.lineWidth = 1;
+  for (const w of close) {
+    if (w.end < t0 || w.start > t1) continue;
+    g.setLineDash(w.level === 'strict' ? [2, 2] : []);
+    g.strokeStyle = w.level === 'strict' ? tint(ink.close, 0.7) : ink.close;
+    const x0 = Math.max(0, x(w.start) - 1);
+    g.strokeRect(x0 + 0.5, 2.5, Math.max(3, Math.min(W, x(w.end) + 1) - x0) - 1, 6);
+  }
+  g.restore();
   if (n && n.t.length) {
     // bars: flashing faster than the limit, general then red
     for (let c = 0; c < cols; c++) {
@@ -3593,7 +3745,8 @@ function drawVideoChart(g, W, H) {
     const worst = pk.h[0] >= pk.r[0] ? ['general', pk.h] : ['red', pk.r];
     lead = `<span class="found-none">✓ No ${st.kinds} found.</span> ${worst[1][0] > 0 ? `The closest it came: ${Math.round(worst[1][0] * 100)}% of the area limit (${worst[0]} flashing, at ${fmt(worst[1][1])}). ` : 'Nothing flashes faster than the limit anywhere. '}`;
   }
-  hint.innerHTML = `${lead}Bars: how much of the screen flashes faster than the limit (orange; magenta for red), as a share of the area limit (the dashed line). Blue: flashing at the limit rate, which extended flashes are made of; grey: brightness${scan && scan.flag_patterns ? '; teal: stripes' : ''}. Boxes are sections; the strip along the top is what the scan found. Click to play from there.`;
+  const closeHint = close.length ? ' Outlined in the strip: close calls, flashing that passes but only just (dashed: only the stricter profile fails it).' : '';
+  hint.innerHTML = `${lead}Bars: how much of the screen flashes faster than the limit (orange; magenta for red), as a share of the area limit (the dashed line). Blue: flashing at the limit rate, which extended flashes are made of; grey: brightness${scan && scan.flag_patterns ? '; teal: stripes' : ''}. Boxes are sections; the strip along the top is what the scan found.${closeHint} Click to play from there.`;
 }
 
 /** Seconds either side over which "flashing at the limit rate" is read: it comes in spikes, one per transition. */

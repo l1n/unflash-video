@@ -107,6 +107,18 @@
    "violations": 0
   }
  },
+ "close-calls": {
+  "w": 720,
+  "h": 450,
+  "seconds": 24.5,
+  "alt": "A video that passes is scanned: \"No flashing found\", and 2 close calls. Unfolded under the whole video, one is at the limit (3 flashes inside a second, too short to be an extended flash) and one only the stricter profile fails, both marked along the top of the timeline and the chart; \"section\" makes a section around the first, which passes and lists the close call with its frames.",
+  "sha256": "1bccad38627af9d72382e2367a997b9ff4fab4eef512c535bd0958bb3d73320a",
+  "checked": {
+   "profile": "strict",
+   "frames": 736,
+   "violations": 0
+  }
+ },
  "debug-info": {
   "w": 720,
   "h": 450,
