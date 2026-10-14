@@ -4,7 +4,7 @@
 //! Both pixel stages (CPU kernels here, WGSL in `unflash-gpu`) reduce every
 //! frame to one [`GridCell`] per window position: the window's summed
 //! luminance and distance from red (for the coherence gate), the count of pixels in
-//! each of the eight per-pixel mask classes, and the age of the oldest
+//! each of the ten per-pixel mask classes, and the age of the oldest
 //! opening transition still feeding a failure window (for the violation's
 //! onset). Everything the detector does after that is a few hundred
 //! numbers per frame.
@@ -119,9 +119,12 @@ pub const MASK_POOL_GEN_UP: u32 = 1 << 4;
 pub const MASK_POOL_GEN_DN: u32 = 1 << 5;
 pub const MASK_POOL_RED_UP: u32 = 1 << 6;
 pub const MASK_POOL_RED_DN: u32 = 1 << 7;
-pub const MASK_BITS: usize = 8;
+/// Strobing at the stricter thresholds: close calls (see `DetectorConfig::warnings`).
+pub const MASK_WARN_GEN: u32 = 1 << 8;
+pub const MASK_WARN_RED: u32 = 1 << 9;
+pub const MASK_BITS: usize = 10;
 
-/// One window position's reduction of a frame. `repr(C)` and 48 bytes so the
+/// One window position's reduction of a frame. `repr(C)` and 56 bytes so the
 /// GPU can write it directly.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -321,6 +324,9 @@ mod tests {
             if i % 5 == 0 {
                 masks[i] |= MASK_POOL_RED_DN;
             }
+            if i % 4 == 0 {
+                masks[i] |= MASK_WARN_RED;
+            }
         }
         let or = vec![0u32; n];
         let mut cells = Vec::new();
@@ -329,6 +335,7 @@ mod tests {
         let c = cells[0];
         assert_eq!(c.cnt[0] as usize, (n + 2) / 3);
         assert_eq!(c.cnt[7] as usize, (n + 4) / 5);
+        assert_eq!(c.cnt[9] as usize, (n + 3) / 4);
         assert_eq!(c.onset_gen, 1000 + (n as u32 - 1) / 3 * 3);
         assert_eq!(c.onset_red, 0);
         let want_l: f64 = l.iter().map(|&x| x as f64).sum();

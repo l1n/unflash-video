@@ -167,6 +167,25 @@ def scenario_red_noise(secs, hz, amp):
     return ts, frames
 
 
+def scenario_burst(secs, hz, burst, lo, hi):
+    """Half the picture flashing for the first `burst` seconds, then still."""
+    ts = times_2997(secs)
+    return ts, [gen_square(t, hz, 0.5, lo, hi) if t < burst
+                else gen_square(0.0, hz, 0.5, lo, hi) for t in ts]
+
+
+def scenario_red_burst(secs, hz, burst):
+    """The whole picture swapping red and grey for `burst` seconds."""
+    ts = times_2997(secs)
+    frames = []
+    for t in ts:
+        f = solid(144)
+        if t < burst and phase(t, hz) == 0:
+            f[...] = (255, 0, 0)
+        frames.append(f)
+    return ts, frames
+
+
 SCENARIOS = {
     "square4hz": (lambda: scenario_square(4.0, 6.0, 0.5, 20, 200), ["wcag"]),
     "square3hz": (lambda: scenario_square(3.0, 10.0, 0.5, 20, 200), ["wcag_ext", "wcag", "strict"]),
@@ -187,6 +206,12 @@ SCENARIOS = {
     "red_darkred": (lambda: scenario_red_pair(5.0, 4.0, (255, 0, 0), (110, 0, 0)), ["wcag"]),
     # red against a green of the same luminance: a red flash only
     "red_green": (lambda: scenario_red_pair(5.0, 4.0, (200, 0, 0), (0, 116, 0)), ["wcag"]),
+    # close calls: two seconds at the limit rate (too short for an extended
+    # flash), and the limit rate at a swing between the stricter profile's
+    # 0.08 and WCAG's 0.10 (relative luminance 0.30 against 0.39)
+    "burst3hz": (lambda: scenario_burst(6.0, 3.0, 2.0, 20, 200), ["wcag_ext", "wcag", "strict"]),
+    "soft3hz": (lambda: scenario_burst(6.0, 3.0, 6.0, 149, 168), ["wcag_ext", "strict"]),
+    "red_burst3hz": (lambda: scenario_red_burst(6.0, 3.0, 2.0), ["wcag"]),
 }
 
 
@@ -216,6 +241,8 @@ def run(name, ts, frames, profile):
             "hazard_red": list(det.stat_haz_red),
             "ext": list(det.stat_ext),
             "ext_red": list(det.stat_ext_red),
+            "warn": list(det.stat_warn),
+            "warn_red": list(det.stat_warn_red),
             "up": list(det.stat_up),
             "down": list(det.stat_dn),
             "red": list(det.stat_red),
@@ -232,6 +259,11 @@ def run(name, ts, frames, profile):
              "onset": v.onset, "peak": v.peak}
             for v in res.violations
         ],
+        "warnings": [
+            {"start": w.start, "end": w.end, "level": w.level, "kind": w.kind,
+             "count": w.count, "peak": w.peak}
+            for w in res.warnings
+        ],
         "anomalies": res.anomalies,
         "held": det.held,
         "safe": res.safe,
@@ -244,7 +276,8 @@ def run(name, ts, frames, profile):
     with open(path, "w") as f:
         json.dump(out, f, separators=(",", ":"))
     print(f"{name:12s} {profile:9s} frames={len(ts):4d} held={det.held:4d} "
-          f"violations={[(v.kind, round(v.start, 2), round(v.end, 2)) for v in res.violations]}")
+          f"violations={[(v.kind, round(v.start, 2), round(v.end, 2)) for v in res.violations]} "
+          f"warnings={[(w.level, w.kind, round(w.start, 2), round(w.end, 2)) for w in res.warnings]}")
 
 
 def main():

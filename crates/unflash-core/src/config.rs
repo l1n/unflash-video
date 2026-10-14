@@ -10,6 +10,8 @@
 //!  - failure: more than 3 flashes (of either kind) in any 1-second period
 //!  - extended flash: >= 5 s of flashing that meets every failure criterion
 //!    except the rate — it runs *at* the permitted rate rather than above it.
+//!  - close calls (warnings, never failures): flashing at the limit rate for
+//!    less than that, and flashing that fails only the stricter profile.
 
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +54,17 @@ pub struct DetectorConfig {
     pub extended_hold: f64,
     pub extended_window: f64,
     pub extended_coverage: f64,
+    // --- close calls (warnings, never failures) ---
+    /// Report flashing that passes, but only just: at the limit rate for
+    /// less than an extended flash needs ("at the limit"), or failing only
+    /// the stricter thresholds below ("strict only", the quieter level).
+    /// Warnings change no verdict, so the `warn*` settings are left out of
+    /// the [signature](Self::signature).
+    pub warnings: bool,
+    /// The stricter profile's swing, area and rate.
+    pub warn_swing: f32,
+    pub warn_area_fraction: f64,
+    pub warn_flash_limit: f64,
     // --- regular patterns (stripes, gratings) ---
     /// Flag hazardous static patterns as violations with their own sections,
     /// or ignore them.
@@ -109,6 +122,10 @@ impl Default for DetectorConfig {
             extended_hold: 1.0,
             extended_window: 5.0,
             extended_coverage: 0.80,
+            warnings: true,
+            warn_swing: 0.08,
+            warn_area_fraction: 0.20,
+            warn_flash_limit: 2.0,
             pattern_mode: ExtendedMode::Section,
             pattern_pairs: 5,
             pattern_swing: 0.10,
@@ -179,6 +196,9 @@ impl Profile {
                 area_fraction: 0.20,
                 flash_limit: 2.0,
                 extended_mode: ExtendedMode::Off,
+                // (the warnings' thresholds are this profile's own:
+                // anything they would find, it fails)
+                warnings: false,
                 ..DetectorConfig::default()
             },
         }
@@ -218,11 +238,12 @@ impl DetectorConfig {
 
     /// Short stable id for the detection settings a verdict was produced
     /// under: every field except the `section_*` ones, which only steer how a
-    /// scan is carved into work sections and cannot change a verdict.
+    /// scan is carved into work sections, and the `warn*` ones, which only
+    /// say what is close to failing; neither can change a verdict.
     pub fn signature(&self) -> String {
         let mut v = serde_json::to_value(self).expect("config is serialisable");
         if let serde_json::Value::Object(map) = &mut v {
-            map.retain(|k, _| !k.starts_with("section_"));
+            map.retain(|k, _| !k.starts_with("section_") && !k.starts_with("warn"));
         }
         // canonical: serde_json::Value objects serialise with sorted keys
         // only when the `preserve_order` feature is off (it is).
@@ -245,6 +266,18 @@ impl DetectorConfig {
     /// Flashes per second that count as an extended flash (at the limit).
     pub fn ext_rate(&self) -> u32 {
         (self.flash_limit.ceil() as i64).max(1) as u32
+    }
+
+    /// Close calls are looked for: the profile asks for them, and its own
+    /// limit is above the stricter one (a stricter rate needs fewer flashes
+    /// in a second, which the rings the profile keeps already hold).
+    pub fn warn_active(&self) -> bool {
+        self.warnings && self.k_warn() <= self.k_fail() && self.warn_swing <= self.swing_threshold
+    }
+
+    /// How many flashes inside a second fail the stricter thresholds.
+    pub fn k_warn(&self) -> u32 {
+        (self.warn_flash_limit.floor() as i64 + 1).max(1) as u32
     }
 }
 
@@ -282,6 +315,9 @@ mod tests {
         let c = DetectorConfig { swing_threshold: 0.09, ..Default::default() };
         assert_eq!(a.signature(), b.signature());
         assert_ne!(a.signature(), c.signature());
+        // warnings change no verdict either
+        let d = DetectorConfig { warnings: false, warn_swing: 0.05, ..Default::default() };
+        assert_eq!(a.signature(), d.signature());
     }
 
     #[test]
@@ -290,5 +326,9 @@ mod tests {
         assert_eq!(DetectorConfig::default().ext_rate(), 3);
         assert_eq!(Profile::Strict.config().k_fail(), 3);
         assert_eq!(Profile::Strict.config().ext_rate(), 2);
+        assert_eq!(DetectorConfig::default().k_warn(), 3);
+        assert!(DetectorConfig::default().warn_active());
+        assert!(Profile::Wcag.config().warn_active());
+        assert!(!Profile::Strict.config().warn_active());
     }
 }

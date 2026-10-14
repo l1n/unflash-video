@@ -14,6 +14,10 @@ it with node tests/e2e/whatsnew.mjs NAME (it is checked for flashing
 there, and tests/e2e/whatsnew-check.mjs holds every change to having
 one); tour:ID names a tour of it (web/tours.js). -->
 
+## 2026-10-13
+
+- <!-- 20:30 shot:close-calls --> **A scan points out close calls: flashing that passes, but only just.** That is flashing at the limit, 3 times inside a second over enough of the screen (WCAG allows it, and it stops before it would be an extended flash), and, more quietly, flashing only the stricter profile fails. They count against nothing: no verdict, section or suggestion changes. They are marked along the top of the timeline and the chart, and listed under the whole video; a click on one plays from just before it, and *section* makes a section around it, which lists it with its frames, to mark by hand if you want it gone. Some viewers are sensitive to flashing WCAG allows, and this is where to look for it. Under the stricter profile there are none: it fails all of them. A scan made before this has none: scan again to see them.
+
 ## 2026-10-02
 
 - <!-- 19:54 shot:unmarked-copied --> **An export copies the sections you left as they were.** It re-encoded every section you had prepared, with marks or without, losing a little quality and time for nothing; a section without marks is now copied from your file like the rest of it, and only the stretches around the sections you marked are re-encoded. And a VP9, AV1 or HEVC export now names the level its size and frame rate need, which some players check before they play a file (a VP9 one claimed level 1, the lowest, whatever its size).

@@ -1477,6 +1477,8 @@ export async function checkSection(env, project, sec, edits, { onProgress, cance
     soft_frames: soft ? [...soft.frames] : [],
     soft_sigma: soft ? soft.sigma : 0,
     violations,
+    // close calls over the section's own frames (shown, never counted)
+    warnings: (result.warnings || []).filter((w) => w.end >= -0.05 && w.start <= endDisp + 0.05),
     inside: cls.inside,
     after: cls.after,
     elsewhere: cls.elsewhere,

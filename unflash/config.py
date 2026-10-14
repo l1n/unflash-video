@@ -62,6 +62,15 @@ class DetectorConfig:
     extended_hold: float = 1.0           # max gap between qualifying strobes
     extended_window: float = 5.0
     extended_coverage: float = 0.80
+    # --- close calls (warnings, never failures) ---
+    # Flashing a profile lets pass but only just: at the limit rate for less
+    # than an extended flash's 5 s ("at the limit"), or failing only the
+    # stricter profile's thresholds below ("strict only", the quieter level).
+    # Warnings change no verdict, so these are left out of the signature.
+    warnings: bool = True
+    warn_swing: float = 0.08             # the stricter profile's thresholds
+    warn_area_fraction: float = 0.20
+    warn_flash_limit: float = 2.0
     # --- analysis model ---
     screen_w: int = 1024
     screen_h: int = 768
@@ -112,6 +121,9 @@ def strict_config() -> DetectorConfig:
         area_fraction=0.20,
         flash_limit=2.0,
         extended_mode="off",
+        # (its own thresholds are the warnings' stricter ones: anything
+        # they would find, this profile fails)
+        warnings=False,
     )
 
 
@@ -130,10 +142,11 @@ def profile_config(name) -> DetectorConfig:
 
 
 # The section_* settings only steer how a scan carves the video into work
-# sections; they cannot change what a detector says about a stretch of frames.
-# Everything else can, so a stored verdict is identified by those fields.
+# sections, and the warn* ones only what is said about flashing that passes;
+# neither can change a verdict. Everything else can, so a stored verdict is
+# identified by those fields.
 VERDICT_FIELDS = tuple(f.name for f in fields(DetectorConfig)
-                       if not f.name.startswith("section_"))
+                       if not f.name.startswith(("section_", "warn")))
 
 
 def detector_signature(detector_dict) -> str:

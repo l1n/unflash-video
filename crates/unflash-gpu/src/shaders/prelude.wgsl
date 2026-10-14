@@ -32,9 +32,10 @@ struct Params {
     held_delta_v: f32,
     src_bgr: u32,
     red_flare: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+    // close calls (core::config warnings)
+    warn_swing: f32,
+    k_warn: u32,
+    warn_enabled: u32,
 };
 
 const MODE_FIRST: u32 = 1u;
@@ -79,6 +80,10 @@ const F_PREV_V: u32 = 14u + 4u * K;
 // the red run's chromaticity at its base and extremum (core::lut::red_values)
 const F_RED_BASE_C: u32 = 15u + 4u * K;
 const F_RED_EXT_C: u32 = 16u + 4u * K;
+// the close calls' general flash counter (no opening times)
+const F_WARN_RING: u32 = 17u + 4u * K;
+const F_WARN_LAST: u32 = 17u + 5u * K;
+const F_WARN_PEND_T: u32 = 18u + 5u * K;
 
 // mask bits
 const MASK_STROBE_GEN: u32 = 1u;
@@ -89,6 +94,9 @@ const MASK_POOL_GEN_UP: u32 = 16u;
 const MASK_POOL_GEN_DN: u32 = 32u;
 const MASK_POOL_RED_UP: u32 = 64u;
 const MASK_POOL_RED_DN: u32 = 128u;
+const MASK_WARN_GEN: u32 = 256u;
+const MASK_WARN_RED: u32 = 512u;
+const MASK_BITS: u32 = 10u;
 
 // flags word layout
 const LUM_DIR_SHIFT: u32 = 0u;
@@ -97,15 +105,16 @@ const GEN_PEND_SHIFT: u32 = 6u;
 const RED_PEND_SHIFT: u32 = 8u;
 const POOL_GEN_SHIFT: u32 = 10u;
 const POOL_RED_SHIFT: u32 = 12u;
+const WARN_PEND_SHIFT: u32 = 14u;
 const DIR_MASK: u32 = 3u;
 const UP: u32 = 1u;
 const DN: u32 = 2u;
 
 // output buffer: header words (frame luminance, moved pixels, two unused,
 // pattern pixels, pattern spacing sum, pattern spacing count, one unused)
-// then 12 words per grid cell
+// then 14 words per grid cell (two sums, MASK_BITS counts, two onsets)
 const OUT_HEADER: u32 = 8u;
-const CELL_WORDS: u32 = 12u;
+const CELL_WORDS: u32 = 14u;
 
 // WCAG 2.2's red flash (core::lut): sRGB's red primary in u'v', and a
 // state's chromaticity packed as u' (15 bits) | v' (16 bits) | saturated (top bit)

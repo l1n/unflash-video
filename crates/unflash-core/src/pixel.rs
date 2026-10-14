@@ -15,7 +15,8 @@ use bytemuck::{Pod, Zeroable};
 use crate::config::DetectorConfig;
 use crate::grid::{
     GridGeometry, MASK_EXT_GEN, MASK_EXT_RED, MASK_POOL_GEN_DN, MASK_POOL_GEN_UP,
-    MASK_POOL_RED_DN, MASK_POOL_RED_UP, MASK_STROBE_GEN, MASK_STROBE_RED,
+    MASK_POOL_RED_DN, MASK_POOL_RED_UP, MASK_STROBE_GEN, MASK_STROBE_RED, MASK_WARN_GEN,
+    MASK_WARN_RED,
 };
 use crate::lut::{luminance, lut, red_transition, red_values};
 use crate::time::{age, dur_to_us, never, saturate};
@@ -36,6 +37,7 @@ pub(crate) const GEN_PEND_SHIFT: u32 = 6;
 pub(crate) const RED_PEND_SHIFT: u32 = 8;
 pub(crate) const POOL_GEN_SHIFT: u32 = 10;
 pub(crate) const POOL_RED_SHIFT: u32 = 12;
+pub(crate) const WARN_PEND_SHIFT: u32 = 14;
 pub(crate) const DIR_MASK: u32 = 3;
 pub(crate) const UP: u32 = 1;
 pub(crate) const DN: u32 = 2;
@@ -93,7 +95,11 @@ pub struct KernelParams {
     pub src_bgr: u32,
     /// Share of white added before a colour's chromaticity is taken.
     pub red_flare: f32,
-    pub _pad: [u32; 3],
+    /// Close calls: the stricter swing, how many flashes in a second fail
+    /// it (at most K), and whether to look at all (0 = no).
+    pub warn_swing: f32,
+    pub k_warn: u32,
+    pub warn_enabled: u32,
 }
 
 impl KernelParams {
@@ -130,7 +136,9 @@ impl KernelParams {
             held_delta_v: geom.held_delta_v,
             src_bgr: 0,
             red_flare: cfg.red_flare,
-            _pad: [0; 3],
+            warn_swing: cfg.warn_swing,
+            k_warn: cfg.k_warn().clamp(1, cfg.k_fail()),
+            warn_enabled: cfg.warn_active() as u32,
         }
     }
 
@@ -222,9 +230,20 @@ impl StateLayout {
     pub fn red_ext_c(&self) -> usize {
         self.red_base_c() + 1
     }
+    /// The close calls' general flash counter (no opening times: a warning
+    /// has no onset to section from).
+    pub fn warn_ring(&self) -> usize {
+        self.red_ext_c() + 1
+    }
+    pub fn warn_last(&self) -> usize {
+        self.warn_ring() + self.k
+    }
+    pub fn warn_pend_t(&self) -> usize {
+        self.warn_last() + 1
+    }
     /// Number of `npix`-sized runs in the state buffer.
     pub fn fields(&self) -> usize {
-        self.red_ext_c() + 1
+        self.warn_pend_t() + 1
     }
 }
 
@@ -259,6 +278,10 @@ pub struct PixelState {
     /// luminance and distance from red of the last frame that was not held
     pub prev_l: Vec<f32>,
     pub prev_v: Vec<f32>,
+    /// The general flash counter at the stricter swing (close calls).
+    pub warn_ring: Vec<u32>,
+    pub warn_last: Vec<u32>,
+    pub warn_pend_t: Vec<u32>,
 }
 
 impl PixelState {
@@ -288,6 +311,9 @@ impl PixelState {
             pool_red_t: vec![0; n],
             prev_l: vec![0.0; n],
             prev_v: vec![0.0; n],
+            warn_ring: vec![0; n * k],
+            warn_last: vec![0; n],
+            warn_pend_t: vec![0; n],
         }
     }
 
@@ -326,6 +352,9 @@ impl PixelState {
         put_f(&mut out, lay.prev_v(), &self.prev_v);
         put_u(&mut out, lay.red_base_c(), &self.red_base_c);
         put_u(&mut out, lay.red_ext_c(), &self.red_ext_c);
+        put_u(&mut out, lay.warn_ring(), &self.warn_ring);
+        put_u(&mut out, lay.warn_last(), &self.warn_last);
+        put_u(&mut out, lay.warn_pend_t(), &self.warn_pend_t);
         out
     }
 }
@@ -491,6 +520,28 @@ fn counter_transition(
     }
 }
 
+/// [`counter_transition`] without the opening times (the close calls'
+/// counter keeps none).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn warn_transition(ring: &mut [u32], n: usize, i: usize, k: usize, last: &mut u32, pend_t: &mut u32, pend_pol: &mut u32, pol: u32, now: u32, pair: u32) {
+    let opposite = if pol == UP { DN } else { UP };
+    if *pend_pol == opposite && age(now, *pend_t) <= pair {
+        let mut s = k - 1;
+        while s > 0 {
+            ring[s * n + i] = ring[(s - 1) * n + i];
+            s -= 1;
+        }
+        ring[i] = now;
+        *last = now;
+        *pend_pol = 0;
+        *pend_t = never(now);
+    } else {
+        *pend_pol = pol;
+        *pend_t = now;
+    }
+}
+
 /// Run the scalar kernel over a whole frame. `params.mode` decides between
 /// initialisation (first frame), a held frame (runs only age) and a full
 /// update.
@@ -538,7 +589,10 @@ pub(crate) fn run_range_scalar(
                 st.gen_open[s * n + i] = nv;
                 st.red_ring[s * n + i] = nv;
                 st.red_open[s * n + i] = nv;
+                st.warn_ring[s * n + i] = nv;
             }
+            st.warn_last[i] = nv;
+            st.warn_pend_t[i] = nv;
             st.gen_last[i] = nv;
             st.gen_pend_t[i] = nv;
             st.red_last[i] = nv;
@@ -563,7 +617,10 @@ pub(crate) fn run_range_scalar(
                 st.gen_open[s * n + i] = saturate(now, st.gen_open[s * n + i]);
                 st.red_ring[s * n + i] = saturate(now, st.red_ring[s * n + i]);
                 st.red_open[s * n + i] = saturate(now, st.red_open[s * n + i]);
+                st.warn_ring[s * n + i] = saturate(now, st.warn_ring[s * n + i]);
             }
+            st.warn_last[i] = saturate(now, st.warn_last[i]);
+            st.warn_pend_t[i] = saturate(now, st.warn_pend_t[i]);
             st.gen_last[i] = saturate(now, st.gen_last[i]);
             st.gen_pend_t[i] = saturate(now, st.gen_pend_t[i]);
             st.red_last[i] = saturate(now, st.red_last[i]);
@@ -595,6 +652,8 @@ pub(crate) fn run_range_scalar(
 
     let kf = p.k_fail as usize - 1;
     let ke = p.k_ext as usize - 1;
+    let kw = p.k_warn as usize - 1;
+    let warn = p.warn_enabled != 0;
     for i in lo..hi {
         let l = planes.l[i];
         let v = planes.v[i];
@@ -682,6 +741,32 @@ pub(crate) fn run_range_scalar(
             }
         }
 
+        // --- close calls: general flashes at the stricter swing ----------
+        if warn {
+            let wq_up = rev_up && (ext - base) >= p.warn_swing && base < p.dark;
+            let wq_dn = rev_dn && (base - ext) >= p.warn_swing && ext < p.dark;
+            let mut pend_pol = (flags >> WARN_PEND_SHIFT) & DIR_MASK;
+            if wq_up || wq_dn {
+                warn_transition(
+                    &mut st.warn_ring,
+                    n,
+                    i,
+                    k,
+                    &mut st.warn_last[i],
+                    &mut st.warn_pend_t[i],
+                    &mut pend_pol,
+                    if wq_up { UP } else { DN },
+                    now,
+                    p.pair,
+                );
+            }
+            flags = (flags & !(DIR_MASK << WARN_PEND_SHIFT)) | (pend_pol << WARN_PEND_SHIFT);
+            let fresh = age(now, st.warn_last[i]) <= p.fresh;
+            if fresh && age(now, st.warn_ring[kw * n + i]) < p.rate {
+                mask |= MASK_WARN_GEN;
+            }
+        }
+
         // --- red flashes -----------------------------------------------
         {
             let mut pend_pol = (flags >> RED_PEND_SHIFT) & DIR_MASK;
@@ -712,6 +797,11 @@ pub(crate) fn run_range_scalar(
             }
             if ext_s {
                 mask |= MASK_EXT_RED;
+            }
+            // (a red transition does not depend on the swing: the close
+            // call reads the same ring at the stricter rate)
+            if warn && fresh && age(now, st.red_ring[kw * n + i]) < p.rate {
+                mask |= MASK_WARN_RED;
             }
         }
 
@@ -903,8 +993,41 @@ mod tests {
     #[test]
     fn layout_is_consistent() {
         let lay = StateLayout { k: 4 };
-        assert_eq!(lay.fields(), 33);
+        assert_eq!(lay.fields(), 39);
         let st = PixelState::new(3, 4);
-        assert_eq!(st.to_flat().len(), 99);
+        assert_eq!(st.to_flat().len(), 117);
+    }
+
+    #[test]
+    fn close_calls_count_at_the_stricter_swing() {
+        // 3 flashes a second, 0.09 swing: under WCAG's 0.10, over the
+        // stricter 0.08. Three flashes come inside a second, which the
+        // stricter profile fails (more than 2); WCAG sees no flash at all.
+        let n = 16;
+        let mut st = PixelState::new(n, 4);
+        let mut planes = FramePlanes::new(n);
+        let mut out = PixelOutputs::new(n);
+        let (mut warn, mut wcag) = (0, 0);
+        for f in 0..120 {
+            // 30 fps: a transition every 5 frames is 3 flashes a second
+            let x = if (f / 5) % 2 == 0 { 0.30f32 } else { 0.39 };
+            planes.l.iter_mut().for_each(|p| *p = x);
+            let p = params(f * 33_333, if f == 0 { MODE_FIRST } else { 0 });
+            run_frame_scalar(&mut st, &planes, &p, &mut out);
+            warn += (out.mask[0] & MASK_WARN_GEN != 0) as u32;
+            wcag += (out.mask[0] & (MASK_STROBE_GEN | MASK_EXT_GEN) != 0) as u32;
+        }
+        assert!(warn > 0, "the stricter counter should strobe");
+        assert_eq!(wcag, 0, "nothing qualifies at WCAG's swing");
+        // and with close calls off, nothing is looked for
+        let mut st = PixelState::new(n, 4);
+        for f in 0..120 {
+            let x = if (f / 5) % 2 == 0 { 0.30f32 } else { 0.39 };
+            planes.l.iter_mut().for_each(|p| *p = x);
+            let mut p = params(f * 33_333, if f == 0 { MODE_FIRST } else { 0 });
+            p.warn_enabled = 0;
+            run_frame_scalar(&mut st, &planes, &p, &mut out);
+            assert_eq!(out.mask[0] & (MASK_WARN_GEN | MASK_WARN_RED), 0);
+        }
     }
 }

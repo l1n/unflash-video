@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::DetectorConfig;
 use crate::grid::{
     GridGeometry, GridStats, MASK_EXT_GEN, MASK_EXT_RED, MASK_POOL_GEN_DN, MASK_POOL_GEN_UP,
-    MASK_POOL_RED_DN, MASK_POOL_RED_UP, MASK_STROBE_GEN, MASK_STROBE_RED,
+    MASK_POOL_RED_DN, MASK_POOL_RED_UP, MASK_STROBE_GEN, MASK_STROBE_RED, MASK_WARN_GEN, MASK_WARN_RED,
 };
 use crate::pixel::MAX_RUN_SECONDS;
 
@@ -77,6 +77,33 @@ impl Violation {
     }
 }
 
+/// How close a [`FlashWarning`] came.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WarningLevel {
+    /// Flashing at the limit rate (every failure criterion but the rate),
+    /// for less than an extended flash needs, or under a profile that does
+    /// not report extended flashes.
+    Limit,
+    /// What only the stricter thresholds fail: the quieter level.
+    Strict,
+}
+
+/// Flashing the profile lets pass, but only just. Never a failure: no
+/// verdict, section or suggestion reads these.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FlashWarning {
+    pub start: f64,
+    pub end: f64,
+    pub level: WarningLevel,
+    /// `Flash` or `Red`: which of the two covered more at the worst moment.
+    pub kind: ViolationKind,
+    /// Area over the level's threshold, at the worst moment.
+    pub count: f64,
+    /// The worst moment.
+    pub peak: f64,
+}
+
 /// Per-frame chart statistics (parallel arrays).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -91,6 +118,10 @@ pub struct FrameStats {
     pub hazard_red: Vec<u32>,
     pub ext: Vec<u32>,
     pub ext_red: Vec<u32>,
+    /// Area strobing at the stricter thresholds (close calls; 0 when the
+    /// profile looks for none).
+    pub warn: Vec<u32>,
+    pub warn_red: Vec<u32>,
     pub held: Vec<bool>,
     /// Internal-clock time of the earliest transition still feeding the
     /// failure window on this frame (tc when the frame is not strobing).
@@ -127,6 +158,8 @@ pub struct FrameRecord {
     pub hazard_red: u32,
     pub ext: u32,
     pub ext_red: u32,
+    pub warn: u32,
+    pub warn_red: u32,
     pub hazard_onset: f64,
     pub hazard_red_onset: f64,
     pub pattern: u32,
@@ -153,6 +186,8 @@ pub struct AnalysisResult {
     pub area_thresh: u32,
     /// Pixels a pattern has to cover.
     pub pattern_thresh: u32,
+    /// Close calls: flashing that passes, but only just.
+    pub warnings: Vec<FlashWarning>,
 }
 
 impl AnalysisResult {
@@ -191,6 +226,9 @@ pub struct PartialVerdict {
     pub flag_extended: bool,
     /// Profile treats regular patterns as violations to fix.
     pub flag_patterns: bool,
+    /// Close calls: flashing that passes, but only just.
+    #[serde(default)]
+    pub warnings: Vec<FlashWarning>,
 }
 
 /// One segment of a file scanned in parallel with the others: its result,
@@ -240,6 +278,9 @@ pub fn merge_segments(cfg: &DetectorConfig, geom: &GridGeometry, segments: &[Seg
             stats.hazard_red.push(s.hazard_red[i]);
             stats.ext.push(s.ext[i]);
             stats.ext_red.push(s.ext_red[i]);
+            // (a segment from before close calls has none)
+            stats.warn.push(s.warn.get(i).copied().unwrap_or(0));
+            stats.warn_red.push(s.warn_red.get(i).copied().unwrap_or(0));
             stats.held.push(s.held[i]);
             stats.hazard_onset.push(s.hazard_onset[i] + shift);
             stats.hazard_red_onset.push(s.hazard_red_onset[i] + shift);
@@ -515,6 +556,53 @@ impl MeanCounter {
     }
 }
 
+/// The coherence gate at the stricter thresholds.
+#[derive(Clone, Debug)]
+struct WarnGate {
+    track_gen: MeanTracker,
+    track_red: MeanTracker,
+    flash_gen: MeanCounter,
+    flash_red: MeanCounter,
+    swing: f32,
+    swing_red: f32,
+    k: usize,
+    area_thresh: u32,
+}
+
+impl WarnGate {
+    fn new(cfg: &DetectorConfig, geom: &GridGeometry) -> Option<Self> {
+        if !cfg.warn_active() {
+            return None;
+        }
+        let ng = geom.ncells();
+        let swing = (cfg.warn_swing * cfg.warn_area_fraction as f32).max(0.02);
+        let swing_red = crate::lut::RED_LEAST_SWING * cfg.warn_area_fraction as f32;
+        let k = cfg.k_warn() as usize;
+        Some(WarnGate {
+            track_gen: MeanTracker::new(ng, swing * 0.3),
+            track_red: MeanTracker::new(ng, swing_red * 0.3),
+            flash_gen: MeanCounter::new(ng, k),
+            flash_red: MeanCounter::new(ng, k),
+            swing,
+            swing_red,
+            k,
+            area_thresh: warn_area_thresh(cfg, geom),
+        })
+    }
+
+    fn reset(&mut self) {
+        self.track_gen.reset();
+        self.track_red.reset();
+        self.flash_gen.reset();
+        self.flash_red.reset();
+    }
+}
+
+/// Pixels a close call at the stricter thresholds has to cover in a window.
+pub fn warn_area_thresh(cfg: &DetectorConfig, geom: &GridGeometry) -> u32 {
+    ((cfg.warn_area_fraction * geom.ww as f64 * geom.wh as f64).round_ties_even() as i64).max(1) as u32
+}
+
 /// The temporal stage of the detector.
 #[derive(Clone, Debug)]
 pub struct Temporal {
@@ -529,6 +617,9 @@ pub struct Temporal {
     mean_swing_red: f32,
     k_fail: usize,
     ext_rate: usize,
+    /// Close calls at the stricter thresholds: window means of their own
+    /// (the mean has to swing by the stricter swing over the stricter area).
+    warn: Option<WarnGate>,
     events: Vec<TransitionEvent>,
     last_event_tc: [f64; 2],
     above: [bool; 2],
@@ -559,6 +650,7 @@ impl Temporal {
             mean_swing_red,
             k_fail: k,
             ext_rate: cfg.ext_rate() as usize,
+            warn: WarnGate::new(&cfg, &geom),
             events: Vec::new(),
             last_event_tc: [NEVER; 2],
             above: [false; 2],
@@ -580,6 +672,9 @@ impl Temporal {
         self.mtrack_red.reset();
         self.mflash_gen.reset();
         self.mflash_red.reset();
+        if let Some(w) = &mut self.warn {
+            w.reset();
+        }
         self.events.clear();
         self.last_event_tc = [NEVER; 2];
         self.above = [false; 2];
@@ -603,6 +698,8 @@ impl Temporal {
             hazard_red: s.hazard_red[i],
             ext: s.ext[i],
             ext_red: s.ext_red[i],
+            warn: s.warn[i],
+            warn_red: s.warn_red[i],
             hazard_onset: s.hazard_onset[i],
             hazard_red_onset: s.hazard_red_onset[i],
             pattern: s.pattern[i],
@@ -620,6 +717,10 @@ impl Temporal {
             // the runs still age: time passes while a picture is held
             self.mtrack_gen.settle(tc);
             self.mtrack_red.settle(tc);
+            if let Some(w) = &mut self.warn {
+                w.track_gen.settle(tc);
+                w.track_red.settle(tc);
+            }
             let last = self.n - 1;
             s.t.push(t);
             s.tc.push(tc);
@@ -631,6 +732,8 @@ impl Temporal {
             s.hazard_red.push(0);
             s.ext.push(0);
             s.ext_red.push(0);
+            s.warn.push(0);
+            s.warn_red.push(0);
             s.held.push(true);
             s.hazard_onset.push(tc);
             s.hazard_red_onset.push(tc);
@@ -662,12 +765,26 @@ impl Temporal {
             self.mflash_red.transitions(|g| tr[g].1 && (tr[g].2 - tr[g].3) >= sw, -1, tc);
         }
 
+        if let Some(w) = &mut self.warn {
+            w.track_gen.feed(&self.m_l, tc, &mut self.tr);
+            let tr = &self.tr;
+            let sw = w.swing;
+            w.flash_gen.transitions(|g| tr[g].0 && (tr[g].3 - tr[g].2) >= sw, 1, tc);
+            w.flash_gen.transitions(|g| tr[g].1 && (tr[g].2 - tr[g].3) >= sw, -1, tc);
+            w.track_red.feed(&self.m_v, tc, &mut self.tr);
+            let tr = &self.tr;
+            let sw = w.swing_red;
+            w.flash_red.transitions(|g| tr[g].0 && (tr[g].3 - tr[g].2) >= sw, 1, tc);
+            w.flash_red.transitions(|g| tr[g].1 && (tr[g].2 - tr[g].3) >= sw, -1, tc);
+        }
+
         // --- flashes: per-pixel rate + concurrent area + coherent mean ----
         let fresh_w = cfg.area_accum_window;
         let coh_w = fresh_w.max(0.2);
         let area_thresh = self.geom.area_thresh;
         let mut haz = [0u32; 2];
         let mut ext = [0u32; 2];
+        let mut warn = [0u32; 2];
         let mut onsets = [tc; 2];
         for (ki, (strobe_bit, ext_bit, kind)) in [
             (MASK_STROBE_GEN, MASK_EXT_GEN, EventKind::General),
@@ -717,6 +834,19 @@ impl Temporal {
             haz[ki] = best;
             ext[ki] = ext_best;
             onsets[ki] = best_onset;
+            // close call: the failure test at the stricter thresholds
+            if let Some(w) = &self.warn {
+                let (wflash, wbit) = if ki == 0 { (&w.flash_gen, MASK_WARN_GEN) } else { (&w.flash_red, MASK_WARN_RED) };
+                let wbit = wbit.trailing_zeros() as usize;
+                wflash.strobing(tc, coh_w, w.k, &mut self.coh);
+                let mut warn_best = 0u32;
+                for g in 0..ng {
+                    if self.coh[g] {
+                        warn_best = warn_best.max(st.cells[g].cnt[wbit]);
+                    }
+                }
+                warn[ki] = warn_best;
+            }
         }
 
         // pooled transition areas: chart statistics only (best grid window)
@@ -735,6 +865,8 @@ impl Temporal {
         s.hazard_red.push(haz[1]);
         s.ext.push(ext[0]);
         s.ext_red.push(ext[1]);
+        s.warn.push(warn[0]);
+        s.warn_red.push(warn[1]);
         s.held.push(false);
         s.hazard_onset.push(onsets[0]);
         s.hazard_red_onset.push(onsets[1]);
@@ -780,7 +912,8 @@ impl Temporal {
         v.extend(self.extended_violations());
         v.extend(self.pattern_violations());
         v.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
-        PartialVerdict { violations: v, frames: self.n, held: self.held, flag_extended: cfg.flag_extended(), flag_patterns: cfg.flag_patterns() }
+        let warnings = self.warnings(&v);
+        PartialVerdict { violations: v, frames: self.n, held: self.held, flag_extended: cfg.flag_extended(), flag_patterns: cfg.flag_patterns(), warnings }
     }
 
     /// The verdict over the frames fed so far: the
@@ -788,7 +921,7 @@ impl Temporal {
     /// `with_stats` a copy of every frame's statistics (for the chart, and
     /// for [`merge_segments`] to join).
     pub fn finish(&self, with_stats: bool) -> AnalysisResult {
-        let PartialVerdict { violations, frames, held, flag_extended, flag_patterns } = self.partial_verdict();
+        let PartialVerdict { violations, frames, held, flag_extended, flag_patterns, warnings } = self.partial_verdict();
         AnalysisResult {
             events: self.events.clone(),
             violations,
@@ -801,6 +934,7 @@ impl Temporal {
             flag_patterns,
             area_thresh: self.geom.area_thresh,
             pattern_thresh: self.pattern_thresh(),
+            warnings,
         }
     }
 
@@ -875,6 +1009,60 @@ impl Temporal {
                 peak: s.t[p],
             })
             .collect()
+    }
+
+    /// Frames where either area reaches `thresh`, joined where they are
+    /// under a second apart (as failures are).
+    fn warning_spans(&self, gen: &[u32], red: &[u32], thresh: u32, level: WarningLevel) -> Vec<FlashWarning> {
+        let mut out: Vec<FlashWarning> = Vec::new();
+        let mut cur_end_tc = NEVER;
+        for i in 0..self.n {
+            let a = gen[i].max(red[i]);
+            if a < thresh {
+                continue;
+            }
+            let (t, tc) = (self.stats.t[i], self.stats.tc[i]);
+            let sev = round2(a as f64 / thresh as f64);
+            let kind = if red[i] > gen[i] { ViolationKind::Red } else { ViolationKind::Flash };
+            match out.last_mut() {
+                Some(cur) if tc - cur_end_tc <= 1.0 => {
+                    cur.end = cur.end.max(t);
+                    if sev > cur.count {
+                        cur.count = sev;
+                        cur.peak = t;
+                        cur.kind = kind;
+                    }
+                }
+                _ => out.push(FlashWarning { start: t, end: t, level, kind, count: sev, peak: t }),
+            }
+            cur_end_tc = tc;
+        }
+        out
+    }
+
+    /// Close calls: flashing at the limit rate that is not part of a
+    /// failure or a reported extended flash, then (quieter) what fails only
+    /// the stricter thresholds and is none of those. A warning overlapping
+    /// a louder report is dropped: the louder one already marks the place.
+    fn warnings(&self, violations: &[Violation]) -> Vec<FlashWarning> {
+        let Some(w) = &self.warn else { return vec![] };
+        if self.n == 0 {
+            return vec![];
+        }
+        let cfg = &self.cfg;
+        let mut louder: Vec<(f64, f64)> = violations
+            .iter()
+            .filter(|v| matches!(v.kind, ViolationKind::Flash | ViolationKind::Red) || (v.kind == ViolationKind::Extended && cfg.flag_extended()))
+            .map(|v| (v.onset, v.end))
+            .collect();
+        let clear = |x: &FlashWarning, spans: &[(f64, f64)]| !spans.iter().any(|&(s, e)| x.start <= e && x.end >= s);
+        let s = &self.stats;
+        let mut out: Vec<FlashWarning> =
+            self.warning_spans(&s.ext, &s.ext_red, self.geom.area_thresh, WarningLevel::Limit).into_iter().filter(|x| clear(x, &louder)).collect();
+        louder.extend(out.iter().map(|x| (x.start, x.end)));
+        out.extend(self.warning_spans(&s.warn, &s.warn_red, w.area_thresh, WarningLevel::Strict).into_iter().filter(|x| clear(x, &louder)));
+        out.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+        out
     }
 
     /// ITC/Ofcom-style extended flash: flashing that meets every failure

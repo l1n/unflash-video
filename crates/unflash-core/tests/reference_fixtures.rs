@@ -12,7 +12,7 @@ use serde::Deserialize;
 use unflash_core::config::Profile;
 use unflash_core::detector::CpuDetector;
 use unflash_core::grid::FrameInput;
-use unflash_core::temporal::{EventKind, ViolationKind};
+use unflash_core::temporal::{EventKind, ViolationKind, WarningLevel};
 
 const W: usize = 128;
 const H: usize = 96;
@@ -28,6 +28,7 @@ struct Fixture {
     stats: Stats,
     events: Vec<Event>,
     violations: Vec<Viol>,
+    warnings: Vec<Warn>,
     anomalies: usize,
     held: usize,
     safe: bool,
@@ -45,6 +46,8 @@ struct Stats {
     hazard_red: Vec<u32>,
     ext: Vec<u32>,
     ext_red: Vec<u32>,
+    warn: Vec<u32>,
+    warn_red: Vec<u32>,
     up: Vec<u32>,
     down: Vec<u32>,
     red: Vec<u32>,
@@ -69,6 +72,16 @@ struct Viol {
     kind: String,
     count: f64,
     onset: f64,
+    peak: f64,
+}
+
+#[derive(Deserialize)]
+struct Warn {
+    start: f64,
+    end: f64,
+    level: String,
+    kind: String,
+    count: f64,
     peak: f64,
 }
 
@@ -151,6 +164,27 @@ fn scenario(name: &str) -> (Vec<f64>, Vec<Vec<u8>>) {
         "square3hz" => {
             let ts = times_2997(n2997(10.0));
             let fr = ts.iter().map(|&t| gen_square(t, 3.0, 0.5, 20, 200, 20)).collect();
+            (ts, fr)
+        }
+        "burst3hz" | "soft3hz" => {
+            // half the picture flashing for the first `burst` seconds, then still
+            let (burst, lo, hi) = if name == "burst3hz" { (2.0, 20, 200) } else { (6.0, 149, 168) };
+            let ts = times_2997(n2997(6.0));
+            let fr = ts.iter().map(|&t| gen_square(if t < burst { t } else { 0.0 }, 3.0, 0.5, lo, hi, 20)).collect();
+            (ts, fr)
+        }
+        "red_burst3hz" => {
+            let ts = times_2997(n2997(6.0));
+            let fr = ts
+                .iter()
+                .map(|&t| {
+                    let mut f = solid(144);
+                    if t < 2.0 && phase(t, 3.0) == 0 {
+                        fill_rect(&mut f, 0, 0, W, H, [255, 0, 0]);
+                    }
+                    f
+                })
+                .collect();
             (ts, fr)
         }
         "noise_drift" => {
@@ -335,6 +369,8 @@ fn check(fix: &Fixture) {
         assert_eq!(rec.hazard_red, s.hazard_red[i], "{name} f{i}: red hazard area");
         assert_eq!(rec.ext, s.ext[i], "{name} f{i}: extended area");
         assert_eq!(rec.ext_red, s.ext_red[i], "{name} f{i}: red extended area");
+        assert_eq!(rec.warn, s.warn[i], "{name} f{i}: close-call area");
+        assert_eq!(rec.warn_red, s.warn_red[i], "{name} f{i}: red close-call area");
         assert!((rec.lum as f64 - s.lum[i]).abs() < 2e-5, "{name} f{i}: lum {} vs {}", rec.lum, s.lum[i]);
         assert!((rec.hazard_onset - s.onset[i]).abs() < 3e-6, "{name} f{i}: onset {} vs {}", rec.hazard_onset, s.onset[i]);
         assert!((rec.hazard_red_onset - s.onset_red[i]).abs() < 3e-6, "{name} f{i}: red onset");
@@ -381,6 +417,21 @@ fn check(fix: &Fixture) {
         assert!((a.onset - b.onset).abs() < 3e-6, "{name} violation {i}: onset {} vs {}", a.onset, b.onset);
         assert!((a.count - b.count).abs() < 0.011, "{name} violation {i}: count {} vs {}", a.count, b.count);
     }
+
+    assert_eq!(res.warnings.len(), fix.warnings.len(), "{name}: warnings {:?}", res.warnings);
+    for (i, (a, b)) in res.warnings.iter().zip(&fix.warnings).enumerate() {
+        let level = match a.level {
+            WarningLevel::Limit => "limit",
+            WarningLevel::Strict => "strict",
+        };
+        let kind = if a.kind == ViolationKind::Red { "red" } else { "flash" };
+        assert_eq!(level, b.level, "{name} warning {i}: level");
+        assert_eq!(kind, b.kind, "{name} warning {i}: kind");
+        assert!((a.start - b.start).abs() < 1e-9, "{name} warning {i}: start {} vs {}", a.start, b.start);
+        assert!((a.end - b.end).abs() < 1e-9, "{name} warning {i}: end {} vs {}", a.end, b.end);
+        assert!((a.peak - b.peak).abs() < 1e-9, "{name} warning {i}: peak {} vs {}", a.peak, b.peak);
+        assert!((a.count - b.count).abs() < 0.011, "{name} warning {i}: count {} vs {}", a.count, b.count);
+    }
 }
 
 #[test]
@@ -396,6 +447,6 @@ fn matches_python_reference() {
     for p in paths {
         let fix: Fixture = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         check(&fix);
-        eprintln!("ok  {} ({}): {} frames, {} violations", fix.name, fix.profile, fix.t.len(), fix.violations.len());
+        eprintln!("ok  {} ({}): {} frames, {} violations, {} warnings", fix.name, fix.profile, fix.t.len(), fix.violations.len(), fix.warnings.len());
     }
 }
