@@ -267,13 +267,17 @@ pub struct Rewriter {
     identity: bool,
     in_len: usize,
     out_len: usize,
+    /// This encoder's own record, its sets under their new ids (see
+    /// [`AvcRegistry::register`]), and those sets in the order it has them.
+    record: Vec<u8>,
+    sets: Vec<Vec<u8>>,
 }
 
 impl Rewriter {
     /// `in_len` / `out_len`: the NAL length size of the samples going in
     /// and coming out.
     pub fn new(in_len: usize, out_len: usize) -> Self {
-        Rewriter { spss: vec![None; 32], ppss: vec![None; 256], sps_map: vec![None; 32], pps_map: vec![None; 256], inband: Vec::new(), identity: true, in_len, out_len }
+        Rewriter { spss: vec![None; 32], ppss: vec![None; 256], sps_map: vec![None; 32], pps_map: vec![None; 256], inband: Vec::new(), identity: true, in_len, out_len, record: Vec::new(), sets: Vec::new() }
     }
 
     /// Register one of the encoder's SPS NAL units under `new_id`; returns
@@ -414,6 +418,41 @@ impl Rewriter {
         }
     }
 
+    /// The `avcC` record of this encoder's samples alone, as the track
+    /// holds them (the sets under their new ids): the sample entry they
+    /// are written under.
+    pub fn record(&self) -> &[u8] {
+        &self.record
+    }
+
+    /// A sample as `rewrite_sample` gives it, with this encoder's parameter
+    /// sets in front of its pictures (after an access unit delimiter, if
+    /// it starts with one): for a keyframe, so a player that reads only
+    /// the track's first sample entry still finds the sets it needs.
+    pub fn with_parameter_sets(&self, sample: &[u8]) -> Vec<u8> {
+        let l = self.out_len;
+        let mut at = 0;
+        if sample.len() > l {
+            let mut len = 0usize;
+            for &b in &sample[..l] {
+                len = (len << 8) | b as usize;
+            }
+            if sample[l] & 0x1f == 9 && l + len <= sample.len() {
+                at = l + len;
+            }
+        }
+        let mut out = Vec::with_capacity(sample.len() + self.sets.iter().map(|s| s.len() + l).sum::<usize>());
+        out.extend_from_slice(&sample[..at]);
+        for nal in &self.sets {
+            for i in (0..l).rev() {
+                out.push((nal.len() >> (8 * i)) as u8);
+            }
+            out.extend_from_slice(nal);
+        }
+        out.extend_from_slice(&sample[at..]);
+        out
+    }
+
     /// One MP4 sample (length-prefixed NAL units) as the merged track needs
     /// it.
     pub fn rewrite_sample(&mut self, sample: &[u8]) -> Result<Vec<u8>> {
@@ -539,6 +578,7 @@ const HIGH_PROFILES: [u8; 4] = [100, 110, 122, 144];
 /// source's, then every encoder's under ids the others do not use.
 pub struct AvcRegistry {
     rec: AvcRecord,
+    base: Vec<u8>,
     sps_used: Vec<bool>,
     pps_used: Vec<bool>,
     /// Encoder sets already registered, by their original bytes: (bytes,
@@ -566,7 +606,18 @@ impl AvcRegistry {
             pps_used[pps.id as usize] = true;
             pps_seen.push((p.clone(), pps.sps_id, pps.id));
         }
-        Ok(AvcRegistry { rec, sps_used, pps_used, sps_seen, pps_seen })
+        let mut b = rec.clone();
+        if HIGH_PROFILES.contains(&b.profile) && b.tail.is_empty() {
+            b.tail = vec![0xfd, 0xf8, 0xf8, 0x00];
+        }
+        let base = write_avcc(&b);
+        Ok(AvcRegistry { rec, base, sps_used, pps_used, sps_seen, pps_seen })
+    }
+
+    /// The record the registry started from, as it reads it (repaired, see
+    /// [`parse_avcc`]): the sample entry of the samples copied as they are.
+    pub fn base_record(&self) -> &[u8] {
+        &self.base
     }
 
     /// The merged record so far.
@@ -651,6 +702,14 @@ impl AvcRegistry {
         }
         self.rec.compat &= enc.compat;
         self.rec.level = self.rec.level.max(enc.level);
+        // the encoder's own record, for a sample entry of its own
+        let renumbered = |nals: &[Vec<u8>]| -> Vec<Vec<u8>> { nals.iter().map(|n| rw.inband.iter().find(|(o, _)| o == n).map(|(_, out)| out.clone()).unwrap_or_else(|| n.clone())).collect() };
+        let mut own = AvcRecord { profile: enc.profile, compat: enc.compat, level: enc.level, len_size: self.rec.len_size, sps: renumbered(&enc.sps), pps: renumbered(&enc.pps), tail: enc.tail.clone() };
+        if HIGH_PROFILES.contains(&own.profile) && own.tail.is_empty() {
+            own.tail = vec![0xfd, 0xf8, 0xf8, 0x00];
+        }
+        rw.sets = own.sps.iter().chain(own.pps.iter()).cloned().collect();
+        rw.record = write_avcc(&own);
         Ok(rw)
     }
 }

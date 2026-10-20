@@ -977,10 +977,26 @@ async function exportOnce(env, movie, project, { encoder, quality, sink = null, 
   // H.264: the track's parameter sets. With smart cut, the source's plus
   // each encoder's under ids of their own (samples renumbered to match);
   // without, the first encoder's, with any other encoder's renumbered. The
-  // records are read (and repaired, see AvcRegistry) as they come.
+  // records are read (and repaired, see AvcRegistry) as they come. Each
+  // stream goes under a sample entry of its own (the copied samples under
+  // the source's record, an encoder's under its own): Apple's players
+  // freeze where one track's pictures switch to other parameter sets, and
+  // start their decoder afresh where the sample entry changes. An
+  // encoder's keyframes carry its sets as well, for players that read
+  // only the first entry (the distinct ids keep the streams apart there).
   let registry = null;
   let rawOnly = null; // a lone encoder's record that could not be read: used as it is
   const rewriters = new Map(); // description bytes -> AvcRewriter | null
+  const entries = new Map(); // record bytes (hex) -> sample entry, from 1
+  const entryRecords = []; // the records of entries 2, 3, ...
+  const entryOf = (record) => {
+    const key = hex(record);
+    if (!entries.has(key)) {
+      entryRecords.push(record);
+      entries.set(key, entryRecords.length + 1);
+    }
+    return entries.get(key);
+  };
   let description = null;
   let codecString = chosen.config.codec;
   let softened = 0;
@@ -1010,11 +1026,11 @@ async function exportOnce(env, movie, project, { encoder, quality, sink = null, 
         }
       }
       if (rawOnly) throw new Error('a second encoder record next to one that could not be read');
+      if (!entries.size) entries.set(hex(registry.base_record()), 1);
       const rw = registry.register(desc);
-      const use = rw.is_identity() ? null : rw;
-      if (!use) rw.free();
-      rewriters.set(key, use);
-      return use;
+      rw.entry = entryOf(rw.record());
+      rewriters.set(key, rw);
+      return rw;
     } catch (e) {
       const why = e && e.message ? e.message : String(e);
       console.warn(`[unflash] could not join the H.264 encoder's stream (${why}); its record:`, hex(desc), plan.mode === 'smart' ? '; the source record: ' + hex(movie.dx.track_description(movie.video.index)) : '');
@@ -1037,7 +1053,7 @@ async function exportOnce(env, movie, project, { encoder, quality, sink = null, 
       if (piece.kind === 'copy') {
         const offUs = Math.round(piece.offset * 1e6);
         await copySamples(reader, out, v, piece.from, piece.to, (i, j) => {
-          for (let k = i; k < j; k++) samples.push({ pts: v.pts[k] + offUs, sync: !!v.sync[k], size: v.size[k] });
+          for (let k = i; k < j; k++) samples.push({ pts: v.pts[k] + offUs, sync: !!v.sync[k], size: v.size[k], entry: 1 });
           copiedFrames += j - i;
           report();
           if (cancelled()) throw failed || new Error('cancelled');
@@ -1051,9 +1067,11 @@ async function exportOnce(env, movie, project, { encoder, quality, sink = null, 
         for (const c of pe.chunks) {
           if (c.desc && !description) description = c.desc;
           const rw = rewriterFor(c.desc);
-          const bytes = rw ? rewrite(rw, c.bytes) : c.bytes;
+          let bytes = rw && !rw.is_identity() ? rewrite(rw, c.bytes) : c.bytes;
+          const entry = rw ? rw.entry : 1;
+          if (entry > 1 && c.sync) bytes = rw.with_parameter_sets(bytes);
           await out.write(bytes);
-          samples.push({ pts: c.pts, sync: c.sync, size: bytes.byteLength });
+          samples.push({ pts: c.pts, sync: c.sync, size: bytes.byteLength, entry });
         }
         pe.chunks.length = 0;
       }
@@ -1066,14 +1084,17 @@ async function exportOnce(env, movie, project, { encoder, quality, sink = null, 
     let shift = 0;
     for (let i = 0; i < samples.length; i++) shift = Math.max(shift, sorted[i] - samples[i].pts);
     if (registry) {
-      // the merged (and repaired) record, and a codec string that covers it
-      description = registry.record();
+      // the first entry's record (repaired), and its codec string
+      description = registry.base_record();
       codecString = `avc1.${Array.from(description.subarray(1, 4), (b) => b.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
     } else if (plan.mode === 'smart' && !description) description = movie.dx.track_description(movie.video.index);
     const vt = mx.add_video_track(codecString, movie.width, movie.height, 1000000, description || new Uint8Array());
+    for (const r of entryRecords) mx.add_description(vt, r);
     // the video ends as much later as all the holds say (the last frame's own too)
     const endUs = Math.round((movie.tsMax + plan.holds.reduce((sum, h) => sum + h.seconds, 0)) * 1e6);
+    let entry = 1;
     for (let i = 0; i < samples.length; i++) {
+      if (samples[i].entry !== entry) mx.use_description(vt, (entry = samples[i].entry));
       const dts = sorted[i] - shift;
       const dur = i + 1 < samples.length ? sorted[i + 1] - sorted[i] : Math.max(medianUs, endUs - sorted[i]);
       mx.add_sample(vt, dts, samples[i].pts, Math.max(1, dur), samples[i].sync, samples[i].size);
