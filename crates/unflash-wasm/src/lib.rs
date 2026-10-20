@@ -700,6 +700,17 @@ impl Muxer {
         self.inner.start()
     }
 
+    /// One more sample entry for a video track (another `avcC` record);
+    /// returns its index, from 1.
+    pub fn add_description(&mut self, track: u32, description: &[u8]) -> Result<u32, JsValue> {
+        self.inner.add_description(track as usize, description.to_vec()).map_err(js_err)
+    }
+
+    /// The sample entry the samples added from now on use.
+    pub fn use_description(&mut self, track: u32, index: u32) -> Result<(), JsValue> {
+        self.inner.use_description(track as usize, index).map_err(js_err)
+    }
+
     /// Record a sample whose `size` bytes the caller appended to the file.
     pub fn add_sample(&mut self, track: u32, dts: f64, pts: f64, duration: f64, sync: bool, size: f64) -> Result<(), JsValue> {
         self.inner.add_sample(track as usize, dts as i64, pts as i64, duration as u32, sync, size as u32).map_err(js_err)
@@ -1290,6 +1301,11 @@ impl AvcRegistry {
     pub fn record(&self) -> Vec<u8> {
         self.inner.record()
     }
+
+    /// The record it started from, repaired: the copied samples' entry.
+    pub fn base_record(&self) -> Vec<u8> {
+        self.inner.base_record().to_vec()
+    }
 }
 
 /// Makes one encoder's samples fit the merged track (see `AvcRegistry`).
@@ -1307,6 +1323,16 @@ impl AvcRewriter {
 
     pub fn rewrite_sample(&mut self, sample: &[u8]) -> Result<Vec<u8>, JsValue> {
         self.inner.rewrite_sample(sample).map_err(js_err)
+    }
+
+    /// This encoder's own record (its sets under their new ids).
+    pub fn record(&self) -> Vec<u8> {
+        self.inner.record().to_vec()
+    }
+
+    /// A rewritten sample with this encoder's parameter sets in front.
+    pub fn with_parameter_sets(&self, sample: &[u8]) -> Vec<u8> {
+        self.inner.with_parameter_sets(sample)
     }
 }
 

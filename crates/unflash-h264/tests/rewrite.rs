@@ -7,7 +7,7 @@ mod common;
 
 use std::process::Command;
 
-use common::{expected, md5s, mux, read, sample};
+use common::{expected, md5s, mux, mux_entries, read, sample};
 use unflash_h264::decoder::sample_nal_units;
 use unflash_h264::rewrite::{first_vcl_nal_type, parse_avcc, AvcRegistry};
 use unflash_h264::Decoder;
@@ -123,6 +123,47 @@ fn spliced_gops_decode_as_their_sources() {
         assert_eq!((rec.sps.len(), rec.pps.len()), (2, 2), "{base}+{other}: both streams' parameter sets");
         check_splice(base, other, &decode(&file), "this decoder");
         if let Some(md5s) = ffmpeg_md5(&file, &format!("{base}-{other}")) {
+            check_splice(base, other, &md5s, "ffmpeg");
+        }
+    }
+}
+
+/// The splice as the export writes it: the copied GOPs under the base's
+/// sample entry, the other stream's under an entry of its own (its sets
+/// alone, renumbered), its keyframes carrying those sets too. ffmpeg
+/// switches records with the entries; this decoder, given only the first
+/// entry's record as a player that reads one entry is, takes the sets from
+/// the keyframes.
+#[test]
+fn spliced_gops_under_entries_of_their_own() {
+    for (base, other) in [("splice_a", "splice_b"), ("splice_a", "splice_c"), ("splice_b", "splice_c")] {
+        let a = read(base);
+        let b = read(other);
+        let ma = parse_bytes(&a).unwrap();
+        let mb = parse_bytes(&b).unwrap();
+        let ta = ma.video().unwrap();
+        let tb = mb.video().unwrap();
+        let mut reg = AvcRegistry::new(ta.description.as_ref().unwrap()).unwrap();
+        let mut rw = reg.register(tb.description.as_ref().unwrap()).unwrap();
+        let own = parse_avcc(rw.record()).unwrap();
+        assert_eq!((own.sps.len(), own.pps.len()), (1, 1), "{base}+{other}: the other stream's sets alone");
+        assert_ne!(rw.record(), reg.base_record(), "{base}+{other}: a record of its own");
+        let mut payloads = Vec::new();
+        let mut entries = Vec::new();
+        for g in 0..4 {
+            let (t, data, from_other) = if g % 2 == 0 { (ta, &a, false) } else { (tb, &b, true) };
+            for s in &t.samples[g * 10..g * 10 + 10] {
+                let mut bytes = if from_other { rw.rewrite_sample(sample(data, s)).unwrap() } else { sample(data, s).to_vec() };
+                if from_other && s.sync {
+                    bytes = rw.with_parameter_sets(&bytes);
+                }
+                payloads.push((bytes, s.pts, s.sync));
+                entries.push(if from_other { 2 } else { 1 });
+            }
+        }
+        let file = mux_entries(reg.base_record().to_vec(), &[rw.record().to_vec()], ta, &payloads, &entries);
+        check_splice(base, other, &decode(&file), "this decoder, from the first entry");
+        if let Some(md5s) = ffmpeg_md5(&file, &format!("entries-{base}-{other}")) {
             check_splice(base, other, &md5s, "ffmpeg");
         }
     }

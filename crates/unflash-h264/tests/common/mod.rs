@@ -54,11 +54,22 @@ pub fn md5s(dec: &mut Decoder, file: &[u8], track: &Track, what: &str, mut map: 
 /// A file of one H.264 track: `record` its `avcC`, `samples` (bytes,
 /// presentation time, sync) its samples, timed as `like`'s.
 pub fn mux(record: Vec<u8>, like: &Track, samples: &[(Vec<u8>, i64, bool)]) -> Vec<u8> {
+    let entries: Vec<u32> = vec![1; samples.len()];
+    mux_entries(record, &[], like, samples, &entries)
+}
+
+/// `mux` with more sample entries (`more`: their records, entries 2, 3,
+/// ...) and the entry each sample is under.
+pub fn mux_entries(record: Vec<u8>, more: &[Vec<u8>], like: &Track, samples: &[(Vec<u8>, i64, bool)], entries: &[u32]) -> Vec<u8> {
     let mut mx = Muxer::new();
     let vt = mx.add_track(TrackDesc::Video { codec: "avc1.640028".into(), width: like.width, height: like.height, timescale: like.timescale, description: record });
+    for m in more {
+        mx.add_description(vt, m.clone()).unwrap();
+    }
     let mut file = mx.start();
     let cts: Vec<i64> = samples.iter().map(|p| p.1).collect();
-    for ((bytes, pts, sync), (dts, dur)) in samples.iter().zip(dts_from_cts(&cts, like.samples[0].duration)) {
+    for (((bytes, pts, sync), (dts, dur)), &e) in samples.iter().zip(dts_from_cts(&cts, like.samples[0].duration)).zip(entries) {
+        mx.use_description(vt, e).unwrap();
         file.extend_from_slice(bytes);
         mx.add_sample(vt, dts, *pts, dur, *sync, bytes.len() as u32).unwrap();
     }

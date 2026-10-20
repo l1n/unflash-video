@@ -175,7 +175,18 @@ const r = await page.evaluate(async (LEVELS) => {
     const timingInfo = { editShift: m.video.edit_shift, first: Array.from({ length: 6 }, (_, i) => [m.v.ptsTicks[i], m.v.dtsTicks[i]]) };
     const record = m.dx.track_description(m.video.index);
     const sets = avccSets(record);
-    return { name, mode: res.mode, spans: res.spans, frames: res.frames, copied: res.copied, parallel: res.parallel, codec: res.codec, plan: plan.pieces.map((p) => `${p.kind} ${p.from}-${p.to}`), paramSets: [sets.sps.length, sets.pps.length], tail: recordTail(record), outFrames: ho.length, mismatches, timing, timingInfo, keyRequests: encoded.filter((e) => e.key).map((e) => e.t), size: res.blob.size, hasAudio: !!m.audio };
+    // the video track's sample entries and its stsc runs (the first stsd
+    // and stsc in the file are the video track's)
+    const file = new Uint8Array(await res.blob.arrayBuffer());
+    const boxAt = (type) => {
+      const t = Array.from(type, (c) => c.charCodeAt(0));
+      for (let i = 4; i + 12 <= file.length; i++) if (file[i] === t[0] && file[i + 1] === t[1] && file[i + 2] === t[2] && file[i + 3] === t[3]) return i;
+      return -1;
+    };
+    const u32 = (i) => ((file[i] << 24) | (file[i + 1] << 16) | (file[i + 2] << 8) | file[i + 3]) >>> 0;
+    const stsc = boxAt('stsc');
+    const entryRuns = Array.from({ length: u32(stsc + 8) }, (_, k) => [u32(stsc + 12 + 12 * k), u32(stsc + 20 + 12 * k)]);
+    return { name, mode: res.mode, spans: res.spans, frames: res.frames, copied: res.copied, parallel: res.parallel, codec: res.codec, plan: plan.pieces.map((p) => `${p.kind} ${p.from}-${p.to}`), paramSets: [sets.sps.length, sets.pps.length], entries: u32(boxAt('stsd') + 8), entryRuns, tail: recordTail(record), outFrames: ho.length, mismatches, timing, timingInfo, keyRequests: encoded.filter((e) => e.key).map((e) => e.t), size: res.blob.size, hasAudio: !!m.audio };
   };
   const results = {};
   // one span in the middle: GOP 1 (frames 10..19, an IDR every 10 frames)
@@ -346,7 +357,8 @@ assert(r.frames === 40, 'splice_a has 40 frames');
 const one = r.results.one;
 assert(one.mode === 'smart' && one.spans === 1 && one.frames === 10 && one.copied === 30, 'one span: GOP 1 re-encoded, the rest copied: ' + JSON.stringify(one));
 assert(one.plan.join(',') === 'copy 0-10,encode 10-20,copy 20-40', 'one span: the pieces: ' + one.plan.join(','));
-assert(one.paramSets[0] === 2 && one.paramSets[1] === 2, 'one span: the record holds both streams\' parameter sets: ' + one.paramSets);
+assert(one.paramSets[0] === 1 && one.paramSets[1] === 1, 'one span: the first sample entry holds the source\'s parameter sets alone: ' + one.paramSets);
+assert(one.entries === 2 && JSON.stringify(one.entryRuns) === '[[1,1],[11,2],[21,1]]', 'one span: the span\'s samples are under a sample entry of their own: ' + JSON.stringify([one.entries, one.entryRuns]));
 assert(one.outFrames === 40 && one.mismatches.length === 0, 'one span: every frame decodes as its source: mismatches ' + JSON.stringify(one.mismatches));
 assert(one.timing, 'one span: decode times are consistent');
 assert(one.keyRequests.length === 1 && one.keyRequests[0] === 333333, 'one span: the span starts with a keyframe request: ' + one.keyRequests);
@@ -355,15 +367,15 @@ const two = r.results.two;
 assert(two.mode === 'smart' && two.spans === 2 && two.frames === 20 && two.copied === 20 && two.parallel === 2, 'two spans: ' + JSON.stringify(two));
 assert(two.plan.join(',') === 'copy 0-10,encode 10-20,copy 20-30,encode 30-40', 'two spans: the pieces: ' + two.plan.join(','));
 assert(two.outFrames === 40 && two.mismatches.length === 0 && two.timing, 'two spans: every frame decodes as its source: ' + JSON.stringify(two.mismatches));
-assert(two.paramSets[0] === 2 && two.paramSets[1] === 2, 'two spans: one extra set of parameter sets, shared by both spans: ' + two.paramSets);
+assert(two.entries === 2 && JSON.stringify(two.entryRuns) === '[[1,1],[11,2],[21,1],[31,2]]', 'two spans: one extra sample entry, shared by both spans: ' + JSON.stringify([two.entries, two.entryRuns]));
 const full = r.results.full;
 assert(full.mode === 'full' && full.frames === 40 && full.copied === 0, 'full: everything re-encoded: ' + JSON.stringify(full));
 assert(full.outFrames === 40 && full.mismatches.length === 0 && full.timing, 'full: every frame is the stand-in encoder\'s: ' + JSON.stringify(full.mismatches));
-assert(full.paramSets[0] === 1 && full.paramSets[1] === 1, 'full: only the encoder\'s parameter sets: ' + full.paramSets);
+assert(full.paramSets[0] === 1 && full.paramSets[1] === 1 && full.entries === 1, 'full: only the encoder\'s parameter sets, one sample entry: ' + JSON.stringify([full.paramSets, full.entries]));
 const ff = r.results.firefox;
 assert(ff.mode === 'smart' && ff.spans === 2 && ff.frames === 20 && ff.copied === 20, 'firefox-style encoder: the spans are spliced in: ' + JSON.stringify(ff));
 assert(ff.outFrames === 40 && ff.mismatches.length === 0 && ff.timing, 'firefox-style encoder: every frame decodes as its source: ' + JSON.stringify(ff.mismatches));
-assert(ff.paramSets[0] === 2 && ff.paramSets[1] === 2, 'firefox-style encoder: the repaired sets join the source\'s: ' + ff.paramSets);
+assert(ff.entries === 2 && ff.paramSets[0] === 1, 'firefox-style encoder: the repaired sets get a sample entry of their own: ' + JSON.stringify([ff.entries, ff.paramSets]));
 const fbr = r.results.fallback;
 assert(fbr.mode === 'full' && fbr.frames === 40 && fbr.copied === 0 && fbr.spans === 1 && fbr.parallel === 1, 'an unreadable record: the export is redone by one encoder: ' + JSON.stringify(fbr));
 assert(fbr.samples === 40 && /re-encoded by one encoder/.test(fbr.warnings[0] || ''), 'and says so: ' + JSON.stringify(fbr));
@@ -372,7 +384,7 @@ assert(errors.length === 0, 'no page errors: ' + errors.join(' | '));
 const ab = r.results.annexB;
 assert(ab.mode === 'smart' && ab.frames === 10 && ab.copied === 30, 'an Annex B encoder with no record: spliced all the same: ' + JSON.stringify(ab));
 assert(ab.outFrames === 40 && ab.mismatches.length === 0 && ab.timing, 'an Annex B encoder: every frame decodes as its source: ' + JSON.stringify(ab.mismatches));
-assert(ab.paramSets[0] === 2 && ab.paramSets[1] === 2, 'an Annex B encoder: its parameter sets join the source\'s: ' + ab.paramSets);
+assert(ab.entries === 2 && ab.paramSets[0] === 1, 'an Annex B encoder: its parameter sets get a sample entry of their own: ' + JSON.stringify([ab.entries, ab.paramSets]));
 const abh = r.results.annexBHigh;
 assert(abh.mode === 'full' && abh.frames === 40 && abh.copied === 0, 'a High-profile Annex B encoder: everything re-encoded: ' + JSON.stringify(abh));
 assert(abh.outFrames === 40 && abh.mismatches.length === 0 && abh.timing, 'a High-profile Annex B encoder: every frame decodes as its source: ' + JSON.stringify(abh.mismatches));

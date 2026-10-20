@@ -35,6 +35,11 @@ pub enum TrackDesc {
 struct MuxTrack {
     desc: TrackDesc,
     samples: Vec<Sample>,
+    /// A video track's sample entries after the first (`add_description`).
+    more: Vec<Vec<u8>>,
+    /// The entry new samples use, from 1, and each sample's.
+    current: u32,
+    entry: Vec<u32>,
 }
 
 /// The 8 bytes to write over the file head at an offset (the `mdat`'s size).
@@ -61,8 +66,32 @@ impl Muxer {
     }
 
     pub fn add_track(&mut self, desc: TrackDesc) -> usize {
-        self.tracks.push(MuxTrack { desc, samples: Vec::new() });
+        self.tracks.push(MuxTrack { desc, samples: Vec::new(), more: Vec::new(), current: 1, entry: Vec::new() });
         self.tracks.len() - 1
+    }
+
+    /// One more sample entry for a video track: the same codec under
+    /// another decoder record (`avcC`), for samples from another encoder
+    /// spliced in. A player starts its decoder afresh where the entry
+    /// changes, which Apple's needs to take a stream with other parameter
+    /// sets. Returns the entry's index (from 1; the track's own is 1).
+    pub fn add_description(&mut self, track: usize, description: Vec<u8>) -> Result<u32, Error> {
+        let t = self.tracks.get_mut(track).ok_or("no such track")?;
+        if !matches!(t.desc, TrackDesc::Video { .. }) {
+            return Err("only a video track takes more sample entries".into());
+        }
+        t.more.push(description);
+        Ok(t.more.len() as u32 + 1)
+    }
+
+    /// The sample entry the samples added from now on use (from 1).
+    pub fn use_description(&mut self, track: usize, index: u32) -> Result<(), Error> {
+        let t = self.tracks.get_mut(track).ok_or("no such track")?;
+        if index < 1 || index as usize > t.more.len() + 1 {
+            return Err("no such sample entry".into());
+        }
+        t.current = index;
+        Ok(())
     }
 
     /// The file head: `ftyp` and the `mdat` header (with a placeholder size).
@@ -93,6 +122,7 @@ impl Muxer {
         }
         let t = self.tracks.get_mut(track).ok_or("no such track")?;
         t.samples.push(Sample { offset: self.pos, size, dts, pts, duration, sync });
+        t.entry.push(t.current);
         self.pos += size as u64;
         Ok(())
     }
@@ -252,10 +282,13 @@ fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32) -> Result<(), Error> {
     // stbl
     let stbl = w.begin_box(b"stbl");
     let at = w.begin_full_box(b"stsd", 0, 0);
-    w.u32(1);
+    w.u32(1 + t.more.len() as u32);
     match &t.desc {
         TrackDesc::Video { codec, width, height, description, .. } => {
             write_video_entry(w, codec, *width, *height, description)?;
+            for d in &t.more {
+                write_video_entry(w, codec, *width, *height, d)?;
+            }
         }
         TrackDesc::Copy { sample_entry, .. } => w.bytes(sample_entry),
     }
@@ -290,12 +323,24 @@ fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32) -> Result<(), Error> {
         }
         w.end_box(at);
     }
-    // stsc: one sample per chunk
+    // stsc: one sample per chunk, a run of chunks for each stretch of
+    // samples under one sample entry
     let at = w.begin_full_box(b"stsc", 0, 0);
-    w.u32(1);
-    w.u32(1);
-    w.u32(1);
-    w.u32(1);
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for (i, &e) in t.entry.iter().enumerate() {
+        if runs.last().map(|r| r.1) != Some(e) {
+            runs.push((i as u32 + 1, e));
+        }
+    }
+    if runs.is_empty() {
+        runs.push((1, 1));
+    }
+    w.u32(runs.len() as u32);
+    for (first, e) in runs {
+        w.u32(first);
+        w.u32(1);
+        w.u32(e);
+    }
     w.end_box(at);
     // stsz
     let at = w.begin_full_box(b"stsz", 0, 0);
