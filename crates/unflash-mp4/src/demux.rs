@@ -79,12 +79,13 @@ pub(crate) fn span(samples: &[Sample]) -> i64 {
     let mut hi = i64::MIN;
     for s in samples {
         lo = lo.min(s.pts);
-        hi = hi.max(s.pts + s.duration as i64);
+        hi = hi.max(s.pts.saturating_add(s.duration as i64));
     }
     if lo == i64::MAX {
         0
     } else {
-        hi - lo
+        // (times no file has, from a caller of the muxer: as long as can be said)
+        hi.saturating_sub(lo)
     }
 }
 
