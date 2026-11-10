@@ -4,7 +4,7 @@
 // detector.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ChunkReader, orTimeout, rawPicture, sampleRange, shown, smallSize, waker, yuvLayoutWords } from '../../web/media.js';
+import { ChunkReader, frameSize, orTimeout, rawPicture, sampleRange, shown, smallSize, waker, yuvLayoutWords } from '../../web/media.js';
 
 /** A file of `size` bytes, each its own offset's low byte, that notes every read of it (and fails the first `failures`). */
 function file(size, { failures = 0 } = {}) {
@@ -185,4 +185,11 @@ test('pictures for the detector alone are made small where a size is given', () 
   assert.equal(smallSize(false, { aw: 256, ah: 144 }), null);
   assert.equal(smallSize(true, null), null);
   assert.equal(smallSize(true, { aw: 0, ah: 144 }), null);
+});
+
+test("a frame's size is that of the part of it that is shown", () => {
+  // (a decoder's frame may be coded larger than it is shown: 1088 lines for 1080)
+  assert.deepEqual(frameSize({ codedWidth: 1920, codedHeight: 1088, visibleRect: { width: 1920, height: 1080 } }), { w: 1920, h: 1080 });
+  assert.deepEqual(frameSize({ codedWidth: 640, codedHeight: 360 }), { w: 640, h: 360 });
+  assert.deepEqual(frameSize({ codedWidth: 640, codedHeight: 360, visibleRect: null }), { w: 640, h: 360 });
 });

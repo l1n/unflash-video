@@ -22,7 +22,7 @@
 // colorSpace, format, and with `shrink` shrunk: {from, copyMs, shrinkMs})
 // or {type:'frame', id, frame} (a VideoFrame that can't be copied,
 // transferred as it is); {type:'done', id} | {type:'error', id, message}.
-import { ChunkReader, waker, yuvLayoutWords } from './media.js';
+import { ChunkReader, waker, yuvLayoutWords, frameSize } from './media.js';
 
 // the WebAssembly module, loaded when a job first asks for small pictures
 let wasmReady = null;
@@ -74,8 +74,7 @@ const COPYABLE = ['I420', 'I420A', 'NV12', 'RGBA', 'RGBX', 'BGRA', 'BGRX'];
  */
 async function sendSmall(f, id, shrink, wasm) {
   const fmt = f.format;
-  const w = f.visibleRect ? f.visibleRect.width : f.codedWidth;
-  const h = f.visibleRect ? f.visibleRect.height : f.codedHeight;
+  const { w, h } = frameSize(f);
   if (shrinkFailed || !COPYABLE.includes(fmt) || fmt === 'I420A') return false;
   try {
     const t0 = performance.now();
@@ -107,8 +106,7 @@ async function sendSmall(f, id, shrink, wasm) {
 async function send(f, id, shrink = null, wasm = null) {
   if (shrink && wasm && (await sendSmall(f, id, shrink, wasm))) return;
   const fmt = f.format;
-  const w = f.visibleRect ? f.visibleRect.width : f.codedWidth;
-  const h = f.visibleRect ? f.visibleRect.height : f.codedHeight;
+  const { w, h } = frameSize(f);
   if (COPYABLE.includes(fmt)) {
     const size = f.allocationSize();
     const buf = bufferOf(size);

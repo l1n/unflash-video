@@ -1,7 +1,7 @@
 // The detector, wrapped so the rest of the app does not care whether it runs
 // on the GPU or the CPU, nor by which route a picture reaches it.
 
-import { orTimeout, yuvLayoutWords } from './media.js';
+import { orTimeout, yuvLayoutWords, frameSize } from './media.js';
 import { profile } from './profile.js';
 
 /**
@@ -409,8 +409,7 @@ export class Feeder {
       this.feedRaw(frame, t, capture);
       return;
     }
-    const w = frame.visibleRect ? frame.visibleRect.width : frame.codedWidth;
-    const h = frame.visibleRect ? frame.visibleRect.height : frame.codedHeight;
+    const { w, h } = frameSize(frame);
     const routes = this.frameRoutes;
     while (routes.length) {
       const route = routes[0];
@@ -512,8 +511,7 @@ export class Feeder {
       if (!['I420', 'I420A', 'NV12'].includes(frame.format)) throw new Error(`its pictures are ${frame.format || 'opaque'}`);
       const colorSpace = this.decoderColorSpace ? await this.decoderColorSpace() : null;
       if (!colorSpace) throw new Error("the colours of the video's decoder are not known");
-      const w = frame.visibleRect ? frame.visibleRect.width : frame.codedWidth;
-      const h = frame.visibleRect ? frame.visibleRect.height : frame.codedHeight;
+      const { w, h } = frameSize(frame);
       if (!(await this.feedYuv(frame, w, h, t, capture, colorSpace))) throw new Error('its planes could not be copied');
     } finally {
       frame.close();

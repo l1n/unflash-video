@@ -502,6 +502,9 @@ export function sampleRange(movie, startSec, endSec, fromIndex = null) {
   return { startIdx, endIdx };
 }
 
+/** The size of the part of a decoded frame that is shown: its visible rectangle's, where it has one. */
+export const frameSize = (f) => (f.visibleRect ? { w: f.visibleRect.width, h: f.visibleRect.height } : { w: f.codedWidth, h: f.codedHeight });
+
 /** Whether a picture at `t` (seconds) is one of those shown in [startSec, endSec), give or take a time's rounding. */
 export const shown = (t, startSec, endSec) => t >= startSec - 1e-6 && t < endSec - 1e-9;
 
