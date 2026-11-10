@@ -1,4 +1,12 @@
 //! Scaling and inverse transforms (8.5.9 – 8.5.13).
+//!
+//! The levels come from the stream, and a damaged one's can be any number:
+//! the arithmetic on them wraps, here by its type ([`std::num::Wrapping`]) or by name,
+//! so that such a block is some wrong picture in every build and a panic in
+//! none. A stream that conforms never comes near (8.5.12.1 bounds what it
+//! may scale to), so for one nothing changes.
+
+use std::num::Wrapping as W;
 
 #[inline(always)]
 fn clip(v: i32) -> u8 {
@@ -14,13 +22,13 @@ pub fn dequant4x4(c: &mut [i32; 16], level_scale: &[i32; 16], qp: i32, dc_done: 
     if qp >= 24 {
         let sh = qp6 - 4;
         for i in start..16 {
-            c[i] = (c[i] * level_scale[i]) << sh;
+            c[i] = c[i].wrapping_mul(level_scale[i]) << sh;
         }
     } else {
         let sh = 4 - qp6;
         let add = 1 << (3 - qp6);
         for i in start..16 {
-            c[i] = (c[i] * level_scale[i] + add) >> sh;
+            c[i] = c[i].wrapping_mul(level_scale[i]).wrapping_add(add) >> sh;
         }
     }
 }
@@ -31,13 +39,13 @@ pub fn dequant8x8(c: &mut [i32; 64], level_scale: &[i32; 64], qp: i32) {
     if qp >= 36 {
         let sh = qp6 - 6;
         for i in 0..64 {
-            c[i] = (c[i] * level_scale[i]) << sh;
+            c[i] = c[i].wrapping_mul(level_scale[i]) << sh;
         }
     } else {
         let sh = 6 - qp6;
         let add = 1 << (5 - qp6);
         for i in 0..64 {
-            c[i] = (c[i] * level_scale[i] + add) >> sh;
+            c[i] = c[i].wrapping_mul(level_scale[i]).wrapping_add(add) >> sh;
         }
     }
 }
@@ -45,11 +53,11 @@ pub fn dequant8x8(c: &mut [i32; 64], level_scale: &[i32; 64], qp: i32) {
 /// 8.5.10: the Intra16x16 luma DC transform and scaling. `c` holds the 16
 /// DC levels in raster order of the 4x4 blocks; returns dcY per block.
 pub fn luma_dc(c: &[i32; 16], level_scale00: i32, qp: i32) -> [i32; 16] {
-    let mut f = [0i32; 16];
+    let mut f = [W(0i32); 16];
     // rows: f = H * c
-    let mut t = [0i32; 16];
+    let mut t = [W(0i32); 16];
     for j in 0..4 {
-        let (c0, c1, c2, c3) = (c[j], c[4 + j], c[8 + j], c[12 + j]);
+        let (c0, c1, c2, c3) = (W(c[j]), W(c[4 + j]), W(c[8 + j]), W(c[12 + j]));
         t[j] = c0 + c1 + c2 + c3;
         t[4 + j] = c0 + c1 - c2 - c3;
         t[8 + j] = c0 - c1 - c2 + c3;
@@ -65,7 +73,8 @@ pub fn luma_dc(c: &[i32; 16], level_scale00: i32, qp: i32) -> [i32; 16] {
     let qp6 = qp / 6;
     let mut out = [0i32; 16];
     for i in 0..16 {
-        out[i] = if qp >= 36 { (f[i] * level_scale00) << (qp6 - 6) } else { (f[i] * level_scale00 + (1 << (5 - qp6))) >> (6 - qp6) };
+        let scaled = f[i].0.wrapping_mul(level_scale00);
+        out[i] = if qp >= 36 { scaled << (qp6 - 6) } else { scaled.wrapping_add(1 << (5 - qp6)) >> (6 - qp6) };
     }
     out
 }
@@ -73,6 +82,7 @@ pub fn luma_dc(c: &[i32; 16], level_scale00: i32, qp: i32) -> [i32; 16] {
 /// 8.5.11: the 2x2 chroma DC transform and scaling (4:2:0). `c` in raster
 /// order of the four 4x4 chroma blocks.
 pub fn chroma_dc(c: &[i32; 4], level_scale00: i32, qpc: i32) -> [i32; 4] {
+    let c = [W(c[0]), W(c[1]), W(c[2]), W(c[3])];
     let f0 = c[0] + c[1] + c[2] + c[3];
     let f1 = c[0] - c[1] + c[2] - c[3];
     let f2 = c[0] + c[1] - c[2] - c[3];
@@ -80,7 +90,7 @@ pub fn chroma_dc(c: &[i32; 4], level_scale00: i32, qpc: i32) -> [i32; 4] {
     let f = [f0, f1, f2, f3];
     let mut out = [0i32; 4];
     for i in 0..4 {
-        out[i] = ((f[i] * level_scale00) << (qpc / 6)) >> 5;
+        out[i] = (f[i].0.wrapping_mul(level_scale00) << (qpc / 6)) >> 5;
     }
     out
 }
@@ -88,9 +98,9 @@ pub fn chroma_dc(c: &[i32; 4], level_scale00: i32, qpc: i32) -> [i32; 4] {
 /// 8.5.12.2: inverse 4x4 transform of scaled coefficients (raster order),
 /// added to the prediction already in `dst`.
 pub fn idct4x4_add(d: &[i32; 16], dst: &mut [u8], stride: usize) {
-    let mut t = [0i32; 16];
+    let mut t = [W(0i32); 16];
     for i in 0..4 {
-        let (d0, d1, d2, d3) = (d[4 * i], d[4 * i + 1], d[4 * i + 2], d[4 * i + 3]);
+        let (d0, d1, d2, d3) = (W(d[4 * i]), W(d[4 * i + 1]), W(d[4 * i + 2]), W(d[4 * i + 3]));
         let e0 = d0 + d2;
         let e1 = d0 - d2;
         let e2 = (d1 >> 1) - d3;
@@ -109,14 +119,14 @@ pub fn idct4x4_add(d: &[i32; 16], dst: &mut [u8], stride: usize) {
         let h = [g0 + g3, g1 + g2, g1 - g2, g0 - g3];
         for i in 0..4 {
             let p = &mut dst[i * stride + j];
-            *p = clip(*p as i32 + ((h[i] + 32) >> 6));
+            *p = clip(*p as i32 + ((h[i] + W(32)) >> 6).0);
         }
     }
 }
 
 /// A block whose only coefficient is the DC: the transform is a constant.
 pub fn idct4x4_dc_add(dc: i32, dst: &mut [u8], stride: usize) {
-    let v = (dc + 32) >> 6;
+    let v = dc.wrapping_add(32) >> 6;
     for i in 0..4 {
         for j in 0..4 {
             let p = &mut dst[i * stride + j];
@@ -127,9 +137,9 @@ pub fn idct4x4_dc_add(dc: i32, dst: &mut [u8], stride: usize) {
 
 /// 8.5.13.2: inverse 8x8 transform added to the prediction in `dst`.
 pub fn idct8x8_add(d: &[i32; 64], dst: &mut [u8], stride: usize) {
-    let mut t = [0i32; 64];
+    let mut t = [W(0i32); 64];
     for i in 0..8 {
-        let r = &d[8 * i..8 * i + 8];
+        let r: [W<i32>; 8] = std::array::from_fn(|k| W(d[8 * i + k]));
         let a0 = r[0] + r[4];
         let a4 = r[0] - r[4];
         let a2 = (r[2] >> 1) - r[6];
@@ -177,7 +187,7 @@ pub fn idct8x8_add(d: &[i32; 64], dst: &mut [u8], stride: usize) {
         let h = [b0 + b7, b2 + b5, b4 + b3, b6 + b1, b6 - b1, b4 - b3, b2 - b5, b0 - b7];
         for i in 0..8 {
             let p = &mut dst[i * stride + j];
-            *p = clip(*p as i32 + ((h[i] + 32) >> 6));
+            *p = clip(*p as i32 + ((h[i] + W(32)) >> 6).0);
         }
     }
 }

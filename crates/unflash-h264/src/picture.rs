@@ -2,6 +2,7 @@
 //! reference picture lists and reference marking (8.2.1, 8.2.4, 8.2.5),
 //! for frames and for field pictures.
 
+use std::num::Wrapping as W;
 use std::rc::Rc;
 
 use crate::ps::Sps;
@@ -253,13 +254,19 @@ impl Dpb {
     }
 
     /// 8.2.1: the picture order counts of the picture a slice header starts.
+    ///
+    /// Every number in it is the stream's, and the counts add up from one
+    /// picture to the next: a damaged stream's pass any bound, so the sums
+    /// wrap (by their type). A stream that conforms keeps them all inside
+    /// 32 bits (8.2.1 requires it), and for one nothing differs.
     pub fn compute_poc(&self, sps: &Sps, hdr: &SliceHeader) -> PocState {
-        let max_frame_num = sps.max_frame_num() as i32;
+        let max_frame_num = W(sps.max_frame_num() as i32);
+        let frame_num = W(hdr.frame_num as i32);
         let structure = hdr.structure();
         // FrameNumOffset (order count types 1 and 2)
-        let prev_offset = if self.prev_had_mmco5 { 0 } else { self.prev_frame_num_offset };
+        let prev_offset = W(if self.prev_had_mmco5 { 0 } else { self.prev_frame_num_offset });
         let frame_num_offset = if hdr.is_idr() {
-            0
+            W(0)
         } else if self.prev_frame_num > hdr.frame_num {
             prev_offset + max_frame_num
         } else {
@@ -267,52 +274,52 @@ impl Dpb {
         };
         let (top, bottom, poc_msb, poc_lsb, frame_num_offset) = match sps.poc_type {
             0 => {
-                let max_lsb = 1i32 << sps.log2_max_poc_lsb;
-                let (prev_msb, prev_lsb) = if hdr.is_idr() { (0, 0) } else { (self.prev_poc_msb, self.prev_poc_lsb) };
-                let lsb = hdr.poc_lsb as i32;
-                let msb = if lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2 {
+                let max_lsb = W(1i32 << sps.log2_max_poc_lsb);
+                let (prev_msb, prev_lsb) = if hdr.is_idr() { (W(0), W(0)) } else { (W(self.prev_poc_msb), W(self.prev_poc_lsb)) };
+                let lsb = W(hdr.poc_lsb as i32);
+                let msb = if lsb < prev_lsb && (prev_lsb - lsb).0 >= max_lsb.0 / 2 {
                     prev_msb + max_lsb
-                } else if lsb > prev_lsb && lsb - prev_lsb > max_lsb / 2 {
+                } else if lsb > prev_lsb && (lsb - prev_lsb).0 > max_lsb.0 / 2 {
                     prev_msb - max_lsb
                 } else {
                     prev_msb
                 };
                 let top = msb + lsb;
-                let bottom = if structure == FRAME { top + hdr.delta_poc_bottom } else { top };
-                (top, bottom, msb, lsb, 0)
+                let bottom = if structure == FRAME { top + W(hdr.delta_poc_bottom) } else { top };
+                (top, bottom, msb, lsb, W(0))
             }
             1 => {
-                let cycle = sps.offset_for_ref_frame.len() as i32;
-                let mut abs_frame_num = if cycle != 0 { frame_num_offset + hdr.frame_num as i32 } else { 0 };
-                if hdr.nal_ref_idc == 0 && abs_frame_num > 0 {
-                    abs_frame_num -= 1;
+                let cycle = W(sps.offset_for_ref_frame.len() as i32);
+                let mut abs_frame_num = if cycle.0 != 0 { frame_num_offset + frame_num } else { W(0) };
+                if hdr.nal_ref_idc == 0 && abs_frame_num.0 > 0 {
+                    abs_frame_num -= W(1);
                 }
-                let mut expected = 0i32;
-                if abs_frame_num > 0 {
-                    let cycle_cnt = (abs_frame_num - 1) / cycle;
-                    let in_cycle = (abs_frame_num - 1) % cycle;
-                    let delta_per_cycle: i32 = sps.offset_for_ref_frame.iter().sum();
+                let mut expected = W(0i32);
+                if abs_frame_num.0 > 0 {
+                    let cycle_cnt = (abs_frame_num - W(1)) / cycle;
+                    let in_cycle = (abs_frame_num - W(1)) % cycle;
+                    let delta_per_cycle: W<i32> = sps.offset_for_ref_frame.iter().map(|&o| W(o)).sum();
                     expected = cycle_cnt * delta_per_cycle;
-                    for k in 0..=in_cycle as usize {
-                        expected += sps.offset_for_ref_frame[k];
+                    for k in 0..=in_cycle.0 as usize {
+                        expected += W(sps.offset_for_ref_frame[k]);
                     }
                 }
                 if hdr.nal_ref_idc == 0 {
-                    expected += sps.offset_for_non_ref_pic;
+                    expected += W(sps.offset_for_non_ref_pic);
                 }
-                let top = expected + hdr.delta_poc[0];
-                let bottom = top + sps.offset_for_top_to_bottom_field + if structure == FRAME { hdr.delta_poc[1] } else { 0 };
-                (top, bottom, 0, 0, frame_num_offset)
+                let top = expected + W(hdr.delta_poc[0]);
+                let bottom = top + W(sps.offset_for_top_to_bottom_field) + W(if structure == FRAME { hdr.delta_poc[1] } else { 0 });
+                (top, bottom, W(0), W(0), frame_num_offset)
             }
             _ => {
                 let poc = if hdr.is_idr() {
-                    0
+                    W(0)
                 } else if hdr.nal_ref_idc == 0 {
-                    2 * (frame_num_offset + hdr.frame_num as i32) - 1
+                    W(2) * (frame_num_offset + frame_num) - W(1)
                 } else {
-                    2 * (frame_num_offset + hdr.frame_num as i32)
+                    W(2) * (frame_num_offset + frame_num)
                 };
-                (poc, poc, 0, 0, frame_num_offset)
+                (poc, poc, W(0), W(0), frame_num_offset)
             }
         };
         let poc = match structure {
@@ -320,7 +327,7 @@ impl Dpb {
             BOTTOM => bottom,
             _ => top.min(bottom),
         };
-        PocState { poc, top, bottom, poc_msb, poc_lsb, frame_num_offset }
+        PocState { poc: poc.0, top: top.0, bottom: bottom.0, poc_msb: poc_msb.0, poc_lsb: poc_lsb.0, frame_num_offset: frame_num_offset.0 }
     }
 
     /// FrameNumWrap of a short-term entry relative to the current frame_num.
@@ -640,7 +647,7 @@ impl Dpb {
             if had_mmco5 {
                 // 8.2.1: after mmco 5 the picture's order counts restart from zero
                 self.prev_poc_msb = 0;
-                self.prev_poc_lsb = if structure == BOTTOM { 0 } else { poc.top - poc.poc };
+                self.prev_poc_lsb = if structure == BOTTOM { 0 } else { poc.top.wrapping_sub(poc.poc) };
             } else {
                 self.prev_poc_msb = poc.poc_msb;
                 self.prev_poc_lsb = poc.poc_lsb;
@@ -714,5 +721,118 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 8.2.1, each of its three ways of counting, by the standard's own
+    /// formulas (the test streams use the first and the last; none the
+    /// second).
+    #[test]
+    fn picture_order_counts_each_way() {
+        let seq = Seq::default(); // frame_num of four bits: it wraps at 16
+        let mut sps = parse_sps(&unescape(&sps_nal(&seq)[1..])).unwrap();
+        let frame = |frame_num: u32, idr: bool| header(&seq, &Slice { frame_num, idr, mbs: 4, ..Slice::default() });
+        let counts = |dpb: &Dpb, sps: &Sps, hdr: &SliceHeader| {
+            let p = dpb.compute_poc(sps, hdr);
+            (p.top, p.bottom, p.poc)
+        };
+
+        // type 0: the low bits are in the slice, the high bits follow their wrapping (16 here)
+        sps.poc_type = 0;
+        sps.log2_max_poc_lsb = 4;
+        let mut dpb = Dpb::new();
+        let mut hdr = frame(1, false);
+        let mut at = |dpb: &mut Dpb, prev: (i32, i32), lsb: u32, delta_bottom: i32| {
+            (dpb.prev_poc_msb, dpb.prev_poc_lsb) = prev;
+            hdr.poc_lsb = lsb;
+            hdr.delta_poc_bottom = delta_bottom;
+            counts(dpb, &sps, &hdr)
+        };
+        assert_eq!(at(&mut dpb, (0, 14), 2, 0), (18, 18, 18)); // wrapped upwards
+        assert_eq!(at(&mut dpb, (16, 2), 14, 0), (14, 14, 14)); // a picture from before the wrap
+        assert_eq!(at(&mut dpb, (16, 6), 8, 0), (24, 24, 24));
+        assert_eq!(at(&mut dpb, (16, 6), 8, -1), (24, 23, 23)); // a frame's count is its earlier field's
+        assert_eq!(at(&mut dpb, (16, 6), 8, 3), (24, 27, 24));
+        // an IDR picture starts from nothing, whatever came before
+        let mut idr = frame(0, true);
+        idr.poc_lsb = 6;
+        assert_eq!(counts(&dpb, &sps, &idr), (6, 6, 6));
+        // a field has its own count alone
+        let mut bottom = header(&Seq { frame_mbs_only: false, ..seq }, &Slice { frame_num: 1, field: Some(true), mbs: 2, ..Slice::default() });
+        bottom.poc_lsb = 9;
+        bottom.delta_poc_bottom = 5;
+        (dpb.prev_poc_msb, dpb.prev_poc_lsb) = (16, 8);
+        assert_eq!(counts(&dpb, &sps, &bottom), (25, 25, 25));
+
+        // type 2: twice the frame number counted through its wraps, a picture that is no reference one less
+        sps.poc_type = 2;
+        let mut dpb = Dpb::new();
+        (dpb.prev_frame_num, dpb.prev_frame_num_offset) = (4, 0);
+        let mut hdr = frame(5, false);
+        assert_eq!(counts(&dpb, &sps, &hdr), (10, 10, 10));
+        hdr.nal_ref_idc = 0;
+        assert_eq!(counts(&dpb, &sps, &hdr), (9, 9, 9));
+        // frame_num has wrapped (15, then 0): sixteen more, on top of the sixteen before
+        (dpb.prev_frame_num, dpb.prev_frame_num_offset) = (15, 16);
+        assert_eq!(counts(&dpb, &sps, &frame(0, false)).2, 64);
+        assert_eq!(dpb.compute_poc(&sps, &frame(0, false)).frame_num_offset, 32);
+        // (after a picture that reset the counting, the offset before it is none)
+        dpb.prev_had_mmco5 = true;
+        assert_eq!(counts(&dpb, &sps, &frame(0, false)).2, 32);
+        assert_eq!(counts(&dpb, &sps, &frame(0, true)).2, 0);
+
+        // type 1: a cycle of expected steps (2 then 4), counted by frame number
+        sps.poc_type = 1;
+        sps.offset_for_ref_frame = vec![2, 4];
+        sps.offset_for_non_ref_pic = -1;
+        sps.offset_for_top_to_bottom_field = 1;
+        let mut dpb = Dpb::new();
+        (dpb.prev_frame_num, dpb.prev_frame_num_offset) = (4, 0);
+        let mut hdr = frame(5, false);
+        hdr.delta_poc = [3, 2];
+        // the fifth frame: two whole cycles (12) and the first step of the third (2), then the slice's own 3
+        assert_eq!(counts(&dpb, &sps, &hdr), (17, 20, 17));
+        // one that is no reference counts as the frame before it, less one: a cycle (6), both steps (6), -1, 3
+        hdr.nal_ref_idc = 0;
+        assert_eq!(counts(&dpb, &sps, &hdr), (14, 17, 14));
+        // with no cycle at all only the slice's own numbers count
+        sps.offset_for_ref_frame = vec![];
+        hdr.nal_ref_idc = 1;
+        assert_eq!(counts(&dpb, &sps, &hdr), (3, 6, 3));
+    }
+
+    /// The numbers are the stream's: ones that add up past 32 bits wrap, in
+    /// a build that checks its arithmetic too (they used to end it).
+    #[test]
+    fn picture_order_counts_of_a_damaged_stream_wrap() {
+        let seq = Seq::default();
+        let mut sps = parse_sps(&unescape(&sps_nal(&seq)[1..])).unwrap();
+        let mut hdr = header(&seq, &Slice { frame_num: 5, mbs: 4, ..Slice::default() });
+        let far = [i32::MAX, i32::MIN, i32::MAX - 1, -1, 1 << 30];
+        for poc_type in 0..3 {
+            sps.poc_type = poc_type;
+            sps.log2_max_poc_lsb = 16;
+            for &a in &far {
+                for &b in &far {
+                    sps.offset_for_ref_frame = vec![a, b, a];
+                    sps.offset_for_non_ref_pic = b;
+                    sps.offset_for_top_to_bottom_field = a;
+                    hdr.delta_poc = [a, b];
+                    hdr.delta_poc_bottom = b;
+                    hdr.poc_lsb = 65535;
+                    for nal_ref_idc in [0, 1] {
+                        hdr.nal_ref_idc = nal_ref_idc;
+                        let mut dpb = Dpb::new();
+                        (dpb.prev_poc_msb, dpb.prev_poc_lsb, dpb.prev_frame_num, dpb.prev_frame_num_offset) = (a, b, 9, a);
+                        let p = dpb.compute_poc(&sps, &hdr);
+                        assert_eq!(p.poc, p.top.min(p.bottom));
+                    }
+                }
+            }
+        }
+        // and the distance between two of them, which scales a motion vector:
+        // the first and last counts there are differ by one, once wrapped
+        assert_eq!(crate::inter::dist_scale_factor(i32::MAX, i32::MIN, i32::MAX), Some(256));
+        assert_eq!(crate::inter::dist_scale_factor(i32::MIN, i32::MAX, 0), Some(-2));
+        assert_eq!(crate::inter::dist_scale_factor(4, 0, 8), Some(128));
     }
 }

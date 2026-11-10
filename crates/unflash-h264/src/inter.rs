@@ -560,8 +560,9 @@ fn weight_bi_w<const W: usize>(p0: &[u8], p1: &[u8], h: usize, weights: Weights,
 /// 8.4.1.2.3 / 8.4.2.3.2: the scaling of a temporal-direct or implicit
 /// weight: (tb, td) -> DistScaleFactor, or None when td is zero.
 pub fn dist_scale_factor(poc_cur: i32, poc_ref0: i32, poc_ref1: i32) -> Option<i32> {
-    let tb = (poc_cur - poc_ref0).clamp(-128, 127);
-    let td = (poc_ref1 - poc_ref0).clamp(-128, 127);
+    // (picture order counts are the stream's: a damaged one's can be far enough apart to wrap)
+    let tb = poc_cur.wrapping_sub(poc_ref0).clamp(-128, 127);
+    let td = poc_ref1.wrapping_sub(poc_ref0).clamp(-128, 127);
     if td == 0 {
         return None;
     }

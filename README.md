@@ -456,7 +456,13 @@ MD5s): every stream within those limits decodes bit-exact, 169 of them.
 
 It is written to the standard and tested bit-exact against ffmpeg's
 decoder on x264 streams that exercise those tools
-(`crates/unflash-h264/tests`, media in `tests/media/h264`). Pictures come
+(`crates/unflash-h264/tests`, media in `tests/media/h264`). The same
+streams are decoded damaged (`tests/robustness.rs`: bits flipped, bytes
+overwritten, NAL lengths made wrong, samples cut short, dropped, repeated
+or swapped for another stream's, the `avcC` record damaged, the stream as
+Annex B cut anywhere), and nothing may panic, in a build that checks its
+arithmetic either: what a damaged stream's numbers add up to wraps.
+Pictures come
 back in decode order with the container's timestamps; `web/media.js`
 re-orders them for presentation, so the rest of the app (scan, sections,
 export, verify) does not know which decoder it is on. Scans and section
@@ -946,6 +952,10 @@ flipped, fields set to the values a size or a count hurts most with,
 bytes cut out and put in, the file cut short. Whatever the readers make
 of it will do, an error or a movie, but a panic (which ends the page) or
 a read that never ends; `MP4_FUZZ_ROUNDS=n` sets the rounds per file.
+`crates/unflash-h264/tests/robustness.rs` does the same to the H.264
+decoder's input (`H264_FUZZ_ROUNDS=n`), as the tests of the HEVC, VP9,
+VP8 and AV1 decoders do to theirs: a panic there ends a decode worker's
+module, and the scan with it.
 `crates/unflash-h264/tests/rewrite.rs` renumbers the parameter sets of
 every conformance stream and decodes it again, and splices GOPs of one
 encoding into another and checks the result in this decoder and in ffmpeg.
