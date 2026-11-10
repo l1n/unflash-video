@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dev-dependencies]
 unflash-mp4 = { path = "../unflash-mp4" }
+unflash-testkit = { path = "../unflash-testkit" }
 
 [lints]
 workspace = true

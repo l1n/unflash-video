@@ -289,17 +289,17 @@ fn flush_then_start_over() {
 fn repo_av1_mp4_matches_ffmpeg() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/av1.mp4");
     if !path.exists() {
-        eprintln!("{} missing (tests/media/gen.sh): skipped", path.display());
+        unflash_testkit::skipped(&format!("{} is missing (tests/media/gen.sh makes it)", path.display()));
         return;
     }
     let out = match Command::new("ffmpeg").args(["-v", "error", "-c:v", "libdav1d", "-i"]).arg(&path).args(["-autoscale", "0", "-fps_mode", "passthrough", "-f", "framemd5", "-pix_fmt", "yuv420p", "-"]).output() {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
-            eprintln!("ffmpeg could not decode it with libdav1d ({}): skipped", String::from_utf8_lossy(&o.stderr).trim());
+            unflash_testkit::skipped(&format!("ffmpeg could not decode tests/media/av1.mp4 with libdav1d ({})", String::from_utf8_lossy(&o.stderr).trim()));
             return;
         }
         Err(e) => {
-            eprintln!("ffmpeg not run ({e}): skipped");
+            unflash_testkit::skipped(&format!("ffmpeg was not run ({e}): tests/media/av1.mp4 is not compared with its decoding"));
             return;
         }
     };

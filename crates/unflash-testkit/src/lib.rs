@@ -10,6 +10,18 @@ use std::path::PathBuf;
 
 use unflash_codec::{Frame, VideoDecoder};
 
+/// A test, or part of one, cannot run for want of `what` (ffmpeg to compare
+/// with, media a script makes): it says so and goes without. Where nothing
+/// may be skipped (`UNFLASH_NO_SKIPS` set, as CI sets it, having ffmpeg and
+/// the media) that is a failure instead: a test that passes without having
+/// run tells nobody that it did not.
+pub fn skipped(what: &str) {
+    if std::env::var_os("UNFLASH_NO_SKIPS").is_some() {
+        panic!("{what} (and UNFLASH_NO_SKIPS is set: nothing may be skipped here)");
+    }
+    eprintln!("SKIPPED: {what}");
+}
+
 /// A file of the test media: `path` under `tests/media`.
 pub fn media(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media").join(path)

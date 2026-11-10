@@ -887,6 +887,7 @@ browser tests on it in parts side by side, on every push.
 
 ```
 cargo test --workspace                    # unit tests, the reference cross-check, GPU-vs-CPU (needs any Vulkan/Metal/DX12 adapter; lavapipe is enough)
+UNFLASH_REQUIRE_GPU=1 UNFLASH_NO_SKIPS=1 cargo test --workspace   # as CI runs them: a test that lacks its GPU adapter, ffmpeg or generated media fails, where it otherwise says SKIPPED and passes
 cargo clippy --workspace --exclude rav1d --all-targets --no-deps -- -D warnings   # the lints CI holds every crate to (Cargo.toml's [workspace.lints] says which are off)
 python3 tests/gen_fixtures.py             # regenerate the reference fixtures from unflash/analysis.py (needs numpy)
 python3 -m unittest discover -s tests/python   # the Python reference: still what the fixtures record, and its rules against the port's own cases (needs numpy)

@@ -1217,6 +1217,7 @@ dependencies = [
  "serde",
  "serde_json",
  "unflash-codec",
+ "unflash-testkit",
 ]
 
 [[package]]
@@ -1224,6 +1225,7 @@ name = "unflash-sound"
 version = "0.1.0"
 dependencies = [
  "unflash-mp4",
+ "unflash-testkit",
 ]
 
 [[package]]

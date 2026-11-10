@@ -60,7 +60,7 @@ fn check_track(name: &str, track: &unflash_mp4::Track, listing: &Path) {
 fn demux_matches_ffprobe() {
     let files = media_files();
     if files.is_empty() {
-        eprintln!("no media files; run tests/media/gen.sh");
+        unflash_testkit::skipped("no MP4 media: tests/media/gen.sh makes it");
         return;
     }
     for f in files {
@@ -106,7 +106,7 @@ fn has(cmd: &str) -> bool {
 fn mux_round_trip() {
     let src = media_dir().join("h264_bframes.mp4");
     if !src.exists() {
-        eprintln!("no media files; run tests/media/gen.sh");
+        unflash_testkit::skipped("no MP4 media: tests/media/gen.sh makes it");
         return;
     }
     let data = std::fs::read(&src).unwrap();
@@ -181,6 +181,6 @@ fn mux_round_trip() {
         let err = String::from_utf8_lossy(&dec.stderr);
         assert!(dec.status.success() && err.trim().is_empty(), "ffmpeg complained: {err}");
     } else {
-        eprintln!("ffmpeg not available; skipped the decode check");
+        unflash_testkit::skipped("ffmpeg is not installed: the muxed file is not decoded by it");
     }
 }

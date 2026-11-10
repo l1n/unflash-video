@@ -56,7 +56,7 @@ fn without_trailing_zeros(b: &[u8]) -> Vec<u8> {
 fn transport_streams_match_ffmpegs_mp4() {
     let files = streams();
     if files.is_empty() {
-        eprintln!("no transport streams; run tests/media/gen.sh");
+        unflash_testkit::skipped("no transport streams: tests/media/gen.sh makes them");
         return;
     }
     let mut checked = 0;
@@ -120,7 +120,7 @@ struct Packet {
 fn blu_ray_lpcm() {
     let path = dir().join("h264_lpcm.m2ts");
     let Ok(ts) = std::fs::read(&path) else {
-        eprintln!("no transport streams; run tests/media/gen.sh");
+        unflash_testkit::skipped("no transport streams: tests/media/gen.sh makes them");
         return;
     };
     let m = parse_bytes(&ts).unwrap();

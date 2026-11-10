@@ -104,7 +104,7 @@ fn ffmpeg_md5(file: &[u8], name: &str) -> Option<Vec<String>> {
     let out = match Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&path).args(["-f", "framemd5", "-"]).output() {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("ffmpeg not run ({e}): the cross-check is skipped");
+            unflash_testkit::skipped(&format!("ffmpeg was not run ({e}): the spliced file {name} is not checked in ffmpeg's decoder"));
             return None;
         }
     };

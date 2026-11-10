@@ -46,9 +46,13 @@ jobs:
         env:
           UNFLASH_REQUIRE_NUMPY: "1"
         run: python3 -B -m unittest discover -s tests/python
+      # here every test has what it needs (a GPU adapter, ffmpeg, the media
+      # made above): one that would go without says so by failing, where on
+      # a machine without them it says SKIPPED and passes
       - name: cargo test
         env:
           UNFLASH_REQUIRE_GPU: "1"
+          UNFLASH_NO_SKIPS: "1"
         run: cargo test --workspace --release
       - name: Benchmark (informational)
         timeout-minutes: 15

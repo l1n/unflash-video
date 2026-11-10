@@ -14,7 +14,7 @@ fn dir() -> PathBuf {
 #[test]
 fn pcm_packets_hold_the_sound() {
     let Ok(rd) = std::fs::read_dir(dir()) else {
-        eprintln!("no PCM media; run tests/media/gen.sh");
+        unflash_testkit::skipped("no PCM media: tests/media/gen.sh makes it");
         return;
     };
     let mut files: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| matches!(p.extension().and_then(|x| x.to_str()), Some("mov" | "mp4"))).collect();
