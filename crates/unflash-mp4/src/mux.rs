@@ -465,7 +465,10 @@ fn synth_av1c(codec: &str) -> Vec<u8> {
     let (level, tier) = parts
         .get(2)
         .map(|s| {
-            let lvl: u8 = s[..s.len().saturating_sub(1)].parse().unwrap_or(0);
+            // (all but its last character, which need not be one byte long)
+            let mut level = s.chars();
+            level.next_back();
+            let lvl: u8 = level.as_str().parse().unwrap_or(0);
             let tier = if s.ends_with('H') { 1u8 } else { 0 };
             (lvl, tier)
         })
@@ -505,5 +508,28 @@ mod tests {
         assert_eq!(out.iter().map(|o| o.1).collect::<Vec<_>>(), vec![1, 1, 1, 1, 1, 1, 1]);
         assert_eq!(dts_from_cts(&[0, 2, 4], 7), vec![(0, 2), (2, 2), (4, 7)]);
         assert!(dts_from_cts(&[], 1).is_empty());
+    }
+
+    /// An encoder that gives no record of its own gets one made from its
+    /// codec string: the profile, level, tier and depth the string names.
+    #[test]
+    fn records_made_from_codec_strings() {
+        // av1C: marker and version, profile|level, tier|high|twelve|mono|subsampling, no delay
+        assert_eq!(synth_av1c("av01.0.08M.08"), [0x81, 0x08, 0x0c, 0]);
+        assert_eq!(synth_av1c("av01.1.13H.10"), [0x81, 0x2d, 0xcc, 0]);
+        assert_eq!(synth_av1c("av01.2.19H.12"), [0x81, 0x53, 0xec, 0]);
+        // what a string leaves out: the main profile, level 0, the main tier, eight bits
+        assert_eq!(synth_av1c("av01"), [0x81, 0x00, 0x0c, 0]);
+        assert_eq!(synth_av1c("av01.0"), [0x81, 0x00, 0x0c, 0]);
+        // a string that is none is no panic (its level used to be cut out by bytes)
+        for odd in ["av01.0.", "av01.0.M", "av01.0.é", "av01.0.08é.08", "av01.x.y.z", "av01.9.99H.99", "é"] {
+            assert_eq!(synth_av1c(odd).len(), 4, "{odd}");
+        }
+        assert_eq!(synth_av1c("av01.0.é"), [0x81, 0x00, 0x0c, 0]);
+        // vpcC: profile, level, depth|4:2:0|limited range, BT.709 three times, no data
+        assert_eq!(synth_vpcc("vp09.00.10.08"), [0, 10, 0x82, 1, 1, 1, 0, 0]);
+        assert_eq!(synth_vpcc("vp09.02.41.10"), [2, 41, 0xa2, 1, 1, 1, 0, 0]);
+        assert_eq!(synth_vpcc("vp09"), [0, 10, 0x82, 1, 1, 1, 0, 0]);
+        assert_eq!(synth_vpcc("vp09.é.é.é"), [0, 10, 0x82, 1, 1, 1, 0, 0]);
     }
 }
