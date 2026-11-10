@@ -4,8 +4,8 @@
 // ends it wherever its lanes are.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { scanChunks, scanMovie } from '../../web/analysis.js';
-import { fakeEnv, fakeMovie, within } from './fakes.mjs';
+import { runupStart, scanChunks, scanMovie } from '../../web/analysis.js';
+import { fakeEnv, fakeMovie, sanitizeDeltas, within } from './fakes.mjs';
 
 // (a scan reports its timings at debug level)
 console.debug = () => {};
@@ -90,4 +90,63 @@ test('a film whose pictures share times is scanned whole, every picture of it', 
   const r = await scanMovie(env, movie, {});
   assert.equal(r.frames, 1800);
   assert.equal(fed.length, 1800);
+});
+
+/** A film of `seconds` at 30 pictures a second whose pictures from `at` seconds on are stamped `gap` seconds later. */
+function filmWithAJump(seconds, at, gap) {
+  const movie = fakeMovie({ seconds });
+  for (let i = at * 30; i < movie.v.pts.length; i++) movie.v.pts[i] += gap * 1e6;
+  movie.tsMax += gap;
+  return movie;
+}
+
+test("a segment's run-up is measured by the detector's clock, which steps over a jump in the timestamps", () => {
+  // twenty seconds of pictures, the second ten stamped ten seconds late (10 s to 20 s is missing)
+  const times = Array.from({ length: 600 }, (_, i) => (i < 300 ? i / 30 : i / 30 + 10));
+  const clock = sanitizeDeltas(times, 5).times;
+  assert.ok(Math.abs(clock[300] - 10) < 1e-9 && Math.abs(clock[599] - 599 / 30) < 1e-9, 'the clock runs on over the jump');
+  const near = (x, want) => assert.ok(Math.abs(x - want) < 1e-9, `${x}, not ${want}`);
+  // with no jump in the way, the run-up starts where it always did
+  const even = Array.from({ length: 600 }, (_, i) => i / 30);
+  near(runupStart(even, even, 10, 6.5), 3.5);
+  near(runupStart(even, even, 10.01, 6.5), 3.51);
+  near(runupStart(times, clock, 28, 6.5), 21.5);
+  near(runupStart(times, clock, 6, 6.5), -0.5);
+  // a seam in the jump: the run-up is the 6.5 s before the jump, not the jump itself
+  near(runupStart(times, clock, 15.5, 6.5), 3.5);
+  near(runupStart(times, clock, 20, 6.5), 3.5);
+  // a second after the jump: a second after it, and 5.5 s before
+  near(runupStart(times, clock, 21, 6.5), 4.5);
+  // past the film's end there is nothing to start at
+  near(runupStart(times, clock, 99, 6.5), 92.5);
+  near(runupStart([], [], 5, 6.5), -1.5);
+});
+
+test('a scan in segments starts each one a run-up early, across a jump in the timestamps too', async () => {
+  const fedBy = async (movie) => {
+    const { env, fed } = fakeEnv();
+    const others = [];
+    const r = await scanMovie(env, movie, {
+      segments: 2,
+      forceSegments: true,
+      makeFeeder: async () => {
+        const other = fakeEnv();
+        others.push(other.fed);
+        return other.feeder;
+      },
+    });
+    return { r, first: fed, second: others[0] };
+  };
+  // an even film of 30 s: the seam is just past 15.5 s (the scan's span ends a second past the last picture's end),
+  // so the picture at 15.5 s is the first segment's last, and the second starts its run-up 6.5 s before the seam
+  const even = await fedBy(fakeMovie({ seconds: 30 }));
+  assert.equal(even.r.segments, 2);
+  assert.deepEqual([even.first[0], even.first.length, even.second[0], even.second.length], [0, 466, 9, 630]);
+  assert.equal(even.r.frames, 900);
+  // twenty seconds of pictures with ten missing in the middle: the same seam now falls in the jump.
+  // The second segment's first picture is the one stamped 20 s, and its run-up the 6.5 s before the jump
+  const jump = await fedBy(filmWithAJump(20, 10, 10));
+  assert.deepEqual([jump.first[0], jump.first.length], [0, 300]);
+  assert.deepEqual([jump.second[0], jump.second.length], [3.5, 195 + 300]);
+  assert.equal(jump.r.frames, 600);
 });

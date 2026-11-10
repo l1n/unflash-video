@@ -547,6 +547,94 @@ mod tests {
         assert_eq!(got.safe(), want.safe());
     }
 
+    /// A film whose timestamps jump (ten seconds missing after its tenth
+    /// second) is flashing either side of the jump. One run steps its clock
+    /// over the jump by the median frame step, so the flashing before and
+    /// after is one stretch. Scanned in two segments with the seam at the
+    /// jump, the second started a run-up early by the detector's clock (the
+    /// frames before the jump), the merged result is the one run's: its
+    /// clock, its count of jumps, its violations. (The merge stepped the
+    /// clock at such a seam by the longest step it takes, five seconds, and
+    /// counted a jump inside a run-up twice.)
+    #[test]
+    fn segments_whose_seam_is_at_a_jump_in_the_timestamps_merge_into_the_sequential_run() {
+        use crate::sections::context_seconds;
+        use crate::temporal::{merge_segments, Segment};
+        let cfg = Profile::WcagExt.config();
+        let (aw, ah) = (64u32, 48u32);
+        let n = (aw * ah) as usize;
+        // 20 s of pictures at 30 a second; from the tenth second on they are stamped ten seconds later,
+        // and two more (at 5 s) share a time: flashing from 8.5 s to 1.5 s past the jump
+        let total = 20 * 30;
+        let stamp = |i: usize| -> f64 {
+            let t = i as f64 / 30.0;
+            if i == 151 {
+                150.0 / 30.0
+            } else if t < 10.0 {
+                t
+            } else {
+                t + 10.0
+            }
+        };
+        let frame = |i: usize| -> Vec<u8> {
+            let t = i as f64 / 30.0;
+            let c = if (8.5..11.5).contains(&t) {
+                if ((t * 8.0).floor() as i64) % 2 == 0 { 30 } else { 200 }
+            } else {
+                90 + (i % 2) as u8
+            };
+            vec![c; n * 3]
+        };
+        let mut seq = CpuDetector::new(cfg.clone(), aw, ah);
+        for i in 0..total {
+            seq.feed(stamp(i), FrameInput::rgb(&frame(i)));
+        }
+        let want = seq.finish();
+        // (the repeated time, and the jump)
+        assert_eq!(want.anomalies, 2);
+        let flash: Vec<_> = want.violations.iter().filter(|v| v.kind == ViolationKind::Flash).collect();
+        assert!(flash.len() == 1 && flash[0].start < 10.0 && flash[0].end > 20.0, "one stretch of flashing across the jump: {:?}", want.violations);
+
+        // the seam in the jump (15 s: no picture is stamped there), and before it (6 s: the jump is the second
+        // segment's own); either way the repeated time is in the second segment's run-up, and so counted by both
+        for (seam, anomalies_in_runups) in [(15.0, 1usize), (6.0, 1)] {
+            let runup = context_seconds(&cfg);
+            // the first frame of the second segment, and the frame its run-up starts at: `runup` seconds
+            // before it by the one run's clock, which is what the detector has to have seen
+            let first = (0..total).find(|&i| stamp(i) >= seam).unwrap();
+            let clock = &want.frame_stats.tc;
+            let start = (0..first).find(|&i| clock[first] - clock[i] <= runup).unwrap();
+            let mut a = CpuDetector::new(cfg.clone(), aw, ah);
+            let mut b = CpuDetector::new(cfg.clone(), aw, ah);
+            for i in 0..total {
+                if i < first {
+                    a.feed(stamp(i), FrameInput::rgb(&frame(i)));
+                }
+                if i >= start {
+                    b.feed(stamp(i), FrameInput::rgb(&frame(i)));
+                }
+            }
+            let (ra, rb) = (a.finish(), b.finish());
+            assert_eq!(ra.anomalies + rb.anomalies, want.anomalies + anomalies_in_runups, "seam at {seam}");
+            let got = merge_segments(&cfg, a.geometry(), &[Segment { from: 0.0, result: ra }, Segment { from: seam, result: rb }]);
+            assert_eq!(got.frame_stats.t, want.frame_stats.t, "seam at {seam}");
+            for (i, (x, y)) in got.frame_stats.tc.iter().zip(&want.frame_stats.tc).enumerate() {
+                assert!((x - y).abs() < 1e-9, "seam at {seam}: the clock at frame {i} is {x}, one run's {y}");
+            }
+            assert_eq!(got.anomalies, want.anomalies, "seam at {seam}");
+            assert_eq!(got.frame_stats.hazard, want.frame_stats.hazard, "seam at {seam}");
+            assert_eq!(got.frame_stats.ext, want.frame_stats.ext, "seam at {seam}");
+            assert_eq!(got.frame_stats.held, want.frame_stats.held, "seam at {seam}");
+            assert_eq!(got.violations.len(), want.violations.len(), "seam at {seam}: {:?} against {:?}", got.violations, want.violations);
+            for (g, w) in got.violations.iter().zip(&want.violations) {
+                assert_eq!((g.kind, g.start, g.end, g.peak, g.count), (w.kind, w.start, w.end, w.peak, w.count), "seam at {seam}");
+                assert!((g.onset - w.onset).abs() < 1e-9, "seam at {seam}: onset {} against {}", g.onset, w.onset);
+            }
+            assert_eq!(got.duration, got.frame_stats.tc[total - 1]);
+            assert!((got.duration - want.duration).abs() < 1e-9);
+        }
+    }
+
     #[test]
     fn detector_split_api_matches_cpu_detector() {
         let cfg = Profile::Wcag.config();

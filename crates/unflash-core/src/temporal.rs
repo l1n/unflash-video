@@ -248,12 +248,22 @@ pub struct Segment {
 /// shifted with it) and the violations are derived from them once, exactly
 /// as [`Temporal::finish`] derives them for one run. The segments must be in
 /// order and each must carry its per-frame statistics.
+///
+/// The clock crosses a seam as one run's would: by the timestamps' own step
+/// or, where they jump there (a gap in a recording) or do not go forwards,
+/// by the median of the steps before, which [`Clock`] works out from the
+/// frames kept so far. (For that to be the whole of it, a segment's run-up
+/// has to be as long by the detector's clock as a run-up is: a caller
+/// measures it across such a jump, not in the file's time.) The jumps are
+/// counted the same way, once each: a segment counts those of its run-up
+/// too.
 pub fn merge_segments(cfg: &DetectorConfig, geom: &GridGeometry, segments: &[Segment]) -> AnalysisResult {
     let mut stats = FrameStats::default();
     let mut events = Vec::new();
     let mut held = 0usize;
-    let mut anomalies = 0usize;
-    let mut last: Option<(f64, f64)> = None; // native time and clock of the last frame kept
+    // the clock of one run over the frames kept: its steps across the seams, and its count of jumps
+    let mut one_run = Clock::new(cfg.max_frame_gap);
+    let mut last_tc: Option<f64> = None; // the merged clock at the last frame kept
     for (si, seg) in segments.iter().enumerate() {
         let s = &seg.result.frame_stats;
         let n = s.len();
@@ -262,12 +272,16 @@ pub fn merge_segments(cfg: &DetectorConfig, geom: &GridGeometry, segments: &[Seg
             continue;
         }
         // the clock a run from the start would show at this segment's first
-        // frame: the previous frame's clock plus the native step between them
-        let shift = match last {
-            Some((lt, ltc)) => ltc + (s.t[first] - lt).max(0.0).min(cfg.max_frame_gap) - s.tc[first],
+        // frame: the previous frame's clock plus the step one run takes there
+        let step = one_run.step(s.t[first]);
+        let shift = match last_tc {
+            Some(ltc) => ltc + step - s.tc[first],
             None => 0.0,
         };
         for i in first..n {
+            if i > first {
+                one_run.step(s.t[i]);
+            }
             stats.t.push(s.t[i]);
             stats.tc.push(s.tc[i] + shift);
             stats.lum.push(s.lum[i]);
@@ -297,10 +311,9 @@ pub fn merge_segments(cfg: &DetectorConfig, geom: &GridGeometry, segments: &[Seg
                 events.push(e);
             }
         }
-        anomalies += seg.result.anomalies;
-        last = Some((s.t[n - 1], s.tc[n - 1] + shift));
+        last_tc = Some(s.tc[n - 1] + shift);
     }
-    Temporal::with_outcome(cfg.clone(), geom.clone(), stats, events, held, anomalies).finish(true)
+    Temporal::with_outcome(cfg.clone(), geom.clone(), stats, events, held, one_run.anomalies).finish(true)
 }
 
 /// The internal monotonic clock that bridges source timestamp

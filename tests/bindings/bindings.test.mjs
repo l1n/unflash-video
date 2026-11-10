@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { PROFILES } from '../../web/project.js';
+import { sanitizeDeltas } from '../unit/fakes.mjs';
 
 const glue = new URL('../../web/pkg/unflash.js', import.meta.url);
 const module = new URL('../../web/pkg/unflash_bg.wasm', import.meta.url);
@@ -118,6 +119,14 @@ it('timestamps that span years (a damaged file) make lists a page can hold, not 
 it("a section's frame times, as the page asks for them", () => {
   assert.deepEqual(JSON.parse(wasm.sanitize_deltas(Float64Array.of(0, 0.25, 0.5, 0.125, 9, 9.25), 5)), { times: [0, 0.25, 0.5, 0.75, 1, 1.25], fixed: 2 });
   assert.deepEqual(JSON.parse(wasm.sanitize_deltas(new Float64Array(), 5)), { times: [], fixed: 0 });
+  // the detector's clock over a film with ten seconds missing and two pictures sharing a time, against the
+  // stand-in the unit tests give a scan (tests/unit/fakes.mjs): the same clock, the same two jumps
+  const jumpy = Float64Array.from({ length: 600 }, (_, i) => (i === 151 ? 150 / 30 : i < 300 ? i / 30 : i / 30 + 10));
+  const real = JSON.parse(wasm.sanitize_deltas(jumpy, 5));
+  const standIn = sanitizeDeltas(Array.from(jumpy), 5);
+  assert.deepEqual([real.fixed, standIn.fixed], [2, 2]);
+  assert.ok(real.times.every((t, i) => Math.abs(t - standIn.times[i]) < 1e-9));
+  assert.ok(Math.abs(real.times[300] - real.times[299] - 1 / 30) < 1e-9, 'over the jump the clock takes a frame\'s step');
   assert.equal(wasm.median_dt(Float64Array.of(0, 0.25, 0.25, 0.5, 1)), 0.25);
   assert.equal(wasm.median_dt(Float64Array.of(2)), 1 / 30);
 
@@ -348,6 +357,39 @@ it('the detector, fed as the page feeds it', () => {
     odd.free();
   }
   for (const x of [det, cache, wrong]) x.free();
+});
+
+it('a film scanned in two segments, the seam at a jump in its timestamps, is judged as one run judges it', () => {
+  const cfg = wasm.profile_config('wcag');
+  const runup = wasm.context_seconds(cfg);
+  const [w, h] = [256, 192];
+  // twelve seconds of pictures at 30 a second, the second six stamped ten seconds late; flashing from 4 s to 7 s of them
+  const stamp = (i) => (i < 180 ? i / 30 : i / 30 + 10);
+  const pictures = [flat(w, h, [30, 30, 30]), flat(w, h, [200, 200, 200]), flat(w, h, [90, 90, 90]), flat(w, h, [91, 91, 91])];
+  const picture = (i) => (i >= 120 && i < 210 ? pictures[Math.floor((i / 30) * 8) % 2] : pictures[2 + (i % 2)]);
+  const run = (from, to) => {
+    const det = new wasm.Detector(cfg, w, h);
+    for (let i = from; i < to; i++) det.feed_rgba(picture(i), w, h, stamp(i), false);
+    const result = JSON.parse(det.finish(true));
+    det.free();
+    return result;
+  };
+  const one = run(0, 360);
+  assert.deepEqual([one.frames, one.anomalies, one.violations.map((v) => v.kind)], [360, 1, ['flash']]);
+  assert.ok(one.violations[0].start < 6 && one.violations[0].end > 16, 'the flashing either side of the jump is one stretch');
+  // the seam in the jump; the second segment's run-up by the detector's clock, as the page measures it
+  const seam = 11;
+  const times = Float64Array.from({ length: 360 }, (_, i) => stamp(i));
+  const clock = JSON.parse(wasm.sanitize_deltas(times, JSON.parse(cfg).max_frame_gap)).times;
+  const start = clock.findIndex((c) => clock[180] - c <= runup + 1e-9);
+  assert.equal(start, 180 - Math.round(runup * 30));
+  const merged = JSON.parse(wasm.merge_scan_segments(cfg, w, h, JSON.stringify([{ from: 0, result: run(0, 180) }, { from: seam, result: run(start, 360) }])));
+  assert.deepEqual([merged.frames, merged.anomalies], [one.frames, one.anomalies]);
+  assert.deepEqual(merged.frame_stats.t, one.frame_stats.t);
+  assert.ok(merged.frame_stats.tc.every((c, i) => Math.abs(c - one.frame_stats.tc[i]) < 1e-9), 'the same clock at every frame');
+  assert.deepEqual(merged.frame_stats.hazard, one.frame_stats.hazard);
+  assert.deepEqual(merged.violations.map((v) => [v.kind, v.start, v.end, v.peak, v.count]), one.violations.map((v) => [v.kind, v.start, v.end, v.peak, v.count]));
+  assert.match(refusal(() => wasm.merge_scan_segments(cfg, w, h, 'none')), /^bad segments: /);
 });
 
 /** A file of `samples` (each { bytes, dts, pts, duration, sync }, in ticks) on one VP9 track, as an export writes it. */

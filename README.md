@@ -609,7 +609,10 @@ from where it began, however long ago, and a pixel still since some change
 long before keeps where that change left its monotonic run (the phase of
 the two-second run cap, and which way it last moved), which a fresh
 detector does not know. At a seam in the middle of flashing that moved a
-violation's edge by four frames in the browser test. The segments remain
+violation's edge by four frames in the browser test. (Where a recording's
+timestamps jump, the detector's clock steps over the jump, and so do a
+segment's run-up, measured by that clock rather than in the file's time,
+and the joined clock at a seam that falls in the jump.) The segments remain
 behind `?chunked=0` (with `?segments=N` to force a count); a file shorter
 than four run-ups per segment is scanned in one.
 

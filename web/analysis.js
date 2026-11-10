@@ -76,6 +76,34 @@ function scanResult(env, movie, result, trace, frames, elapsedMs, what) {
 }
 
 /**
+ * Where a segment that begins at `from` starts decoding: a run-up before
+ * it, `runup` seconds by the detector's clock, which is what its detector
+ * has to have seen to be where one run would be. In a film whose timestamps
+ * run evenly that is `from - runup`. Where they jump inside that stretch (a
+ * gap in a recording), the detector's clock steps over the jump as if it
+ * were not there, so the frames before the jump are run-up too: counted in
+ * the file's time, a segment that began after a ten-second gap had no
+ * run-up at all, and flashing that ran across the gap was two stretches.
+ * `times` are the film's presentation times in order (seconds), `clock`
+ * the detector's clock at each of them (`sanitize_deltas`).
+ */
+export function runupStart(times, clock, from, runup) {
+  // the segment's first frame: the first at or after `from`
+  let lo = 0;
+  let hi = times.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (times[mid] < from - 1e-9) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo >= times.length) return from - runup;
+  // the earliest frame no more than `runup` before it by the clock
+  let i = lo;
+  while (i > 0 && clock[lo] - clock[i - 1] <= runup + 1e-9) i--;
+  return Math.min(from - runup, times[i]);
+}
+
+/**
  * Whole-video scan. With `segments` above one and a `makeFeeder`, the file
  * is cut into that many spans scanned at the same time, each by its own
  * decoder and detector, every span after the first starting a run-up early
@@ -99,6 +127,15 @@ export async function scanMovie(env, movie, { onProgress, onPartial = null, canc
   if (!forceSegments) nseg = Math.min(nseg, Math.max(1, Math.floor(span / (MIN_SEGMENT_RUNUPS * runup))));
   const bounds = [];
   for (let k = 0; k < nseg; k++) bounds.push({ from: movie.tsMin + (span * k) / nseg, to: k + 1 < nseg ? movie.tsMin + (span * (k + 1)) / nseg : end });
+  // where each segment after the first starts decoding: `runup` before it,
+  // or further back where the timestamps jump inside that (runupStart)
+  let runupFrom = (from) => from - runup;
+  if (nseg > 1) {
+    const times = Float64Array.from(movie.v.pts).sort();
+    for (let i = 0; i < times.length; i++) times[i] /= 1e6;
+    const san = JSON.parse(wasm.sanitize_deltas(times, JSON.parse(config).max_frame_gap));
+    if (san.fixed) runupFrom = (from) => runupStart(times, san.times, from, runup);
+  }
   // detectors from `moreFeeders` are lent (kept by the caller), from `makeFeeder` made for this scan
   const feeders = [feeder];
   if (nseg > 1 && moreFeeders) feeders.push(...(await moreFeeders(nseg - 1)));
@@ -141,7 +178,7 @@ export async function scanMovie(env, movie, { onProgress, onPartial = null, canc
     const reader = k > 0 ? movie.reader.fork() : null;
     await decodeRange(
       movie,
-      k === 0 ? from : Math.max(movie.tsMin, from - runup),
+      k === 0 ? from : Math.max(movie.tsMin, runupFrom(from)),
       to,
       async (frame, t) => {
         await f.videoFrame(frame, t, false);

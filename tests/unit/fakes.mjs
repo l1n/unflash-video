@@ -105,8 +105,47 @@ export function fakeEnv({ feedMs = 0, failAt = -1 } = {}) {
     finish: () => ({ violations: [] }),
     partialVerdict: () => ({ violations: [], flag_extended: false, flag_patterns: false }),
   };
-  const wasm = { context_seconds: () => 6.5, violations_to_sections: () => '[]', timeline_summary: () => '{}' };
-  return { env: { wasm, config: '{}', feeder }, fed };
+  const wasm = {
+    context_seconds: () => 6.5,
+    violations_to_sections: () => '[]',
+    timeline_summary: () => '{}',
+    sanitize_deltas: (times, maxGap) => JSON.stringify(sanitizeDeltas(Array.from(times), maxGap === undefined ? 5 : maxGap)),
+    merge_scan_segments: () => JSON.stringify({ violations: [] }),
+  };
+  return { env: { wasm, config: '{}', feeder }, fed, feeder };
+}
+
+/**
+ * The detector's clock over `times`, as the module's sanitize_deltas gives
+ * it (`Clock` in crates/unflash-core): a step that does not go forwards, or
+ * is longer than `maxGap`, is taken as the median of the last 120 good ones
+ * (a thirtieth of a second before there is one). tests/bindings holds the
+ * module's to the case the unit tests use.
+ */
+export function sanitizeDeltas(times, maxGap) {
+  const out = [];
+  const recent = [];
+  let fixed = 0;
+  let at = times.length ? times[0] : 0;
+  for (let i = 0; i < times.length; i++) {
+    let step = 0;
+    if (i > 0) {
+      const dt = times[i] - times[i - 1];
+      if (dt <= 0 || dt > maxGap) {
+        fixed++;
+        const sorted = [...recent].sort((a, b) => a - b);
+        const n = sorted.length;
+        step = n ? (n % 2 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2) : 1 / 30;
+      } else {
+        step = dt;
+        recent.push(dt);
+        if (recent.length > 120) recent.shift();
+      }
+    }
+    at += step;
+    out.push(at);
+  }
+  return { times: out, fixed };
 }
 
 /** `promise`'s outcome, or 'pending' if it has none after `ms`. */
