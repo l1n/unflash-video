@@ -38,11 +38,14 @@ jobs:
           ffmpeg -version | head -1
       - name: Test media
         run: bash tests/media/gen.sh
-      - name: Reference fixtures are up to date (informational)
-        continue-on-error: true
-        run: |
-          python3 tests/gen_fixtures.py
-          git diff --exit-code -- tests/fixtures
+      # the Python reference still sees what the fixtures record (cargo test
+      # below holds the Rust port to those), its profiles are the ones in
+      # the fixtures' profiles.json, and its rules give the answers the
+      # port's tests ask of the port
+      - name: Python reference
+        env:
+          UNFLASH_REQUIRE_NUMPY: "1"
+        run: python3 -B -m unittest discover -s tests/python
       - name: cargo test
         env:
           UNFLASH_REQUIRE_GPU: "1"

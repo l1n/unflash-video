@@ -6,7 +6,9 @@ procedurally generated frame sequences and writes what it saw to
 tests/fixtures/*.json. The Rust integration test
 crates/unflash-core/tests/reference_fixtures.rs regenerates the identical
 frames (checked by CRC-32) and asserts the port produces the same per-frame
-hazard areas, events and violations.
+hazard areas, events and violations. The profiles' settings go beside them
+(profiles.json), and the port's profiles must have the same.
+tests/python/test_detector.py holds the reference itself to all of it.
 
     python3 tests/gen_fixtures.py
 
@@ -24,7 +26,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from unflash.analysis import FlashDetector  # noqa: E402
-from unflash.config import profile_config  # noqa: E402
+from unflash.config import PROFILES, profile_config  # noqa: E402
 
 W, H = 128, 96
 OUT = os.path.join(ROOT, "tests", "fixtures")
@@ -280,6 +282,12 @@ def run(name, ts, frames, profile):
           f"warnings={[(w.level, w.kind, round(w.start, 2), round(w.end, 2)) for w in res.warnings]}")
 
 
+def profiles_text():
+    """Every profile's settings, as tests/fixtures/profiles.json holds them:
+    the Rust port's profiles must have the same (reference_fixtures.rs)."""
+    return json.dumps({name: profile_config(name).to_dict() for name in sorted(PROFILES)}, indent=1, sort_keys=True) + "\n"
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     names = sys.argv[1:] or list(SCENARIOS)
@@ -288,6 +296,9 @@ def main():
         ts, frames = gen()
         for profile in profiles:
             run(name, ts, frames, profile)
+    if not sys.argv[1:]:
+        with open(os.path.join(OUT, "profiles.json"), "w") as f:
+            f.write(profiles_text())
 
 
 if __name__ == "__main__":

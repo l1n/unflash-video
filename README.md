@@ -888,6 +888,7 @@ browser tests on it in parts side by side, on every push.
 cargo test --workspace                    # unit tests, the reference cross-check, GPU-vs-CPU (needs any Vulkan/Metal/DX12 adapter; lavapipe is enough)
 cargo clippy --workspace --exclude rav1d --all-targets --no-deps -- -D warnings   # the lints CI holds every crate to (Cargo.toml's [workspace.lints] says which are off)
 python3 tests/gen_fixtures.py             # regenerate the reference fixtures from unflash/analysis.py (needs numpy)
+python3 -m unittest discover -s tests/python   # the Python reference: still what the fixtures record, and its rules against the port's own cases (needs numpy)
 bash tests/media/gen.sh                   # demuxer/muxer test files: MP4, MKV, PCM, transport streams and ffmpeg's MP4 of each (needs ffmpeg)
 bash tests/media/h264/gen.sh              # H.264 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libx264)
 cargo run --release -p unflash-h264 --example compare -- file.mp4   # decode any MP4 and diff every frame against ffmpeg
@@ -919,7 +920,15 @@ node tests/e2e/site.mjs                   # the site as published: each build's 
 
 `crates/unflash-core/tests/reference_fixtures.rs` regenerates the frames the
 Python detector was run on (CRC-checked) and asserts identical per-frame
-hazard areas, events, violations and verdicts on all fixtures.
+hazard areas, events, violations and verdicts on all fixtures, and that
+every setting of the reference's three profiles (`profiles.json` beside
+them) is the port's. `tests/python/` holds the reference to the same
+fixtures from its side (run again over the scenes, it must still see what
+they record: a change to the detector that moves a number fails there,
+and the fixtures are then made again on purpose), and its rules that need
+no video (marks into an edited timeline, sections around violations, the
+rate no profile can fail, frame times made sane) to the very cases the
+port's unit tests use, so neither can drift from the other unnoticed.
 `crates/unflash-gpu/tests/gpu_vs_cpu.rs` compares the entire per-pixel state
 of the GPU stage with the CPU kernel after every frame, and the pattern mask
 and statistics on striped frames. `crates/unflash-h264/tests/streams.rs`

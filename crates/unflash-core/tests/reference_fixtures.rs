@@ -441,6 +441,8 @@ fn matches_python_reference() {
         .unwrap_or_else(|e| panic!("no fixtures in {}: {e}; run tests/gen_fixtures.py", dir.display()))
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+        // (the profiles' settings: profiles_match_python_reference)
+        .filter(|p| p.file_name().map(|n| n != "profiles.json").unwrap_or(false))
         .collect();
     paths.sort();
     assert!(!paths.is_empty(), "no fixtures found in {}", dir.display());
@@ -448,5 +450,37 @@ fn matches_python_reference() {
         let fix: Fixture = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         check(&fix);
         eprintln!("ok  {} ({}): {} frames, {} violations, {} warnings", fix.name, fix.profile, fix.t.len(), fix.violations.len(), fix.warnings.len());
+    }
+}
+
+/// The profiles are the reference's: every setting the Python detector has
+/// (`tests/fixtures/profiles.json`, written by `tests/gen_fixtures.py`) the
+/// port has, with the same value. The scenes above only show a wrong value
+/// where one of them leans on it; this holds them all. What the port has
+/// beyond the reference are the settings of the stripe pattern test, which
+/// the reference does not have.
+#[test]
+fn profiles_match_python_reference() {
+    let path = fixtures_dir().join("profiles.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}; run tests/gen_fixtures.py", path.display()));
+    let reference: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>> = serde_json::from_str(&text).unwrap();
+    assert_eq!(reference.keys().map(String::as_str).collect::<Vec<_>>(), ["strict", "wcag", "wcag_ext"]);
+    assert_eq!(Profile::ALL.len(), reference.len());
+    for (name, theirs) in &reference {
+        let config = Profile::from_name(name).unwrap_or_else(|| panic!("the port has no profile {name}")).config();
+        let ours = serde_json::to_value(&config).unwrap();
+        let ours = ours.as_object().unwrap();
+        assert!(theirs.len() > 25, "{name}: only {} settings in the reference's file", theirs.len());
+        for (key, want) in theirs {
+            let got = ours.get(key).unwrap_or_else(|| panic!("{name}: the port has no setting {key}"));
+            // (1024 and 1024.0 are one setting; the port keeps what the pixel
+            // kernels read as 32-bit floats, so 0.8 is the nearest of those)
+            match (got.as_f64(), want.as_f64()) {
+                (Some(a), Some(b)) => assert_eq!(a as f32, b as f32, "{name}: {key}"),
+                _ => assert_eq!(got, want, "{name}: {key}"),
+            }
+        }
+        let more: Vec<&String> = ours.keys().filter(|k| !theirs.contains_key(*k)).collect();
+        assert!(!more.is_empty() && more.iter().all(|k| k.starts_with("pattern_")), "{name}: settings the reference lacks: {more:?}");
     }
 }
