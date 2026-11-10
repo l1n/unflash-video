@@ -120,6 +120,15 @@ jobs:
           wasm-bindgen --version
       - name: Build
         run: ./build.sh release
+      # the module as the page calls it, in Node: what crosses as JSON, what
+      # is refused and in what words, and that nothing asked of it traps
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: The bindings, in Node
+        env:
+          UNFLASH_NO_SKIPS: "1"
+        run: node --test tests/bindings/bindings.test.mjs
       # the synthetic clips only change with their generator: kept in the
       # cache, and made (with ffmpeg and numpy) only when it misses
       - name: Synthetic videos, from the cache

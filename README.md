@@ -908,6 +908,7 @@ cargo run --release -p unflash-sound --example fate -- ac3 dir   # AC-3 and E-AC
 bash tests/media/dts/gen.sh               # DTS decoder test streams, from ffmpeg's encoder (the tests compare with ffmpeg's decoder when it is installed)
 cargo run --release -p unflash-sound --example fate -- dts dir   # DTS and DTS-HD files (ffmpeg's FATE samples) against ffmpeg's decode of their core
 node --test --test-force-exit "tests/unit/*.test.mjs"   # the page's own logic in Node: no browser, no build, under a second
+node --test tests/bindings/bindings.test.mjs   # the WebAssembly module as the page calls it, in Node (after ./build.sh; SKIPPED without the build)
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
 node tests/e2e/tour.mjs                   # the guided tour, on a first visit and after an update
@@ -960,6 +961,20 @@ exists), a transport stream's samples found again in packets built by
 hand, and PCM in every form. They run in a quarter of a second, so they
 are the place for a rule's corner cases; the browser tests below are for
 what only a browser can show.
+`tests/bindings/` calls the built module (`web/pkg`) the way the page does,
+also in Node: every profile's settings and what is derived from them,
+sections and the per-second summary from a scan's violations, a section's
+frame times, its marks (what each frame shows, when, where the picture
+waits), a check's violations sorted by where they land, thinning to a rate,
+the frame cache (joined, blended, blurred), pictures made small, the CPU
+detector fed in every form it takes, and an export written by the muxer
+and read back by the demuxer. Each holds the JSON to the shape the page
+reads, and each asks for what cannot be done (a file that is no video, a
+record that is none, a picture too short for its size, a number typed
+wrong) and requires an exception that says why, never a trap, which would
+end the module for the page; timestamps spanning years, as a damaged file
+can have, must make lists a page can hold (they used to make one that
+killed it).
 `tests/e2e/run.mjs` scans, edits, blends, softens, exports and verifies the
 synthetic clips in headless Chromium, including the H.264 clip through the
 built-in decoder (the test browser has no H.264); the VP9 exports copy
