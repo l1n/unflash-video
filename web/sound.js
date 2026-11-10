@@ -181,8 +181,9 @@ const WINDOW_S = 20;
 const WAKE_MS = 1500;
 /** What a codec string is called where people see it. */
 const CODEC_NAMES = [
-  [/^mp4a\.40\./, 'AAC'],
+  // (MP3 before AAC: mp4a.40.34 is MP3 carried as MPEG-4 audio, and the first rule to fit names the codec)
   [/^(mp3|mp4a\.6b|mp4a\.69|mp4a\.40\.34)$/i, 'MP3'],
+  [/^mp4a\.40\./, 'AAC'],
   [/^opus$/, 'Opus'],
   [/^vorbis$/, 'Vorbis'],
   [/^flac$/, 'FLAC'],

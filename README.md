@@ -958,7 +958,9 @@ soften rules (the blend's with the very cases the Rust is held to),
 project files read back and made safe, the changelog (this repository's
 own among them: every change timed, with its film and a tour that
 exists), a transport stream's samples found again in packets built by
-hand, and PCM in every form. They run in a quarter of a second, so they
+hand, PCM in every form, and where each sample of the sound lands once
+frames are held (sixty random layouts of holds, in whatever pieces the
+sound arrives). They run in a quarter of a second, so they
 are the place for a rule's corner cases; the browser tests below are for
 what only a browser can show.
 `tests/bindings/` calls the built module (`web/pkg`) the way the page does,
