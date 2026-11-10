@@ -877,14 +877,15 @@ site as it stands, which lists its builds and their files' hashes in
 older one says so and offers *new version: reload* in the header; the debug
 report names the build. `node site.mjs OUT --build ID [--keep-from URL|DIR]`
 makes one by hand (after `./build.sh`); `tests/e2e/site.mjs` tests it.
-`.github/workflows/ci.yml` runs the Rust tests (on lavapipe), builds the
-WASM once and runs the browser tests on it in parts side by side, on every
-push.
+`.github/workflows/ci.yml` runs the Rust tests (on lavapipe), lints every
+crate (clippy, on a pinned toolchain), builds the WASM once and runs the
+browser tests on it in parts side by side, on every push.
 
 ## Testing
 
 ```
 cargo test --workspace                    # unit tests, the reference cross-check, GPU-vs-CPU (needs any Vulkan/Metal/DX12 adapter; lavapipe is enough)
+cargo clippy --workspace --exclude rav1d --all-targets --no-deps -- -D warnings   # the lints CI holds every crate to (Cargo.toml's [workspace.lints] says which are off)
 python3 tests/gen_fixtures.py             # regenerate the reference fixtures from unflash/analysis.py (needs numpy)
 bash tests/media/gen.sh                   # demuxer/muxer test files: MP4, MKV, PCM, transport streams and ffmpeg's MP4 of each (needs ffmpeg)
 bash tests/media/h264/gen.sh              # H.264 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libx264)

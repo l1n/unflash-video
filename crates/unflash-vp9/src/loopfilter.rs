@@ -110,7 +110,6 @@ pub struct Run {
 }
 
 /// The superblock loop filter process (8.8.2) for one plane and direction.
-#[allow(clippy::too_many_arguments)]
 fn filter_superblock<T: Pixel>(data: &mut [T], stride: usize, mi: &[MiInfo], mi_rows: usize, mi_cols: usize, levels: &Levels, plane: usize, pass: usize, row: usize, col: usize, bd: u32) {
     let s = (plane > 0) as usize;
     for edge in 0..16 >> s {

@@ -643,21 +643,19 @@ impl FrameDecoder {
         }
 
         // exponent strategies
-        let cplexpstr;
-        let lfeexpstr;
-        if eac3 {
-            cplexpstr = if cplinu { af.cplexpstr[blk] } else { 0 };
+        let (cplexpstr, lfeexpstr) = if eac3 {
+            let cpl = if cplinu { af.cplexpstr[blk] } else { 0 };
             for ch in 0..nfch {
                 self.alloc[ch].expstr = af.chexpstr[blk][ch];
             }
-            lfeexpstr = if h.lfeon { af.lfeexpstr[blk] } else { 0 };
+            (cpl, if h.lfeon { af.lfeexpstr[blk] } else { 0 })
         } else {
-            cplexpstr = if cplinu { b.read(2) as u8 } else { 0 };
+            let cpl = if cplinu { b.read(2) as u8 } else { 0 };
             for ch in 0..nfch {
                 self.alloc[ch].expstr = b.read(2) as u8;
             }
-            lfeexpstr = if h.lfeon { b.read(1) as u8 } else { 0 };
-        }
+            (cpl, if h.lfeon { b.read(1) as u8 } else { 0 })
+        };
         for ch in 0..nfch {
             if self.alloc[ch].expstr != 0 && !self.fbw[ch].incpl && !self.fbw[ch].inspx {
                 let c = b.read(6) as u8;

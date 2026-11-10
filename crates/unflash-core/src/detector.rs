@@ -420,7 +420,7 @@ mod tests {
             // a drifting texture (new pictures, no flashing)
             for y in 0..ah as usize {
                 for x in 0..aw as usize {
-                    let c = if ((x + i / 3) / 20 + y / 20) % 2 == 0 { 110 } else { 80 };
+                    let c = if ((x + i / 3) / 20 + y / 20).is_multiple_of(2) { 110 } else { 80 };
                     let k = (y * aw as usize + x) * 3;
                     f[k] = c;
                     f[k + 1] = c;

@@ -144,7 +144,6 @@ fn tracker_feed8(t: &mut Tr8, x: f32x8, aux: u32x8, now: u32x8, eps: f32x8, max_
 }
 
 /// Flash pairing and rate ring for eight pixels of one kind.
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn counter8(
     ring: &mut [u32],
@@ -193,7 +192,6 @@ fn counter8(
 
 /// [`counter8`] without the opening times (the close calls' counter keeps
 /// none).
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn warn_counter8(
     ring: &mut [u32],
@@ -392,7 +390,7 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
             flags = (flags & !(dir_mask << WARN_PEND_SHIFT)) | (pend_pol << WARN_PEND_SHIFT);
             let fresh_m = age_le(now, ld_u(&st.warn_last, i), fresh);
             let ws = fresh_m & age_lt(now, ld_u(&st.warn_ring, kw * n + i), rate);
-            mask = mask | (ws & u32x8::splat(MASK_WARN_GEN));
+            mask |= ws & u32x8::splat(MASK_WARN_GEN);
         }
 
         // --- red flashes ------------------------------------------------
@@ -408,7 +406,7 @@ pub fn run_frame_simd(st: &mut PixelState, planes: &FramePlanes, p: &KernelParam
             mask = mask | (strobe & u32x8::splat(MASK_STROBE_RED)) | (ext_s & u32x8::splat(MASK_EXT_RED));
             if warn {
                 let ws = fresh_m & age_lt(now, ld_u(&st.red_ring, kw * n + i), rate);
-                mask = mask | (ws & u32x8::splat(MASK_WARN_RED));
+                mask |= ws & u32x8::splat(MASK_WARN_RED);
             }
         }
 

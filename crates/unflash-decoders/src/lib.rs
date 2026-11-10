@@ -44,11 +44,12 @@ macro_rules! pictures {
     };
 }
 
+// (boxed: the decoders' states differ in size by kilobytes)
 enum Inner {
-    Hevc(unflash_hevc::Decoder),
-    Vp9(unflash_vp9::Decoder),
-    Vp8(unflash_vp8::Decoder),
-    Av1(unflash_av1::Decoder),
+    Hevc(Box<unflash_hevc::Decoder>),
+    Vp9(Box<unflash_vp9::Decoder>),
+    Vp8(Box<unflash_vp8::Decoder>),
+    Av1(Box<unflash_av1::Decoder>),
 }
 
 impl Inner {
@@ -57,10 +58,10 @@ impl Inner {
     /// CodecPrivate; may be empty).
     fn new(codec: &str, config: &[u8]) -> Result<Inner, String> {
         Ok(match codec {
-            "hevc" => Inner::Hevc(unflash_hevc::Decoder::new(config).map_err(|x| x.to_string())?),
-            "vp9" => Inner::Vp9(unflash_vp9::Decoder::new(config).map_err(|x| x.to_string())?),
-            "vp8" => Inner::Vp8(unflash_vp8::Decoder::new(config).map_err(|x| x.to_string())?),
-            "av1" => Inner::Av1(unflash_av1::Decoder::new(config).map_err(|x| x.to_string())?),
+            "hevc" => Inner::Hevc(Box::new(unflash_hevc::Decoder::new(config).map_err(|x| x.to_string())?)),
+            "vp9" => Inner::Vp9(Box::new(unflash_vp9::Decoder::new(config).map_err(|x| x.to_string())?)),
+            "vp8" => Inner::Vp8(Box::new(unflash_vp8::Decoder::new(config).map_err(|x| x.to_string())?)),
+            "av1" => Inner::Av1(Box::new(unflash_av1::Decoder::new(config).map_err(|x| x.to_string())?)),
             other => return Err(format!("there is no built-in decoder for {other}")),
         })
     }
@@ -151,6 +152,8 @@ impl SoftDecoder {
     }
 
     /// Take the next ready picture; false when there is none.
+    // (JavaScript calls it by this name; it is no iterator's `next`)
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> bool {
         let Some(p) = self.ready.pop_front() else {
             self.cur = None;

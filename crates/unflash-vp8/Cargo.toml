@@ -1,18 +1,22 @@
 [package]
 name = "unflash-vp8"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "A small VP8 decoder (RFC 6386, all profiles) for browsers without one"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 bytemuck = { workspace = true, optional = true }
-wide = { version = "0.7", optional = true }
+wide = { workspace = true, optional = true }
 
 [dev-dependencies]
 unflash-mp4 = { path = "../unflash-mp4" }
-md5 = "0.7"
+md5.workspace = true
 
 [features]
 default = ["simd"]
 simd = ["dep:wide", "dep:bytemuck"]
+
+[lints]
+workspace = true

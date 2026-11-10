@@ -108,7 +108,6 @@ impl<P: Sample> Core<P> {
     }
 
     /// Start decoding a picture: its reference picture set and buffers.
-    #[allow(clippy::too_many_arguments)]
     fn start_picture(&mut self, sps: Rc<Sps>, pps: Rc<Pps>, layout: Rc<Layout>, hdr: &SliceHeader, poc: i32, pts: f64, output: bool, flush_refs: bool) {
         if flush_refs {
             self.clear_dpb();

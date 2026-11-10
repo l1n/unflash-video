@@ -70,7 +70,6 @@ fn motion_bs(pic: &Picture, pb: usize, qb: usize, mvy_limit: i32) -> u8 {
 /// edge, or a vertical one in a field); vertical motion differs at
 /// `mvy_limit` quarter samples (2 for field macroblocks).
 #[inline]
-#[allow(clippy::too_many_arguments)]
 fn boundary_strength(pic: &Picture, p: &MbDeblockInfo, q: &MbDeblockInfo, pb: usize, qb: usize, p_bit: u16, q_bit: u16, strong: bool, mvy_limit: i32) -> u8 {
     if p.intra || q.intra {
         return if strong { 4 } else { 3 };
@@ -86,7 +85,6 @@ fn boundary_strength(pic: &Picture, p: &MbDeblockInfo, q: &MbDeblockInfo, pb: us
 /// macroblock; none in an inter one without coefficients whose blocks all
 /// move as one; else as `inter_bs` finds them.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 fn internal_bs(pic: &Picture, cur: &MbDeblockInfo, bx0: usize, by0: usize, w4: usize, mvy_limit: i32, bs_v: &mut [[u8; 4]; 4], bs_h: &mut [[u8; 4]; 4]) {
     if cur.intra {
         for e in 1..4 {
@@ -104,7 +102,6 @@ fn internal_bs(pic: &Picture, cur: &MbDeblockInfo, bx0: usize, by0: usize, w4: u
 /// The strengths of the internal edges of an inter macroblock: 2 where a
 /// block on either side has coefficients (tested for every segment at once
 /// on the coefficient bits), else the motion test.
-#[allow(clippy::too_many_arguments)]
 fn inter_bs(pic: &Picture, cur: &MbDeblockInfo, bx0: usize, by0: usize, w4: usize, mvy_limit: i32, bs_v: &mut [[u8; 4]; 4], bs_h: &mut [[u8; 4]; 4]) {
     let nz = cur.nonzero;
     // bit 4k + e - 1: block (e - 1, k) or (e, k) of vertical edge e has coefficients
@@ -276,7 +273,6 @@ mod simd {
 
     /// The chroma filter on eight lines: their p0 and q0.
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
     fn chroma8(p1: i16x8, p0: i16x8, q0: i16x8, q1: i16x8, on: i16x8, tc0: i16x8, alpha: i16x8, beta: i16x8, strong_edge: bool) -> (i16x8, i16x8) {
         let filt = on & (p0 - q0).abs().cmp_lt(alpha) & (p1 - p0).abs().cmp_lt(beta) & (q1 - q0).abs().cmp_lt(beta);
         let (p0f, q0f) = if strong_edge {
@@ -292,7 +288,6 @@ mod simd {
     /// Luma across a vertical edge: sixteen lines `stride` apart from `at`
     /// (the first line's q0), `bs` and `tc0` per four lines.
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     pub fn luma_edge_v(pl: &mut [u8], at: usize, stride: usize, bs: [u8; 4], tc0: [i16; 4], strong_edge: bool, alpha: i32, beta: i32) {
         let (alpha, beta) = (i16x8::splat(alpha as i16), i16x8::splat(beta as i16));
         for h in 0..2 {
@@ -313,7 +308,6 @@ mod simd {
     /// Luma across a horizontal edge: sixteen columns from `at` (the first
     /// column's q0; rows `stride` apart), `bs` and `tc0` per four columns.
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     pub fn luma_edge_h(pl: &mut [u8], at: usize, stride: usize, bs: [u8; 4], tc0: [i16; 4], strong_edge: bool, alpha: i32, beta: i32) {
         let (alpha, beta) = (i16x8::splat(alpha as i16), i16x8::splat(beta as i16));
         for h in 0..2 {
@@ -335,7 +329,6 @@ mod simd {
     /// apart from `at` in each, `bs` per two lines; `tc0`, `alpha` and
     /// `beta` per plane.
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     pub fn chroma_edge_v(u: &mut [u8], v: &mut [u8], at: usize, stride: usize, bs: [u8; 4], tc0: [[i16; 4]; 2], strong_edge: bool, alpha: [i32; 2], beta: [i32; 2]) {
         // vector r: p1 p0 q0 q1 of line r of Cb, then of Cr; transposed,
         // lane r of vector j is sample j of line r
@@ -361,7 +354,6 @@ mod simd {
     /// Chroma across a horizontal edge: eight columns from `at`, `bs` and
     /// `tc0` per two columns.
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     pub fn chroma_edge_h(pl: &mut [u8], at: usize, stride: usize, bs: [u8; 4], tc0: [i16; 4], strong_edge: bool, alpha: i32, beta: i32) {
         let row = |k: usize| load8(&pl[at + k * stride - 2 * stride..]);
         let (p1, p0, q0, q1) = (row(0), row(1), row(2), row(3));
@@ -379,7 +371,6 @@ mod scalar {
 
     /// Luma across a vertical edge: sixteen lines `stride` apart from `at`
     /// (the first line's q0), `bs` and `tc0` per four lines.
-    #[allow(clippy::too_many_arguments)]
     pub fn luma_edge_v(pl: &mut [u8], at: usize, stride: usize, bs: [u8; 4], tc0: [i16; 4], _strong_edge: bool, alpha: i32, beta: i32) {
         for r in 0..16 {
             let k = r / 4;
@@ -392,7 +383,6 @@ mod scalar {
 
     /// Luma across a horizontal edge: sixteen columns from `at`, `bs` and
     /// `tc0` per four columns.
-    #[allow(clippy::too_many_arguments)]
     pub fn luma_edge_h(pl: &mut [u8], at: usize, stride: usize, bs: [u8; 4], tc0: [i16; 4], _strong_edge: bool, alpha: i32, beta: i32) {
         for c in 0..16 {
             let k = c / 4;
@@ -409,7 +399,6 @@ mod scalar {
 
     /// Chroma across a vertical edge of both planes: eight lines from `at`
     /// in each, `bs` per two lines; `tc0`, `alpha` and `beta` per plane.
-    #[allow(clippy::too_many_arguments)]
     pub fn chroma_edge_v(u: &mut [u8], v: &mut [u8], at: usize, stride: usize, bs: [u8; 4], tc0: [[i16; 4]; 2], _strong_edge: bool, alpha: [i32; 2], beta: [i32; 2]) {
         for (c, plane) in [u, v].into_iter().enumerate() {
             for r in 0..8 {
@@ -424,7 +413,6 @@ mod scalar {
 
     /// Chroma across a horizontal edge: eight columns from `at`, `bs` and
     /// `tc0` per two columns.
-    #[allow(clippy::too_many_arguments)]
     pub fn chroma_edge_h(pl: &mut [u8], at: usize, stride: usize, bs: [u8; 4], tc0: [i16; 4], _strong_edge: bool, alpha: i32, beta: i32) {
         for c in 0..8 {
             let k = c / 2;

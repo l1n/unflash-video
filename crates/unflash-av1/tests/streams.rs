@@ -102,7 +102,7 @@ fn check_frames(name: &str, got: &[Frame], want: &[(usize, String)]) {
     for (i, (f, (size, md5))) in got.iter().zip(want).enumerate() {
         let (w, h) = (f.width as usize, f.height as usize);
         assert_eq!(f.y.len(), w * h, "{name}: picture {i} luma size");
-        assert_eq!(f.u.len(), (w + 1) / 2 * ((h + 1) / 2), "{name}: picture {i} chroma size");
+        assert_eq!(f.u.len(), w.div_ceil(2) * h.div_ceil(2), "{name}: picture {i} chroma size");
         assert_eq!(f.y.len() + f.u.len() + f.v.len(), *size, "{name}: picture {i} is {w}x{h}");
         assert!(!f.damaged, "{name}: picture {i} damaged");
         assert_eq!(&md5_frame(f), md5, "{name}: picture {i} ({w}x{h}, pts {}) differs from ffmpeg's", f.pts);
@@ -190,7 +190,7 @@ fn monochrome_has_grey_chroma() {
         assert_eq!(f.y.len(), *size);
         assert_eq!(&format!("{:x}", md5::compute(&f.y)), md5, "picture {i}: luma differs from ffmpeg's");
         assert!(f.u.iter().chain(&f.v).all(|&c| c == 128), "picture {i}: grey chroma");
-        assert_eq!(f.u.len(), (f.width as usize + 1) / 2 * ((f.height as usize + 1) / 2));
+        assert_eq!(f.u.len(), (f.width as usize).div_ceil(2) * (f.height as usize).div_ceil(2));
     }
 }
 

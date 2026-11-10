@@ -95,6 +95,9 @@ impl Default for MbInfo {
     }
 }
 
+// (one per slice, on the stack: a box would put a pointer between the
+// macroblock loop and CABAC's contexts)
+#[allow(clippy::large_enum_variant)]
 pub enum Entropy<'a> {
     Cavlc(BitReader<'a>),
     Cabac(Cabac<'a>),
@@ -215,7 +218,6 @@ fn chroma_qp(qp: i32, offset: i32) -> i32 {
 }
 
 impl<'a> SliceDecoder<'a> {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sps: &'a Sps,
         pps: &'a Pps,
@@ -2297,11 +2299,11 @@ impl<'a> SliceDecoder<'a> {
             wc = [Some((w0, 0, w1, 0, 5)); 2];
         }
         // weights that are exactly the default prediction take the plain path
-        if wl.map_or(false, |v| inter::weights_are_default(v, bi)) {
+        if wl.is_some_and(|v| inter::weights_are_default(v, bi)) {
             wl = None;
         }
         for c in 0..2 {
-            if wc[c].map_or(false, |v| inter::weights_are_default(v, bi)) {
+            if wc[c].is_some_and(|v| inter::weights_are_default(v, bi)) {
                 wc[c] = None;
             }
         }

@@ -529,7 +529,6 @@ pub fn iadst16<L: Lane>(t: &mut [L; 16]) {
 /// `dst` (8.6.2, 8.7.2), and leave `coef` zeroed for the next block.
 /// `coef` holds the dequantised coefficients in raster order; `eob` is the
 /// number read in scan order and `rows` how many leading rows hold any.
-#[allow(clippy::too_many_arguments)]
 pub fn reconstruct<P: Pixel>(coef: &mut [i32], tx_size: usize, tx_type: u8, lossless: bool, eob: usize, rows: usize, dst: &mut [P], stride: usize, bd: u32) {
     if lossless {
         wht_add(coef, dst, stride, bd);
@@ -560,7 +559,6 @@ fn dc_add<C: Scalar, P: Pixel>(coef: &mut [i32], tx_size: usize, dst: &mut [P], 
 }
 
 /// A transform block (not DC-only) in scalar arithmetic.
-#[allow(clippy::too_many_arguments)]
 pub fn scalar_transform_add<C: Scalar, P: Pixel>(coef: &mut [i32], tx_size: usize, tx_type: u8, rows: usize, dst: &mut [P], stride: usize, bd: u32) {
     let shift = SHIFT[tx_size];
     // rows (horizontal) take the ADST in DCT_ADST and ADST_ADST blocks,
@@ -578,7 +576,6 @@ pub fn scalar_transform_add<C: Scalar, P: Pixel>(coef: &mut [i32], tx_size: usiz
 /// The row transforms, then the column transforms, in place (rows past
 /// `rows` hold only zeros, and so transform to zeros), then the residual
 /// added to the prediction row by row.
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn two_d<C: Scalar, P: Pixel, const N: usize>(coef: &mut [i32], rows: usize, dst: &mut [P], stride: usize, bd: u32, shift: u32, row: impl Fn(&mut [C; N]), col: impl Fn(&mut [C; N])) {
     let rows = rows.min(N);

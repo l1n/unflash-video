@@ -11,8 +11,6 @@ on:
   push:
     branches:
       - main
-      # temporary, so the site is live before the branch is merged; remove after merging
-      - claude/wasm-rust-webgpu-realtime-cex8qj
   workflow_dispatch:
 
 permissions:

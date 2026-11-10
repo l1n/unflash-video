@@ -30,7 +30,6 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
     /// 6.4.2: whether the prediction block covering (`xn`, `yn`) is
     /// available to prediction block `part_idx` (at `xp`, `yp`, `w`×`h`)
     /// of the coding block at (`xc`, `yc`) of size `nc`, and inter coded.
-    #[allow(clippy::too_many_arguments)]
     fn pb_available(&self, xc: i32, yc: i32, nc: i32, xp: i32, yp: i32, w: i32, h: i32, part_idx: usize, xn: i32, yn: i32) -> bool {
         let same_cb = xc <= xn && yc <= yn && xn < xc + nc && yn < yc + nc;
         let available = if !same_cb {
@@ -48,7 +47,6 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
     }
 
     /// 8.5.3.2.2: the motion of a merged prediction block.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn merge_motion(&self, xc: usize, yc: usize, nc: usize, xp: usize, yp: usize, w: usize, h: usize, part_idx: usize, merge_idx: usize) -> Motion {
         let (orig_w, orig_h) = (w, h);
         let (xc, yc, nc) = (xc as i32, yc as i32, nc as i32);
@@ -151,7 +149,6 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
 
     /// 8.5.3.2.6: the motion vector predictor of list `x` for reference
     /// index `ref_idx`, chosen by mvp_lX_flag.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn amvp(&self, xc: usize, yc: usize, nc: usize, xp: usize, yp: usize, w: usize, h: usize, part_idx: usize, x: usize, ref_idx: usize, mvp_flag: usize) -> [i16; 2] {
         let (xc, yc, nc, xp, yp, w, h) = (xc as i32, yc as i32, nc as i32, xp as i32, yp as i32, w as i32, h as i32);
         let y = 1 - x;

@@ -174,7 +174,6 @@ fn bilinear_row<const W: usize>(a: &[u8], b: &[u8], f: usize, o: &mut [u8]) {
 
 /// Filter a `W`x`h` block whose top-left source sample is `src[origin]`
 /// (stride `ss`, with the six-tap margins around it) into `dst`.
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn filter_block<const W: usize>(src: &[u8], origin: usize, ss: usize, fx: usize, fy: usize, h: usize, filter: Filter, dst: &mut [u8], ds: usize) {
     if fx == 0 && fy == 0 {
@@ -237,7 +236,6 @@ fn filter_block<const W: usize>(src: &[u8], origin: usize, ss: usize, fx: usize,
 }
 
 /// `filter_block` for the block widths VP8 uses (16, 8 and 4).
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn filter_any(src: &[u8], origin: usize, ss: usize, fx: usize, fy: usize, w: usize, h: usize, filter: Filter, dst: &mut [u8], ds: usize) {
     match w {
@@ -251,7 +249,6 @@ fn filter_any(src: &[u8], origin: usize, ss: usize, fx: usize, fy: usize, w: usi
 /// (stride `ds`) from the reference plane `src` (`pw`x`ph` samples, stride
 /// `ps`). The block's top-left source sample is (`x`, `y`) in whole
 /// samples plus (`fx`, `fy`) eighths of a sample.
-#[allow(clippy::too_many_arguments)]
 pub fn predict(src: &[u8], ps: usize, pw: usize, ph: usize, x: i32, y: i32, fx: usize, fy: usize, w: usize, h: usize, filter: Filter, dst: &mut [u8], ds: usize) {
     // the six taps reach two samples before the block and three after in
     // each direction with a fraction (the bilinear filter less far), and
@@ -291,7 +288,6 @@ mod tests {
     use super::*;
 
     /// One sample the plain way: taps on the endlessly edge-extended plane.
-    #[allow(clippy::too_many_arguments)]
     fn reference(plane: &[u8], pw: usize, ph: usize, x: i32, y: i32, fx: usize, fy: usize, filter: Filter) -> u8 {
         let at = |xx: i32, yy: i32| plane[yy.clamp(0, ph as i32 - 1) as usize * pw + xx.clamp(0, pw as i32 - 1) as usize] as i32;
         match filter {

@@ -43,7 +43,7 @@ impl Vlc {
                     primary[prefix].value as usize
                 } else {
                     let idx = secondary.len() / 256;
-                    secondary.extend(std::iter::repeat(Entry { value: 0, len: 0 }).take(256));
+                    secondary.extend(std::iter::repeat_n(Entry { value: 0, len: 0 }, 256));
                     primary[prefix] = Entry { value: idx as i16, len: SUB };
                     idx
                 };

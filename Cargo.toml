@@ -28,6 +28,24 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 wgpu = { version = "30", default-features = false, features = ["wgsl", "std"] }
 log = "0.4"
+# the SIMD lanes of the decoders and the pixel kernel
+wide = "0.7"
+# the wasm-bindgen CLI that build.sh and the workflows run must be this version
+wasm-bindgen = "0.2.128"
+console_error_panic_hook = "0.1"
+# the tests' picture hashes, as ffmpeg's framemd5 gives them
+md5 = "0.7"
+
+# One set of lint levels for every crate here (each opts in with
+# `[lints] workspace = true`; the vendored rav1d keeps its own).
+[workspace.lints.clippy]
+# the decoders' and kernels' functions take the state the standards'
+# processes take, and their loops index several arrays by one counter, as
+# the standards' pseudocode does
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+# `chunks_exact(N)` reads as what it does; `as_chunks` gains nothing here
+chunks_exact_to_as_chunks = "allow"
 
 [profile.release]
 opt-level = 3

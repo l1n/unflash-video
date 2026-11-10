@@ -203,12 +203,10 @@ pub fn parse_slice_header(r: &mut BitReader, nal_unit_type: u8, nal_ref_idc: u8,
         direct_spatial_mv_pred = r.flag()?;
     }
     let mut num_ref_idx_active = pps.num_ref_idx_default_active;
-    if slice_type != SliceType::I {
-        if r.flag()? {
-            num_ref_idx_active[0] = r.ue_max(31, "num_ref_idx_l0_active_minus1")? + 1;
-            if slice_type == SliceType::B {
-                num_ref_idx_active[1] = r.ue_max(31, "num_ref_idx_l1_active_minus1")? + 1;
-            }
+    if slice_type != SliceType::I && r.flag()? {
+        num_ref_idx_active[0] = r.ue_max(31, "num_ref_idx_l0_active_minus1")? + 1;
+        if slice_type == SliceType::B {
+            num_ref_idx_active[1] = r.ue_max(31, "num_ref_idx_l1_active_minus1")? + 1;
         }
     }
     if slice_type != SliceType::B {

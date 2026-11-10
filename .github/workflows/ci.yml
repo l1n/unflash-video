@@ -9,6 +9,7 @@ env:
   PLAYWRIGHT_VERSION: "1.56.1"
   FIREFOX_VERSION: "156.0.1"
   WASM_BINDGEN_VERSION: "0.2.128"   # must match Cargo.lock
+  LINT_TOOLCHAIN: "1.99.1"          # clippy's lints change with the compiler: the lint job's is pinned, and raised by hand
 
 jobs:
   rust:
@@ -49,6 +50,29 @@ jobs:
       - name: Benchmark (informational)
         timeout-minutes: 15
         run: cargo run --release -p unflash-gpu --example bench -- 1920x1080 0.25 200
+
+  lint:
+    # every crate of ours, warnings denied (Cargo.toml's [workspace.lints]
+    # says which lints are off, and why). The vendored rav1d is a dependency
+    # here, not a subject: --no-deps.
+    name: Lint (clippy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+      # (+toolchain: rust-toolchain.toml would otherwise choose the newest)
+      - name: clippy, native
+        run: cargo "+$LINT_TOOLCHAIN" clippy --workspace --exclude rav1d --all-targets --no-deps -- -D warnings
+      - name: clippy, the browser build
+        run: cargo "+$LINT_TOOLCHAIN" clippy -p unflash-wasm -p unflash-decoders --target wasm32-unknown-unknown --no-deps -- -D warnings
 
   build:
     # the WebAssembly and the synthetic clips, made once for every browser part

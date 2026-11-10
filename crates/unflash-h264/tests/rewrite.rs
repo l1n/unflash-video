@@ -223,7 +223,7 @@ fn renumbering_changes_only_the_pps_id() {
                         let mut rb2 = BitReader::new(&rb); rb2.skip(r2.bit_pos() as u32);
                         for k in 0..(s1 - r1.bit_pos()) { assert_eq!(ra2.u(1).unwrap(), rb2.u(1).unwrap(), "{name} sample {si}: data bit {k}"); }
                     } else {
-                        let a0 = (r1.bit_pos() + 7) / 8; let b0 = (r2.bit_pos() + 7) / 8;
+                        let a0 = r1.bit_pos().div_ceil(8); let b0 = r2.bit_pos().div_ceil(8);
                         let mut ea = ra.len(); while ea > a0 && ra[ea-1] == 0 { ea -= 1; }
                         let mut eb = rb.len(); while eb > b0 && rb[eb-1] == 0 { eb -= 1; }
                         assert_eq!(&ra[a0..ea], &rb[b0..eb], "{name} sample {si}: cabac data");

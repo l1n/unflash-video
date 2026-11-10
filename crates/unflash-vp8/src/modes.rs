@@ -99,7 +99,6 @@ fn implied_bmode(y_mode: u8) -> u8 {
 /// picture). `segment` is the macroblock's entry of the segment map: read
 /// when the map is updated, kept when segmentation is on without an
 /// update, and 0 when it is off.
-#[allow(clippy::too_many_arguments)]
 pub fn read_mb(bd: &mut BoolDecoder, p: &ModeParams, mb_x: usize, mb_y: usize, above: &MbInfo, left: &MbInfo, above_left: &MbInfo, segment: &mut u8) -> MbInfo {
     let seg = p.segmentation;
     if seg.update_map {
@@ -191,7 +190,6 @@ fn clamp_mv(mv: Mv, mb_x: usize, mb_y: usize, p: &ModeParams) -> Mv {
 
 /// 16.3 and 16.4: the inter mode and motion vectors of `mb`, whose
 /// reference frame is known.
-#[allow(clippy::too_many_arguments)]
 fn read_inter_modes(bd: &mut BoolDecoder, p: &ModeParams, mb_x: usize, mb_y: usize, above: &MbInfo, left: &MbInfo, above_left: &MbInfo, mb: &mut MbInfo) {
     let (mut near, mut cnt) = find_near_mvs(p, mb.ref_frame, above, left, above_left);
     let mv = if !bd.read(MODE_CONTEXTS[cnt[0]][0]) {

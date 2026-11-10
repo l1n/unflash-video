@@ -96,7 +96,7 @@ fn gen(i: usize, t: f64, aw: usize, ah: usize) -> Vec<u8> {
 /// one corner: the held-frame gate must see the colour move even though the
 /// luminance does not, and the repeats inside each run must still be held.
 fn gen_equilum(i: usize, _t: f64, aw: usize, ah: usize) -> Vec<u8> {
-    let rgb = if (i / 3) % 2 == 0 { [250u8, 0, 0] } else { [122u8, 124, 122] };
+    let rgb = if (i / 3).is_multiple_of(2) { [250u8, 0, 0] } else { [122u8, 124, 122] };
     let mut f = vec![0u8; aw * ah * 3];
     for px in f.chunks_exact_mut(3) {
         px.copy_from_slice(&rgb);

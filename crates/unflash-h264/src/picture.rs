@@ -394,9 +394,9 @@ impl Dpb {
             }
             SliceType::B => {
                 let mut before: Vec<&DpbEntry> = short.iter().copied().filter(|e| e.poc <= cur_poc).collect();
-                before.sort_by(|a, b| b.poc.cmp(&a.poc));
+                before.sort_by_key(|e| std::cmp::Reverse(e.poc));
                 let mut after: Vec<&DpbEntry> = short.iter().copied().filter(|e| e.poc > cur_poc).collect();
-                after.sort_by(|a, b| a.poc.cmp(&b.poc));
+                after.sort_by_key(|e| e.poc);
                 let mut l0 = before.clone();
                 l0.extend(after.iter().copied());
                 let mut l1 = after;
@@ -515,7 +515,7 @@ impl Dpb {
                     continue;
                 }
                 let fnw = Self::frame_num_wrap(sps, e.frame_num, cur_frame_num);
-                if worst.map_or(true, |(_, w)| fnw < w) {
+                if worst.is_none_or(|(_, w)| fnw < w) {
                     worst = Some((i, fnw));
                 }
             }
@@ -588,7 +588,7 @@ impl Dpb {
                                 Mmco::MaxLongTermIdx(plus1) => {
                                     self.max_long_term_frame_idx = if plus1 == 0 { None } else { Some(plus1 - 1) };
                                     let max = self.max_long_term_frame_idx;
-                                    self.remove_where(|e| e.kind == RefKind::Long && max.map_or(true, |m| e.long_term_frame_idx > m));
+                                    self.remove_where(|e| e.kind == RefKind::Long && max.is_none_or(|m| e.long_term_frame_idx > m));
                                 }
                                 Mmco::UnmarkAll => {
                                     self.clear();

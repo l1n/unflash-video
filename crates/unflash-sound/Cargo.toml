@@ -3,9 +3,13 @@ name = "unflash-sound"
 description = "Small AC-3 / E-AC-3 (Dolby Digital, Dolby Digital Plus) and DTS core audio decoders for browsers without them"
 version.workspace = true
 edition.workspace = true
-license = "MIT"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 
 [dev-dependencies]
 unflash-mp4 = { path = "../unflash-mp4" }
+
+[lints]
+workspace = true

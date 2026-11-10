@@ -333,9 +333,9 @@ mod tests {
         aggregate(&g, &l, &v, &masks, &og, &or, &mut cells);
         assert_eq!(cells.len(), 1);
         let c = cells[0];
-        assert_eq!(c.cnt[0] as usize, (n + 2) / 3);
-        assert_eq!(c.cnt[7] as usize, (n + 4) / 5);
-        assert_eq!(c.cnt[9] as usize, (n + 3) / 4);
+        assert_eq!(c.cnt[0] as usize, n.div_ceil(3));
+        assert_eq!(c.cnt[7] as usize, n.div_ceil(5));
+        assert_eq!(c.cnt[9] as usize, n.div_ceil(4));
         assert_eq!(c.onset_gen, 1000 + (n as u32 - 1) / 3 * 3);
         assert_eq!(c.onset_red, 0);
         let want_l: f64 = l.iter().map(|&x| x as f64).sum();

@@ -113,7 +113,6 @@ impl Shrink {
 
     /// A 4:2:0 picture held as three planes (a decoder's own picture, from
     /// the first visible sample of each plane), made small the same way.
-    #[allow(clippy::too_many_arguments)]
     pub fn yuv420_planes(&mut self, y: &[u8], y_stride: usize, u: &[u8], u_stride: usize, v: &[u8], v_stride: usize, bt709: bool, full_range: bool, out: &mut Vec<u8>) {
         let (w, h, cw, ch) = (self.sw, self.sh, self.sw.div_ceil(2), self.sh.div_ceil(2));
         assert!(y_stride >= w && y.len() >= (h - 1) * y_stride + w, "luma plane too short");
@@ -497,7 +496,7 @@ mod tests {
                 x ^= x >> 17;
                 x ^= x << 5;
                 let smooth = ((i / 4 % w) * 255 / w.max(1)) as u32;
-                (if (i / 4 / w) % 3 == 0 { smooth } else { x % 256 }) as u8
+                (if (i / 4 / w).is_multiple_of(3) { smooth } else { x % 256 }) as u8
             })
             .collect()
     }

@@ -1,17 +1,21 @@
 [package]
 name = "unflash-h264"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "A small H.264 / AVC decoder (Constrained Baseline, Main and High, 4:2:0 8-bit, progressive and interlaced) for browsers without one"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
-wide = { version = "0.7", optional = true }
+wide = { workspace = true, optional = true }
 
 [dev-dependencies]
 unflash-mp4 = { path = "../unflash-mp4" }
-md5 = "0.7"
+md5.workspace = true
 
 [features]
 default = ["simd"]
 simd = ["dep:wide"]
+
+[lints]
+workspace = true

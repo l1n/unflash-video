@@ -14,8 +14,11 @@ unflash-core = { path = "../unflash-core" }
 unflash-vp8 = { path = "../unflash-vp8" }
 unflash-vp9 = { path = "../unflash-vp9" }
 unflash-av1 = { path = "../unflash-av1" }
-wasm-bindgen = "0.2.128"
+wasm-bindgen.workspace = true
 serde_json.workspace = true
-console_error_panic_hook = "0.1"
+console_error_panic_hook.workspace = true
 unflash-hevc = { path = "../unflash-hevc" }
 unflash-sound = { path = "../unflash-sound" }
+
+[lints]
+workspace = true

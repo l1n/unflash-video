@@ -10,10 +10,11 @@ repository.workspace = true
 bytemuck.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-wide = { version = "0.7", optional = true }
+wide = { workspace = true, optional = true }
 
 [features]
 default = ["simd"]
 simd = ["dep:wide"]
 
-[dev-dependencies]
+[lints]
+workspace = true

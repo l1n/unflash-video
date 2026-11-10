@@ -781,7 +781,7 @@ fn parse_stbl(stbl: &[u8], tp: &mut TrakParts) -> Result<(), Error> {
                                 sd.flags = er.u32()?;
                                 let packet_bytes = er.u32()?;
                                 let packet_frames = er.u32()?;
-                                sd.frame_bytes = if packet_frames > 0 { packet_bytes / packet_frames } else { 0 };
+                                sd.frame_bytes = packet_bytes.checked_div(packet_frames).unwrap_or(0);
                             }
                             sound = Some(sd);
                         }
