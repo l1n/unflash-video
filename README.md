@@ -939,6 +939,12 @@ the tests of `crates/unflash-decoders` ask the same of HEVC, VP9, VP8 and
 AV1 through the bindings a decode worker calls (each sample under its
 number, each picture taken as packed I420 or made small), and of the
 Dolby and DTS decoders that their sound comes out as two planes.
+`crates/unflash-mp4/tests/robustness.rs` reads the test media (MP4,
+QuickTime, Matroska, WebM, transport streams) with random damage: bits
+flipped, fields set to the values a size or a count hurts most with,
+bytes cut out and put in, the file cut short. Whatever the readers make
+of it will do, an error or a movie, but a panic (which ends the page) or
+a read that never ends; `MP4_FUZZ_ROUNDS=n` sets the rounds per file.
 `crates/unflash-h264/tests/rewrite.rs` renumbers the parameter sets of
 every conformance stream and decodes it again, and splices GOPs of one
 encoding into another and checks the result in this decoder and in ffmpeg.

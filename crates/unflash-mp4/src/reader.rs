@@ -189,6 +189,11 @@ impl<'a> Bits<'a> {
         }
         Some(((1u64 << zeros) - 1 + self.u(zeros)? as u64) as u32)
     }
+    /// ue(v) that must not exceed `max`: a parameter set that says more is
+    /// none (the sizes worked out from one are then never out of range).
+    pub fn ue_max(&mut self, max: u32) -> Option<u32> {
+        self.ue().filter(|&v| v <= max)
+    }
     pub fn se(&mut self) -> Option<i32> {
         let k = self.ue()? as i64;
         Some(if k & 1 == 1 { (k + 1) / 2 } else { -(k / 2) } as i32)

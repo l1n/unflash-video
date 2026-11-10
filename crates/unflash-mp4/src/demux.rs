@@ -572,7 +572,8 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<(Movie, Vec<(u32, Trex)>), 
         if let Some(form) = tp.pcm {
             let ch = tp.channels.max(1);
             if fixed > 1 && fixed != tp.pcm_frame && fixed % ch == 0 {
-                if let Some(c) = pcm_codec(PcmForm { bits: fixed / ch * 8, ..form }) {
+                // (a size no sample has: no form of PCM is that wide, and none is found for it)
+                if let Some(c) = pcm_codec(PcmForm { bits: (fixed / ch).saturating_mul(8), ..form }) {
                     tp.codec = CodecInfo { codec: c.into(), description: None };
                     tp.pcm_frame = fixed;
                 }
