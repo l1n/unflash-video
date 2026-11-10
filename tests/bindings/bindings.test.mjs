@@ -368,11 +368,11 @@ function muxed(samples, timescale) {
   return file;
 }
 
-/** The file's index read as the page reads it: the range asked for, fed, until it is done. */
-function demuxed(file) {
+/** The file's index read as the page reads it: the range asked for, fed, until it is done (in `most` reads at most). */
+function demuxed(file, most = 1000) {
   const dx = new wasm.Demuxer(file.length);
   for (let rounds = 0; !dx.is_done(); rounds++) {
-    assert.ok(rounds < 1000, 'the reader keeps asking');
+    assert.ok(rounds < most, `the reader is still asking after ${most} reads`);
     const need = dx.need();
     if (!need.length) break;
     dx.feed(need[0], file.subarray(need[0], need[0] + need[1]));
@@ -448,7 +448,8 @@ it('a file that is no video is refused in so many words, and soon', () => {
     [Uint8Array.of(0x1a, 0x45, 0xdf, 0xa3, 0x80), /^not a Matroska file \(no segment found\)$/],
     [packets, /^no program found in this transport stream \(no PAT\/PMT\)$/],
   ]) {
-    assert.match(refusal(() => demuxed(file).free()), why);
+    // (soon: by the second read)
+    assert.match(refusal(() => demuxed(file, 2).free()), why);
   }
   // before its index is read there is no movie to ask about
   const early = new wasm.Demuxer(64);
