@@ -107,6 +107,18 @@
    "violations": 0
   }
  },
+ "clock-jump": {
+  "w": 720,
+  "h": 450,
+  "seconds": 15.6,
+  "alt": "A damaged file opens: its last five frames are stamped 136 years after the rest, so it claims to be 1 194 444 hours long. Scan runs to its end and finds the flashing in the file's first ten seconds, one section. (Such a file used to stall the page as soon as it was open, and a scan of it never came back.)",
+  "sha256": "f6ce8c39da7ecc6705af8edad3a8091e9cf24124e192a316c1db0d3e7080481e",
+  "checked": {
+   "profile": "strict",
+   "frames": 469,
+   "violations": 0
+  }
+ },
  "close-calls": {
   "w": 720,
   "h": 450,
@@ -137,6 +149,18 @@
   "seconds": 18,
   "alt": "The same 1080p scan in Firefox twice: above, decoded on the page; below, decoded in the background, several pictures at once, and done sooner.",
   "sha256": "e7d27e50d6f1d385b6878000188216535a30fbb032ee20c4dcba17b0a58973c3",
+  "checked": {
+   "profile": "strict",
+   "frames": 542,
+   "violations": 0
+  }
+ },
+ "decoder-again": {
+  "w": 720,
+  "h": 450,
+  "seconds": 18,
+  "alt": "The network is gone for a moment as an HEVC video is opened: Unflash cannot fetch its HEVC decoder, and says so. With the network back, the same video is opened again: this time the decoder is fetched, Unflash says it uses its built-in HEVC decoder, and the scan finds the flashing. (Every such video used to fail as the first had, until the page was reloaded.)",
+  "sha256": "b6128c0e301ccef6efa9236a7485aeef27b1673b597dfff06a5db8cbcb7bc5f0",
   "checked": {
    "profile": "strict",
    "frames": 542,
@@ -734,6 +758,18 @@
    "violations": 0
   }
  },
+ "section-ranges": {
+  "w": 720,
+  "h": 450,
+  "seconds": 19.6,
+  "alt": "A scanned video with one section, open: from 0:01.508 to 0:09.767. A range inside it, 0:04 to 0:06, is typed beside the timeline and \"add section\" clicked: Unflash says the range is over section #1, and that two sections cannot share frames. Then the section is given 0:12 to 0:15, past the end of the ten-second video, with \"apply range\": Unflash says that range is outside the video, and the section keeps the range it had (it used to become a section from 0:12 to 0:10, which could not be prepared).",
+  "sha256": "30e40779da850b5324a60cd6c13304edd456332c354792c28a6ab7c24585c7d9",
+  "checked": {
+   "profile": "strict",
+   "frames": 588,
+   "violations": 0
+  }
+ },
  "section-sound": {
   "w": 720,
   "h": 450,
@@ -780,6 +816,18 @@
   "checked": {
    "profile": "strict",
    "frames": 829,
+   "violations": 0
+  }
+ },
+ "sound-in-step": {
+  "w": 720,
+  "h": 450,
+  "seconds": 20.6,
+  "alt": "A TV recording that starts part-way through a scene: the debug report says its sound starts 701 ms before its first whole picture. It is exported as it is, and the export opened: there too the sound starts 701 ms before the picture (the two used to start together in an export, the sound late from there on).",
+  "sha256": "2b8de9308df7c5a309301230d97676343975809d2e561ed7b83409200f7bdb01",
+  "checked": {
+   "profile": "strict",
+   "frames": 619,
    "violations": 0
   }
  },

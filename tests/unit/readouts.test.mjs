@@ -3,8 +3,25 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ENVELOPE_S, cleanExportName, fmtWait, limitRateEnvelope, niceStep } from '../../web/readouts.js';
+import { ENVELOPE_S, cleanExportName, fmtWait, limitRateEnvelope, niceStep, soundStart } from '../../web/readouts.js';
 import { SoundRun, sourceTime } from '../../web/sound.js';
+
+test("where a video's sound starts against its picture, in words", () => {
+  assert.equal(soundStart(0, 0), 'starts with the picture');
+  // (to the millisecond: an MP4's own clock for a movie counts in them)
+  assert.equal(soundStart(701000, 333), 'starts 701 ms before the picture');
+  assert.equal(soundStart(21333, 0), 'starts 21 ms before the picture');
+  assert.equal(soundStart(0, 66667), 'starts 67 ms after the picture');
+  assert.equal(soundStart(1000, 1499), 'starts with the picture');
+  assert.equal(soundStart(0, -21333), 'starts 21 ms before the picture');
+  // seconds once milliseconds stop saying anything
+  assert.equal(soundStart(0, 9999000), 'starts 9999 ms after the picture');
+  assert.equal(soundStart(12.34e6, 0), 'starts 12.3 s before the picture');
+  // a track with no samples has no start
+  assert.equal(soundStart(NaN, 0), null);
+  assert.equal(soundStart(0, undefined), null);
+  assert.equal(soundStart(Infinity, 0), null);
+});
 
 test("a time axis's ticks are a round step apart, a dozen or so whatever it spans", () => {
   assert.deepEqual([0.01, 0.5, 0.6, 3, 11, 15, 16, 61, 1000, 1801, 3600].map(niceStep), [0.5, 0.5, 1, 5, 15, 15, 30, 120, 1200, 3600, 3600]);

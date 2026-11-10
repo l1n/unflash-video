@@ -1,6 +1,7 @@
 // What the page says and draws from numbers alone: the steps between a
-// timeline's ticks, how long a job took, the name an export is saved under,
-// the envelope the chart reads flashing at the limit rate from. No page is
+// timeline's ticks, how long a job took, where a video's sound starts
+// against its picture, the name an export is saved under, the envelope the
+// chart reads flashing at the limit rate from. No page is
 // needed for any of it, so that each can be held to its rule in Node
 // (tests/unit/readouts.test.mjs).
 
@@ -25,6 +26,21 @@ export function fmtWait(secs) {
   const total = Math.round(secs);
   const m = Math.floor(total / 60);
   return m < 60 ? `${m} min ${total % 60} s` : `${Math.floor(m / 60)} h ${m % 60} min`;
+}
+
+/**
+ * Where a video's sound starts against its picture, in words, from each
+ * one's earliest time (µs on the one clock): "starts with the picture",
+ * "starts 701 ms before the picture" (a recording that begins part-way
+ * through a scene has sound before its first whole picture), "starts 67 ms
+ * after the picture". Null where either has no time.
+ */
+export function soundStart(pictureUs, soundUs) {
+  if (!Number.isFinite(pictureUs) || !Number.isFinite(soundUs)) return null;
+  const ms = Math.round((soundUs - pictureUs) / 1000);
+  if (ms === 0) return 'starts with the picture';
+  const by = Math.abs(ms) < 10000 ? `${Math.abs(ms)} ms` : `${(Math.abs(ms) / 1000).toFixed(1)} s`;
+  return `starts ${by} ${ms < 0 ? 'before' : 'after'} the picture`;
 }
 
 /** `raw` as a file name: no characters a file system refuses, no path, ending in .mp4 (null: nothing left). */

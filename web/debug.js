@@ -2,6 +2,7 @@
 // video and the jobs of this visit (with the last scan's time per
 // operation), for someone helping with a slow or failing run. File names
 // are left out.
+import { soundStart } from './readouts.js';
 
 const errors = [];
 const jobs = [];
@@ -124,6 +125,13 @@ function chunkedLines(h) {
   return [`chunked: ${h.chunks} chunks of about ${h.chunkS} s, detected in file order${looks}${balance}; at most ${bytes(h.peak)} of pictures held (${bytes(h.budget)} allowed)`, ...lanes];
 }
 
+/** The earliest of a track's times (which are in decode order: not always the first), or NaN for none. */
+function earliest(times) {
+  let min = NaN;
+  for (const t of times) if (!(t >= min)) min = t;
+  return min;
+}
+
 /** The usual time between keyframes (the median, s), or null: how far apart a decoder can start. */
 function keyframeSpacing(m) {
   const v = m.v;
@@ -187,10 +195,12 @@ export function debugReport({ version, build = null, state, profile, gpu, segmen
     const v = m.video || {};
     const a = m.audio;
     const spacing = keyframeSpacing(m);
+    // (an export is to keep the two as far apart as the file has them)
+    const starts = a && m.v && m.a ? soundStart(earliest(m.v.pts), earliest(m.a.pts)) : null;
     lines.push(
       ...block('Video', [
         [`${String(m.format || '?').toUpperCase()}${m.info && m.info.fragmented ? ' (fragmented)' : ''}`, v.codec, `${m.width}×${m.height}`, `${(m.fps || 0).toFixed(3)} fps`, duration(m.duration || 0), `${int(m.frameCount || 0)} frames`, m.file ? bytes(m.file.size) : null, spacing ? `keyframes every ${spacing.toFixed(1)} s` : null].filter(Boolean).join(' · '),
-        a ? `audio ${a.codec}${a.copyable === false ? ' (re-encoded on export)' : ''}${m.audioTracks > 1 ? ` · track ${(m.audioSkipped || []).length + 1} of ${m.audioTracks}${(m.audioSkipped || []).length ? ` (${m.audioSkipped.map((t) => t.codec).join(', ')} before it can't be played here)` : ''}` : ''}${sound ? ` · the section player's sound: ${soundLine(sound)}` : ''}` : 'no audio',
+        a ? `audio ${a.codec}${a.copyable === false ? ' (re-encoded on export)' : ''}${m.audioTracks > 1 ? ` · track ${(m.audioSkipped || []).length + 1} of ${m.audioTracks}${(m.audioSkipped || []).length ? ` (${m.audioSkipped.map((t) => t.codec).join(', ')} before it can't be played here)` : ''}` : ''}${starts ? ` · ${starts}` : ''}${sound ? ` · the section player's sound: ${soundLine(sound)}` : ''}` : 'no audio',
         state.decode && !state.decode.supported && state.decode.reason ? `cannot decode: ${state.decode.reason}` : null,
       ])
     );

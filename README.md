@@ -348,7 +348,8 @@ Pages build regenerates them; for a local copy run
 **Debug info**, at the bottom right, puts together what someone helping
 with a slow or failing run needs, as text to paste into a message: the
 browser, the WebGPU adapter, the detector and how pictures reach it, the
-open video (container, codec, size, frame rate, length), each job of the
+open video (container, codec, size, frame rate, length, and how long
+before or after its picture its sound starts), each job of the
 visit with how long it took (how much of that the tab spent out of sight,
 and, for one of more than two seconds, the steps that took most of it:
 opening a video reads its index, asks the browser about its decoder,
@@ -993,10 +994,10 @@ pass, a worker gained during one), the range a section may take (inside
 the video, over no other section) and the sections an export applies, a
 project file with things of the wrong kind in it, and what the page says
 and draws from numbers alone (`web/readouts.js`: the steps between a
-timeline's ticks, how long a job took, an export's file name, the
-chart's envelope). They run in a quarter of a second, so they
-are the place for a rule's corner cases; the browser tests below are for
-what only a browser can show.
+timeline's ticks, how long a job took, an export's file name, where the
+sound starts against the picture, the chart's envelope). They run in a
+quarter of a second, so they are the place for a rule's corner cases;
+the browser tests below are for what only a browser can show.
 `tests/bindings/` calls the built module (`web/pkg`) the way the page does,
 also in Node: every profile's settings and what is derived from them,
 sections and the per-second summary from a scan's violations, a section's
