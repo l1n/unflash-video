@@ -842,6 +842,7 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 | `crates/unflash-core` | the detector: config and profiles, the per-pixel kernel (scalar and SIMD), grid reduction, temporal stage, violations, sections, editing helpers, the blend (blend frames). No I/O. |
 | `crates/unflash-gpu` | the WGSL pipeline on `wgpu` (native backends and the browser's WebGPU) |
 | `crates/unflash-mp4` | byte-range demuxers for WebCodecs, MP4 (fragmented files, edit lists, PCM) and Matroska / WebM (lacing, unknown sizes, header stripping) and MPEG transport streams (samples as an MP4 holds them, found again in the stream's packets by `web/ts.js`), giving codec strings, decoder descriptions and sample tables; MP4 sample entries for Matroska and transport stream audio; a muxer for the export |
+| `crates/unflash-codec` | what the built-in video decoders share: the picture HEVC, VP9, VP8 and AV1 hand out and the trait they are driven through, the bit reader of the two NAL-unit codecs (H.264, HEVC), and the one rule for a stream that names no colour matrix |
 | `crates/unflash-h264` | the built-in H.264 decoder, for browsers whose WebCodecs has none |
 | `crates/unflash-hevc` | the built-in HEVC decoder (Main, Main 10; 4:2:0, 4:0:0) |
 | `crates/unflash-vp9` | the built-in VP9 decoder (profiles 0 and 2) |

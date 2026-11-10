@@ -219,8 +219,8 @@ fn renumbering_changes_only_the_pps_id() {
                         let stop = |d: &[u8]| { let mut l = d.len(); while l > 0 && d[l-1] == 0 { l -= 1; } (l-1)*8 + 7 - d[l-1].trailing_zeros() as usize };
                         let (s1, s2) = (stop(&ra), stop(&rb));
                         assert_eq!(s1 - r1.bit_pos(), s2 - r2.bit_pos(), "{name} sample {si}: data length");
-                        let mut ra2 = BitReader::new(&ra); ra2.skip(r1.bit_pos() as u32);
-                        let mut rb2 = BitReader::new(&rb); rb2.skip(r2.bit_pos() as u32);
+                        let mut ra2 = BitReader::new(&ra); ra2.advance(r1.bit_pos());
+                        let mut rb2 = BitReader::new(&rb); rb2.advance(r2.bit_pos());
                         for k in 0..(s1 - r1.bit_pos()) { assert_eq!(ra2.u(1).unwrap(), rb2.u(1).unwrap(), "{name} sample {si}: data bit {k}"); }
                     } else {
                         let a0 = r1.bit_pos().div_ceil(8); let b0 = r2.bit_pos().div_ceil(8);

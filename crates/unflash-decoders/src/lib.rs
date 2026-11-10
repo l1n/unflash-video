@@ -11,6 +11,7 @@
 
 use std::collections::VecDeque;
 
+use unflash_codec::{Frame, VideoDecoder};
 use unflash_core::resample::Shrink;
 use wasm_bindgen::prelude::*;
 
@@ -23,79 +24,40 @@ pub fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// A picture as every decoder here gives it: tightly packed 8-bit 4:2:0
-/// planes (chroma (w + 1) / 2 by (h + 1) / 2), and the sample it was shown
-/// by (the decoders carry the number `decode` was given as its time).
-struct Picture {
-    width: u32,
-    height: u32,
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
-    index: u32,
-    damaged: bool,
-    bt709: bool,
-    full_range: bool,
+/// Any of the built-in decoders, driven alike, its errors as the text the
+/// page shows.
+trait Stream {
+    fn decode(&mut self, sample: &[u8], pts: f64) -> Result<Vec<Frame>, String>;
+    fn flush(&mut self) -> Result<Vec<Frame>, String>;
+    fn reorder_depth(&self) -> u32;
 }
 
-macro_rules! pictures {
-    ($frames:expr) => {
-        $frames.into_iter().map(|f| Picture { width: f.width, height: f.height, y: f.y, u: f.u, v: f.v, index: f.pts as u32, damaged: f.damaged, bt709: f.bt709, full_range: f.full_range })
-    };
-}
-
-// (boxed: the decoders' states differ in size by kilobytes)
-enum Inner {
-    Hevc(Box<unflash_hevc::Decoder>),
-    Vp9(Box<unflash_vp9::Decoder>),
-    Vp8(Box<unflash_vp8::Decoder>),
-    Av1(Box<unflash_av1::Decoder>),
-}
-
-impl Inner {
-    /// A decoder for `codec` (the app's name: hevc, vp9, vp8, av1) and the
-    /// track's configuration record (hvcC, vpcC, av1C or Matroska's
-    /// CodecPrivate; may be empty).
-    fn new(codec: &str, config: &[u8]) -> Result<Inner, String> {
-        Ok(match codec {
-            "hevc" => Inner::Hevc(Box::new(unflash_hevc::Decoder::new(config).map_err(|x| x.to_string())?)),
-            "vp9" => Inner::Vp9(Box::new(unflash_vp9::Decoder::new(config).map_err(|x| x.to_string())?)),
-            "vp8" => Inner::Vp8(Box::new(unflash_vp8::Decoder::new(config).map_err(|x| x.to_string())?)),
-            "av1" => Inner::Av1(Box::new(unflash_av1::Decoder::new(config).map_err(|x| x.to_string())?)),
-            other => return Err(format!("there is no built-in decoder for {other}")),
-        })
+impl<D: VideoDecoder> Stream for D {
+    fn decode(&mut self, sample: &[u8], pts: f64) -> Result<Vec<Frame>, String> {
+        VideoDecoder::decode(self, sample, pts).map_err(|e| e.to_string())
     }
-
-    /// Decode sample number `index`; the pictures it completes join `out`.
-    fn decode(&mut self, sample: &[u8], index: u32, out: &mut VecDeque<Picture>) -> Result<(), String> {
-        let t = index as f64;
-        match self {
-            Inner::Hevc(d) => out.extend(pictures!(d.decode(sample, t).map_err(|e| e.to_string())?)),
-            Inner::Vp9(d) => out.extend(pictures!(d.decode(sample, t).map_err(|e| e.to_string())?)),
-            Inner::Vp8(d) => out.extend(pictures!(d.decode(sample, t).map_err(|e| e.to_string())?)),
-            Inner::Av1(d) => out.extend(pictures!(d.decode(sample, t).map_err(|e| e.to_string())?)),
-        }
-        Ok(())
+    fn flush(&mut self) -> Result<Vec<Frame>, String> {
+        VideoDecoder::flush(self).map_err(|e| e.to_string())
     }
-
-    /// The pictures still held at the end of the stream join `out`.
-    fn flush(&mut self, out: &mut VecDeque<Picture>) -> Result<(), String> {
-        match self {
-            Inner::Hevc(d) => out.extend(pictures!(d.flush().map_err(|e| e.to_string())?)),
-            Inner::Vp9(d) => out.extend(pictures!(d.flush().map_err(|e| e.to_string())?)),
-            Inner::Vp8(d) => out.extend(pictures!(d.flush().map_err(|e| e.to_string())?)),
-            Inner::Av1(d) => out.extend(pictures!(d.flush().map_err(|e| e.to_string())?)),
-        }
-        Ok(())
-    }
-
-    /// How many pictures may come out before one shown earlier: HEVC's in
-    /// decoding order; the others' come in presentation order.
     fn reorder_depth(&self) -> u32 {
-        match self {
-            Inner::Hevc(d) => d.reorder_depth(),
-            _ => 0,
-        }
+        VideoDecoder::reorder_depth(self)
+    }
+}
+
+/// A decoder for `codec` (the app's name: hevc, vp9, vp8, av1) and the
+/// track's configuration record (hvcC, vpcC, av1C or Matroska's
+/// CodecPrivate; may be empty).
+fn open(codec: &str, config: &[u8]) -> Result<Box<dyn Stream>, String> {
+    // (boxed: one decoder at a time, of states that differ in size by kilobytes)
+    fn boxed<D: VideoDecoder + 'static>(config: &[u8]) -> Result<Box<dyn Stream>, String> {
+        Ok(Box::new(D::open(config).map_err(|e| e.to_string())?))
+    }
+    match codec {
+        "hevc" => boxed::<unflash_hevc::Decoder>(config),
+        "vp9" => boxed::<unflash_vp9::Decoder>(config),
+        "vp8" => boxed::<unflash_vp8::Decoder>(config),
+        "av1" => boxed::<unflash_av1::Decoder>(config),
+        other => Err(format!("there is no built-in decoder for {other}")),
     }
 }
 
@@ -105,9 +67,12 @@ impl Inner {
 /// whole (packed I420 at `frame_ptr`, in this module's memory).
 #[wasm_bindgen]
 pub struct SoftDecoder {
-    inner: Inner,
-    ready: VecDeque<Picture>,
-    cur: Option<Picture>,
+    inner: Box<dyn Stream>,
+    /// The pictures decoded and not yet taken, and the one taken last. (The
+    /// decoders carry the number `decode` was given as a picture's time:
+    /// the sample it was shown by.)
+    ready: VecDeque<Frame>,
+    cur: Option<Frame>,
     /// The current picture as packed I420, when pictures are not made small.
     frame: Vec<u8>,
     /// The analysis size pictures are made small to, and the last one made.
@@ -122,7 +87,7 @@ impl SoftDecoder {
     /// configuration record (`config`).
     #[wasm_bindgen(constructor)]
     pub fn new(codec: &str, config: &[u8]) -> Result<SoftDecoder, JsValue> {
-        Ok(SoftDecoder { inner: Inner::new(codec, config).map_err(js_err)?, ready: VecDeque::new(), cur: None, frame: Vec::new(), shrink: None, shrinker: None, small: Vec::new() })
+        Ok(SoftDecoder { inner: open(codec, config).map_err(js_err)?, ready: VecDeque::new(), cur: None, frame: Vec::new(), shrink: None, shrinker: None, small: Vec::new() })
     }
 
     /// From now on make each picture `analysis_width`×`analysis_height`
@@ -135,13 +100,13 @@ impl SoftDecoder {
     /// Decode one sample (`index`: its number, which the picture it shows
     /// carries back in `frame_pts`). Returns how many pictures are ready.
     pub fn decode(&mut self, sample: &[u8], index: u32) -> Result<u32, JsValue> {
-        self.inner.decode(sample, index, &mut self.ready).map_err(js_err)?;
+        self.ready.extend(self.inner.decode(sample, index as f64).map_err(js_err)?);
         Ok(self.ready.len() as u32)
     }
 
     /// The pictures still held at the end; returns how many are ready.
     pub fn flush(&mut self) -> Result<u32, JsValue> {
-        self.inner.flush(&mut self.ready).map_err(js_err)?;
+        self.ready.extend(self.inner.flush().map_err(js_err)?);
         Ok(self.ready.len() as u32)
     }
 
@@ -159,20 +124,13 @@ impl SoftDecoder {
             self.cur = None;
             return false;
         };
-        let (w, h) = (p.width as usize, p.height as usize);
-        let cw = w.div_ceil(2);
         match self.shrink {
             Some((aw, ah)) => {
+                let (w, cw) = (p.width as usize, p.chroma_size().0);
                 let k = Shrink::reuse(&mut self.shrinker, p.width, p.height, aw, ah);
                 k.yuv420_planes(&p.y, w, &p.u, cw, &p.v, cw, p.bt709, p.full_range, &mut self.small);
             }
-            None => {
-                self.frame.clear();
-                self.frame.extend_from_slice(&p.y[..w * h]);
-                let ch = h.div_ceil(2);
-                self.frame.extend_from_slice(&p.u[..cw * ch]);
-                self.frame.extend_from_slice(&p.v[..cw * ch]);
-            }
+            None => p.pack_i420(&mut self.frame),
         }
         self.cur = Some(p);
         true
@@ -186,7 +144,7 @@ impl SoftDecoder {
     }
     /// The number of the sample the current picture was shown by.
     pub fn frame_pts(&self) -> u32 {
-        self.cur.as_ref().map_or(0, |p| p.index)
+        self.cur.as_ref().map_or(0, |p| p.pts as u32)
     }
     pub fn frame_damaged(&self) -> bool {
         self.cur.as_ref().is_some_and(|p| p.damaged)
@@ -216,7 +174,7 @@ impl SoftDecoder {
 /// it), or an error saying why not (an unsupported profile, say).
 #[wasm_bindgen]
 pub fn probe(codec: &str, config: &[u8]) -> Result<String, JsValue> {
-    Inner::new(codec, config).map_err(js_err)?;
+    open(codec, config).map_err(js_err)?;
     Ok("{}".into())
 }
 

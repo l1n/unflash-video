@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/unflash-av1",
+    "crates/unflash-codec",
     "crates/unflash-core",
     "crates/unflash-decoders",
     "crates/unflash-gpu",

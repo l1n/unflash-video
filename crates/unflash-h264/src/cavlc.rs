@@ -67,13 +67,13 @@ impl Vlc {
             if e2.len == 0 {
                 return Err(Error::Bitstream("invalid CAVLC code"));
             }
-            r.skip(8 + e2.len as u32);
+            r.advance(8 + e2.len as usize);
             Ok(e2.value as i32)
         } else {
             if e.len == 0 {
                 return Err(Error::Bitstream("invalid CAVLC code"));
             }
-            r.skip(e.len as u32);
+            r.advance(e.len as usize);
             Ok(e.value as i32)
         }
     }
@@ -146,7 +146,7 @@ pub fn residual_block(r: &mut BitReader, nc: i32, start: usize, end: usize, coef
         if level_prefix >= 32 {
             return Err(Error::Bitstream("bad level_prefix"));
         }
-        r.skip(level_prefix + 1);
+        r.advance(level_prefix as usize + 1);
         let mut level_code = (level_prefix.min(15) << suffix_length) as i32;
         if suffix_length > 0 || level_prefix >= 14 {
             let size = if level_prefix == 14 && suffix_length == 0 {

@@ -1140,8 +1140,13 @@ dependencies = [
  "libc",
  "md5",
  "rav1d",
+ "unflash-codec",
  "unflash-mp4",
 ]
+
+[[package]]
+name = "unflash-codec"
+version = "0.1.0"
 
 [[package]]
 name = "unflash-core"
@@ -1160,6 +1165,7 @@ dependencies = [
  "console_error_panic_hook",
  "serde_json",
  "unflash-av1",
+ "unflash-codec",
  "unflash-core",
  "unflash-hevc",
  "unflash-sound",
@@ -1185,6 +1191,7 @@ name = "unflash-h264"
 version = "0.1.0"
 dependencies = [
  "md5",
+ "unflash-codec",
  "unflash-mp4",
  "wide",
 ]
@@ -1194,6 +1201,7 @@ name = "unflash-hevc"
 version = "0.1.0"
 dependencies = [
  "md5",
+ "unflash-codec",
  "unflash-mp4",
  "wide",
 ]
@@ -1204,6 +1212,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "unflash-codec",
 ]
 
 [[package]]
@@ -1219,6 +1228,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "md5",
+ "unflash-codec",
  "unflash-mp4",
  "wide",
 ]
@@ -1228,6 +1238,7 @@ name = "unflash-vp9"
 version = "0.1.0"
 dependencies = [
  "md5",
+ "unflash-codec",
  "unflash-mp4",
  "wide",
 ]
@@ -1240,6 +1251,7 @@ dependencies = [
  "js-sys",
  "serde",
  "serde_json",
+ "unflash-codec",
  "unflash-core",
  "unflash-gpu",
  "unflash-h264",

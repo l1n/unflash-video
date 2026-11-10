@@ -773,7 +773,7 @@ mod tests {
         let mut r = BitReader::new(&out);
         assert_eq!(r.u(3).unwrap(), 0b101);
         let mut r2 = BitReader::new(&src);
-        r2.skip(2);
+        r2.advance(2);
         for _ in 0..20 {
             assert_eq!(r.u(1).unwrap(), r2.u(1).unwrap());
         }

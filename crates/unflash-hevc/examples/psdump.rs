@@ -4,7 +4,7 @@
 
 use std::rc::Rc;
 
-use unflash_hevc::bitreader::{unescape, BitReader};
+use unflash_hevc::bitreader::{unescape_into, BitReader};
 use unflash_hevc::ps::{parse_pps, parse_sps, Pps, Sps};
 use unflash_hevc::slice::{parse_slice_header, SliceHeader};
 
@@ -34,7 +34,7 @@ fn main() {
         }
         let t = (nal[0] >> 1) & 0x3f;
         let layer = ((nal[0] & 1) << 5) | (nal[1] >> 3);
-        unescape(&nal[2..], &mut rbsp);
+        unescape_into(&nal[2..], &mut rbsp);
         match t {
             33 if layer == 0 => match parse_sps(&rbsp) {
                 Ok(sps) => {
@@ -54,7 +54,7 @@ fn main() {
             },
             0..=31 if layer == 0 => {
                 let mut r = BitReader::new(&rbsp);
-                let first = r.peek(1) == Some(1);
+                let first = r.peek(1) == 1;
                 match parse_slice_header(&mut r, t, &spss, &ppss, if first { None } else { prev.as_ref() }) {
                     Ok(h) => {
                         println!("{k}: slice type {t} {:?} poc_lsb {} addr {} dependent {} qp {} data at {}", h.slice_type, h.poc_lsb, h.segment_address, h.dependent, h.qp, h.data_offset);

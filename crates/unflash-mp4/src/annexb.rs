@@ -4,22 +4,10 @@
 //! string, the bit depths, where a picture and a field pair begin), and the
 //! decoder setup records (avcC, hvcC) built from the parameter sets.
 
-use crate::reader::Bits;
+// (the RBSP of a NAL unit: its emulation prevention bytes taken out, as the decoders take them)
+pub use unflash_codec::bits::unescape as rbsp;
 
-/// The RBSP of a NAL unit: its emulation prevention bytes taken out.
-pub fn rbsp(nal: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(nal.len());
-    let mut zeros = 0;
-    for &b in nal {
-        if zeros >= 2 && b == 3 {
-            zeros = 0;
-            continue;
-        }
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-        out.push(b);
-    }
-    out
-}
+use crate::reader::Bits;
 
 /// What an H.264 sequence parameter set says that a container needs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

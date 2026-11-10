@@ -1370,7 +1370,7 @@ pub fn avcc_record(sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> {
 /// matrix 1 (or 9, BT.2020's), BT.601 for 5 or 6, otherwise by height
 /// (BT.709 above 576 lines); full range as the VUI says, else limited.
 fn conversion(sps: &unflash_h264::Sps) -> (bool, bool) {
-    let hd = sps.cropped_size().1 > 576;
+    let hd = unflash_codec::bt709_by_height(sps.cropped_size().1);
     match &sps.vui {
         Some(v) => (
             match v.matrix_coefficients {
@@ -1388,7 +1388,7 @@ fn conversion(sps: &unflash_h264::Sps) -> (bool, bool) {
 /// by picture size.
 fn color_space_json(sps: &unflash_h264::Sps) -> String {
     let (_, h) = sps.cropped_size();
-    let hd = h > 576;
+    let hd = unflash_codec::bt709_by_height(h);
     let (mut primaries, mut transfer, mut matrix, mut full) = (if hd { "bt709" } else { "smpte170m" }, if hd { "bt709" } else { "smpte170m" }, if hd { "bt709" } else { "smpte170m" }, false);
     if let Some(v) = &sps.vui {
         full = v.video_full_range;

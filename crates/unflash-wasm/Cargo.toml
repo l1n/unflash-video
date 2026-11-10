@@ -10,6 +10,7 @@ repository.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+unflash-codec = { path = "../unflash-codec" }
 unflash-core = { path = "../unflash-core" }
 unflash-gpu = { path = "../unflash-gpu" }
 unflash-mp4 = { path = "../unflash-mp4" }
