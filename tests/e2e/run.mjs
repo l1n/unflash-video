@@ -1768,18 +1768,35 @@ try {
         },
         { raw: true, workers: true, shrink: { aw: w.aw, ah: w.ah } }
       );
-      // each picture of the video on a <video>, as the live monitor reads it
+      // each picture of the video on a <video>, as the live monitor reads it:
+      // when the element says it has put that picture up (its video frame
+      // callback, which names the picture's time). Read at `seeked`, the
+      // element once gave the picture before in CI, one frame of the 300:
+      // `seeked` comes before the picture is up in four seeks of ten
       v.muted = true;
       v.src = URL.createObjectURL(blob);
       await new Promise((resolve, reject) => {
         v.onloadeddata = resolve;
         v.onerror = () => reject(new Error('the <video> cannot play flash.mp4'));
       });
-      for (let k = 0; k < own.size; k++) {
-        await new Promise((resolve) => {
-          v.addEventListener('seeked', resolve, { once: true });
+      const show = (k) =>
+        new Promise((resolve, reject) => {
+          const late = setTimeout(() => reject(new Error(`the <video> did not put up picture ${k} of flash.mp4`)), 30000);
+          const up = (now, meta) => {
+            if (Math.round(meta.mediaTime * 30) !== k) return v.requestVideoFrameCallback(up);
+            clearTimeout(late);
+            resolve();
+          };
+          v.requestVideoFrameCallback(up);
           v.currentTime = (k + 0.5) / 30;
         });
+      // (the element says so only of a picture it has to put up: one already
+      // up, as the first is once the film has loaded, it does not put up
+      // again. Sent to its last picture first, each one asked for below is
+      // another than the one up)
+      await show(own.size - 1);
+      for (let k = 0; k < own.size; k++) {
+        await show(k);
         await dets.video.videoElement(v, k / 30, true);
         n.video += own.has(k) ? differ(own.get(k), last('video')) : Infinity;
         n.shown++;
