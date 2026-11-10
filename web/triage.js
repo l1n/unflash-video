@@ -65,11 +65,15 @@ export function triageChunks(movie, chunks) {
   // the rest of the film is like (a real 1080p keyframe runs 0.02 to 0.15
   // bytes a pixel, a flat white or black one a few thousandths)
   const flatBytes = Math.max(keyMedian / 4, FLAT_BYTES_PER_PIXEL * Math.max(1, movie.width * movie.height));
+  // where the film ends: its last picture's time, and that picture's own
+  // (the chunks' last bound is a second past it, for the decode's sake:
+  // taken as the last chunk's length, it made that chunk's rates read low)
+  const end = movie.tsMax + (movie.medianDelta || 0);
   const features = [];
   for (let c = 0; c < nc; c++) {
     const a = chunks.idx[c];
     const b = c + 1 < nc ? chunks.idx[c + 1] : size.length;
-    const secs = Math.max(0.001, chunks.t[c + 1] - chunks.t[c]);
+    const secs = Math.max(0.001, (c + 1 < nc ? chunks.t[c + 1] : end) - chunks.t[c]);
     let bytes = 0;
     let keys = 0;
     let flat = 0;

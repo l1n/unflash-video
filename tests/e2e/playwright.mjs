@@ -37,7 +37,10 @@ export async function loadPlaywright() {
   }
   candidates.push('/opt/node22/lib/node_modules/playwright/index.mjs', '/usr/lib/node_modules/playwright/index.mjs', '/usr/local/lib/node_modules/playwright/index.mjs');
   for (const c of candidates) {
-    if (fs.existsSync(c)) return import(c);
+    if (!fs.existsSync(c)) continue;
+    // (found by require.resolve it is the CommonJS build, whose exports an import puts under `default`)
+    const pw = await import(c);
+    return pw.chromium ? pw : pw.default;
   }
   throw new Error('playwright not found; npm install -g playwright && npx playwright install chromium');
 }

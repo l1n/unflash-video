@@ -56,6 +56,21 @@ test('another chunk length cuts accordingly', () => {
   assert.deepEqual(c.idx, [0, 50, 100, 150, 200, 250]);
 });
 
+test('a film in which two pictures share a time is one chunk', () => {
+  // (in chunks, a picture stamped like the one before it is taken for one that is in
+  // already, from a lane that had the chunk before: such a film is scanned in one piece)
+  const movie = film(30, 25);
+  movie.v.pts[130] = movie.v.pts[129];
+  const c = scanChunks(movie);
+  assert.deepEqual(c.idx, [0]);
+  assert.deepEqual(c.n, [300]);
+  assert.equal(c.t.length, 2);
+  // pictures decoded out of the order they are shown in share no time for that
+  const reordered = film(30, 25);
+  [reordered.v.pts[131], reordered.v.pts[132]] = [reordered.v.pts[132], reordered.v.pts[131]];
+  assert.equal(scanChunks(reordered).length, 3);
+});
+
 const four = () => new ChunkPicker([10, 10, 10, 10], [0, 10, 20, 30, 40], { bytes: 1, budget: 15 });
 
 test('lanes take the chunks in order, within the budget for pictures held', () => {

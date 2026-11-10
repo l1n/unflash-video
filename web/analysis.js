@@ -195,18 +195,30 @@ function holdBudget() {
   return (gb ? Math.min(1024, Math.max(384, gb * 96)) : 512) * 1024 * 1024;
 }
 
+/** Whether two of a film's pictures share a time (`pts`: each sample's, in decoding order). */
+function timesRepeat(pts) {
+  const sorted = Float64Array.from(pts).sort();
+  for (let i = 1; i < sorted.length; i++) if (sorted[i] === sorted[i - 1]) return true;
+  return false;
+}
+
 /**
  * Where a chunked scan cuts the file: at sync samples about `chunkS` seconds
  * apart (none within half that of the end). Chunk c holds the pictures shown
  * in [t[c], t[c + 1]); its decode starts at sample idx[c] (a sync sample,
- * but for the first chunk), and it holds about n[c] pictures.
+ * but for the first chunk), and it holds about n[c] pictures. A film in
+ * which two pictures share a time is not cut at all: a chunk's pictures are
+ * told apart by their times (a picture no later than the last one in is one
+ * another lane gave already, see onFrameFor), so the second of two such
+ * would be dropped, and a scan in one piece feeds it.
  */
 export function scanChunks(movie, chunkS = CHUNK_S) {
   const { pts, sync } = movie.v;
   const count = pts.length;
   const t = [movie.tsMin];
   const idx = [0];
-  for (let i = 1; i < count; i++) {
+  const whole = timesRepeat(pts);
+  for (let i = 1; i < count && !whole; i++) {
     if (!sync[i]) continue;
     const ti = pts[i] / 1e6;
     if (ti - t[t.length - 1] >= chunkS && movie.tsMax - ti >= chunkS / 2) {
@@ -841,7 +853,11 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
       changed();
       const slot = slots[c];
       for (;;) {
-        if (stop()) return;
+        if (stop()) {
+          // (a cancel: the lanes waiting for room wait on the detector, and would for good)
+          changed();
+          return;
+        }
         if (slot.head < slot.pics.length) {
           const { pic, t } = slot.pics[slot.head];
           slot.pics[slot.head++] = null;
@@ -877,6 +893,9 @@ async function scanChunked(env, movie, { onProgress, onPartial = null, cancel, m
       halt(e);
       throw e;
     });
+    // (its failure is taken up below, once the lanes have ended: until then
+    // the page would count it as a rejection nobody handled, an error more)
+    detecting.catch(() => {});
     let settled = await Promise.allSettled(lanes.map(laneLoop));
     // chunks a built-in decoder gave back after the other lanes had finished: they all go on
     while (!stop() && picker.left > 0 && settled.every((r) => r.status === 'fulfilled') && lanes.some((l) => !l.failed)) settled = await Promise.allSettled(lanes.filter((l) => !l.failed).map(laneLoop));

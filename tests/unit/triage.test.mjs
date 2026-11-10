@@ -3,6 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { triageChunks } from '../../web/triage.js';
+import { scanChunks } from '../../web/analysis.js';
 
 /** A film of `chunks` one-second chunks of ten frames, the first of each a keyframe: `key` bytes it, `other` each of the rest. */
 function film(chunks, { key = 5000, other = 1000 } = {}) {
@@ -16,7 +17,9 @@ function film(chunks, { key = 5000, other = 1000 } = {}) {
   }
   const idx = Array.from({ length: chunks }, (_, c) => c * 10);
   const t = Array.from({ length: chunks + 1 }, (_, c) => c);
-  return { movie: { v: { size, sync }, width: 100, height: 100 }, chunks: { idx, t, length: chunks } };
+  // (the chunks' last bound as a scan gives it: a second past the last picture)
+  t[chunks] = chunks - 0.1 + 1;
+  return { movie: { v: { size, sync }, width: 100, height: 100, tsMin: 0, tsMax: chunks - 0.1, medianDelta: 0.1 }, chunks: { idx, t, length: chunks } };
 }
 
 const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-9, `${a} is not ${b}`);
@@ -77,4 +80,18 @@ test('a film without frames, or of one chunk, gives no order to speak of', () =>
   const one = triageChunks(movie, chunks);
   assert.deepEqual(one.order, [0]);
   near(one.score[0], 0.5);
+});
+
+test("the last chunk is measured to the film's end, like the others to their next", () => {
+  // a minute at ten frames a second, a keyframe every second, every second alike, cut as a scan cuts it
+  const n = 600;
+  const sync = Array.from({ length: n }, (_, i) => (i % 10 === 0 ? 1 : 0));
+  const movie = { v: { pts: Array.from({ length: n }, (_, i) => i * 100000), sync, size: sync.map((k) => (k ? 5000 : 1000)) }, width: 100, height: 100, tsMin: 0, tsMax: 59.9, medianDelta: 0.1 };
+  const chunks = scanChunks(movie);
+  assert.equal(chunks.length, 6);
+  const r = triageChunks(movie, chunks);
+  // (the last chunk's end as scanChunks gives it is a second past the last picture, for the
+  // decode's sake: counted as length, it made the last chunk's rates read a tenth low)
+  for (const f of r.features) near(f.keys, 1);
+  for (const s of r.score) near(s, 0.5);
 });

@@ -474,9 +474,12 @@ export class Feeder {
   }
 
   async videoFrame(frame, t, capture = false) {
-    await this.waitSlot();
-    const t0 = performance.now();
+    let t0 = 0;
     try {
+      // (inside the try: a wait that fails, on a readback the GPU never
+      // gave, must not leave the frame open, which holds its decoder up)
+      await this.waitSlot();
+      t0 = performance.now();
       await this.feedFrame(frame, t, capture);
     } finally {
       frame.close();
