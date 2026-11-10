@@ -20,24 +20,38 @@ export function builtInFor(codec) {
  * `load` as something asked for any number of times and run once: its
  * promise is kept and given to everyone who asks. But a load that failed
  * (the network down for a moment) is not kept: the next one who asks sets
- * off another.
+ * off another. `load` is told how many tries have failed before it.
  */
 export function keptLoad(load) {
   let kept = null;
+  let failed = 0;
   return () => {
     if (!kept) {
-      const mine = (kept = (async () => load())());
+      const mine = (kept = (async () => load(failed))());
       mine.catch(() => {
-        if (kept === mine) kept = null;
+        if (kept !== mine) return;
+        kept = null;
+        failed++;
       });
     }
     return kept;
   };
 }
 
+/**
+ * The address a module is asked for under, after `failed` tries that
+ * failed: its own the first time, then with the try's number after it. A
+ * browser keeps a module it could not fetch as one that failed, under its
+ * address, and answers every later import of it with that failure (the
+ * fetch is not made again): another try has to ask under another address.
+ */
+export function moduleAddress(path, failed) {
+  return failed > 0 ? `${path}?again=${failed}` : path;
+}
+
 /** The decoders module (HEVC, VP9, VP8, AV1, and the AC-3 / E-AC-3 and DTS sound decoder), loaded on first use. */
-export const loadDecoders = keptLoad(async () => {
-  const mod = await import('./pkg-dec/unflash_decoders.js');
+export const loadDecoders = keptLoad(async (failed) => {
+  const mod = await import(moduleAddress('./pkg-dec/unflash_decoders.js', failed));
   await mod.default();
   return mod;
 });

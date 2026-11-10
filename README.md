@@ -511,6 +511,12 @@ fuzzing fed them. `tests/e2e/decoders.mjs` scans the flash clip in each
 codec with its built-in decoder and requires what the browser's own
 decoder finds, and a hybrid scan of the VP9 clip, the built-in decoder
 beside the browser's, exactly what the browser's decoder gives alone.
+The decoders module is fetched when a video first needs it; when that
+fetch fails (the network gone for a moment), the next video asks again,
+under another address, because a browser keeps a module it could not
+fetch as failed under the address it was asked for (the same suite
+refuses the script once, then the WebAssembly once, and requires the
+second try to scan).
 
 The decoding runs in parallel Web Workers (`web/h264pool.js`, one group of
 pictures per worker, split at sync samples), with eight-lane SIMD row

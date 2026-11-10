@@ -7,11 +7,13 @@
 // lane of the browser's decoder gives, the built-in decoder having decoded
 // part of it. Then the workers of the built-in decoders, H.264's and the
 // decoders module's, in trouble: a job that fails, a video closed while
-// they decode, two samples at the same time.
+// they decode, two samples at the same time. And the decoders module that
+// could not be fetched once (its script, or its WebAssembly): the next
+// video asks for it again, and has it.
 //   node tests/e2e/decoders.mjs        (after ./build.sh)
 import fs from 'node:fs';
 import path from 'node:path';
-import { MEDIA, OUT, assert, chromium, watch, open, scan, flashesAsInTheMp4, sameViolations } from './playwright.mjs';
+import { MEDIA, OUT, assert, chromium, watch, open, job, scan, flashesAsInTheMp4, sameViolations } from './playwright.mjs';
 
 const { browser, port, close } = await chromium();
 const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
@@ -134,6 +136,41 @@ try {
     assert(r.left === 0 && r.after.frames === 300, `${name}: the workers whose jobs failed leave the pool, and the video decodes again: ${JSON.stringify(r)}`);
     assert(r.closed.error === 'the decoder pool was closed', `${name}: a video closed while its pool decodes ends the pass: ${JSON.stringify(r.closed)}`);
     assert(r.sameTime.frames === 300 && r.sameTimePage.frames === 300, `${name}: two samples at one time each keep their picture, in the workers and on the page: ${JSON.stringify([r.sameTime, r.sameTimePage])}`);
+  }
+
+  // --- the decoders module could not be fetched once: the next video asks again ---
+  // (The page kept its failed load, so every video after it failed the same
+  // way until a reload. And a browser keeps a module it could not fetch as
+  // failed, under its address, without asking the network again: only a
+  // browser shows that, so it is tried here, for the script and for the
+  // WebAssembly it fetches.)
+  for (const what of ['unflash_decoders.js', 'unflash_decoders_bg.wasm']) {
+    const ctx = await browser.newContext({ viewport: { width: 1400, height: 1000 } });
+    const p = await ctx.newPage();
+    const errs = [];
+    watch(p, errs, /Failed to load resource|MEDIA_ERR|DEMUXER_ERROR|PIPELINE_ERROR/i);
+    await p.goto(`http://127.0.0.1:${port}/?auto=0`);
+    await p.waitForFunction(() => document.querySelector('#support').textContent.includes('WebGPU'), null, { timeout: 60000 });
+    let refused = 0;
+    await p.route('**/pkg-dec/' + what, (r) => {
+      refused++;
+      return r.abort('internetdisconnected');
+    });
+    // (not open(), which takes the banner this is to raise for a failure)
+    await job(p, () => p.setInputFiles('#fileInput', path.join(MEDIA, 'flash_hevc.mp4')));
+    const gone = await p.evaluate(() => ({ banner: document.querySelector('#bannerText').textContent, builtIn: !!window.__unflash.state.movie.builtIn }));
+    await p.unroute('**/pkg-dec/' + what);
+    assert(refused > 0 && !gone.builtIn && /the built-in HEVC decoder cannot read it/.test(gone.banner), `${what} refused: the video says that its decoder could not be read: ${JSON.stringify(gone)}`);
+    await open(p, path.join(MEDIA, 'flash_hevc.mp4'));
+    const again = await p.evaluate(() => ({ builtIn: window.__unflash.state.movie.builtIn ? window.__unflash.state.movie.builtIn.name : null, banner: document.querySelector('#bannerText').textContent }));
+    console.log(`${what} refused once:`, JSON.stringify({ refused, said: gone.banner.slice(0, 150), then: again.builtIn }));
+    // (before the scan: without its decoder the video has no Scan to click)
+    assert(again.builtIn === 'HEVC', `${what} refused once: the same video, opened again, has its decoder: ${JSON.stringify(again)}`);
+    const back = await scan(p);
+    assert(back.frames === 300, `${what} refused once: and scans, every frame: ${back.frames}`);
+    flashesAsInTheMp4(`flash_hevc.mp4, ${what} fetched at the second try`, back.violations);
+    if (errs.length) throw new Error(`page errors (${what} refused once):\n` + errs.join('\n'));
+    await ctx.close();
   }
 
   if (errors.length) throw new Error('page errors:\n' + errors.join('\n'));

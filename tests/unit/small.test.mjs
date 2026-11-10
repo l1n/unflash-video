@@ -3,7 +3,7 @@
 // reports (web/profile.js), and how many decode workers run (web/h264pool.js).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { builtInFor, keptLoad } from '../../web/codecs.js';
+import { builtInFor, keptLoad, moduleAddress } from '../../web/codecs.js';
 import { stored, store } from '../../web/storage.js';
 import { profile } from '../../web/profile.js';
 import { defaultWorkerCount } from '../../web/h264pool.js';
@@ -102,7 +102,9 @@ test('a module is loaded once and kept, but a load that failed is tried again', 
   // every film after it used to fail the same way until the page was loaded again)
   const outcomes = [new Error('offline'), new Error('still offline'), { name: 'the module' }];
   let loads = 0;
-  const load = keptLoad(async () => {
+  const told = [];
+  const load = keptLoad(async (failed) => {
+    told.push(failed);
     const o = outcomes[loads++];
     if (o instanceof Error) throw o;
     return o;
@@ -121,4 +123,8 @@ test('a module is loaded once and kept, but a load that failed is tried again', 
   assert.equal(await load(), mod);
   assert.equal(await load(), mod);
   assert.equal(loads, 3);
+  // each try was told how many had failed before it, and asks for the module under an address of
+  // its own: a browser answers a second import of an address that failed with the same failure
+  assert.deepEqual(told, [0, 1, 2]);
+  assert.deepEqual(told.map((n) => moduleAddress('./pkg-dec/unflash_decoders.js', n)), ['./pkg-dec/unflash_decoders.js', './pkg-dec/unflash_decoders.js?again=1', './pkg-dec/unflash_decoders.js?again=2']);
 });
