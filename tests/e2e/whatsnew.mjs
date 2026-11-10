@@ -717,6 +717,11 @@ const DERIVED = {
     ffmpeg(['-i', path.join(MEDIA, 'flash.ts'), '-c', 'copy', '-output_ts_offset', '3600', first]);
     fs.writeFileSync(out, Buffer.concat([fs.readFileSync(first), fs.readFileSync(path.join(MEDIA, 'flash.ts'))]));
   },
+  // a recording that starts part-way through a scene: the transport stream
+  // from its 40th packet on, whose sound starts 0.7 s before its first whole picture
+  'mid-scene.ts': (out) => fs.writeFileSync(out, fs.readFileSync(path.join(MEDIA, 'flash.ts')).subarray(188 * 40)),
+  // a damaged file: its last five pictures 136 years (4.3e9 s) after the rest
+  'clock-jump.mkv': (out) => ffmpeg(['-i', path.join(MEDIA, 'flash.mp4'), '-an', '-c', 'copy', '-bsf:v', "setts=ts='if(gte(N,295),TS+4300000000*15360,TS)'", out]),
 };
 
 function concat(out, names) {

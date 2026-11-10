@@ -224,7 +224,6 @@ fn filter_column_i16<const TAPS: usize>(rows: [&[i16]; TAPS], c: &[i32; TAPS], o
 /// 1/4 samples for luma, `TAPS` = 8, or 1/8 for chroma, `TAPS` = 4), into
 /// `dst` (stride `w`) at 14-bit precision. Samples outside the plane
 /// repeat the nearest edge sample (8-222, 8-239).
-#[allow(clippy::too_many_arguments)]
 fn interpolate<P: Sample, const TAPS: usize>(plane: &Plane<P>, xi: i32, yi: i32, xf: usize, yf: usize, w: usize, h: usize, bit_depth: u32, dst: &mut [i16], scratch: &mut Scratch<P>) {
     let before = TAPS / 2 - 1;
     let (pw, ph) = (plane.width as i32, plane.height as i32);
@@ -296,7 +295,6 @@ fn interpolate<P: Sample, const TAPS: usize>(plane: &Plane<P>, xi: i32, yi: i32,
 
 /// 8.5.3.3.3.2: the luma prediction of a `w`×`h` block at (`x`, `y`)
 /// displaced by `mv` (quarter samples).
-#[allow(clippy::too_many_arguments)]
 pub fn luma<P: Sample>(plane: &Plane<P>, x: i32, y: i32, mv: [i16; 2], w: usize, h: usize, bit_depth: u32, dst: &mut [i16], scratch: &mut Scratch<P>) {
     let (mx, my) = (mv[0] as i32, mv[1] as i32);
     interpolate::<P, 8>(plane, x + (mx >> 2), y + (my >> 2), (mx & 3) as usize, (my & 3) as usize, w, h, bit_depth, dst, scratch);
@@ -304,7 +302,6 @@ pub fn luma<P: Sample>(plane: &Plane<P>, x: i32, y: i32, mv: [i16; 2], w: usize,
 
 /// 8.5.3.3.3.3: the chroma prediction (4:2:0) of a `w`×`h` block at chroma
 /// position (`x`, `y`) for the luma vector `mv` (eighth chroma samples).
-#[allow(clippy::too_many_arguments)]
 pub fn chroma<P: Sample>(plane: &Plane<P>, x: i32, y: i32, mv: [i16; 2], w: usize, h: usize, bit_depth: u32, dst: &mut [i16], scratch: &mut Scratch<P>) {
     let (mx, my) = (mv[0] as i32, mv[1] as i32);
     interpolate::<P, 4>(plane, x + (mx >> 3), y + (my >> 3), (mx & 7) as usize, (my & 7) as usize, w, h, bit_depth, dst, scratch);
@@ -354,7 +351,6 @@ pub fn put_bi<P: Sample>(a: &[i16], b: &[i16], w: usize, h: usize, bit_depth: u3
 }
 
 /// 8.5.3.3.4.3: explicit weighting of a single list `l`.
-#[allow(clippy::too_many_arguments)]
 pub fn put_weighted_uni<P: Sample>(src: &[i16], w: usize, h: usize, bit_depth: u32, wt: &Weights, l: usize, dst: &mut [P], ds: usize) {
     let max = (1 << bit_depth) - 1;
     let (w0, o0, sh) = (wt.w[l], wt.o[l], wt.log2wd);
@@ -372,7 +368,6 @@ pub fn put_weighted_uni<P: Sample>(src: &[i16], w: usize, h: usize, bit_depth: u
 }
 
 /// 8.5.3.3.4.3: explicit weighted bi-prediction.
-#[allow(clippy::too_many_arguments)]
 pub fn put_weighted_bi<P: Sample>(a: &[i16], b: &[i16], w: usize, h: usize, bit_depth: u32, wt: &Weights, dst: &mut [P], ds: usize) {
     let max = (1 << bit_depth) - 1;
     let sh = wt.log2wd;

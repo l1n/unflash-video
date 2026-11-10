@@ -1,0 +1,12 @@
+[package]
+name = "unflash-codec"
+description = "What Unflash's built-in video decoders share: the picture they hand out and the trait they are driven through"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

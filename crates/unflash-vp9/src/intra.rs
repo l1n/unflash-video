@@ -29,7 +29,6 @@ impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
     /// of `plane`. `not_on_right`: the block is not in the rightmost column
     /// of transform blocks of its block, so for 4x4 blocks the samples above
     /// and to the right are already decoded.
-    #[allow(clippy::too_many_arguments)]
     pub fn predict_intra(&mut self, plane: usize, x: usize, y: usize, have_left: bool, have_above: bool, not_on_right: bool, tx_size: usize, mode: u8) {
         let size = 4usize << tx_size;
         let bd = self.bit_depth;

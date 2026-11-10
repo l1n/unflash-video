@@ -14,32 +14,9 @@ use crate::tables::{AC_QLOOKUP, DC_QLOOKUP};
 use crate::tile::{AboveCtx, LeftCtx, MiInfo, PrevMv, RefFrame, Scratch, TileDecoder};
 use crate::{Error, Result};
 
-/// A decoded frame, as shown.
-pub struct Frame {
-    /// The frame size (the render size is informational only).
-    pub width: u32,
-    pub height: u32,
-    /// 8-bit 4:2:0 planes, tightly packed; chroma is (w + 1) / 2 x (h + 1) / 2.
-    /// Deeper samples are rounded: (v + (1 << (bd - 9))) >> (bd - 8).
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
-    pub bit_depth: u8,
-    /// The planes at full precision, when `bit_depth` is above 8 and the
-    /// decoder was asked for them ([`Decoder::set_keep_deep`]).
-    pub y16: Option<Vec<u16>>,
-    pub u16: Option<Vec<u16>>,
-    pub v16: Option<Vec<u16>>,
-    /// The timestamp of the sample the frame was shown by.
-    pub pts: f64,
-    /// Some of it could not be decoded, or it was predicted from such a frame.
-    pub damaged: bool,
-    /// The colour matrix is BT.709 (color_space; streams that leave it
-    /// unknown are taken as BT.709 above 576 lines, as players do).
-    pub bt709: bool,
-    /// Full-range samples (color_range).
-    pub full_range: bool,
-}
+/// A decoded frame, as shown (the frame size: the render size is
+/// informational only): the picture every built-in decoder hands out.
+pub use unflash_codec::Frame;
 
 /// A reference slot's frame, at its bit depth.
 #[derive(Clone)]
@@ -512,7 +489,7 @@ fn conceal<T: Pixel>(cur: &mut FrameBuf<T>, last: Option<&FrameBuf<T>>, (r0, r1,
 fn is_bt709(color_space: u8, height: u32) -> bool {
     match color_space {
         CS_BT_709 | CS_SMPTE_240 | CS_BT_2020 => true,
-        CS_UNKNOWN => height > 576,
+        CS_UNKNOWN => unflash_codec::bt709_by_height(height),
         _ => false,
     }
 }
@@ -572,6 +549,22 @@ fn frame_from_high(f: &FrameBuf<u16>, pts: f64, keep_deep: bool) -> Frame {
         damaged: f.damaged,
         bt709: is_bt709(f.color_space, f.height),
         full_range: f.color_range,
+    }
+}
+
+impl unflash_codec::VideoDecoder for Decoder {
+    type Error = Error;
+
+    fn open(config: &[u8]) -> Result<Decoder> {
+        Decoder::new(config)
+    }
+
+    fn decode(&mut self, sample: &[u8], pts: f64) -> Result<Vec<Frame>> {
+        Decoder::decode(self, sample, pts)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Frame>> {
+        Decoder::flush(self)
     }
 }
 

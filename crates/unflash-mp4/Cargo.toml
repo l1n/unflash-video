@@ -7,7 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+unflash-codec = { path = "../unflash-codec" }
 serde.workspace = true
 
 [dev-dependencies]
+# (for its tests alone: the testkit reads its media with this crate)
+unflash-testkit = { path = "../unflash-testkit" }
 serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -91,7 +91,7 @@ fn has(cmd: &str) -> bool {
 fn matroska_matches_ffmpeg() {
     let files = files();
     if files.is_empty() {
-        eprintln!("no Matroska media; run tests/media/gen.sh");
+        unflash_testkit::skipped("no Matroska media: tests/media/gen.sh makes it");
         return;
     }
     for f in files {
@@ -167,7 +167,7 @@ fn remux(name: &str, data: &[u8], movie: &Movie) {
         assert_eq!(back.audio().unwrap().codec, a.codec.replace("mp4a.6B", "mp3"), "{name}: audio codec after the copy");
     }
     if !(has("ffmpeg") && has("ffprobe")) {
-        eprintln!("ffmpeg not available; skipped the decode check");
+        unflash_testkit::skipped("ffmpeg is not installed: the MP4 made of a Matroska file is not decoded by it");
         return;
     }
     let tmp = std::env::temp_dir().join(format!("unflash_mkv_{name}.mp4"));

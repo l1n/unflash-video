@@ -250,7 +250,7 @@ fn random_stream(rng: &mut Lcg, l: &Layout, count: usize) -> Vec<u8> {
 #[test]
 fn random_frames_decode_as_ffmpeg_decodes_them() {
     if !ffmpeg_available() {
-        eprintln!("SKIPPED random_frames_decode_as_ffmpeg_decodes_them: ffmpeg and ffprobe are not installed");
+        unflash_testkit::skipped("random_frames_decode_as_ffmpeg_decodes_them: ffmpeg and ffprobe are not installed");
         return;
     }
     let mut rng = Lcg(19);
@@ -328,7 +328,7 @@ fn lfe_frame(lff: u8, lfe: Vec<i32>, scale: u32) -> Frame {
 #[test]
 fn lfe_128_differs_from_ffmpegs_only_in_its_tap_order() {
     if !ffmpeg_available() {
-        eprintln!("SKIPPED lfe_128_differs_from_ffmpegs_only_in_its_tap_order: ffmpeg and ffprobe are not installed");
+        unflash_testkit::skipped("lfe_128_differs_from_ffmpegs_only_in_its_tap_order: ffmpeg and ffprobe are not installed");
         return;
     }
     // scale factor index 72 (11482), where ffmpeg's fixed point LFE scale
@@ -375,7 +375,7 @@ fn lfe_128_differs_from_ffmpegs_only_in_its_tap_order() {
 #[test]
 fn samples_past_full_scale_are_held_to_24_bits() {
     if !ffmpeg_available() {
-        eprintln!("SKIPPED samples_past_full_scale_are_held_to_24_bits: ffmpeg and ffprobe are not installed");
+        unflash_testkit::skipped("samples_past_full_scale_are_held_to_24_bits: ffmpeg and ffprobe are not installed");
         return;
     }
     // a stereo frame of four subsubframes, silent but for channel 0's
@@ -466,7 +466,7 @@ fn samples_past_full_scale_are_held_to_24_bits() {
 #[test]
 fn embedded_downmix_is_ffmpegs() {
     if !ffmpeg_available() {
-        eprintln!("SKIPPED embedded_downmix_is_ffmpegs: ffmpeg and ffprobe are not installed");
+        unflash_testkit::skipped("embedded_downmix_is_ffmpegs: ffmpeg and ffprobe are not installed");
         return;
     }
     let mut rng = Lcg(23);
@@ -537,7 +537,7 @@ fn differing_frames(frames: &[Frame], name: &str) -> Vec<usize> {
 #[test]
 fn every_huffman_code_decodes_as_ffmpegs() {
     if !ffmpeg_available() {
-        eprintln!("SKIPPED every_huffman_code_decodes_as_ffmpegs: ffmpeg and ffprobe are not installed");
+        unflash_testkit::skipped("every_huffman_code_decodes_as_ffmpegs: ffmpeg and ffprobe are not installed");
         return;
     }
     let mut bad = Vec::new();
@@ -640,7 +640,7 @@ fn every_huffman_code_decodes_as_ffmpegs() {
 #[test]
 fn joint_scales_are_ffmpegs() {
     if !ffmpeg_available() {
-        eprintln!("SKIPPED joint_scales_are_ffmpegs: ffmpeg and ffprobe are not installed");
+        unflash_testkit::skipped("joint_scales_are_ffmpegs: ffmpeg and ffprobe are not installed");
         return;
     }
     let mut rng = Lcg(29);

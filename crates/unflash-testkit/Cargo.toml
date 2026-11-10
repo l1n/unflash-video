@@ -1,0 +1,16 @@
+[package]
+name = "unflash-testkit"
+description = "What the tests and tools of Unflash's built-in decoders share: the test media, its samples, and ffmpeg's hashes of its pictures"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+unflash-codec = { path = "../unflash-codec" }
+unflash-mp4 = { path = "../unflash-mp4" }
+md5.workspace = true
+
+[lints]
+workspace = true

@@ -956,18 +956,16 @@ impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
         let fc = self.fc;
         let sign = self.bd.read(fc.mv_sign[comp]);
         let class = self.bd.read_tree(&MV_CLASS_TREE, &fc.mv_class[comp]);
-        let mag;
-        let (fr, hp);
-        if class == 0 {
+        let mag = if class == 0 {
             let bit = self.bd.read(fc.mv_class0_bit[comp]) as usize;
-            fr = self.bd.read_tree(&MV_FR_TREE, &fc.mv_class0_fr[comp][bit]);
-            hp = if use_hp { self.bd.read(fc.mv_class0_hp[comp]) as usize } else { 1 };
+            let fr = self.bd.read_tree(&MV_FR_TREE, &fc.mv_class0_fr[comp][bit]);
+            let hp = if use_hp { self.bd.read(fc.mv_class0_hp[comp]) as usize } else { 1 };
             if let Some(c) = self.counts.as_deref_mut() {
                 c.mv_class0_bit[comp][bit] += 1;
                 c.mv_class0_fr[comp][bit][fr] += 1;
                 c.mv_class0_hp[comp][hp] += 1;
             }
-            mag = ((bit << 3) | (fr << 1) | hp) + 1;
+            ((bit << 3) | (fr << 1) | hp) + 1
         } else {
             let mut d = 0;
             for i in 0..class {
@@ -977,14 +975,14 @@ impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
                 }
                 d |= bit << i;
             }
-            fr = self.bd.read_tree(&MV_FR_TREE, &fc.mv_fr[comp]);
-            hp = if use_hp { self.bd.read(fc.mv_hp[comp]) as usize } else { 1 };
+            let fr = self.bd.read_tree(&MV_FR_TREE, &fc.mv_fr[comp]);
+            let hp = if use_hp { self.bd.read(fc.mv_hp[comp]) as usize } else { 1 };
             if let Some(c) = self.counts.as_deref_mut() {
                 c.mv_fr[comp][fr] += 1;
                 c.mv_hp[comp][hp] += 1;
             }
-            mag = (2 << (class + 2)) + ((d << 3) | (fr << 1) | hp) + 1;
-        }
+            (2 << (class + 2)) + ((d << 3) | (fr << 1) | hp) + 1
+        };
         if let Some(c) = self.counts.as_deref_mut() {
             c.mv_sign[comp][sign as usize] += 1;
             c.mv_class[comp][class] += 1;

@@ -134,7 +134,7 @@ const COEF_COUNT_SAT: u32 = 24;
 /// merge_prob (8.4.1).
 fn merge_prob(pre: u8, ct0: u32, ct1: u32, count_sat: u32, max_update_factor: u32) -> u8 {
     let den = ct0 as u64 + ct1 as u64;
-    let prob = if den == 0 { 128 } else { ((ct0 as u64 * 256 + (den >> 1)) / den).clamp(1, 255) };
+    let prob = (ct0 as u64 * 256 + (den >> 1)).checked_div(den).map_or(128, |p| p.clamp(1, 255));
     let count = den.min(count_sat as u64);
     let factor = max_update_factor as u64 * count / count_sat as u64;
     ((pre as u64 * (256 - factor) + prob * factor + 128) >> 8) as u8

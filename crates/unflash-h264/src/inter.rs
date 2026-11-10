@@ -367,7 +367,6 @@ fn luma_block<const W: usize>(src: &[u8], base: usize, ss: usize, xf: i32, yf: i
 /// sample is at (`x`, `y`) in the picture, displaced by (`mvx`, `mvy`) in
 /// quarter samples, written to `dst` (stride `ds`); with `avg` the
 /// prediction is averaged into `dst` (the default bi-prediction).
-#[allow(clippy::too_many_arguments)]
 pub fn mc_luma(plane: &[u8], ps: usize, pw: usize, ph: usize, x: i32, y: i32, mvx: i32, mvy: i32, w: usize, h: usize, dst: &mut [u8], ds: usize, avg: bool) {
     let xi = x + (mvx >> 2);
     let yi = y + (mvy >> 2);
@@ -389,7 +388,6 @@ pub fn mc_luma(plane: &[u8], ps: usize, pw: usize, ph: usize, x: i32, y: i32, mv
 /// The (w + 5) × (h + 5) samples around a block reaching outside the
 /// picture, edges replicated, into `win` (stride w + 5).
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn edge_window<'a>(plane: &[u8], ps: usize, pw: usize, ph: usize, xi: i32, yi: i32, w: usize, h: usize, win: &'a mut [u8; WIN * WIN]) -> &'a [u8] {
     let ww = w + 5;
     for j in 0..h + 5 {
@@ -452,7 +450,6 @@ fn chroma_block<const W: usize>(src: &[u8], base: usize, ss: usize, xf: i32, yf:
 /// (`x`, `y`) of size `w`×`h`, motion vector in eighth chroma samples,
 /// into `dst` with stride `ds` (averaged in when `avg`). The plane has
 /// stride `ps` and `pw`×`ph` samples.
-#[allow(clippy::too_many_arguments)]
 pub fn mc_chroma(plane: &[u8], ps: usize, pw: usize, ph: usize, x: i32, y: i32, mvx: i32, mvy: i32, w: usize, h: usize, dst: &mut [u8], ds: usize, avg: bool) {
     let xi = x + (mvx >> 3);
     let yi = y + (mvy >> 3);
@@ -563,8 +560,9 @@ fn weight_bi_w<const W: usize>(p0: &[u8], p1: &[u8], h: usize, weights: Weights,
 /// 8.4.1.2.3 / 8.4.2.3.2: the scaling of a temporal-direct or implicit
 /// weight: (tb, td) -> DistScaleFactor, or None when td is zero.
 pub fn dist_scale_factor(poc_cur: i32, poc_ref0: i32, poc_ref1: i32) -> Option<i32> {
-    let tb = (poc_cur - poc_ref0).clamp(-128, 127);
-    let td = (poc_ref1 - poc_ref0).clamp(-128, 127);
+    // (picture order counts are the stream's: a damaged one's can be far enough apart to wrap)
+    let tb = poc_cur.wrapping_sub(poc_ref0).clamp(-128, 127);
+    let td = poc_ref1.wrapping_sub(poc_ref0).clamp(-128, 127);
     if td == 0 {
         return None;
     }

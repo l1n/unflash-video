@@ -25,7 +25,7 @@ pub fn skip(what: &str) -> bool {
     if ffmpeg_available() {
         return false;
     }
-    eprintln!("SKIPPED {what}: ffmpeg and ffprobe are not installed, so there is no reference to compare with");
+    unflash_testkit::skipped(&format!("{what}: ffmpeg and ffprobe are not installed, so there is no reference to compare with"));
     true
 }
 

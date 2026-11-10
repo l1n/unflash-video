@@ -14,6 +14,11 @@ use unflash_h264::mb::MbKind;
 use unflash_h264::yuv::to_i420;
 use unflash_h264::Decoder;
 
+/// A picture as decoded: its IDR period and POC (the order pictures are
+/// shown in), its samples as packed I420, each macroblock's kind and field
+/// flag, whether it is damaged, and its frame_num.
+type Shown = (u32, i32, Vec<u8>, Vec<MbKind>, Vec<bool>, bool, u32);
+
 fn main() {
     let path = std::env::args().nth(1).expect("file");
     let max: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
@@ -21,12 +26,11 @@ fn main() {
     let data = std::fs::read(&path).unwrap();
     let mut dec = Decoder::new();
     dec.set_skip_deblock(no_deblock);
-    // (idr period, poc, frame data, kinds, field flags, damaged)
-    let mut frames: Vec<(u32, i32, Vec<u8>, Vec<MbKind>, Vec<bool>, bool, u32)> = Vec::new();
+    let mut frames: Vec<Shown> = Vec::new();
     let mut idr_period = 0u32;
     let mut buf = Vec::new();
     let nals = annexb_nal_units(&data);
-    let mut collect = |dec: &mut Decoder, frames: &mut Vec<(u32, i32, Vec<u8>, Vec<MbKind>, Vec<bool>, bool, u32)>, idr_period: &mut u32| {
+    let mut collect = |dec: &mut Decoder, frames: &mut Vec<Shown>, idr_period: &mut u32| {
         let out = dec.decode_annexb(&[], 0.0).unwrap_or_default();
         for f in out {
             to_i420(&f.pic, f.crop, &mut buf);
@@ -75,7 +79,7 @@ fn main() {
             break;
         }
         let theirs = &reference[k * frame_size..(k + 1) * frame_size];
-        if let Some(spec) = std::env::var("H264_ROW").ok() {
+        if let Ok(spec) = std::env::var("H264_ROW") {
             // H264_ROW=frame,y0,y1,x0,x1: print a window of luma samples from both decoders
             let v: Vec<usize> = spec.split(',').filter_map(|t| t.parse().ok()).collect();
             if v.len() == 5 && v[0] == k {

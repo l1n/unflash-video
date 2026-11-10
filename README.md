@@ -348,7 +348,8 @@ Pages build regenerates them; for a local copy run
 **Debug info**, at the bottom right, puts together what someone helping
 with a slow or failing run needs, as text to paste into a message: the
 browser, the WebGPU adapter, the detector and how pictures reach it, the
-open video (container, codec, size, frame rate, length), each job of the
+open video (container, codec, size, frame rate, length, and how long
+before or after its picture its sound starts), each job of the
 visit with how long it took (how much of that the tab spent out of sight,
 and, for one of more than two seconds, the steps that took most of it:
 opening a video reads its index, asks the browser about its decoder,
@@ -456,7 +457,13 @@ MD5s): every stream within those limits decodes bit-exact, 169 of them.
 
 It is written to the standard and tested bit-exact against ffmpeg's
 decoder on x264 streams that exercise those tools
-(`crates/unflash-h264/tests`, media in `tests/media/h264`). Pictures come
+(`crates/unflash-h264/tests`, media in `tests/media/h264`). The same
+streams are decoded damaged (`tests/robustness.rs`: bits flipped, bytes
+overwritten, NAL lengths made wrong, samples cut short, dropped, repeated
+or swapped for another stream's, the `avcC` record damaged, the stream as
+Annex B cut anywhere), and nothing may panic, in a build that checks its
+arithmetic either: what a damaged stream's numbers add up to wraps.
+Pictures come
 back in decode order with the container's timestamps; `web/media.js`
 re-orders them for presentation, so the rest of the app (scan, sections,
 export, verify) does not know which decoder it is on. Scans and section
@@ -505,6 +512,12 @@ fuzzing fed them. `tests/e2e/decoders.mjs` scans the flash clip in each
 codec with its built-in decoder and requires what the browser's own
 decoder finds, and a hybrid scan of the VP9 clip, the built-in decoder
 beside the browser's, exactly what the browser's decoder gives alone.
+The decoders module is fetched when a video first needs it; when that
+fetch fails (the network gone for a moment), the next video asks again,
+under another address, because a browser keeps a module it could not
+fetch as failed under the address it was asked for (the same suite
+refuses the script once, then the WebAssembly once, and requires the
+second try to scan).
 
 The decoding runs in parallel Web Workers (`web/h264pool.js`, one group of
 pictures per worker, split at sync samples), with eight-lane SIMD row
@@ -603,7 +616,10 @@ from where it began, however long ago, and a pixel still since some change
 long before keeps where that change left its monotonic run (the phase of
 the two-second run cap, and which way it last moved), which a fresh
 detector does not know. At a seam in the middle of flashing that moved a
-violation's edge by four frames in the browser test. The segments remain
+violation's edge by four frames in the browser test. (Where a recording's
+timestamps jump, the detector's clock steps over the jump, and so do a
+segment's run-up, measured by that clock rather than in the file's time,
+and the joined clock at a seam that falls in the jump.) The segments remain
 behind `?chunked=0` (with `?segments=N` to force a count); a file shorter
 than four run-ups per segment is scanned in one.
 
@@ -841,7 +857,8 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 |---|---|
 | `crates/unflash-core` | the detector: config and profiles, the per-pixel kernel (scalar and SIMD), grid reduction, temporal stage, violations, sections, editing helpers, the blend (blend frames). No I/O. |
 | `crates/unflash-gpu` | the WGSL pipeline on `wgpu` (native backends and the browser's WebGPU) |
-| `crates/unflash-mp4` | byte-range demuxers for WebCodecs, MP4 (fragmented files, edit lists, PCM) and Matroska / WebM (lacing, unknown sizes, header stripping) and MPEG transport streams (samples as an MP4 holds them, found again in the stream's packets by `web/ts.js`), giving codec strings, decoder descriptions and sample tables; MP4 sample entries for Matroska and transport stream audio; a muxer for the export |
+| `crates/unflash-mp4` | byte-range demuxers for WebCodecs, MP4 (fragmented files, edit lists, PCM) and Matroska / WebM (lacing, unknown sizes, header stripping) and MPEG transport streams (samples as an MP4 holds them, found again in the stream's packets by `web/ts.js`), giving codec strings, decoder descriptions and sample tables; MP4 sample entries for Matroska and transport stream audio; a muxer for the export, which keeps each track where it started (a track that starts after the first says so with an empty edit, so picture and sound stay as far apart as they were) |
+| `crates/unflash-codec` | what the built-in video decoders share: the picture HEVC, VP9, VP8 and AV1 hand out and the trait they are driven through, the bit reader of the two NAL-unit codecs (H.264, HEVC), and the one rule for a stream that names no colour matrix |
 | `crates/unflash-h264` | the built-in H.264 decoder, for browsers whose WebCodecs has none |
 | `crates/unflash-hevc` | the built-in HEVC decoder (Main, Main 10; 4:2:0, 4:0:0) |
 | `crates/unflash-vp9` | the built-in VP9 decoder (profiles 0 and 2) |
@@ -851,6 +868,7 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 | `crates/unflash-av1` | AV1 decoding (8- and 10-bit, film grain applied) into 8-bit 4:2:0 pictures: a small wrapper over rav1d, bit-exact with ffmpeg's libdav1d |
 | `third_party/rav1d` | rav1d 1.1.0, the Rust port of dav1d (BSD-2-Clause), without its assembly and patched to build for wasm32 (see its `UNFLASH.md`) |
 | `crates/unflash-wasm` | the `wasm-bindgen` API |
+| `crates/unflash-testkit` | for the decoders' tests and tools only: the test media, a file's video samples whatever holds it, a picture's MD5 as ffmpeg's `framemd5` reckons it |
 | `web/` | the app (plain ES modules, no build step beyond the WASM); `site.mjs` makes the published site from it |
 | `unflash/` | the Python reference implementation |
 
@@ -877,15 +895,18 @@ site as it stands, which lists its builds and their files' hashes in
 older one says so and offers *new version: reload* in the header; the debug
 report names the build. `node site.mjs OUT --build ID [--keep-from URL|DIR]`
 makes one by hand (after `./build.sh`); `tests/e2e/site.mjs` tests it.
-`.github/workflows/ci.yml` runs the Rust tests (on lavapipe), builds the
-WASM once and runs the browser tests on it in parts side by side, on every
-push.
+`.github/workflows/ci.yml` runs the Rust tests (on lavapipe), lints every
+crate (clippy, on a pinned toolchain), builds the WASM once and runs the
+browser tests on it in parts side by side, on every push.
 
 ## Testing
 
 ```
 cargo test --workspace                    # unit tests, the reference cross-check, GPU-vs-CPU (needs any Vulkan/Metal/DX12 adapter; lavapipe is enough)
+UNFLASH_REQUIRE_GPU=1 UNFLASH_NO_SKIPS=1 cargo test --workspace   # as CI runs them: a test that lacks its GPU adapter, ffmpeg or generated media fails, where it otherwise says SKIPPED and passes
+cargo clippy --workspace --exclude rav1d --all-targets --no-deps -- -D warnings   # the lints CI holds every crate to (Cargo.toml's [workspace.lints] says which are off)
 python3 tests/gen_fixtures.py             # regenerate the reference fixtures from unflash/analysis.py (needs numpy)
+python3 -m unittest discover -s tests/python   # the Python reference: still what the fixtures record, and its rules against the port's own cases (needs numpy)
 bash tests/media/gen.sh                   # demuxer/muxer test files: MP4, MKV, PCM, transport streams and ffmpeg's MP4 of each (needs ffmpeg)
 bash tests/media/h264/gen.sh              # H.264 decoder test streams and ffmpeg's per-frame MD5s (needs ffmpeg with libx264)
 cargo run --release -p unflash-h264 --example compare -- file.mp4   # decode any MP4 and diff every frame against ffmpeg
@@ -902,6 +923,8 @@ bash tests/media/ac3/gen.sh               # AC-3 / E-AC-3 decoder test streams, 
 cargo run --release -p unflash-sound --example fate -- ac3 dir   # AC-3 and E-AC-3 files (ffmpeg's FATE samples) against ffmpeg's decode
 bash tests/media/dts/gen.sh               # DTS decoder test streams, from ffmpeg's encoder (the tests compare with ffmpeg's decoder when it is installed)
 cargo run --release -p unflash-sound --example fate -- dts dir   # DTS and DTS-HD files (ffmpeg's FATE samples) against ffmpeg's decode of their core
+node --test --test-force-exit "tests/unit/*.test.mjs"   # the page's own logic in Node: no browser, no build, under a second
+node --test tests/bindings/bindings.test.mjs   # the WebAssembly module as the page calls it, in Node (after ./build.sh; SKIPPED without the build)
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
 node tests/e2e/tour.mjs                   # the guided tour, on a first visit and after an update
@@ -916,14 +939,79 @@ node tests/e2e/site.mjs                   # the site as published: each build's 
 
 `crates/unflash-core/tests/reference_fixtures.rs` regenerates the frames the
 Python detector was run on (CRC-checked) and asserts identical per-frame
-hazard areas, events, violations and verdicts on all fixtures.
+hazard areas, events, violations and verdicts on all fixtures, and that
+every setting of the reference's three profiles (`profiles.json` beside
+them) is the port's. `tests/python/` holds the reference to the same
+fixtures from its side (run again over the scenes, it must still see what
+they record: a change to the detector that moves a number fails there,
+and the fixtures are then made again on purpose), and its rules that need
+no video (marks into an edited timeline, sections around violations, the
+rate no profile can fail, frame times made sane) to the very cases the
+port's unit tests use, so neither can drift from the other unnoticed.
+The detector's own unit tests include the same film judged ten seconds
+in and 4290 seconds in, where the kernels' 32-bit microsecond clock wraps
+half way through its flashing (71.6 minutes): frame for frame the same
+areas and the same violations, by the scalar kernel and the SIMD one; and
+pictures of a cinema's proportions (1920x800) through the shrinker, whose
+rows are summed in 32 bits where the others' fit 16.
 `crates/unflash-gpu/tests/gpu_vs_cpu.rs` compares the entire per-pixel state
 of the GPU stage with the CPU kernel after every frame, and the pattern mask
 and statistics on striped frames. `crates/unflash-h264/tests/streams.rs`
-decodes the x264 test streams and requires ffmpeg's MD5 of every frame.
+decodes the x264 test streams and requires ffmpeg's MD5 of every frame;
+the tests of `crates/unflash-decoders` ask the same of HEVC, VP9, VP8 and
+AV1 through the bindings a decode worker calls (each sample under its
+number, each picture taken as packed I420 or made small), and of the
+Dolby and DTS decoders that their sound comes out as two planes.
+`crates/unflash-mp4/tests/robustness.rs` reads the test media (MP4,
+QuickTime, Matroska, WebM, transport streams) with random damage: bits
+flipped, fields set to the values a size or a count hurts most with,
+bytes cut out and put in, the file cut short. Whatever the readers make
+of it will do, an error or a movie, but a panic (which ends the page) or
+a read that never ends; `MP4_FUZZ_ROUNDS=n` sets the rounds per file.
+`crates/unflash-h264/tests/robustness.rs` does the same to the H.264
+decoder's input (`H264_FUZZ_ROUNDS=n`), as the tests of the HEVC, VP9,
+VP8 and AV1 decoders do to theirs: a panic there ends a decode worker's
+module, and the scan with it.
 `crates/unflash-h264/tests/rewrite.rs` renumbers the parameter sets of
 every conformance stream and decodes it again, and splices GOPs of one
 encoding into another and checks the result in this decoder and in ffmpeg.
+`tests/unit/` holds the page's modules to what their comments say, in
+Node, without a browser or the WebAssembly build: which chunk each decode
+lane of a scan takes next and what an early look takes with it, the
+triage scores, what an export re-encodes and what it copies, the level
+each codec string names (against the standards' tables), the blend and
+soften rules (the blend's with the very cases the Rust is held to),
+project files read back and made safe, the changelog (this repository's
+own among them: every change timed, with its film and a tour that
+exists), a transport stream's samples found again in packets built by
+hand, PCM in every form, where each sample of the sound lands once
+frames are held (sixty random layouts of holds, in whatever pieces the
+sound arrives), and the pool of built-in decoder workers against
+stand-in workers (the groups a range is cut into, open GOPs among them;
+every picture once and in order across groups, workers and stretches; a
+worker that fails, a damaged picture, a cancel, a pool closed under a
+pass, a worker gained during one), the range a section may take (inside
+the video, over no other section) and the sections an export applies, a
+project file with things of the wrong kind in it, and what the page says
+and draws from numbers alone (`web/readouts.js`: the steps between a
+timeline's ticks, how long a job took, an export's file name, where the
+sound starts against the picture, the chart's envelope). They run in a
+quarter of a second, so they are the place for a rule's corner cases;
+the browser tests below are for what only a browser can show.
+`tests/bindings/` calls the built module (`web/pkg`) the way the page does,
+also in Node: every profile's settings and what is derived from them,
+sections and the per-second summary from a scan's violations, a section's
+frame times, its marks (what each frame shows, when, where the picture
+waits), a check's violations sorted by where they land, thinning to a rate,
+the frame cache (joined, blended, blurred), pictures made small, the CPU
+detector fed in every form it takes, and an export written by the muxer
+and read back by the demuxer. Each holds the JSON to the shape the page
+reads, and each asks for what cannot be done (a file that is no video, a
+record that is none, a picture too short for its size, a number typed
+wrong) and requires an exception that says why, never a trap, which would
+end the module for the page; timestamps spanning years, as a damaged file
+can have, must make lists a page can hold (they used to make one that
+killed it).
 `tests/e2e/run.mjs` scans, edits, blends, softens, exports and verifies the
 synthetic clips in headless Chromium, including the H.264 clip through the
 built-in decoder (the test browser has no H.264); the VP9 exports copy

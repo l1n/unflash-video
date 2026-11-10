@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 
 use unflash_vp9::{Decoder, Error};
 
-#[path = "../tests/common/mod.rs"]
-mod common;
-use common::frame_md5;
+use unflash_testkit::frame_md5;
 
 fn vectors(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)

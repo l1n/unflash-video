@@ -113,7 +113,6 @@ impl Shrink {
 
     /// A 4:2:0 picture held as three planes (a decoder's own picture, from
     /// the first visible sample of each plane), made small the same way.
-    #[allow(clippy::too_many_arguments)]
     pub fn yuv420_planes(&mut self, y: &[u8], y_stride: usize, u: &[u8], u_stride: usize, v: &[u8], v_stride: usize, bt709: bool, full_range: bool, out: &mut Vec<u8>) {
         let (w, h, cw, ch) = (self.sw, self.sh, self.sw.div_ceil(2), self.sh.div_ceil(2));
         assert!(y_stride >= w && y.len() >= (h - 1) * y_stride + w, "luma plane too short");
@@ -497,14 +496,17 @@ mod tests {
                 x ^= x >> 17;
                 x ^= x << 5;
                 let smooth = ((i / 4 % w) * 255 / w.max(1)) as u32;
-                (if (i / 4 / w) % 3 == 0 { smooth } else { x % 256 }) as u8
+                (if (i / 4 / w).is_multiple_of(3) { smooth } else { x % 256 }) as u8
             })
             .collect()
     }
 
     #[test]
     fn shrink_matches_the_float_area_average() {
-        for &(sw, sh, aw, ah) in &[(1920u32, 960u32, 256u32, 128u32), (1920, 1080, 256, 144), (1280, 720, 256, 144), (3840, 2160, 256, 144), (1918, 1078, 256, 143), (640, 360, 256, 144), (256, 144, 256, 144), (97, 61, 13, 7)] {
+        for &(sw, sh, aw, ah) in &[(1920u32, 960u32, 256u32, 128u32), (1920, 1080, 256, 144), (1280, 720, 256, 144), (3840, 2160, 256, 144), (1918, 1078, 256, 143), (640, 360, 256, 144), (256, 144, 256, 144), (97, 61, 13, 7),
+            // pictures of a cinema's proportions (1920x800 is the commonest): their rows come in boxes of more than
+            // 257 weights in all, too many for the 16-bit sums the sizes above are added up in, and are added in 32 bits
+            (1920, 800, 256, 106), (1920, 817, 256, 108), (1280, 534, 256, 106), (2048, 858, 256, 106), (3840, 1600, 256, 106), (16, 263, 4, 2)] {
             let src = picture(sw as usize, sh as usize, sw ^ sh);
             let want = area_downsample(&src, 4, sw, sh, aw, ah);
             let mut sh_ = Shrink::new(sw, sh, aw, ah);
@@ -519,6 +521,32 @@ mod tests {
             if (sw, sh) == (aw, ah) {
                 assert_eq!(off, 0, "the same size copies through");
             }
+        }
+    }
+
+    /// The sums of a tall picture's rows, in 32 bits: 263 rows made one are
+    /// more than 16 bits hold once most of them are light (261 white rows
+    /// add up to 66 555). White but for its first two rows, the picture is
+    /// 255·261/263 = 253.06; black and white by turns, 255·131/263 = 127.02.
+    #[test]
+    fn rows_too_many_for_16_bit_sums_are_summed_in_32() {
+        let (sw, sh) = (4usize, 263usize);
+        for (white, want) in [(Box::new(|y: usize| y >= 2) as Box<dyn Fn(usize) -> bool>, 253u8), (Box::new(|y: usize| y % 2 == 1), 127)] {
+            let mut src = vec![0u8; sw * sh * 4];
+            for y in (0..sh).filter(|&y| white(y)) {
+                src[y * sw * 4..(y + 1) * sw * 4].fill(255);
+            }
+            let mut k = Shrink::new(sw as u32, sh as u32, 2, 1);
+            let mut got = Vec::new();
+            k.packed(&src, 0, sw * 4, false, &mut got);
+            assert_eq!(got, [want, want, want, 255, want, want, want, 255]);
+            // and the same picture as 4:2:0 (full range, no colour): the same grey
+            let mut planes = vec![128u8; sw * sh + 2 * (sw / 2) * sh.div_ceil(2)];
+            planes[..sw * sh].copy_from_slice(&src.chunks_exact(4).map(|p| p[0]).collect::<Vec<u8>>());
+            let layout = crate::yuv::YuvLayout::packed_i420(sw, sh, false, true);
+            let mut yuv = Vec::new();
+            k.yuv420(&planes, &layout, &mut yuv);
+            assert_eq!(yuv, got);
         }
     }
 

@@ -6,17 +6,12 @@
 //! VP9_FUZZ_ROUNDS=n runs n rounds per stream instead of a few (in a debug
 //! build, arithmetic overflow is caught too).
 
-use std::path::PathBuf;
-
 use unflash_vp9::header::{parse_uncompressed_header, StreamState};
 use unflash_vp9::Decoder;
 
-fn media(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/vp9").join(name)
-}
-
-fn ivf_samples(data: &[u8]) -> Vec<Vec<u8>> {
-    unflash_mp4::ivf::frames(data).expect("an IVF file").into_iter().map(|(_, f)| f.to_vec()).collect()
+/// The frames of one of the test media's IVF files.
+fn ivf_samples(name: &str) -> Vec<Vec<u8>> {
+    unflash_testkit::load(&format!("vp9/{name}")).samples.into_iter().map(|s| s.data).collect()
 }
 
 /// xorshift64*: deterministic, so a failure can be replayed.
@@ -92,7 +87,7 @@ fn mutate(rng: &mut Rng, samples: &mut Vec<Vec<u8>>, other: &[Vec<u8>]) {
 fn corrupt_streams_do_not_panic() {
     let rounds: usize = std::env::var("VP9_FUZZ_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
     let names = ["altref.ivf", "p2_10bit.ivf", "tiles.ivf", "aq_cyclic.ivf", "lossless.ivf", "odd_small.ivf", "resize_odd.ivf", "errres.ivf"];
-    let streams: Vec<Vec<Vec<u8>>> = names.iter().map(|n| ivf_samples(&std::fs::read(media(n)).expect("run tests/media/vp9/gen.sh"))).collect();
+    let streams: Vec<Vec<Vec<u8>>> = names.iter().map(|n| ivf_samples(n)).collect();
     let all: Vec<Vec<u8>> = streams.iter().flatten().cloned().collect();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     for (name, samples) in names.iter().zip(&streams) {
@@ -119,8 +114,8 @@ fn corrupt_streams_do_not_panic() {
 /// (the map was left at the key frame's size, and read past its end).
 #[test]
 fn failed_size_change_keeps_the_segment_map_whole() {
-    let cyclic = ivf_samples(&std::fs::read(media("aq_cyclic.ivf")).expect("run tests/media/vp9/gen.sh"));
-    let mut key = ivf_samples(&std::fs::read(media("odd_small.ivf")).expect("run tests/media/vp9/gen.sh")).swap_remove(0);
+    let cyclic = ivf_samples("aq_cyclic.ivf");
+    let mut key = ivf_samples("odd_small.ivf").swap_remove(0);
     let fh = parse_uncompressed_header(&key, &mut StreamState::default(), &[None; 8]).unwrap();
     key[fh.uncompressed_size] = 0xff;
     let mut dec = Decoder::new(&[]).unwrap();
@@ -136,7 +131,7 @@ fn failed_size_change_keeps_the_segment_map_whole() {
 /// shows at most eight, as many as a superframe can hold.
 #[test]
 fn shown_frames_per_sample_are_bounded() {
-    let key = ivf_samples(&std::fs::read(media("odd_small.ivf")).expect("run tests/media/vp9/gen.sh")).swap_remove(0);
+    let key = ivf_samples("odd_small.ivf").swap_remove(0);
     let mut dec = Decoder::new(&[]).unwrap();
     assert_eq!(dec.decode(&key, 0.0).unwrap().len(), 1);
     // (0x88: show_existing_frame of slot 0, in one byte)

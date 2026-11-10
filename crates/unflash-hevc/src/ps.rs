@@ -426,7 +426,7 @@ fn parse_vui_tail(r: &mut BitReader, max_sub_layers_minus1: u32, alt: bool) -> R
     if !alt {
         // default_display_window_flag, unless the next bits look like the
         // draft syntax (as ffmpeg checks)
-        let looks_invalid = r.bits_left() >= 68 && r.peek(21) == Some(0x100000);
+        let looks_invalid = r.bits_left() >= 68 && r.peek(21) == 0x100000;
         if !looks_invalid && r.flag()? {
             for _ in 0..4 {
                 r.ue()?;

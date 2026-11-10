@@ -36,7 +36,7 @@ impl BitWriter {
 
     #[inline]
     pub fn bit(&mut self, b: bool) {
-        if self.nbits % 8 == 0 {
+        if self.nbits.is_multiple_of(8) {
             self.buf.push(0);
         }
         if b {
@@ -83,7 +83,7 @@ impl BitWriter {
 
     /// `cabac_alignment_one_bit`s up to the next byte boundary.
     pub fn align_ones(&mut self) {
-        while self.nbits % 8 != 0 {
+        while !self.nbits.is_multiple_of(8) {
             self.bit(true);
         }
     }
@@ -91,14 +91,14 @@ impl BitWriter {
     /// `rbsp_trailing_bits`: the stop bit and zeros to the byte boundary.
     pub fn trailing(&mut self) {
         self.bit(true);
-        while self.nbits % 8 != 0 {
+        while !self.nbits.is_multiple_of(8) {
             self.bit(false);
         }
     }
 
     /// Whole bytes, at a byte boundary.
     pub fn bytes(&mut self, b: &[u8]) {
-        debug_assert!(self.nbits % 8 == 0);
+        debug_assert!(self.nbits.is_multiple_of(8));
         self.buf.extend_from_slice(b);
         self.nbits += 8 * b.len();
     }
@@ -773,7 +773,7 @@ mod tests {
         let mut r = BitReader::new(&out);
         assert_eq!(r.u(3).unwrap(), 0b101);
         let mut r2 = BitReader::new(&src);
-        r2.skip(2);
+        r2.advance(2);
         for _ in 0..20 {
             assert_eq!(r.u(1).unwrap(), r2.u(1).unwrap());
         }

@@ -127,7 +127,6 @@ fn morton(x: usize, y: usize) -> usize {
 }
 
 impl<'a, P: Sample> SliceDecoder<'a, P> {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(sps: &'a Sps, pps: &'a Pps, layout: &'a Layout, hdr: &'a SliceHeader, slice_idx: u16, rbsp: &'a [u8], pic: &'a mut Picture<P>, meta: &'a mut Meta, refs: &'a [Vec<RefPic<P>>; 2], carry: &'a mut Carry, poc: i32) -> Result<SliceDecoder<'a, P>> {
         let cabac = Cabac::new(rbsp, hdr.data_offset, init_contexts(init_type(hdr), hdr.qp))?;
         let col = if hdr.temporal_mvp && !hdr.is_intra() {
@@ -724,7 +723,6 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
 
     /// 7.3.8.8: `transform_tree( )`; `parent_cbf` holds cbf_cb and cbf_cr
     /// of the parent node (true at the root).
-    #[allow(clippy::too_many_arguments)]
     fn transform_tree(&mut self, x0: usize, y0: usize, xb: usize, yb: usize, log2: usize, depth: usize, blk: usize, parent_cbf: [bool; 2]) -> Result<()> {
         let max_tb = self.sps.log2_max_tb as usize;
         let min_tb = self.sps.log2_min_tb as usize;
@@ -759,7 +757,6 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
     }
 
     /// 7.3.8.10: `transform_unit( )` with the reconstruction of its blocks.
-    #[allow(clippy::too_many_arguments)]
     fn transform_unit(&mut self, x0: usize, y0: usize, xb: usize, yb: usize, log2: usize, blk: usize, cbf_luma: bool, cbf_chroma: [bool; 2]) -> Result<()> {
         let n = 1usize << log2;
         self.mark_edges(x0, y0, n, n, TU_LEFT, TU_TOP);
@@ -961,7 +958,6 @@ impl<'a, P: Sample> SliceDecoder<'a, P> {
 
     /// 7.3.8.6: `prediction_unit( )`, its motion, and its prediction
     /// samples; returns merge_flag.
-    #[allow(clippy::too_many_arguments)]
     fn prediction_unit(&mut self, xc: usize, yc: usize, nc: usize, xp: usize, yp: usize, w: usize, h: usize, part_idx: usize, skip: bool) -> Result<bool> {
         let merge = skip || self.cabac.decision(ctx::MERGE_FLAG) != 0;
         let motion = if merge {

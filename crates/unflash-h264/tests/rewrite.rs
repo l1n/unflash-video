@@ -104,13 +104,13 @@ fn ffmpeg_md5(file: &[u8], name: &str) -> Option<Vec<String>> {
     let out = match Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&path).args(["-f", "framemd5", "-"]).output() {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("ffmpeg not run ({e}): the cross-check is skipped");
+            unflash_testkit::skipped(&format!("ffmpeg was not run ({e}): the spliced file {name} is not checked in ffmpeg's decoder"));
             return None;
         }
     };
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
-    Some(common::framemd5(&String::from_utf8_lossy(&out.stdout)))
+    Some(unflash_testkit::framemd5(&String::from_utf8_lossy(&out.stdout)))
 }
 
 #[test]
@@ -219,11 +219,11 @@ fn renumbering_changes_only_the_pps_id() {
                         let stop = |d: &[u8]| { let mut l = d.len(); while l > 0 && d[l-1] == 0 { l -= 1; } (l-1)*8 + 7 - d[l-1].trailing_zeros() as usize };
                         let (s1, s2) = (stop(&ra), stop(&rb));
                         assert_eq!(s1 - r1.bit_pos(), s2 - r2.bit_pos(), "{name} sample {si}: data length");
-                        let mut ra2 = BitReader::new(&ra); ra2.skip(r1.bit_pos() as u32);
-                        let mut rb2 = BitReader::new(&rb); rb2.skip(r2.bit_pos() as u32);
+                        let mut ra2 = BitReader::new(&ra); ra2.advance(r1.bit_pos());
+                        let mut rb2 = BitReader::new(&rb); rb2.advance(r2.bit_pos());
                         for k in 0..(s1 - r1.bit_pos()) { assert_eq!(ra2.u(1).unwrap(), rb2.u(1).unwrap(), "{name} sample {si}: data bit {k}"); }
                     } else {
-                        let a0 = (r1.bit_pos() + 7) / 8; let b0 = (r2.bit_pos() + 7) / 8;
+                        let a0 = r1.bit_pos().div_ceil(8); let b0 = r2.bit_pos().div_ceil(8);
                         let mut ea = ra.len(); while ea > a0 && ra[ea-1] == 0 { ea -= 1; }
                         let mut eb = rb.len(); while eb > b0 && rb[eb-1] == 0 { eb -= 1; }
                         assert_eq!(&ra[a0..ea], &rb[b0..eb], "{name} sample {si}: cabac data");

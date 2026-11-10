@@ -66,27 +66,11 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A decoded picture.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Frame {
-    /// Display size: the frame's (upscaled) size, which may be odd.
-    pub width: u32,
-    pub height: u32,
-    /// 8-bit 4:2:0 planes, tightly packed; chroma is (width + 1) / 2 by
-    /// (height + 1) / 2.
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
-    /// The pts of the sample that produced it, seconds.
-    pub pts: f64,
-    /// Decoding hit an error: the picture may be concealed or garbage.
-    pub damaged: bool,
-    /// BT.709 matrix (BT.709, BT.2020 and SMPTE 240M streams, and
-    /// unspecified ones taller than 576 lines, as players guess); BT.601
-    /// otherwise.
-    pub bt709: bool,
-    pub full_range: bool,
-}
+/// A decoded picture, at its display size (the frame's size, upscaled
+/// where the stream says so): the picture every built-in decoder hands out.
+/// Its matrix is BT.709 for BT.709, BT.2020 and SMPTE 240M streams, and for
+/// unspecified ones by their height; BT.601 otherwise.
+pub use unflash_codec::Frame;
 
 /// A picture at the stream's own bit depth, for tests and tools: samples as
 /// decoded (0..=255 or 0..=1023), planes tightly packed as in [`Frame`].
@@ -357,13 +341,13 @@ impl Picture {
     /// (bt709, full_range) from the sequence header's colour config.
     fn colour(&self) -> (bool, bool) {
         // SAFETY: a picture's sequence header lives as long as the picture.
-        let Some(seq) = self.0.seq_hdr.map(|s| unsafe { s.as_ref() }) else { return (self.size().1 > 576, false) };
+        let Some(seq) = self.0.seq_hdr.map(|s| unsafe { s.as_ref() }) else { return (unflash_codec::bt709_by_height(self.size().1 as u32), false) };
         let bt709 = match seq.mtrx {
             // (SMPTE 240M's coefficients are within 0.015 of BT.709's)
             DAV1D_MC_BT709 | DAV1D_MC_BT2020_NCL | DAV1D_MC_BT2020_CL | DAV1D_MC_SMPTE240 => true,
             DAV1D_MC_BT470BG | DAV1D_MC_BT601 | DAV1D_MC_FCC => false,
             // unspecified (and the rest): as players guess
-            _ => self.size().1 > 576,
+            _ => unflash_codec::bt709_by_height(self.size().1 as u32),
         };
         (bt709, seq.color_range != 0)
     }
@@ -440,7 +424,7 @@ fn to_frame(pic: &Picture, pts: f64, damaged: bool) -> Result<Frame> {
             }
         }
     })?;
-    Ok(Frame { width: w as u32, height: h as u32, y, u, v, pts, damaged, bt709, full_range })
+    Ok(Frame { width: w as u32, height: h as u32, y, u, v, bit_depth: bits, y16: None, u16: None, v16: None, pts, damaged, bt709, full_range })
 }
 
 /// A 10-bit sample rounded to 8 bits.
@@ -460,6 +444,22 @@ fn to_raw(pic: &Picture, pts: f64, damaged: bool) -> Result<RawFrame> {
         }
     })?;
     Ok(RawFrame { width: w as u32, height: h as u32, bit_depth: bits, y, u, v, pts, damaged })
+}
+
+impl unflash_codec::VideoDecoder for Decoder {
+    type Error = Error;
+
+    fn open(config: &[u8]) -> Result<Decoder> {
+        Decoder::new(config)
+    }
+
+    fn decode(&mut self, sample: &[u8], pts: f64) -> Result<Vec<Frame>> {
+        Decoder::decode(self, sample, pts)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Frame>> {
+        Decoder::flush(self)
+    }
 }
 
 #[cfg(test)]

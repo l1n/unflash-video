@@ -12,24 +12,9 @@ use crate::tokens::{self, Coeffs, NonZero, Y2_BLOCK};
 use crate::transform;
 use crate::{Error, Result};
 
-/// A decoded picture, cropped to the display size.
-pub struct Frame {
-    pub width: u32,
-    pub height: u32,
-    /// 8-bit 4:2:0 planes, tightly packed; chroma is (width + 1) / 2 by
-    /// (height + 1) / 2.
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
-    pub pts: f64,
-    /// Part of the frame's data was missing: the rest is concealed.
-    pub damaged: bool,
-    /// VP8 is BT.601 in limited range: both false. (ffmpeg reports the
-    /// `clamping_type` bit as full range, but that bit is about clamping,
-    /// and libvpx always writes 0.)
-    pub bt709: bool,
-    pub full_range: bool,
-}
+/// A decoded picture, cropped to the display size: the picture every
+/// built-in decoder hands out.
+pub use unflash_codec::Frame;
 
 pub struct Decoder {
     /// Probabilities, segmentation and filter deltas carried between frames.
@@ -277,8 +262,15 @@ impl Decoder {
             y: crop(&pic.y, pic.width, w, h)?,
             u: crop(&pic.u, pic.width / 2, cw, ch)?,
             v: crop(&pic.v, pic.width / 2, cw, ch)?,
+            bit_depth: 8,
+            y16: None,
+            u16: None,
+            v16: None,
             pts,
             damaged,
+            // VP8 is BT.601 in limited range. (ffmpeg reports the
+            // `clamping_type` bit as full range, but that bit is about
+            // clamping, and libvpx always writes 0.)
             bt709: false,
             full_range: false,
         })
@@ -512,5 +504,21 @@ fn conceal(pic: &mut Picture, last: Option<&Picture>, mb_x: usize, mb_y: usize) 
                 None => plane[at..at + size].fill(128),
             }
         }
+    }
+}
+
+impl unflash_codec::VideoDecoder for Decoder {
+    type Error = Error;
+
+    fn open(config: &[u8]) -> Result<Decoder> {
+        Decoder::new(config)
+    }
+
+    fn decode(&mut self, sample: &[u8], pts: f64) -> Result<Vec<Frame>> {
+        Decoder::decode(self, sample, pts)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Frame>> {
+        Decoder::flush(self)
     }
 }

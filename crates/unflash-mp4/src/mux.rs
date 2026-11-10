@@ -135,9 +135,10 @@ impl Muxer {
         }
         let mdat_size = self.pos - self.mdat_at;
         let patch = (self.mdat_at + 8, mdat_size.to_be_bytes());
+        let starts = track_starts(&self.tracks);
         let mut max_dur_ms = 0u64;
-        for t in &self.tracks {
-            max_dur_ms = max_dur_ms.max(track_duration_ms(t));
+        for (t, start) in self.tracks.iter().zip(&starts) {
+            max_dur_ms = max_dur_ms.max(start.delay_ms + shown_ms(t, start));
         }
         let mut w = Writer::new();
         let moov = w.begin_box(b"moov");
@@ -157,7 +158,7 @@ impl Muxer {
         w.u32(self.tracks.len() as u32 + 1);
         w.end_box(at);
         for (i, t) in self.tracks.iter().enumerate() {
-            write_trak(&mut w, t, i as u32 + 1)?;
+            write_trak(&mut w, t, i as u32 + 1, starts[i])?;
         }
         w.end_box(moov);
         Ok((w.buf, patch))
@@ -174,19 +175,75 @@ fn track_duration_ticks(t: &MuxTrack) -> u64 {
     span(&t.samples).max(0) as u64
 }
 
-fn track_duration_ms(t: &MuxTrack) -> u64 {
-    let ts = track_timescale(t) as u128;
-    (track_duration_ticks(t) as u128 * 1000 / ts) as u64
+/// Where a track's presentation starts against the movie's: after
+/// `delay_ms` of nothing (the movie's ticks), or with its first `trim` ticks
+/// (its own) left out.
+#[derive(Clone, Copy, Default)]
+struct Start {
+    delay_ms: u64,
+    trim: i64,
 }
 
-fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32) -> Result<(), Error> {
+/// What of a track is shown, in milliseconds: all of it but what is trimmed.
+fn shown_ms(t: &MuxTrack, start: &Start) -> u64 {
+    ((track_duration_ticks(t) as i128 - start.trim as i128).max(0) * 1000 / track_timescale(t) as i128) as u64
+}
+
+/// Each track's start. The caller's times are on one clock for all the
+/// tracks, but a track's tables hold only durations, so that written as
+/// they are every track would start at once, and picture and sound that
+/// began apart would begin together. The movie's time 0 is the clock's own
+/// 0 when anything starts at or before it (what is before it is trimmed, as
+/// it was in the file the times come from: an AAC track's priming, say),
+/// and else the start of the earliest track (a clock taken from a transport
+/// stream starts anywhere). A track that starts after that says by how much
+/// with an empty edit (see `write_trak`). A track with no samples starts
+/// nowhere.
+fn track_starts(tracks: &[MuxTrack]) -> Vec<Start> {
+    // each track's first presentation time and its ticks a second
+    let firsts: Vec<Option<(i128, i128)>> = tracks.iter().map(|t| t.samples.iter().map(|s| s.pts).min().map(|first| (first as i128, track_timescale(t) as i128))).collect();
+    // (a/b < c/d as a·d < c·b: the scales are positive)
+    let Some(&(first0, scale0)) = firsts.iter().flatten().min_by(|a, b| (a.0 * b.1).cmp(&(b.0 * a.1))) else { return vec![Start::default(); tracks.len()] };
+    // the moment that becomes the movie's time 0, as a fraction of a second
+    let (origin, origin_scale) = if first0 <= 0 { (0, 1) } else { (first0, scale0) };
+    firsts
+        .iter()
+        .map(|first| {
+            let Some((first, scale)) = *first else { return Start::default() };
+            // how long after the origin it starts, in 1/(scale·origin_scale) s
+            let lead = first * origin_scale - origin * scale;
+            let den = scale * origin_scale;
+            if lead > 0 {
+                Start { delay_ms: ((lead * 1000 + den / 2) / den).min(u64::MAX as i128) as u64, trim: 0 }
+            } else {
+                // (before the clock's 0, whose scale is 1: its own ticks)
+                Start { delay_ms: 0, trim: (-lead / origin_scale).min(i64::MAX as i128) as i64 }
+            }
+        })
+        .collect()
+}
+
+/// What is taken off every composition offset of a track so that none is
+/// negative: the least of them, when that is below zero (else nothing). A
+/// track whose samples are shown before they are decoded has times that an
+/// edit list moved: an AAC track read from an MP4 has every presentation
+/// time 1024 ticks before its decode time, the priming its edit skips. The
+/// file says the same the same way, with offsets from zero up (none at all
+/// for such a sound track) and the difference in the edit's media time,
+/// which every reader understands; offsets below zero are read by some.
+fn composition_lift(t: &MuxTrack) -> i64 {
+    t.samples.iter().map(|s| s.pts.wrapping_sub(s.dts)).min().unwrap_or(0).min(0)
+}
+
+fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32, start: Start) -> Result<(), Error> {
     let ts = track_timescale(t);
     let (kind, width, height) = match &t.desc {
         TrackDesc::Video { width, height, .. } => (TrackKind::Video, *width, *height),
         TrackDesc::Copy { kind, width, height, .. } => (*kind, *width, *height),
     };
     let dur_ticks = track_duration_ticks(t);
-    let dur_ms = track_duration_ms(t);
+    let dur_ms = shown_ms(t, &start);
+    let delay_ms = start.delay_ms;
     let first_pts = t.samples.iter().map(|s| s.pts).min().unwrap_or(0);
     let first_dts = t.samples.first().map(|s| s.dts).unwrap_or(0);
 
@@ -197,7 +254,7 @@ fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32) -> Result<(), Error> {
     w.u64(0);
     w.u32(id);
     w.u32(0);
-    w.u64(dur_ms);
+    w.u64(delay_ms + dur_ms);
     w.zeros(8);
     w.u16(0); // layer
     w.u16(0); // alternate group
@@ -210,14 +267,23 @@ fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32) -> Result<(), Error> {
     w.u32(height << 16);
     w.end_box(at);
     // edts: the file's decode times start at 0 (stts holds durations only),
-    // so its composition times are the caller's less the first decode time;
-    // the presentation starts at the earliest of them, skipping the
-    // reordering delay
-    let media_start = first_pts - first_dts;
-    if media_start > 0 {
+    // so its composition times are the caller's less the first decode time
+    // (and less `lift`, see `composition_lift`); the presentation starts at
+    // the earliest of them that is not trimmed (which skips the reordering
+    // delay too), after an empty edit as long as the track starts later
+    // than the movie (`track_starts`)
+    // (in 128 bits: the times are the caller's, and need not be ones a file has)
+    let media_start = (first_pts as i128 + start.trim as i128 - first_dts as i128 - composition_lift(t) as i128).clamp(0, i64::MAX as i128) as i64;
+    if media_start > 0 || delay_ms > 0 {
         let edts = w.begin_box(b"edts");
         let at = w.begin_full_box(b"elst", 1, 0);
-        w.u32(1);
+        w.u32(1 + (delay_ms > 0) as u32);
+        if delay_ms > 0 {
+            w.u64(delay_ms);
+            w.u64(u64::MAX); // media_time -1: nothing of the track yet
+            w.i16(1);
+            w.i16(0);
+        }
         w.u64(dur_ms);
         w.u64(media_start as u64);
         w.i16(1);
@@ -303,9 +369,10 @@ fn write_trak(w: &mut Writer, t: &MuxTrack, id: u32) -> Result<(), Error> {
     }
     w.end_box(at);
     // ctts
-    if t.samples.iter().any(|s| s.pts != s.dts) {
+    let lift = composition_lift(t);
+    if t.samples.iter().any(|s| s.pts.wrapping_sub(s.dts) != lift) {
         let at = w.begin_full_box(b"ctts", 1, 0);
-        let runs = run_length(t.samples.iter().map(|s| s.pts - s.dts));
+        let runs = run_length(t.samples.iter().map(|s| s.pts.wrapping_sub(s.dts).wrapping_sub(lift)));
         w.u32(runs.len() as u32);
         for (count, o) in &runs {
             w.u32(*count);
@@ -465,7 +532,10 @@ fn synth_av1c(codec: &str) -> Vec<u8> {
     let (level, tier) = parts
         .get(2)
         .map(|s| {
-            let lvl: u8 = s[..s.len().saturating_sub(1)].parse().unwrap_or(0);
+            // (all but its last character, which need not be one byte long)
+            let mut level = s.chars();
+            level.next_back();
+            let lvl: u8 = level.as_str().parse().unwrap_or(0);
             let tier = if s.ends_with('H') { 1u8 } else { 0 };
             (lvl, tier)
         })
@@ -505,5 +575,143 @@ mod tests {
         assert_eq!(out.iter().map(|o| o.1).collect::<Vec<_>>(), vec![1, 1, 1, 1, 1, 1, 1]);
         assert_eq!(dts_from_cts(&[0, 2, 4], 7), vec![(0, 2), (2, 2), (4, 7)]);
         assert!(dts_from_cts(&[], 1).is_empty());
+    }
+
+    /// A file of two VP9 tracks, each with three samples a tick of 1/30 s
+    /// (the first at 1000 Hz, the second at 90 kHz), the first sample of
+    /// each shown at `starts` (in its track's ticks).
+    fn two_tracks(starts: [i64; 2]) -> Vec<u8> {
+        let mut mx = Muxer::new();
+        let scales = [1000u32, 90000];
+        let tracks: Vec<usize> = scales.iter().map(|&timescale| mx.add_track(TrackDesc::Video { codec: "vp09.00.10.08".into(), width: 64, height: 48, timescale, description: vec![] })).collect();
+        let mut file = mx.start();
+        for k in 0..3 {
+            for (i, &t) in tracks.iter().enumerate() {
+                let step = scales[i] as i64 / 30;
+                let at = starts[i] + k * step;
+                file.push(0);
+                mx.add_sample(t, at, at, step as u32, true, 1).unwrap();
+            }
+        }
+        let (moov, (at, patch)) = mx.finish().unwrap();
+        file[at as usize..at as usize + 8].copy_from_slice(&patch);
+        file.extend_from_slice(&moov);
+        file
+    }
+
+    /// Where each track of `file` starts, in microseconds, as this crate's
+    /// reader sees it (its edit list applied).
+    fn starts_us(file: &[u8]) -> Vec<i64> {
+        let movie = crate::demux::parse_bytes(file).unwrap();
+        movie.tracks.iter().map(|t| t.to_us(t.samples.iter().map(|s| s.pts).min().unwrap())).collect()
+    }
+
+    /// The caller's times are on one clock for every track, and a file's
+    /// tables hold only durations: where a track starts later than the
+    /// earliest, the file has to say so (an empty edit), or picture and
+    /// sound that began apart begin together.
+    #[test]
+    fn tracks_that_start_apart_stay_apart() {
+        // the second track 200 ms after the first; then the first 66 ms after the second
+        assert_eq!(starts_us(&two_tracks([0, 18000])), [0, 200_000]);
+        assert_eq!(starts_us(&two_tracks([66, 0])), [66_000, 0]);
+        // a clock that does not start at zero: the earliest track does, the other as far after it
+        assert_eq!(starts_us(&two_tracks([5000, 5000 * 90 + 2700])), [0, 30_000]);
+        // a clock with something before its zero keeps its zero: what is before it is trimmed, not shown
+        assert_eq!(starts_us(&two_tracks([-40, 1800])), [-40_000, 20_000]);
+        assert_eq!(starts_us(&two_tracks([-40, -900])), [-40_000, -10_000]);
+        assert_eq!(starts_us(&two_tracks([0, -900])), [0, -10_000]);
+        // together: no edit is needed, and none is written
+        let together = two_tracks([700, 63000]);
+        assert_eq!(starts_us(&together), [0, 0]);
+        assert!(!together.windows(4).any(|w| w == b"edts"));
+        // the file is as long as its last track runs: three samples of 1/30 s after 200 ms
+        let movie = crate::demux::parse_bytes(&two_tracks([0, 18000])).unwrap();
+        assert_eq!(movie.tracks[1].samples.len(), 3);
+        let moov_durations = |file: &[u8]| -> (u64, Vec<u64>) {
+            // mvhd and tkhd (version 1): the duration is the 8 bytes after two dates, a timescale or id, and (tkhd) 4 reserved
+            let find = |name: &[u8; 4]| -> Vec<usize> { (0..file.len() - 4).filter(|&i| &file[i..i + 4] == name).collect() };
+            let u64_at = |i: usize| u64::from_be_bytes(file[i..i + 8].try_into().unwrap());
+            (u64_at(find(b"mvhd")[0] + 4 + 4 + 16 + 4), find(b"tkhd").iter().map(|&i| u64_at(i + 4 + 4 + 16 + 4 + 4)).collect())
+        };
+        // (the first track's three samples are 33 ms each; the second's 100 ms begin after 200)
+        assert_eq!(moov_durations(&two_tracks([0, 18000])), (300, vec![99, 300]));
+        // (trimmed: 40 ms of the first track's 99 are before the clock's zero; the second begins 20 ms after it)
+        assert_eq!(moov_durations(&two_tracks([-40, 1800])), (120, vec![59, 120]));
+    }
+
+    /// A track read from an MP4 whose edit list skips into it (an AAC
+    /// track's priming) has every presentation time before its decode time.
+    /// It is written the way it was read: no offset below zero in the file
+    /// (here none at all), and an edit that skips as far.
+    #[test]
+    fn times_an_edit_moved_are_written_as_an_edit() {
+        let mut mx = Muxer::new();
+        let t = mx.add_track(TrackDesc::Video { codec: "vp09.00.10.08".into(), width: 64, height: 48, timescale: 48000, description: vec![] });
+        let mut file = mx.start();
+        for k in 0..4i64 {
+            file.push(0);
+            mx.add_sample(t, k * 1024, k * 1024 - 1024, 1024, true, 1).unwrap();
+        }
+        let (moov, (at, patch)) = mx.finish().unwrap();
+        file[at as usize..at as usize + 8].copy_from_slice(&patch);
+        file.extend_from_slice(&moov);
+        let find = |name: &[u8; 4]| (0..file.len() - 4).find(|&i| &file[i..i + 4] == name);
+        assert_eq!(find(b"ctts"), None);
+        // elst (version 1): one edit, of what is shown (3 of the 4 packets: 64 ms), from media time 1024
+        let elst = find(b"elst").expect("an edit list");
+        let u64_at = |i: usize| u64::from_be_bytes(file[i..i + 8].try_into().unwrap());
+        assert_eq!((u32::from_be_bytes(file[elst + 8..elst + 12].try_into().unwrap()), u64_at(elst + 12), u64_at(elst + 20)), (1, 64, 1024));
+        // and read back, every packet is where it was: the first before the clock's zero
+        let movie = crate::demux::parse_bytes(&file).unwrap();
+        assert_eq!(movie.tracks[0].samples.iter().map(|s| s.pts).collect::<Vec<_>>(), [-1024, 0, 1024, 2048]);
+
+        // pictures shown out of the order they are decoded in keep their offsets, from zero up
+        let mut mx = Muxer::new();
+        let t = mx.add_track(TrackDesc::Video { codec: "vp09.00.10.08".into(), width: 64, height: 48, timescale: 30, description: vec![] });
+        let mut file = mx.start();
+        // (decode times -1 to 2, shown at 0, 2, 1, 3: the first is decoded a tick early to make room)
+        for (dts, pts) in [(-1i64, 0i64), (0, 2), (1, 1), (2, 3)] {
+            file.push(0);
+            mx.add_sample(t, dts, pts, 1, true, 1).unwrap();
+        }
+        let (moov, (at, patch)) = mx.finish().unwrap();
+        file[at as usize..at as usize + 8].copy_from_slice(&patch);
+        file.extend_from_slice(&moov);
+        let movie = crate::demux::parse_bytes(&file).unwrap();
+        assert_eq!(movie.tracks[0].samples.iter().map(|s| s.pts).collect::<Vec<_>>(), [0, 2, 1, 3]);
+        assert_eq!(movie.tracks[0].edit_shift, -1);
+
+        // times no file has are no panic
+        let mut mx = Muxer::new();
+        let t = mx.add_track(TrackDesc::Video { codec: "vp09.00.10.08".into(), width: 64, height: 48, timescale: 1, description: vec![] });
+        let _ = mx.start();
+        for (dts, pts) in [(i64::MIN, i64::MAX), (i64::MAX, i64::MIN), (0, i64::MIN), (i64::MIN, 0)] {
+            let _ = mx.add_sample(t, dts, pts, u32::MAX, true, 1);
+        }
+        let _ = mx.finish();
+    }
+
+    /// An encoder that gives no record of its own gets one made from its
+    /// codec string: the profile, level, tier and depth the string names.
+    #[test]
+    fn records_made_from_codec_strings() {
+        // av1C: marker and version, profile|level, tier|high|twelve|mono|subsampling, no delay
+        assert_eq!(synth_av1c("av01.0.08M.08"), [0x81, 0x08, 0x0c, 0]);
+        assert_eq!(synth_av1c("av01.1.13H.10"), [0x81, 0x2d, 0xcc, 0]);
+        assert_eq!(synth_av1c("av01.2.19H.12"), [0x81, 0x53, 0xec, 0]);
+        // what a string leaves out: the main profile, level 0, the main tier, eight bits
+        assert_eq!(synth_av1c("av01"), [0x81, 0x00, 0x0c, 0]);
+        assert_eq!(synth_av1c("av01.0"), [0x81, 0x00, 0x0c, 0]);
+        // a string that is none is no panic (its level used to be cut out by bytes)
+        for odd in ["av01.0.", "av01.0.M", "av01.0.é", "av01.0.08é.08", "av01.x.y.z", "av01.9.99H.99", "é"] {
+            assert_eq!(synth_av1c(odd).len(), 4, "{odd}");
+        }
+        assert_eq!(synth_av1c("av01.0.é"), [0x81, 0x00, 0x0c, 0]);
+        // vpcC: profile, level, depth|4:2:0|limited range, BT.709 three times, no data
+        assert_eq!(synth_vpcc("vp09.00.10.08"), [0, 10, 0x82, 1, 1, 1, 0, 0]);
+        assert_eq!(synth_vpcc("vp09.02.41.10"), [2, 41, 0xa2, 1, 1, 1, 0, 0]);
+        assert_eq!(synth_vpcc("vp09"), [0, 10, 0x82, 1, 1, 1, 0, 0]);
+        assert_eq!(synth_vpcc("vp09.é.é.é"), [0, 10, 0x82, 1, 1, 1, 0, 0]);
     }
 }

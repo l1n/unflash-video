@@ -434,7 +434,7 @@ fn random_frame(rng: &mut Lcg, acmod: u8, lfeon: bool) -> Vec<u8> {
 #[test]
 fn random_ac3_frames_decode_as_ffmpeg_decodes_them() {
     if !ffmpeg_available() {
-        eprintln!("SKIPPED random_ac3_frames_decode_as_ffmpeg_decodes_them: ffmpeg and ffprobe are not installed");
+        unflash_testkit::skipped("random_ac3_frames_decode_as_ffmpeg_decodes_them: ffmpeg and ffprobe are not installed");
         return;
     }
     let mut rng = Lcg(11);
@@ -1257,7 +1257,7 @@ fn random_eac3_frame(rng: &mut Lcg, acmod: u8, lfeon: bool, blocks: usize, fscod
 #[test]
 fn random_eac3_frames_decode_as_ffmpeg_decodes_them() {
     if !ffmpeg_available() {
-        eprintln!("SKIPPED random_eac3_frames_decode_as_ffmpeg_decodes_them: ffmpeg and ffprobe are not installed");
+        unflash_testkit::skipped("random_eac3_frames_decode_as_ffmpeg_decodes_them: ffmpeg and ffprobe are not installed");
         return;
     }
     let mut rng = Lcg(23);

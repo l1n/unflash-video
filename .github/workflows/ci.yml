@@ -9,6 +9,7 @@ env:
   PLAYWRIGHT_VERSION: "1.56.1"
   FIREFOX_VERSION: "156.0.1"
   WASM_BINDGEN_VERSION: "0.2.128"   # must match Cargo.lock
+  LINT_TOOLCHAIN: "1.99.1"          # clippy's lints change with the compiler: the lint job's is pinned, and raised by hand
 
 jobs:
   rust:
@@ -37,18 +38,62 @@ jobs:
           ffmpeg -version | head -1
       - name: Test media
         run: bash tests/media/gen.sh
-      - name: Reference fixtures are up to date (informational)
-        continue-on-error: true
-        run: |
-          python3 tests/gen_fixtures.py
-          git diff --exit-code -- tests/fixtures
+      # the Python reference still sees what the fixtures record (cargo test
+      # below holds the Rust port to those), its profiles are the ones in
+      # the fixtures' profiles.json, and its rules give the answers the
+      # port's tests ask of the port
+      - name: Python reference
+        env:
+          UNFLASH_REQUIRE_NUMPY: "1"
+        run: python3 -B -m unittest discover -s tests/python
+      # here every test has what it needs (a GPU adapter, ffmpeg, the media
+      # made above): one that would go without says so by failing, where on
+      # a machine without them it says SKIPPED and passes
       - name: cargo test
         env:
           UNFLASH_REQUIRE_GPU: "1"
+          UNFLASH_NO_SKIPS: "1"
         run: cargo test --workspace --release
       - name: Benchmark (informational)
         timeout-minutes: 15
         run: cargo run --release -p unflash-gpu --example bench -- 1920x1080 0.25 200
+
+  lint:
+    # every crate of ours, warnings denied (Cargo.toml's [workspace.lints]
+    # says which lints are off, and why). The vendored rav1d is a dependency
+    # here, not a subject: --no-deps.
+    name: Lint (clippy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+      # (+toolchain: rust-toolchain.toml would otherwise choose the newest)
+      - name: clippy, native
+        run: cargo "+$LINT_TOOLCHAIN" clippy --workspace --exclude rav1d --all-targets --no-deps -- -D warnings
+      - name: clippy, the browser build
+        run: cargo "+$LINT_TOOLCHAIN" clippy -p unflash-wasm -p unflash-decoders --target wasm32-unknown-unknown --no-deps -- -D warnings
+
+  unit:
+    # the page's own logic (what a scan decodes next, what an export copies,
+    # project files, the changelog), in Node: no browser and no build
+    name: Unit tests (JavaScript)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # (--test-force-exit: web/media.js keeps a message channel open, as the page needs)
+      - run: node --test --test-force-exit "tests/unit/*.test.mjs"
 
   build:
     # the WebAssembly and the synthetic clips, made once for every browser part
@@ -75,6 +120,15 @@ jobs:
           wasm-bindgen --version
       - name: Build
         run: ./build.sh release
+      # the module as the page calls it, in Node: what crosses as JSON, what
+      # is refused and in what words, and that nothing asked of it traps
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: The bindings, in Node
+        env:
+          UNFLASH_NO_SKIPS: "1"
+        run: node --test tests/bindings/bindings.test.mjs
       # the synthetic clips only change with their generator: kept in the
       # cache, and made (with ffmpeg and numpy) only when it misses
       - name: Synthetic videos, from the cache

@@ -111,7 +111,14 @@ export class ChunkReader {
   async readFile(offset, size) {
     if (this.file.size <= this.wholeLimit) {
       const root = this.parent || this;
-      if (!root.whole) root.whole = root.file.slice(0, root.file.size).arrayBuffer().then((b) => new Uint8Array(b));
+      if (!root.whole) {
+        const reading = root.file.slice(0, root.file.size).arrayBuffer().then((b) => new Uint8Array(b));
+        root.whole = reading;
+        // (a read that failed is not kept: the next one tries again, as a windowed read does)
+        reading.catch(() => {
+          if (root.whole === reading) root.whole = null;
+        });
+      }
       const all = await root.whole;
       return all.subarray(offset, offset + size);
     }
@@ -495,6 +502,9 @@ export function sampleRange(movie, startSec, endSec, fromIndex = null) {
   return { startIdx, endIdx };
 }
 
+/** The size of the part of a decoded frame that is shown: its visible rectangle's, where it has one. */
+export const frameSize = (f) => (f.visibleRect ? { w: f.visibleRect.width, h: f.visibleRect.height } : { w: f.codedWidth, h: f.codedHeight });
+
 /** Whether a picture at `t` (seconds) is one of those shown in [startSec, endSec), give or take a time's rounding. */
 export const shown = (t, startSec, endSec) => t >= startSec - 1e-6 && t < endSec - 1e-9;
 
@@ -592,15 +602,21 @@ async function decodeRangeWorker(movie, startSec, endSec, onFrame, { cancel, fro
     }
   } catch (e) {
     stop();
-    // the worker's job is waited out before it takes another
-    const until = performance.now() + 5000;
-    while (!done && !failed && performance.now() < until) {
+    // what the worker has sent is closed and given back (also when its job
+    // had ended already: pictures it sent before that are still here)
+    const discard = () => {
       while (inbox.length) {
         const m = inbox.shift();
         if (m.frame) m.frame.close();
         credit(m.pic ? m.pic.data : null);
       }
+    };
+    discard();
+    // the worker's job is waited out before it takes another
+    const until = performance.now() + 5000;
+    while (!done && !failed && performance.now() < until) {
       await wait();
+      discard();
     }
     healthy = done || !!failed;
     throw e;

@@ -11,6 +11,7 @@
 
 use std::collections::VecDeque;
 
+use unflash_codec::{Frame, VideoDecoder};
 use unflash_core::resample::Shrink;
 use wasm_bindgen::prelude::*;
 
@@ -23,78 +24,40 @@ pub fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// A picture as every decoder here gives it: tightly packed 8-bit 4:2:0
-/// planes (chroma (w + 1) / 2 by (h + 1) / 2), and the sample it was shown
-/// by (the decoders carry the number `decode` was given as its time).
-struct Picture {
-    width: u32,
-    height: u32,
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
-    index: u32,
-    damaged: bool,
-    bt709: bool,
-    full_range: bool,
+/// Any of the built-in decoders, driven alike, its errors as the text the
+/// page shows.
+trait Stream {
+    fn decode(&mut self, sample: &[u8], pts: f64) -> Result<Vec<Frame>, String>;
+    fn flush(&mut self) -> Result<Vec<Frame>, String>;
+    fn reorder_depth(&self) -> u32;
 }
 
-macro_rules! pictures {
-    ($frames:expr) => {
-        $frames.into_iter().map(|f| Picture { width: f.width, height: f.height, y: f.y, u: f.u, v: f.v, index: f.pts as u32, damaged: f.damaged, bt709: f.bt709, full_range: f.full_range })
-    };
-}
-
-enum Inner {
-    Hevc(unflash_hevc::Decoder),
-    Vp9(unflash_vp9::Decoder),
-    Vp8(unflash_vp8::Decoder),
-    Av1(unflash_av1::Decoder),
-}
-
-impl Inner {
-    /// A decoder for `codec` (the app's name: hevc, vp9, vp8, av1) and the
-    /// track's configuration record (hvcC, vpcC, av1C or Matroska's
-    /// CodecPrivate; may be empty).
-    fn new(codec: &str, config: &[u8]) -> Result<Inner, String> {
-        Ok(match codec {
-            "hevc" => Inner::Hevc(unflash_hevc::Decoder::new(config).map_err(|x| x.to_string())?),
-            "vp9" => Inner::Vp9(unflash_vp9::Decoder::new(config).map_err(|x| x.to_string())?),
-            "vp8" => Inner::Vp8(unflash_vp8::Decoder::new(config).map_err(|x| x.to_string())?),
-            "av1" => Inner::Av1(unflash_av1::Decoder::new(config).map_err(|x| x.to_string())?),
-            other => return Err(format!("there is no built-in decoder for {other}")),
-        })
+impl<D: VideoDecoder> Stream for D {
+    fn decode(&mut self, sample: &[u8], pts: f64) -> Result<Vec<Frame>, String> {
+        VideoDecoder::decode(self, sample, pts).map_err(|e| e.to_string())
     }
-
-    /// Decode sample number `index`; the pictures it completes join `out`.
-    fn decode(&mut self, sample: &[u8], index: u32, out: &mut VecDeque<Picture>) -> Result<(), String> {
-        let t = index as f64;
-        match self {
-            Inner::Hevc(d) => out.extend(pictures!(d.decode(sample, t).map_err(|e| e.to_string())?)),
-            Inner::Vp9(d) => out.extend(pictures!(d.decode(sample, t).map_err(|e| e.to_string())?)),
-            Inner::Vp8(d) => out.extend(pictures!(d.decode(sample, t).map_err(|e| e.to_string())?)),
-            Inner::Av1(d) => out.extend(pictures!(d.decode(sample, t).map_err(|e| e.to_string())?)),
-        }
-        Ok(())
+    fn flush(&mut self) -> Result<Vec<Frame>, String> {
+        VideoDecoder::flush(self).map_err(|e| e.to_string())
     }
-
-    /// The pictures still held at the end of the stream join `out`.
-    fn flush(&mut self, out: &mut VecDeque<Picture>) -> Result<(), String> {
-        match self {
-            Inner::Hevc(d) => out.extend(pictures!(d.flush().map_err(|e| e.to_string())?)),
-            Inner::Vp9(d) => out.extend(pictures!(d.flush().map_err(|e| e.to_string())?)),
-            Inner::Vp8(d) => out.extend(pictures!(d.flush().map_err(|e| e.to_string())?)),
-            Inner::Av1(d) => out.extend(pictures!(d.flush().map_err(|e| e.to_string())?)),
-        }
-        Ok(())
-    }
-
-    /// How many pictures may come out before one shown earlier: HEVC's in
-    /// decoding order; the others' come in presentation order.
     fn reorder_depth(&self) -> u32 {
-        match self {
-            Inner::Hevc(d) => d.reorder_depth(),
-            _ => 0,
-        }
+        VideoDecoder::reorder_depth(self)
+    }
+}
+
+/// A decoder for `codec` (the app's name: hevc, vp9, vp8, av1) and the
+/// track's configuration record (hvcC, vpcC, av1C or Matroska's
+/// CodecPrivate; may be empty).
+fn open(codec: &str, config: &[u8]) -> Result<Box<dyn Stream>, String> {
+    // (boxed: one decoder at a time, of states that differ in size by kilobytes)
+    fn boxed<D: VideoDecoder + 'static>(config: &[u8]) -> Result<Box<dyn Stream>, String> {
+        Ok(Box::new(D::open(config).map_err(|e| e.to_string())?))
+    }
+    match codec {
+        "hevc" => boxed::<unflash_hevc::Decoder>(config),
+        "vp9" => boxed::<unflash_vp9::Decoder>(config),
+        "vp8" => boxed::<unflash_vp8::Decoder>(config),
+        "av1" => boxed::<unflash_av1::Decoder>(config),
+        other => Err(format!("there is no built-in decoder for {other}")),
     }
 }
 
@@ -104,9 +67,12 @@ impl Inner {
 /// whole (packed I420 at `frame_ptr`, in this module's memory).
 #[wasm_bindgen]
 pub struct SoftDecoder {
-    inner: Inner,
-    ready: VecDeque<Picture>,
-    cur: Option<Picture>,
+    inner: Box<dyn Stream>,
+    /// The pictures decoded and not yet taken, and the one taken last. (The
+    /// decoders carry the number `decode` was given as a picture's time:
+    /// the sample it was shown by.)
+    ready: VecDeque<Frame>,
+    cur: Option<Frame>,
     /// The current picture as packed I420, when pictures are not made small.
     frame: Vec<u8>,
     /// The analysis size pictures are made small to, and the last one made.
@@ -121,7 +87,7 @@ impl SoftDecoder {
     /// configuration record (`config`).
     #[wasm_bindgen(constructor)]
     pub fn new(codec: &str, config: &[u8]) -> Result<SoftDecoder, JsValue> {
-        Ok(SoftDecoder { inner: Inner::new(codec, config).map_err(js_err)?, ready: VecDeque::new(), cur: None, frame: Vec::new(), shrink: None, shrinker: None, small: Vec::new() })
+        Ok(SoftDecoder { inner: open(codec, config).map_err(js_err)?, ready: VecDeque::new(), cur: None, frame: Vec::new(), shrink: None, shrinker: None, small: Vec::new() })
     }
 
     /// From now on make each picture `analysis_width`×`analysis_height`
@@ -134,13 +100,13 @@ impl SoftDecoder {
     /// Decode one sample (`index`: its number, which the picture it shows
     /// carries back in `frame_pts`). Returns how many pictures are ready.
     pub fn decode(&mut self, sample: &[u8], index: u32) -> Result<u32, JsValue> {
-        self.inner.decode(sample, index, &mut self.ready).map_err(js_err)?;
+        self.ready.extend(self.inner.decode(sample, index as f64).map_err(js_err)?);
         Ok(self.ready.len() as u32)
     }
 
     /// The pictures still held at the end; returns how many are ready.
     pub fn flush(&mut self) -> Result<u32, JsValue> {
-        self.inner.flush(&mut self.ready).map_err(js_err)?;
+        self.ready.extend(self.inner.flush().map_err(js_err)?);
         Ok(self.ready.len() as u32)
     }
 
@@ -151,25 +117,20 @@ impl SoftDecoder {
     }
 
     /// Take the next ready picture; false when there is none.
+    // (JavaScript calls it by this name; it is no iterator's `next`)
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> bool {
         let Some(p) = self.ready.pop_front() else {
             self.cur = None;
             return false;
         };
-        let (w, h) = (p.width as usize, p.height as usize);
-        let cw = w.div_ceil(2);
         match self.shrink {
             Some((aw, ah)) => {
+                let (w, cw) = (p.width as usize, p.chroma_size().0);
                 let k = Shrink::reuse(&mut self.shrinker, p.width, p.height, aw, ah);
                 k.yuv420_planes(&p.y, w, &p.u, cw, &p.v, cw, p.bt709, p.full_range, &mut self.small);
             }
-            None => {
-                self.frame.clear();
-                self.frame.extend_from_slice(&p.y[..w * h]);
-                let ch = h.div_ceil(2);
-                self.frame.extend_from_slice(&p.u[..cw * ch]);
-                self.frame.extend_from_slice(&p.v[..cw * ch]);
-            }
+            None => p.pack_i420(&mut self.frame),
         }
         self.cur = Some(p);
         true
@@ -183,7 +144,7 @@ impl SoftDecoder {
     }
     /// The number of the sample the current picture was shown by.
     pub fn frame_pts(&self) -> u32 {
-        self.cur.as_ref().map_or(0, |p| p.index)
+        self.cur.as_ref().map_or(0, |p| p.pts as u32)
     }
     pub fn frame_damaged(&self) -> bool {
         self.cur.as_ref().is_some_and(|p| p.damaged)
@@ -213,7 +174,7 @@ impl SoftDecoder {
 /// it), or an error saying why not (an unsupported profile, say).
 #[wasm_bindgen]
 pub fn probe(codec: &str, config: &[u8]) -> Result<String, JsValue> {
-    Inner::new(codec, config).map_err(js_err)?;
+    open(codec, config).map_err(js_err)?;
     Ok("{}".into())
 }
 
@@ -293,4 +254,172 @@ impl SoundDecoder {
 #[wasm_bindgen]
 pub fn wasm_memory() -> JsValue {
     wasm_bindgen::memory()
+}
+
+/// The bindings natively, as a decode worker drives them (`web/softworker.js`,
+/// `web/media.js`'s `decodeBuiltIn`): no JavaScript here, so only what gives
+/// no error is called through the exported API; the errors' text is read
+/// from `open` and the decoders themselves.
+#[cfg(test)]
+mod tests {
+    use unflash_testkit::{expected, load, md5_hex, Stream as Film};
+
+    use super::*;
+
+    /// Every picture of `film` through a `SoftDecoder`: each sample goes in
+    /// under its number, each picture comes back with the number of the
+    /// sample that showed it. In the order shown: (sample, the MD5 of the
+    /// picture as packed I420, damaged).
+    fn through(codec: &str, film: &Film, shrink: Option<(u32, u32)>, mut each: impl FnMut(&SoftDecoder)) -> Vec<(u32, String, bool)> {
+        let mut dec = SoftDecoder::new(codec, &film.config).unwrap();
+        if let Some((aw, ah)) = shrink {
+            dec.set_shrink(aw, ah);
+        }
+        let mut out = Vec::new();
+        let mut take = |dec: &mut SoftDecoder, ready: u32| {
+            for left in (0..ready).rev() {
+                assert!(dec.next());
+                assert_eq!(dec.ready.len() as u32, left);
+                each(dec);
+                // (JavaScript reads the picture in this module's memory, where these point)
+                assert_eq!((dec.frame_ptr(), dec.frame_len() as usize), (dec.frame.as_ptr(), dec.frame.len()));
+                out.push((dec.frame_pts(), md5_hex(&dec.frame), dec.frame_damaged()));
+            }
+            assert!(!dec.next(), "no more pictures than it said were ready");
+            assert_eq!((dec.width(), dec.height(), dec.frame_pts(), dec.frame_damaged()), (0, 0, 0, false));
+        };
+        for (i, sample) in film.samples.iter().enumerate() {
+            let ready = dec.decode(&sample.data, i as u32).unwrap();
+            take(&mut dec, ready);
+        }
+        let ready = dec.flush().unwrap();
+        take(&mut dec, ready);
+        out.sort_by(|a, b| film.samples[a.0 as usize].pts.total_cmp(&film.samples[b.0 as usize].pts));
+        out
+    }
+
+    #[test]
+    fn each_decoder_gives_ffmpeg_s_pictures_through_the_bindings() {
+        for (codec, path) in [("hevc", "hevc/b_pyramid.mp4"), ("hevc", "hevc/odd_size.mp4"), ("vp9", "vp9/altref.ivf"), ("vp9", "vp9/odd.ivf"), ("vp8", "vp8/altref.webm"), ("vp8", "vp8/odd.ivf"), ("av1", "av1/aom_altref_tiles.mp4"), ("av1", "av1/aom_odd.mp4")] {
+            let film = load(path);
+            let dec = SoftDecoder::new(codec, &film.config).unwrap();
+            // HEVC's pictures come out in decoding order (under the samples that showed
+            // them), as many held back as the stream says; the others' in the order shown
+            match (codec, path) {
+                ("hevc", "hevc/b_pyramid.mp4") => assert!((1..=15).contains(&dec.reorder_depth()), "{path}: B pictures are reordered"),
+                ("hevc", _) => assert!(dec.reorder_depth() <= 15, "{path}"),
+                _ => assert_eq!(dec.reorder_depth(), 0, "{path}"),
+            }
+            let want = expected(path);
+            let mut sizes = std::collections::BTreeSet::new();
+            let got = through(codec, &film, None, |d| {
+                sizes.insert((d.width(), d.height(), d.frame_len()));
+            });
+            assert_eq!(got.len(), want.len(), "{path}: pictures");
+            for (i, ((_, md5, damaged), want)) in got.iter().zip(&want).enumerate() {
+                assert!(!damaged, "{path}: picture {i} damaged");
+                assert_eq!(md5, want, "{path}: picture {i} is not ffmpeg's");
+            }
+            // every sample that shows a picture shows one, and once
+            let shown: std::collections::BTreeSet<u32> = got.iter().map(|g| g.0).collect();
+            assert_eq!(shown.len(), got.len(), "{path}");
+            // packed I420: the luma, and two chroma planes of the size rounded up
+            for (w, h, len) in sizes {
+                assert_eq!(len, w * h + 2 * w.div_ceil(2) * h.div_ceil(2), "{path}: {w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn pictures_made_small_are_the_whole_ones_averaged() {
+        for (codec, path) in [("vp8", "vp8/smooth.ivf"), ("hevc", "hevc/intra.mp4"), ("av1", "av1/aom_altref_tiles.mp4")] {
+            let film = load(path);
+            // the same pictures whole, for their mean samples
+            let mut whole = Vec::new();
+            through(codec, &film, None, |d| {
+                let p = d.cur.as_ref().unwrap();
+                let mean = |plane: &[u8]| plane.iter().map(|&s| s as f64).sum::<f64>() / plane.len() as f64;
+                whole.push((mean(&p.y), mean(&p.u), mean(&p.v), p.bt709, p.full_range));
+            });
+            let (aw, ah) = (32u32, 18u32);
+            let mut small = Vec::new();
+            through(codec, &film, Some((aw, ah)), |d| {
+                assert_eq!(d.frame_len(), 0, "{path}: no whole picture is copied out beside the small one");
+                small.push(d.small());
+            });
+            assert_eq!(small.len(), whole.len(), "{path}");
+            for (i, (rgba, &(y, u, v, bt709, full))) in small.iter().zip(&whole).enumerate() {
+                assert_eq!(rgba.len(), (aw * ah * 4) as usize, "{path}: picture {i}");
+                assert!(rgba.chunks_exact(4).all(|px| px[3] == 255), "{path}: picture {i} opaque");
+                let mean = |c: usize| rgba.chunks_exact(4).map(|px| px[c] as f64).sum::<f64>() / (aw * ah) as f64;
+                // the picture's mean colour, converted as the stream says: a mean of clipped
+                // samples is not quite the clipped mean, so to within a few codes
+                let (kr, kb) = if bt709 { (0.2126, 0.0722) } else { (0.299, 0.114) };
+                let (yy, cb, cr) = if full { (y, u - 128.0, v - 128.0) } else { ((y - 16.0) * 255.0 / 219.0, (u - 128.0) * 255.0 / 224.0, (v - 128.0) * 255.0 / 224.0) };
+                let r = yy + 2.0 * (1.0 - kr) * cr;
+                let b = yy + 2.0 * (1.0 - kb) * cb;
+                let g = (yy - kr * r - kb * b) / (1.0 - kr - kb);
+                for (c, want) in [r, g, b].into_iter().enumerate() {
+                    assert!((mean(c) - want.clamp(0.0, 255.0)).abs() < 4.0, "{path}: picture {i} channel {c}: {} against {want}", mean(c));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_picture_s_colours_are_named_for_the_page() {
+        let film = load("vp8/smooth.ivf");
+        let mut dec = SoftDecoder::new("vp8", &film.config).unwrap();
+        // before any picture: the usual guess
+        assert_eq!(dec.color_json(), r#"{"fullRange":false,"matrix":"bt709","primaries":"bt709","transfer":"bt709"}"#);
+        assert_eq!(dec.decode(&film.samples[0].data, 0).unwrap(), 1);
+        assert!(dec.next());
+        // VP8 is BT.601, limited range
+        assert_eq!(dec.color_json(), r#"{"fullRange":false,"matrix":"smpte170m","primaries":"smpte170m","transfer":"smpte170m"}"#);
+    }
+
+    #[test]
+    fn what_cannot_be_decoded_says_why_in_words() {
+        assert_eq!(open("mpeg2", &[]).err().unwrap(), "there is no built-in decoder for mpeg2");
+        assert_eq!(open("", &[]).err().unwrap(), "there is no built-in decoder for ");
+        // each decoder's own error, as the page shows it
+        for codec in ["hevc", "vp9", "vp8", "av1"] {
+            // (without a configuration record: the samples' own headers will do)
+            let mut dec = open(codec, &[]).unwrap_or_else(|e| panic!("{codec}: {e}"));
+            // HEVC may reorder as far as the standard allows until a stream says less
+            assert_eq!(dec.reorder_depth(), if codec == "hevc" { 15 } else { 0 }, "{codec}");
+            assert!(dec.flush().unwrap().is_empty(), "{codec}");
+        }
+        let e = open("vp9", &[]).unwrap().decode(&[0xff, 0xff, 0xff, 0xff], 0.0).err().unwrap();
+        assert!(e.starts_with("invalid VP9 data") || e.starts_with("unsupported VP9 stream"), "{e}");
+        // (a key frame whose start code is not VP8's)
+        let e = open("vp8", &[]).unwrap().decode(&[0x10, 0x00, 0x00, 0xff, 0xff, 0xff, 0, 0, 0, 0], 0.0).err().unwrap();
+        assert!(e.starts_with("invalid VP8 data"), "{e}");
+        // a stream the AV1 decoder does not turn into pictures is turned down from its
+        // configuration record alone, which is what `probe` tells the page
+        assert_eq!(open("av1", &load("av1/aom_444.mp4").config).err().unwrap(), "unsupported AV1 stream: 4:4:4 chroma");
+        assert_eq!(open("av1", &load("av1/aom_422.mp4").config).err().unwrap(), "unsupported AV1 stream: 4:2:2 chroma");
+        assert!(open("av1", &load("av1/aom_12bit.mp4").config).err().unwrap().starts_with("unsupported AV1 stream: 12-bit"));
+        assert!(open("av1", &load("av1/aom_odd.mp4").config).is_ok());
+    }
+
+    #[test]
+    fn dolby_and_dts_sound_come_out_as_stereo_planes() {
+        for (codec, path, rate, block) in [("ac3", "ac3/ac3_stereo_44k.ac3", 44100, 1536), ("ac3", "ac3/ac3_3f2r_lfe_48k.ac3", 48000, 1536), ("ac3", "ac3/eac3_stereo_48k.eac3", 48000, 256), ("dts", "dts/dts_stereo_48k_1411k.dts", 48000, 256), ("dts", "dts/dts_5.1_48k_768k.dts", 48000, 256)] {
+            let data = unflash_testkit::read(path);
+            let mut dec = SoundDecoder::new(codec).unwrap();
+            assert_eq!((dec.samples(), dec.channels(), dec.sample_rate()), (0, 0, 0), "{path}: nothing decoded yet");
+            // (a file of whole frames is a chunk of whole frames)
+            let out = dec.decode(&data).unwrap();
+            assert_eq!(dec.channels(), 2, "{path}: mixed down to stereo");
+            assert_eq!(dec.sample_rate(), rate, "{path}");
+            assert!(dec.samples() > 0 && dec.samples().is_multiple_of(block), "{path}: {} samples", dec.samples());
+            assert_eq!(out.len() as u32, dec.samples() * dec.channels(), "{path}: one plane after the other");
+            assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 1.5), "{path}: samples in range");
+            assert!(out.iter().any(|&s| s != 0.0) || path.contains("silence"), "{path}: not silence");
+            // the next chunk starts from nothing held over in the planes
+            let again = dec.decode(&data).unwrap();
+            assert_eq!(again.len(), out.len(), "{path}");
+        }
+    }
 }

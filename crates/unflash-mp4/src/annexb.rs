@@ -4,22 +4,16 @@
 //! string, the bit depths, where a picture and a field pair begin), and the
 //! decoder setup records (avcC, hvcC) built from the parameter sets.
 
+// (the RBSP of a NAL unit: its emulation prevention bytes taken out, as the decoders take them)
+pub use unflash_codec::bits::unescape as rbsp;
+
 use crate::reader::Bits;
 
-/// The RBSP of a NAL unit: its emulation prevention bytes taken out.
-pub fn rbsp(nal: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(nal.len());
-    let mut zeros = 0;
-    for &b in nal {
-        if zeros >= 2 && b == 3 {
-            zeros = 0;
-            continue;
-        }
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-        out.push(b);
-    }
-    out
-}
+/// The most macroblocks a side an H.264 parameter set may claim here, and
+/// (times sixteen) the most samples a side an HEVC one may: enough for any
+/// level of either, and small enough that the arithmetic on a hostile
+/// stream's sizes cannot overflow.
+const MAX_MBS: u32 = 1 << 16;
 
 /// What an H.264 sequence parameter set says that a container needs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -60,12 +54,13 @@ pub fn parse_avc_sps(nal: &[u8]) -> Option<AvcSps> {
     let id = b.ue()?;
     let (mut chroma, mut separate, mut depth_luma, mut depth_chroma) = (1, false, 8, 8);
     if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
-        chroma = b.ue()?;
+        // (each value within what the standard lets it be: 7.4.2.1.1)
+        chroma = b.ue_max(3)?;
         if chroma == 3 {
             separate = b.flag()?;
         }
-        depth_luma = 8 + b.ue()?;
-        depth_chroma = 8 + b.ue()?;
+        depth_luma = 8 + b.ue_max(6)?;
+        depth_chroma = 8 + b.ue_max(6)?;
         b.flag()?; // qpprime_y_zero_transform_bypass
         if b.flag()? {
             for i in 0..(if chroma != 3 { 8 } else { 12 }) {
@@ -75,7 +70,7 @@ pub fn parse_avc_sps(nal: &[u8]) -> Option<AvcSps> {
             }
         }
     }
-    let log2_max_frame_num = b.ue()? + 4;
+    let log2_max_frame_num = b.ue_max(12)? + 4;
     match b.ue()? {
         0 => {
             b.ue()?;
@@ -92,8 +87,10 @@ pub fn parse_avc_sps(nal: &[u8]) -> Option<AvcSps> {
     }
     b.ue()?; // max_num_ref_frames
     b.flag()?; // gaps_in_frame_num_value_allowed
-    let width_mbs = b.ue()? + 1;
-    let height_units = b.ue()? + 1;
+    // (a picture of 65 536 macroblocks a side at most: far past any level,
+    // and its size in samples still a number)
+    let width_mbs = b.ue_max(MAX_MBS - 1)? + 1;
+    let height_units = b.ue_max(MAX_MBS - 1)? + 1;
     let frame_mbs_only = b.flag()?;
     if !frame_mbs_only {
         b.flag()?; // mb_adaptive_frame_field
@@ -102,7 +99,8 @@ pub fn parse_avc_sps(nal: &[u8]) -> Option<AvcSps> {
     let mut crop = [0u32; 4];
     if b.flag()? {
         for c in &mut crop {
-            *c = b.ue()?;
+            // (no more is cropped than there is)
+            *c = b.ue_max(MAX_MBS * 32)?;
         }
     }
     // the crop's units: chroma samples, and field pairs' rows
@@ -257,20 +255,21 @@ pub fn parse_hevc_sps(nal: &[u8]) -> Option<HevcSps> {
         }
     }
     b.ue()?; // sps_seq_parameter_set_id
-    let chroma = b.ue()?;
+    // (each value within what the standard lets it be: 7.4.3.2.1)
+    let chroma = b.ue_max(3)?;
     if chroma == 3 {
         b.flag()?;
     }
-    let w = b.ue()?;
-    let h = b.ue()?;
+    let w = b.ue_max(MAX_MBS * 16)?;
+    let h = b.ue_max(MAX_MBS * 16)?;
     let mut crop = [0u32; 4];
     if b.flag()? {
         for c in &mut crop {
-            *c = b.ue()?;
+            *c = b.ue_max(MAX_MBS * 16)?;
         }
     }
-    let depth_luma = 8 + b.ue()?;
-    let depth_chroma = 8 + b.ue()?;
+    let depth_luma = 8 + b.ue_max(8)?;
+    let depth_chroma = 8 + b.ue_max(8)?;
     let (sub_w, sub_h) = match chroma {
         1 => (2, 2),
         2 => (2, 1),
@@ -341,6 +340,149 @@ mod tests {
         let s = parse_avc_sps(&sps).unwrap();
         assert_eq!((s.profile, s.width, s.height), (66, 1920, 1080));
         assert_eq!(avcc(&[&sps], &[&[0x68, 0xce, 0x0f, 0xc8]], &s).len(), 6 + 2 + sps.len() + 1 + 2 + 4);
+    }
+
+    /// A parameter set written bit by bit, to say what no encoder would.
+    #[derive(Default)]
+    struct Written {
+        bits: Vec<bool>,
+    }
+
+    impl Written {
+        fn u(&mut self, n: u32, v: u64) -> &mut Self {
+            for i in (0..n).rev() {
+                self.bits.push((v >> i) & 1 == 1);
+            }
+            self
+        }
+        fn ue(&mut self, v: u64) -> &mut Self {
+            let x = v + 1;
+            let n = 64 - x.leading_zeros();
+            self.u(n - 1, 0).u(n, x)
+        }
+        /// The NAL unit: `header`, the bits and their stop bit, emulation
+        /// prevention bytes put in where two zeros would be followed by a
+        /// byte under four.
+        fn nal(&self, header: &[u8]) -> Vec<u8> {
+            let mut bits = self.bits.clone();
+            bits.push(true);
+            let mut out = header.to_vec();
+            let mut zeros = 0;
+            for chunk in bits.chunks(8) {
+                let byte = chunk.iter().enumerate().fold(0u8, |b, (i, &on)| b | ((on as u8) << (7 - i)));
+                if zeros >= 2 && byte <= 3 {
+                    out.push(3);
+                    zeros = 0;
+                }
+                out.push(byte);
+                zeros = if byte == 0 { zeros + 1 } else { 0 };
+            }
+            out
+        }
+    }
+
+    /// A Baseline H.264 SPS of `width` by `height` macroblocks, its
+    /// log2_max_frame_num_minus4 and its four crop values as given.
+    fn avc_sps(log2_frame_num: u64, width: u64, height: u64, crop: Option<[u64; 4]>) -> Vec<u8> {
+        let mut w = Written::default();
+        // profile 66, no constraint flags, level 3.0; sps id 0
+        w.u(8, 66).u(8, 0).u(8, 30).ue(0);
+        // frame numbers; picture order count type 2; one reference frame; no gaps
+        w.ue(log2_frame_num).ue(2).ue(1).u(1, 0);
+        w.ue(width - 1).ue(height - 1);
+        // frames only; direct 8x8 inference
+        w.u(1, 1).u(1, 1);
+        match crop {
+            Some(c) => {
+                w.u(1, 1);
+                for v in c {
+                    w.ue(v);
+                }
+            }
+            None => {
+                w.u(1, 0);
+            }
+        }
+        // no VUI
+        w.u(1, 0);
+        w.nal(&[0x67])
+    }
+
+    #[test]
+    fn a_parameter_set_that_claims_the_impossible_is_none() {
+        // (what is written here reads back: 20 by 15 macroblocks, 8 rows of chroma cropped)
+        let s = parse_avc_sps(&avc_sps(0, 20, 15, None)).unwrap();
+        assert_eq!((s.profile, s.width, s.height, s.log2_max_frame_num, s.frame_mbs_only), (66, 320, 240, 4, true));
+        assert_eq!(parse_avc_sps(&avc_sps(12, 20, 15, Some([0, 0, 0, 4]))).map(|s| (s.width, s.height, s.log2_max_frame_num)), Some((320, 232, 16)));
+        // sizes that are no picture's: in a build that checks its arithmetic these
+        // overflowed (a panic, which in the page is the end of it); in one that does
+        // not, they came out as some other size
+        let huge = u32::MAX as u64 - 1;
+        assert_eq!(parse_avc_sps(&avc_sps(0, huge + 1, 15, None)), None);
+        assert_eq!(parse_avc_sps(&avc_sps(0, 20, huge + 1, None)), None);
+        assert_eq!(parse_avc_sps(&avc_sps(0, 1 << 16, 1 << 16, None)).map(|s| (s.width, s.height)), Some((1 << 20, 1 << 20)));
+        assert_eq!(parse_avc_sps(&avc_sps(0, (1 << 16) + 1, 15, None)), None);
+        assert_eq!(parse_avc_sps(&avc_sps(13, 20, 15, None)), None);
+        assert_eq!(parse_avc_sps(&avc_sps(huge, 20, 15, None)), None);
+        assert_eq!(parse_avc_sps(&avc_sps(0, 20, 15, Some([huge, huge, 0, 0]))), None);
+        assert_eq!(parse_avc_sps(&avc_sps(0, 20, 15, Some([0, 0, huge, huge]))), None);
+        // more cropped than there is: nothing left, not a size wrapped round
+        assert_eq!(parse_avc_sps(&avc_sps(0, 20, 15, Some([400, 400, 300, 300]))).map(|s| (s.width, s.height)), Some((0, 0)));
+        // a High profile's chroma format and bit depths
+        let high = |chroma: u64, depth: u64| {
+            let mut w = Written::default();
+            w.u(8, 100).u(8, 0).u(8, 30).ue(0);
+            // chroma format, luma and chroma depths, no bypass, no scaling matrices
+            w.ue(chroma).ue(depth).ue(depth).u(1, 0).u(1, 0);
+            w.ue(0).ue(2).ue(1).u(1, 0).ue(19).ue(14).u(1, 1).u(1, 1).u(1, 0).u(1, 0);
+            parse_avc_sps(&w.nal(&[0x67])).map(|s| (s.chroma_format, s.bit_depth_luma, s.bit_depth_chroma, s.width))
+        };
+        assert_eq!(high(1, 2), Some((1, 10, 10, 320)));
+        assert_eq!(high(2, 6), Some((2, 14, 14, 320)));
+        assert_eq!(high(4, 0), None);
+        assert_eq!(high(1, 7), None);
+        assert_eq!(high(1, huge), None);
+    }
+
+    /// An HEVC SPS of `width` by `height` samples (one sub-layer, 4:2:0),
+    /// its bit depths less eight and its conformance window as given.
+    fn hevc_sps(width: u64, height: u64, crop: Option<[u64; 4]>, depth: u64) -> Vec<u8> {
+        let mut w = Written::default();
+        // vps id 0, one sub-layer, temporal id nesting; a profile_tier_level of 12 bytes
+        w.u(4, 0).u(3, 0).u(1, 1);
+        for byte in [1u64, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 93] {
+            w.u(8, byte);
+        }
+        // sps id 0, 4:2:0
+        w.ue(0).ue(1).ue(width).ue(height);
+        match crop {
+            Some(c) => {
+                w.u(1, 1);
+                for v in c {
+                    w.ue(v);
+                }
+            }
+            None => {
+                w.u(1, 0);
+            }
+        }
+        w.ue(depth).ue(depth);
+        w.nal(&[0x42, 0x01])
+    }
+
+    #[test]
+    fn an_hevc_parameter_set_that_claims_the_impossible_is_none() {
+        let s = parse_hevc_sps(&hevc_sps(1920, 1088, Some([0, 0, 0, 4]), 2)).unwrap();
+        assert_eq!((s.width, s.height, s.chroma_format, s.bit_depth_luma, s.bit_depth_chroma, s.max_sub_layers, s.temporal_id_nesting), (1920, 1080, 1, 10, 10, 1, true));
+        assert_eq!(s.ptl[0], 1);
+        let huge = u32::MAX as u64 - 1;
+        assert_eq!(parse_hevc_sps(&hevc_sps(huge, 1088, None, 0)), None);
+        assert_eq!(parse_hevc_sps(&hevc_sps(1920, huge, None, 0)), None);
+        assert_eq!(parse_hevc_sps(&hevc_sps(1920, 1088, Some([huge, huge, 0, 0]), 0)), None);
+        assert_eq!(parse_hevc_sps(&hevc_sps(1920, 1088, Some([0, 0, huge, huge]), 0)), None);
+        assert_eq!(parse_hevc_sps(&hevc_sps(1920, 1088, None, 9)), None);
+        assert_eq!(parse_hevc_sps(&hevc_sps(1920, 1088, None, huge)), None);
+        assert_eq!(parse_hevc_sps(&hevc_sps(1920, 1088, Some([2000, 2000, 0, 0]), 0)).map(|s| s.width), Some(0));
     }
 
     #[test]

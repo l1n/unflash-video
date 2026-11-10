@@ -748,6 +748,8 @@ pub fn audio_sample_entry(codec: &str, description: &[u8], sample_rate: u32, cha
 
 // ---- detector --------------------------------------------------------------
 
+// (one per detector: the CPU stage stays in place)
+#[allow(clippy::large_enum_variant)]
 enum Stage {
     Cpu(CpuStage),
     Gpu(Box<GpuStage>),
@@ -792,6 +794,8 @@ impl Detector {
             let ctx = GpuContext::new().await.map_err(js_err)?;
             let det = CoreDetector::for_source(cfg.clone(), src_width, src_height);
             let batch = batch.map(|b| b.max(1) as usize).unwrap_or(unflash_gpu::DEFAULT_BATCH);
+            // (`mut` for the notifier, which only a browser build sets)
+            #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))]
             let mut stage = GpuStage::with_options(&ctx, &cfg, det.geometry().clone(), unflash_gpu::DEFAULT_SLOTS, batch).map_err(js_err)?;
             let waiter: Rc<RefCell<Option<js_sys::Function>>> = Default::default();
             // (in a browser; a native build of these bindings only runs tests)
@@ -1366,7 +1370,7 @@ pub fn avcc_record(sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> {
 /// matrix 1 (or 9, BT.2020's), BT.601 for 5 or 6, otherwise by height
 /// (BT.709 above 576 lines); full range as the VUI says, else limited.
 fn conversion(sps: &unflash_h264::Sps) -> (bool, bool) {
-    let hd = sps.cropped_size().1 > 576;
+    let hd = unflash_codec::bt709_by_height(sps.cropped_size().1);
     match &sps.vui {
         Some(v) => (
             match v.matrix_coefficients {
@@ -1384,7 +1388,7 @@ fn conversion(sps: &unflash_h264::Sps) -> (bool, bool) {
 /// by picture size.
 fn color_space_json(sps: &unflash_h264::Sps) -> String {
     let (_, h) = sps.cropped_size();
-    let hd = h > 576;
+    let hd = unflash_codec::bt709_by_height(h);
     let (mut primaries, mut transfer, mut matrix, mut full) = (if hd { "bt709" } else { "smpte170m" }, if hd { "bt709" } else { "smpte170m" }, if hd { "bt709" } else { "smpte170m" }, false);
     if let Some(v) = &sps.vui {
         full = v.video_full_range;

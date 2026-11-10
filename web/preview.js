@@ -173,25 +173,29 @@ export class SectionPlayer {
     this._size(movie);
     if (this.sound && !run.once) this.sound.use(movie, plan);
     const g = this.canvas.getContext('2d');
-    await walkEdited(
-      movie,
-      piece,
-      async (frame, t, info) => {
-        if (run.cancelled) return;
-        // skipping ahead to the slot asked for: decode, don't show
-        if (info.sec ? info.slot < first : t < tFirst - 1e-9) return;
-        // wait for the picture's moment
-        if (!(await this._until(run, t, true))) return;
-        g.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
-        run.slot = info.sec ? info.slot : -1;
-        run.t = t;
-        if (this.onFrame) this.onFrame(info, t, plan);
-        if (run.once) run.cancelled = true;
-      },
-      { cancel: () => run.cancelled }
-    );
-    // the last frame stays up for its time, and for its hold if it is held
-    if (!run.cancelled && run.base) await this._until(run, plan.end + plan.extra, false);
-    if (this.sound) this.sound.halt();
+    try {
+      await walkEdited(
+        movie,
+        piece,
+        async (frame, t, info) => {
+          if (run.cancelled) return;
+          // skipping ahead to the slot asked for: decode, don't show
+          if (info.sec ? info.slot < first : t < tFirst - 1e-9) return;
+          // wait for the picture's moment
+          if (!(await this._until(run, t, true))) return;
+          g.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+          run.slot = info.sec ? info.slot : -1;
+          run.t = t;
+          if (this.onFrame) this.onFrame(info, t, plan);
+          if (run.once) run.cancelled = true;
+        },
+        { cancel: () => run.cancelled }
+      );
+      // the last frame stays up for its time, and for its hold if it is held
+      if (!run.cancelled && run.base) await this._until(run, plan.end + plan.extra, false);
+    } finally {
+      // (and when the pictures stop at an error: the sound used to play on)
+      if (this.sound) this.sound.halt();
+    }
   }
 }

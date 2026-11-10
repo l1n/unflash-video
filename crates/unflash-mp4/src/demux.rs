@@ -79,12 +79,13 @@ pub(crate) fn span(samples: &[Sample]) -> i64 {
     let mut hi = i64::MIN;
     for s in samples {
         lo = lo.min(s.pts);
-        hi = hi.max(s.pts + s.duration as i64);
+        hi = hi.max(s.pts.saturating_add(s.duration as i64));
     }
     if lo == i64::MAX {
         0
     } else {
-        hi - lo
+        // (times no file has, from a caller of the muxer: as long as can be said)
+        hi.saturating_sub(lo)
     }
 }
 
@@ -572,7 +573,8 @@ fn parse_moov(moov: &[u8], file_size: u64) -> Result<(Movie, Vec<(u32, Trex)>), 
         if let Some(form) = tp.pcm {
             let ch = tp.channels.max(1);
             if fixed > 1 && fixed != tp.pcm_frame && fixed % ch == 0 {
-                if let Some(c) = pcm_codec(PcmForm { bits: fixed / ch * 8, ..form }) {
+                // (a size no sample has: no form of PCM is that wide, and none is found for it)
+                if let Some(c) = pcm_codec(PcmForm { bits: (fixed / ch).saturating_mul(8), ..form }) {
                     tp.codec = CodecInfo { codec: c.into(), description: None };
                     tp.pcm_frame = fixed;
                 }
@@ -781,7 +783,7 @@ fn parse_stbl(stbl: &[u8], tp: &mut TrakParts) -> Result<(), Error> {
                                 sd.flags = er.u32()?;
                                 let packet_bytes = er.u32()?;
                                 let packet_frames = er.u32()?;
-                                sd.frame_bytes = if packet_frames > 0 { packet_bytes / packet_frames } else { 0 };
+                                sd.frame_bytes = packet_bytes.checked_div(packet_frames).unwrap_or(0);
                             }
                             sound = Some(sd);
                         }

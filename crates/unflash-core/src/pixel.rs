@@ -417,7 +417,6 @@ pub fn held_count(l: &[f32], prev_l: &[f32], delta: f32, v: &[f32], prev_v: &[f3
 /// red run's chromaticity: what the colour was at the run's ends). Returns
 /// (reversed_up, reversed_down, base_snapshot, ext_snapshot,
 /// aux_base_snapshot, aux_ext_snapshot).
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn tracker_feed(
     dir: &mut u32,
@@ -485,7 +484,6 @@ fn tracker_feed(
 }
 
 /// Flash pairing + rate ring for one pixel of one kind. `pol` is UP or DN.
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn counter_transition(
     ring: &mut [u32],
@@ -522,7 +520,6 @@ fn counter_transition(
 
 /// [`counter_transition`] without the opening times (the close calls'
 /// counter keeps none).
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn warn_transition(ring: &mut [u32], n: usize, i: usize, k: usize, last: &mut u32, pend_t: &mut u32, pend_pol: &mut u32, pol: u32, now: u32, pair: u32) {
     let opposite = if pol == UP { DN } else { UP };

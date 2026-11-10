@@ -22,7 +22,6 @@ fn round_q4(v: i32) -> i32 {
 impl<'a, 'd, T: Pixel> TileDecoder<'a, 'd, T> {
     /// Predict the `w` x `h` samples at (`x`, `y`) of `plane` (the whole
     /// block, or one 4x4 sub-block `block_idx` of a block smaller than 8x8).
-    #[allow(clippy::too_many_arguments)]
     pub fn predict_inter(&mut self, b: &Block, plane: usize, x: usize, y: usize, w: usize, h: usize, block_idx: usize) {
         let is_compound = b.ref_frame[1] > INTRA_FRAME;
         for list in 0..1 + is_compound as usize {
@@ -130,7 +129,6 @@ pub struct Mc<'a> {
 
 /// An unscaled block (8.5.2.4 with steps of 16): find the samples the
 /// filters need, in place or as an edge-replicated copy, and interpolate.
-#[allow(clippy::too_many_arguments)]
 fn predict_unscaled<T: Pixel>(refp: &Plane<T>, cur: &mut Plane<T>, x: usize, y: usize, w: usize, h: usize, start_x: i64, start_y: i64, filter: &[[i16; 8]; 16], bd: u32, average: bool, tmp: &mut [i32], edge: &mut [T]) {
     let mc = Mc { w, h, fx: (start_x & 15) as usize, fy: (start_y & 15) as usize, filter, bd, average };
     // the footprint: 3 samples before and 4 after the block in each
@@ -224,7 +222,6 @@ pub fn predict_block<T: Pixel>(src: &[T], ss: usize, dst: &mut [T], ds: usize, m
 
 /// A block predicted from a reference of another size (8.5.2.4): each
 /// output sample steps `x_step` / `y_step` sixteenths through the reference.
-#[allow(clippy::too_many_arguments)]
 fn predict_scaled<T: Pixel>(refp: &Plane<T>, cur: &mut Plane<T>, x: usize, y: usize, w: usize, h: usize, start_x: i64, start_y: i64, x_step: i32, y_step: i32, filter: &[[i16; 8]; 16], bd: u32, average: bool, tmp: &mut [i32]) {
     let last_x = refp.width as i64 - 1;
     let last_y = refp.height as i64 - 1;

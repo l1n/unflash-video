@@ -84,6 +84,110 @@ const RACE = {
 };
 
 export const SCENES = [
+  // ======== 2026-11-10 ==========================================================
+  {
+    name: 'sound-in-step',
+    alt: "A TV recording that starts part-way through a scene: the debug report says its sound starts 701 ms before its first whole picture. It is exported as it is, and the export opened: there too the sound starts 701 ms before the picture (the two used to start together in an export, the sound late from there on).",
+    query: QA,
+    setup: (d) => d.open('mid-scene.ts'),
+    view: { x: 560, y: 350, width: 720, height: 450 },
+    async play(d) {
+      // (which file the report is of, in the corner of it that is empty)
+      const says = (text) => d.caption(text, { right: d.page.viewportSize().width - (d.view.x + d.view.width) + 14, top: d.view.y + 14 });
+      await report(d, /^\s*audio .*/);
+      await says('the recording');
+      await d.wait(3000);
+      await d.caption('');
+      await d.click('#btnCloseDebug', { after: 300 });
+      await d.camera({ x: 560, y: 0, width: 720, height: 450 }, { ms: 700 });
+      await d.click('#btnExport', { after: 0 });
+      await d.until(() => !document.querySelector('#btnDoExport').disabled);
+      await d.camera('#exportModal .modal-box', { pad: 6, ms: 700 });
+      await d.job(() => d.click('#btnDoExport'));
+      await d.until(() => !document.querySelector('#exportDownload').classList.contains('hidden'));
+      const file = await d.download('#exportDownload', { after: 900 });
+      await d.click('#btnCloseExport', { after: 300 });
+      await d.camera({ x: 0, y: 0, width: 720, height: 450 }, { ms: 700 });
+      await d.pickPath('label.filebtn.primary', file);
+      await d.opened('mid-scene.unflashed.mp4');
+      await report(d, /^\s*audio .*/);
+      await says('its export');
+      await d.wait(2400);
+    },
+  },
+  {
+    name: 'section-ranges',
+    alt: 'A scanned video with one section, open: from 0:01.508 to 0:09.767. A range inside it, 0:04 to 0:06, is typed beside the timeline and "add section" clicked: Unflash says the range is over section #1, and that two sections cannot share frames. Then the section is given 0:12 to 0:15, past the end of the ten-second video, with "apply range": Unflash says that range is outside the video, and the section keeps the range it had (it used to become a section from 0:12 to 0:10, which could not be prepared).',
+    query: Q,
+    // (the timeline with the section on it, the section's own range and what Unflash says, in one view)
+    viewport: { width: 960, height: 600 },
+    async setup(d) {
+      await inSection(d);
+      await toTop(d, '.ws-head');
+    },
+    async play(d) {
+      await d.type('#addStart', '0:04', { after: 200 });
+      await d.type('#addEnd', '0:06', { after: 300 });
+      await d.click('#btnAddSection', { after: 300 });
+      await d.point('#toast', { dy: -0.6, ms: 600 });
+      await d.wait(3000);
+      await d.type('#secStart', '0:12', { after: 200 });
+      await d.type('#secEnd', '0:15', { after: 300 });
+      await d.click('#btnApplyRange', { after: 300 });
+      await d.point('#toast', { dy: -0.6, ms: 600 });
+      await d.wait(1600);
+      await d.point('#wsTitle', { dx: 0.7, ms: 600 });
+      await d.wait(1600);
+      const kept = await d.eval(() => window.__unflash.state.project.sections.map((x) => [x.start < x.end, x.nFrames]));
+      if (kept.length !== 1 || !kept[0][0] || !kept[0][1]) throw new Error('a refused range changed the sections: ' + JSON.stringify(kept));
+    },
+  },
+  {
+    name: 'decoder-again',
+    alt: "The network is gone for a moment as an HEVC video is opened: Unflash cannot fetch its HEVC decoder, and says so. With the network back, the same video is opened again: this time the decoder is fetched, Unflash says it uses its built-in HEVC decoder, and the scan finds the flashing. (Every such video used to fail as the first had, until the page was reloaded.)",
+    query: QA,
+    viewport: { width: 960, height: 600 },
+    async play(d) {
+      // (the decoders are fetched when a video first needs them)
+      await d.page.route('**/pkg-dec/**', (r) => r.abort('internetdisconnected'));
+      await d.caption('the network is gone for a moment');
+      await d.pick('label.filebtn.primary', 'flash_hevc.mp4');
+      await d.until(() => /built-in HEVC decoder cannot read it/.test(document.querySelector('#bannerText').textContent));
+      await d.point('#bannerText', { dx: 0.4, dy: 0.6, ms: 600 });
+      await d.wait(3600);
+      await d.page.unroute('**/pkg-dec/**');
+      await d.caption('and is back');
+      await d.wait(1400);
+      await d.pick('label.filebtn.primary', 'flash_hevc.mp4');
+      await d.until(() => /uses its built-in HEVC decoder/.test(document.querySelector('#bannerText').textContent));
+      await d.idle();
+      await d.caption('');
+      await d.point('#bannerText', { dx: 0.4, dy: 0.6, ms: 600 });
+      await d.wait(2600);
+      await d.job(() => d.click('#btnScan'));
+      await d.wait(1600);
+    },
+  },
+  {
+    name: 'clock-jump',
+    alt: "A damaged file opens: its last five frames are stamped 136 years after the rest, so it claims to be 1 194 444 hours long. Scan runs to its end and finds the flashing in the file's first ten seconds, one section. (Such a file used to stall the page as soon as it was open, and a scan of it never came back.)",
+    query: QA,
+    viewport: { width: 960, height: 600 },
+    async play(d) {
+      await d.pick('label.filebtn.primary', 'clock-jump.mkv');
+      await d.opened('clock-jump.mkv');
+      // (how long it says it is)
+      await d.point('#sectionList .sec-whole', { dx: 0.45, dy: 0.62, ms: 700 });
+      await d.wait(2600);
+      await d.job(() => d.click('#btnScan'));
+      await d.point('#toast', { dy: -0.6, ms: 600 });
+      await d.wait(2200);
+      await d.point('#sectionList .sec-item', { dx: 0.6, ms: 700 });
+      await d.wait(2000);
+    },
+  },
+
+  // ======== 2026-10-13 ==========================================================
   {
     name: 'close-calls',
     alt: 'A video that passes is scanned: "No flashing found", and 2 close calls. Unfolded under the whole video, one is at the limit (3 flashes inside a second, too short to be an extended flash) and one only the stricter profile fails, both marked along the top of the timeline and the chart; "section" makes a section around the first, which passes and lists the close call with its frames.',

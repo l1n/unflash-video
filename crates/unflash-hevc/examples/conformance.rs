@@ -21,9 +21,7 @@ use std::process::Command;
 
 use unflash_hevc::{Decoder, Error};
 
-#[path = "../tests/common/mod.rs"]
-mod common;
-use common::{framemd5, md5};
+use unflash_testkit::{frame_md5 as md5, framemd5};
 
 /// Streams in which the standard's output process (C.5.2.2) discards
 /// pictures still waiting for output at an IRAP picture, as ffmpeg does.

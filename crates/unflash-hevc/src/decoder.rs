@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use crate::bitreader::{unescape, BitReader};
+use crate::bitreader::{unescape_into, BitReader};
 use crate::ctu::{Carry, RefPic, SliceDecoder};
 use crate::deblock::deblock;
 use crate::dpb::{apply_rps, picture_order_count, ref_lists, DpbEntry, RefSet};
@@ -14,29 +14,9 @@ use crate::sao::sao;
 use crate::slice::{nal, parse_slice_header, SliceHeader};
 use crate::{Error, Result};
 
-/// A decoded picture, cropped to the conformance window.
-pub struct Frame {
-    pub width: u32,
-    pub height: u32,
-    /// 8-bit 4:2:0 planes, tightly packed; chroma is (w+1)/2 x (h+1)/2.
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
-    /// The stream's bit depth.
-    pub bit_depth: u8,
-    /// The planes at full precision when the bit depth is above 8 and the
-    /// decoder was asked for them ([`Decoder::set_keep_deep`]).
-    pub y16: Option<Vec<u16>>,
-    pub u16: Option<Vec<u16>>,
-    pub v16: Option<Vec<u16>>,
-    /// The timestamp of the sample the picture came from.
-    pub pts: f64,
-    /// Part of the picture could not be decoded (it is concealed).
-    pub damaged: bool,
-    /// BT.709 colour (from the VUI, else by picture height).
-    pub bt709: bool,
-    pub full_range: bool,
-}
+/// A decoded picture, cropped to the conformance window: the picture every
+/// built-in decoder hands out.
+pub use unflash_codec::Frame;
 
 /// A finished picture to hand out, with what its frame needs.
 struct Finished<P> {
@@ -108,7 +88,6 @@ impl<P: Sample> Core<P> {
     }
 
     /// Start decoding a picture: its reference picture set and buffers.
-    #[allow(clippy::too_many_arguments)]
     fn start_picture(&mut self, sps: Rc<Sps>, pps: Rc<Pps>, layout: Rc<Layout>, hdr: &SliceHeader, poc: i32, pts: f64, output: bool, flush_refs: bool) {
         if flush_refs {
             self.clear_dpb();
@@ -334,7 +313,7 @@ fn is_bt709(matrix_coeffs: Option<u8>, height: usize) -> bool {
     match matrix_coeffs {
         Some(1) | Some(9) => true,
         Some(5) | Some(6) => false,
-        _ => height > 576,
+        _ => unflash_codec::bt709_by_height(height as u32),
     }
 }
 
@@ -560,7 +539,7 @@ impl Decoder {
             return Ok(());
         }
         let mut rbsp = std::mem::take(&mut self.rbsp);
-        unescape(&data[2..], &mut rbsp);
+        unescape_into(&data[2..], &mut rbsp);
         let result = match nal_type {
             nal::SPS => parse_sps(&rbsp).map(|sps| {
                 let id = sps.id as usize;
@@ -594,7 +573,7 @@ impl Decoder {
     fn decode_slice(&mut self, nal_type: u8, temporal_id: u8, rbsp: &[u8], pts: f64) -> Result<()> {
         let mut r = BitReader::new(rbsp);
         // a dependent slice segment continues the last independent one
-        let first = r.peek(1) == Some(1);
+        let first = r.peek(1) == 1;
         let prev = if first { None } else { self.prev_hdr.as_ref() };
         let hdr = match parse_slice_header(&mut r, nal_type, &self.spss, &self.ppss, prev) {
             Ok(h) => h,
@@ -704,6 +683,26 @@ impl Decoder {
         let flush_refs = sps_changed || (irap && no_rasl_output);
         with_core!(&mut self.core, c => c.start_picture(sps, pps, layout, hdr, poc, pts, output, flush_refs), ());
         Ok(())
+    }
+}
+
+impl unflash_codec::VideoDecoder for Decoder {
+    type Error = Error;
+
+    fn open(config: &[u8]) -> Result<Decoder> {
+        Decoder::new(config)
+    }
+
+    fn decode(&mut self, sample: &[u8], pts: f64) -> Result<Vec<Frame>> {
+        Decoder::decode(self, sample, pts)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Frame>> {
+        Decoder::flush(self)
+    }
+
+    fn reorder_depth(&self) -> u32 {
+        Decoder::reorder_depth(self)
     }
 }
 

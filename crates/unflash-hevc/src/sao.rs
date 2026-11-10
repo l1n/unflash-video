@@ -132,7 +132,6 @@ fn band_offset<P: Sample>(src: &[P], dst: &mut [P], a: &Area, bd: u32, band: usi
 /// minimum, a concave or convex corner or a local maximum along the
 /// direction get the offset of that category. Samples whose neighbours
 /// cannot be read keep their values.
-#[allow(clippy::too_many_arguments)]
 fn edge_offset<P: Sample>(src: &[P], dst: &mut [P], a: &Area, (pw, ph): (usize, usize), dirs: [(isize, isize); 2], usable: &[[bool; 3]; 3], off: [i32; 4], max: i32) {
     let [(ax, ay), (bx, by)] = dirs;
     // the offset by 2 + Sign(v - a) + Sign(v - b)

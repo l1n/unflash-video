@@ -292,6 +292,60 @@ mod tests {
         d.finish()
     }
 
+    /// The kernels keep time in 32 bits of microseconds, which wrap after
+    /// 71.6 minutes: a film is judged the same across that moment as in its
+    /// first seconds. The same ten seconds of flashing, with stills before
+    /// and after, once ten seconds into a film and once 4290 seconds in
+    /// (the wrap is at 4294.967296 s, half way through the flashing): frame
+    /// for frame the same areas, and the same violations where they are, by
+    /// the scalar kernel and by the SIMD one.
+    #[test]
+    fn a_film_longer_than_the_32_bit_clock_is_judged_as_its_first_seconds_are() {
+        let (aw, ah) = (64u32, 48u32);
+        let dark = frame(aw, ah, 0.5, 20);
+        let light = frame(aw, ah, 0.5, 200);
+        // what each frame measured, and what was found, timed from the flashing's start at `t0`
+        type Measured = (u32, u32, u32, u32, u32, u32, bool);
+        type Found = (ViolationKind, i64, i64, i64, i64, f64);
+        let film = |t0: f64, simd: bool| -> (Vec<Measured>, Vec<Found>, f64) {
+            let mut d = CpuDetector::new(Profile::WcagExt.config(), aw, ah);
+            d.stage.use_simd = simd && d.stage.use_simd;
+            // stills five seconds apart (the longest step the clock takes as it is) up to the flashing
+            let mut t = 0.0;
+            while t < t0 {
+                d.feed(t, FrameInput::rgb(&dark));
+                t += 5.0;
+            }
+            assert_eq!(t, t0);
+            // 240 frames at 24 a second, four flashes a second
+            let burst = (0..240)
+                .map(|k| {
+                    let at = k as f64 / 24.0;
+                    let lit = ((at * 8.0).floor() as i64) % 2 == 1;
+                    let r = d.feed(t0 + at, FrameInput::rgb(if lit { &light } else { &dark }));
+                    (r.hazard, r.hazard_red, r.ext, r.up_area, r.down_area, r.red_area, r.held)
+                })
+                .collect();
+            // and stills again
+            for after in [10.0, 15.0, 20.0, 25.0] {
+                d.feed(t0 + after, FrameInput::rgb(&dark));
+            }
+            let r = d.finish();
+            assert_eq!(r.anomalies, 0);
+            let us = |x: f64| ((x - t0) * 1e6).round() as i64;
+            (burst, r.violations.iter().map(|v| (v.kind, us(v.start), us(v.end), us(v.onset), us(v.peak), v.count)).collect(), r.duration)
+        };
+        for simd in [false, true] {
+            let (early, found_early, _) = film(10.0, simd);
+            let (late, found_late, lasted) = film(4290.0, simd);
+            assert!(early.iter().any(|f| f.0 > 0) && found_early.iter().any(|v| v.0 == ViolationKind::Flash), "the flashing is flashing the detector counts: {found_early:?}");
+            // (the 32-bit time did wrap: the film ran past 2^32 microseconds)
+            assert!(lasted > 4314.9 && crate::time::secs_to_us(lasted) < 21_000_000, "{lasted}");
+            assert_eq!(early, late, "simd {simd}: the frames across the wrap measure what the first ones did");
+            assert_eq!(found_early, found_late, "simd {simd}");
+        }
+    }
+
     #[test]
     fn four_hz_fails_three_passes() {
         let r = square_wave(Profile::Wcag.config(), 4.0, 24.0, 4.0, 0.5, 20, 200);
@@ -420,7 +474,7 @@ mod tests {
             // a drifting texture (new pictures, no flashing)
             for y in 0..ah as usize {
                 for x in 0..aw as usize {
-                    let c = if ((x + i / 3) / 20 + y / 20) % 2 == 0 { 110 } else { 80 };
+                    let c = if ((x + i / 3) / 20 + y / 20).is_multiple_of(2) { 110 } else { 80 };
                     let k = (y * aw as usize + x) * 3;
                     f[k] = c;
                     f[k + 1] = c;
@@ -491,6 +545,94 @@ mod tests {
         assert_eq!(got.frame_stats.warn_red, want.frame_stats.warn_red);
         assert_eq!(got.warnings, want.warnings);
         assert_eq!(got.safe(), want.safe());
+    }
+
+    /// A film whose timestamps jump (ten seconds missing after its tenth
+    /// second) is flashing either side of the jump. One run steps its clock
+    /// over the jump by the median frame step, so the flashing before and
+    /// after is one stretch. Scanned in two segments with the seam at the
+    /// jump, the second started a run-up early by the detector's clock (the
+    /// frames before the jump), the merged result is the one run's: its
+    /// clock, its count of jumps, its violations. (The merge stepped the
+    /// clock at such a seam by the longest step it takes, five seconds, and
+    /// counted a jump inside a run-up twice.)
+    #[test]
+    fn segments_whose_seam_is_at_a_jump_in_the_timestamps_merge_into_the_sequential_run() {
+        use crate::sections::context_seconds;
+        use crate::temporal::{merge_segments, Segment};
+        let cfg = Profile::WcagExt.config();
+        let (aw, ah) = (64u32, 48u32);
+        let n = (aw * ah) as usize;
+        // 20 s of pictures at 30 a second; from the tenth second on they are stamped ten seconds later,
+        // and two more (at 5 s) share a time: flashing from 8.5 s to 1.5 s past the jump
+        let total = 20 * 30;
+        let stamp = |i: usize| -> f64 {
+            let t = i as f64 / 30.0;
+            if i == 151 {
+                150.0 / 30.0
+            } else if t < 10.0 {
+                t
+            } else {
+                t + 10.0
+            }
+        };
+        let frame = |i: usize| -> Vec<u8> {
+            let t = i as f64 / 30.0;
+            let c = if (8.5..11.5).contains(&t) {
+                if ((t * 8.0).floor() as i64) % 2 == 0 { 30 } else { 200 }
+            } else {
+                90 + (i % 2) as u8
+            };
+            vec![c; n * 3]
+        };
+        let mut seq = CpuDetector::new(cfg.clone(), aw, ah);
+        for i in 0..total {
+            seq.feed(stamp(i), FrameInput::rgb(&frame(i)));
+        }
+        let want = seq.finish();
+        // (the repeated time, and the jump)
+        assert_eq!(want.anomalies, 2);
+        let flash: Vec<_> = want.violations.iter().filter(|v| v.kind == ViolationKind::Flash).collect();
+        assert!(flash.len() == 1 && flash[0].start < 10.0 && flash[0].end > 20.0, "one stretch of flashing across the jump: {:?}", want.violations);
+
+        // the seam in the jump (15 s: no picture is stamped there), and before it (6 s: the jump is the second
+        // segment's own); either way the repeated time is in the second segment's run-up, and so counted by both
+        for (seam, anomalies_in_runups) in [(15.0, 1usize), (6.0, 1)] {
+            let runup = context_seconds(&cfg);
+            // the first frame of the second segment, and the frame its run-up starts at: `runup` seconds
+            // before it by the one run's clock, which is what the detector has to have seen
+            let first = (0..total).find(|&i| stamp(i) >= seam).unwrap();
+            let clock = &want.frame_stats.tc;
+            let start = (0..first).find(|&i| clock[first] - clock[i] <= runup).unwrap();
+            let mut a = CpuDetector::new(cfg.clone(), aw, ah);
+            let mut b = CpuDetector::new(cfg.clone(), aw, ah);
+            for i in 0..total {
+                if i < first {
+                    a.feed(stamp(i), FrameInput::rgb(&frame(i)));
+                }
+                if i >= start {
+                    b.feed(stamp(i), FrameInput::rgb(&frame(i)));
+                }
+            }
+            let (ra, rb) = (a.finish(), b.finish());
+            assert_eq!(ra.anomalies + rb.anomalies, want.anomalies + anomalies_in_runups, "seam at {seam}");
+            let got = merge_segments(&cfg, a.geometry(), &[Segment { from: 0.0, result: ra }, Segment { from: seam, result: rb }]);
+            assert_eq!(got.frame_stats.t, want.frame_stats.t, "seam at {seam}");
+            for (i, (x, y)) in got.frame_stats.tc.iter().zip(&want.frame_stats.tc).enumerate() {
+                assert!((x - y).abs() < 1e-9, "seam at {seam}: the clock at frame {i} is {x}, one run's {y}");
+            }
+            assert_eq!(got.anomalies, want.anomalies, "seam at {seam}");
+            assert_eq!(got.frame_stats.hazard, want.frame_stats.hazard, "seam at {seam}");
+            assert_eq!(got.frame_stats.ext, want.frame_stats.ext, "seam at {seam}");
+            assert_eq!(got.frame_stats.held, want.frame_stats.held, "seam at {seam}");
+            assert_eq!(got.violations.len(), want.violations.len(), "seam at {seam}: {:?} against {:?}", got.violations, want.violations);
+            for (g, w) in got.violations.iter().zip(&want.violations) {
+                assert_eq!((g.kind, g.start, g.end, g.peak, g.count), (w.kind, w.start, w.end, w.peak, w.count), "seam at {seam}");
+                assert!((g.onset - w.onset).abs() < 1e-9, "seam at {seam}: onset {} against {}", g.onset, w.onset);
+            }
+            assert_eq!(got.duration, got.frame_stats.tc[total - 1]);
+            assert!((got.duration - want.duration).abs() < 1e-9);
+        }
     }
 
     #[test]

@@ -2,25 +2,13 @@
 //! to the per-frame MD5s ffmpeg's decoder produced (`gen.sh`), and the
 //! decoder survives damaged copies of them.
 
-use std::path::PathBuf;
-
 use unflash_hevc::{Decoder, Error, Frame};
-use unflash_mp4::demux::parse_bytes;
-
-mod common;
-use common::{framemd5, md5};
-
-fn media(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/hevc").join(name)
-}
+use unflash_testkit::{frame_md5 as md5, load};
 
 /// The MP4 file's parameter sets and samples.
 fn samples(name: &str) -> (Vec<u8>, Vec<(Vec<u8>, f64)>) {
-    let data = std::fs::read(media(&format!("{name}.mp4"))).expect("run tests/media/hevc/gen.sh");
-    let movie = parse_bytes(&data).unwrap();
-    let track = movie.video().unwrap();
-    let samples = track.samples.iter().map(|s| (data[s.offset as usize..(s.offset + s.size as u64) as usize].to_vec(), s.pts as f64)).collect();
-    (track.description.clone().unwrap(), samples)
+    let film = load(&format!("hevc/{name}.mp4"));
+    (film.config, film.samples.into_iter().map(|s| (s.data, s.pts)).collect())
 }
 
 /// Decode a file; every picture in presentation order (deeper ones at full
@@ -41,7 +29,7 @@ fn decode(name: &str, keep_deep: bool) -> Result<Vec<Frame>, Error> {
 }
 
 fn expected(name: &str) -> Vec<String> {
-    framemd5(&std::fs::read_to_string(media(&format!("{name}.framemd5"))).unwrap())
+    unflash_testkit::expected(&format!("hevc/{name}.mp4"))
 }
 
 fn check(name: &str) {

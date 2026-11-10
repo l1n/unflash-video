@@ -264,15 +264,8 @@ impl<'a> Cabac<'a> {
             return 25; // I_PCM
         }
         let luma = self.decision(rest[0]);
-        let chroma;
-        let pm;
-        if self.decision(rest[1]) != 0 {
-            chroma = 1 + self.decision(rest[2]);
-            pm = (self.decision(rest[3]) << 1) | self.decision(rest[4]);
-        } else {
-            chroma = 0;
-            pm = (self.decision(rest[3]) << 1) | self.decision(rest[4]);
-        }
+        let chroma = if self.decision(rest[1]) != 0 { 1 + self.decision(rest[2]) } else { 0 };
+        let pm = (self.decision(rest[3]) << 1) | self.decision(rest[4]);
         1 + pm + 4 * chroma + 12 * luma
     }
 
@@ -469,7 +462,7 @@ impl<'a> Cabac<'a> {
                 return Err(Error::Bitstream("mb_qp_delta too large"));
             }
         }
-        Ok(if k & 1 == 1 { ((k + 1) / 2) as i32 } else { -((k / 2) as i32) })
+        Ok(if k & 1 == 1 { k.div_ceil(2) as i32 } else { -((k / 2) as i32) })
     }
 
     /// transform_size_8x8_flag; `inc` = condTermFlagA + condTermFlagB.
@@ -508,7 +501,6 @@ impl<'a> Cabac<'a> {
 
 /// `Cabac::residual_block` on the engine's registers `e`.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 fn residual(e: &mut Engine, ctx: &mut [u8; 1024], data: &[u8], cat: usize, max: usize, start: usize, coeffs: &mut [i32], field: bool) -> Result<u32> {
     let (sig_base, last_base, abs_base) = RESIDUAL_BASES[field as usize][cat];
     let (sig_base, last_base, abs_base) = (sig_base as usize, last_base as usize, abs_base as usize);

@@ -2,34 +2,15 @@
 //! the per-frame MD5s ffmpeg's own VP8 decoder produced (`gen.sh`); and
 //! damaged streams decode without panicking.
 
-use std::path::PathBuf;
-
-use unflash_mp4::demux::parse_bytes;
-use unflash_vp8::{Decoder, Error, Frame};
-
-fn media(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/vp8").join(name)
-}
+use unflash_testkit::{frame_md5 as md5, load};
+use unflash_vp8::{Decoder, Error};
 
 /// The samples of a file in decoding order with their times: the frames
 /// of an IVF file, or the video samples of a WebM file.
 fn samples(file: &str) -> Vec<(f64, Vec<u8>)> {
-    let data = std::fs::read(media(file)).expect("run tests/media/vp8/gen.sh");
-    if let Some(frames) = unflash_mp4::ivf::frames(&data) {
-        return frames.into_iter().map(|(ts, f)| (ts as f64, f.to_vec())).collect();
-    }
-    let movie = parse_bytes(&data).unwrap();
-    let track = movie.video().unwrap();
-    assert_eq!(track.codec, "vp8");
-    track.samples.iter().map(|s| (s.pts as f64, data[s.offset as usize..(s.offset + s.size as u64) as usize].to_vec())).collect()
-}
-
-fn md5(f: &Frame) -> String {
-    let mut ctx = md5::Context::new();
-    ctx.consume(&f.y);
-    ctx.consume(&f.u);
-    ctx.consume(&f.v);
-    format!("{:x}", ctx.compute())
+    let film = load(&format!("vp8/{file}"));
+    assert!(film.codec.is_empty() || film.codec == "vp8", "{file}: {}", film.codec);
+    film.samples.into_iter().map(|s| (s.pts, s.data)).collect()
 }
 
 /// Decode a file: the MD5 of every shown frame, in output order.
@@ -51,9 +32,7 @@ fn decode(file: &str) -> Result<Vec<String>, Error> {
 }
 
 fn expected(file: &str) -> Vec<String> {
-    let stem = file.rsplit_once('.').unwrap().0;
-    let text = std::fs::read_to_string(media(&format!("{stem}.framemd5"))).unwrap();
-    text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).map(|l| l.rsplit(',').next().unwrap().trim().to_string()).collect()
+    unflash_testkit::expected(&format!("vp8/{file}"))
 }
 
 fn check(file: &str) {

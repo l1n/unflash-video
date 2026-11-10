@@ -60,7 +60,7 @@ fn check_track(name: &str, track: &unflash_mp4::Track, listing: &Path) {
 fn demux_matches_ffprobe() {
     let files = media_files();
     if files.is_empty() {
-        eprintln!("no media files; run tests/media/gen.sh");
+        unflash_testkit::skipped("no MP4 media: tests/media/gen.sh makes it");
         return;
     }
     for f in files {
@@ -102,18 +102,13 @@ fn has(cmd: &str) -> bool {
     Command::new(cmd).arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
-#[test]
-fn mux_round_trip() {
-    let src = media_dir().join("h264_bframes.mp4");
-    if !src.exists() {
-        eprintln!("no media files; run tests/media/gen.sh");
-        return;
-    }
-    let data = std::fs::read(&src).unwrap();
-    let movie = parse_bytes(&data).unwrap();
+/// `data` (an MP4 with picture and sound) written again by the muxer as an
+/// export copies it: the video under its record, the sound under its sample
+/// entry, every sample at the times the reader gave it.
+fn remux(data: &[u8]) -> Vec<u8> {
+    let movie = parse_bytes(data).unwrap();
     let video = movie.video().unwrap();
     let audio = movie.audio().unwrap();
-
     let mut mx = Muxer::new();
     let vt = mx.add_track(TrackDesc::Video {
         codec: video.codec.clone(),
@@ -147,6 +142,65 @@ fn mux_round_trip() {
     let (moov, (patch_at, patch)) = mx.finish().unwrap();
     out[patch_at as usize..patch_at as usize + 8].copy_from_slice(&patch);
     out.extend_from_slice(&moov);
+    out
+}
+
+/// Where ffprobe says the video and the audio stream of a file start, in seconds.
+fn ffprobe_starts(path: &Path) -> (f64, f64) {
+    let out = Command::new("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "csv=p=0"]).arg(path).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let start = |kind: &str| -> f64 { text.lines().find_map(|l| l.strip_prefix(kind)).and_then(|t| t.trim_start_matches(',').trim().parse().ok()).unwrap_or_else(|| panic!("no {kind} stream in ffprobe's listing of {}: {text}", path.display())) };
+    (start("video"), start("audio"))
+}
+
+/// Picture and sound that start apart in a file start as far apart in a
+/// copy of it: the muxer used to start every track at once, so that a
+/// picture that began 67 ms after the sound (h264_frag.mp4) began with it.
+#[test]
+fn a_copy_starts_its_picture_and_sound_where_the_file_does() {
+    let mut seen = 0;
+    for path in media_files() {
+        let data = std::fs::read(&path).unwrap();
+        let movie = parse_bytes(&data).unwrap();
+        let (Some(video), Some(audio)) = (movie.video(), movie.audio()) else { continue };
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let first_us = |t: &unflash_mp4::Track| t.to_us(t.samples.iter().map(|s| s.pts).min().unwrap());
+        let out = remux(&data);
+        let back = parse_bytes(&out).unwrap_or_else(|e| panic!("{name}: our own output does not parse: {e}"));
+        // (these files' clocks start at or before zero, so each track keeps its own time, to the millisecond an edit is written in)
+        assert!(first_us(video).min(first_us(audio)) <= 0, "{name}: a clock that starts after zero is rebased; this test is of ones that are kept");
+        for (kind, was, is) in [("picture", first_us(video), first_us(back.video().unwrap())), ("sound", first_us(audio), first_us(back.audio().unwrap()))] {
+            assert!((was - is).abs() <= 1000, "{name}: the {kind} started at {was} µs and starts at {is} µs in the copy");
+        }
+        if has("ffprobe") {
+            let tmp = std::env::temp_dir().join(format!("unflash_starts_{name}"));
+            std::fs::write(&tmp, &out).unwrap();
+            let (was, is) = (ffprobe_starts(&path), ffprobe_starts(&tmp));
+            eprintln!("{name}: ffprobe has picture and sound start at {was:?}, and in the copy at {is:?}");
+            assert!((was.0 - is.0).abs() < 0.0015 && (was.1 - is.1).abs() < 0.0015, "{name}: ffprobe has picture and sound start at {was:?}, and in the copy at {is:?}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+        seen += 1;
+    }
+    if seen == 0 {
+        unflash_testkit::skipped("no MP4 media with picture and sound: tests/media/gen.sh makes it");
+    } else if !has("ffprobe") {
+        unflash_testkit::skipped("ffprobe is not installed: the copies' starts are read by this crate's reader alone");
+    }
+}
+
+#[test]
+fn mux_round_trip() {
+    let src = media_dir().join("h264_bframes.mp4");
+    if !src.exists() {
+        unflash_testkit::skipped("no MP4 media: tests/media/gen.sh makes it");
+        return;
+    }
+    let data = std::fs::read(&src).unwrap();
+    let movie = parse_bytes(&data).unwrap();
+    let video = movie.video().unwrap();
+    let audio = movie.audio().unwrap();
+    let out = remux(&data);
 
     let back = parse_bytes(&out).expect("our own output parses");
     let bv = back.video().unwrap();
@@ -181,6 +235,6 @@ fn mux_round_trip() {
         let err = String::from_utf8_lossy(&dec.stderr);
         assert!(dec.status.success() && err.trim().is_empty(), "ffmpeg complained: {err}");
     } else {
-        eprintln!("ffmpeg not available; skipped the decode check");
+        unflash_testkit::skipped("ffmpeg is not installed: the muxed file is not decoded by it");
     }
 }

@@ -215,7 +215,7 @@ fn reduced_sample_rates() {
 fn matroska_blocks() {
     for (file, eac3) in [("mkv/h264_ac3.mkv", false), ("mkv/h264_eac3.mkv", true)] {
         let Ok(data) = std::fs::read(media(file)) else {
-            eprintln!("SKIPPED matroska_blocks for {file}: not there (tests/media/gen.sh makes it)");
+            unflash_testkit::skipped(&format!("matroska_blocks for {file}: not there (tests/media/gen.sh makes it)"));
             continue;
         };
         let movie = unflash_mp4::demux::parse_bytes(&data).unwrap();
@@ -237,7 +237,7 @@ fn matroska_blocks() {
         let info = dec.info().unwrap();
         assert_eq!((info.eac3, info.sample_rate, info.channels), (eac3, track.sample_rate, track.channels as usize), "{file}");
         if !common::ffmpeg_available() {
-            eprintln!("SKIPPED the comparison with ffmpeg for {file}: ffmpeg is not installed");
+            unflash_testkit::skipped(&format!("the comparison with ffmpeg for {file}: ffmpeg is not installed"));
             continue;
         }
         let reference = common::ffmpeg_decode(&media(file), &[], &["-map", "0:a"]).expect("ffmpeg decodes the file");
