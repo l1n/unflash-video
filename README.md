@@ -903,6 +903,7 @@ bash tests/media/ac3/gen.sh               # AC-3 / E-AC-3 decoder test streams, 
 cargo run --release -p unflash-sound --example fate -- ac3 dir   # AC-3 and E-AC-3 files (ffmpeg's FATE samples) against ffmpeg's decode
 bash tests/media/dts/gen.sh               # DTS decoder test streams, from ffmpeg's encoder (the tests compare with ffmpeg's decoder when it is installed)
 cargo run --release -p unflash-sound --example fate -- dts dir   # DTS and DTS-HD files (ffmpeg's FATE samples) against ffmpeg's decode of their core
+node --test --test-force-exit "tests/unit/*.test.mjs"   # the page's own logic in Node: no browser, no build, under a second
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
 node tests/e2e/tour.mjs                   # the guided tour, on a first visit and after an update
@@ -925,6 +926,18 @@ decodes the x264 test streams and requires ffmpeg's MD5 of every frame.
 `crates/unflash-h264/tests/rewrite.rs` renumbers the parameter sets of
 every conformance stream and decodes it again, and splices GOPs of one
 encoding into another and checks the result in this decoder and in ffmpeg.
+`tests/unit/` holds the page's modules to what their comments say, in
+Node, without a browser or the WebAssembly build: which chunk each decode
+lane of a scan takes next and what an early look takes with it, the
+triage scores, what an export re-encodes and what it copies, the level
+each codec string names (against the standards' tables), the blend and
+soften rules (the blend's with the very cases the Rust is held to),
+project files read back and made safe, the changelog (this repository's
+own among them: every change timed, with its film and a tour that
+exists), a transport stream's samples found again in packets built by
+hand, and PCM in every form. They run in a quarter of a second, so they
+are the place for a rule's corner cases; the browser tests below are for
+what only a browser can show.
 `tests/e2e/run.mjs` scans, edits, blends, softens, exports and verifies the
 synthetic clips in headless Chromium, including the H.264 clip through the
 built-in decoder (the test browser has no H.264); the VP9 exports copy

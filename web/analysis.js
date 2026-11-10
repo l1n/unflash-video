@@ -323,9 +323,10 @@ export class ChunkPicker {
 
   /**
    * An early look at the likeliest hot chunk still free that the lanes
-   * would not get to soon anyway (`near`: how many chunks after the first
-   * free one they will), with its run-up and the hot chunks after it free
-   * too: { first, from, last } (first..from-1 the run-up), or null.
+   * would not get to soon anyway (`near`: how many chunks they will, the
+   * first free one and those after it: a scan passes its number of lanes),
+   * with its run-up and the hot chunks after it free too: { first, from,
+   * last } (first..from-1 the run-up), or null.
    */
   hotRun(near = 1) {
     let lo = this.cur;

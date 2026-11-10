@@ -74,6 +74,20 @@ jobs:
       - name: clippy, the browser build
         run: cargo "+$LINT_TOOLCHAIN" clippy -p unflash-wasm -p unflash-decoders --target wasm32-unknown-unknown --no-deps -- -D warnings
 
+  unit:
+    # the page's own logic (what a scan decodes next, what an export copies,
+    # project files, the changelog), in Node: no browser and no build
+    name: Unit tests (JavaScript)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # (--test-force-exit: web/media.js keeps a message channel open, as the page needs)
+      - run: node --test --test-force-exit "tests/unit/*.test.mjs"
+
   build:
     # the WebAssembly and the synthetic clips, made once for every browser part
     name: Build for the browser tests

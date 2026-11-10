@@ -506,7 +506,9 @@ export async function exportPlan(env, movie, project, { codec = null, smartCut =
     for (const [t0, t1] of touched) {
       const us0 = t0 * 1e6 - 0.5;
       const us1 = t1 * 1e6 - 0.5;
-      // the last cut point at or before the interval, the first at or after it
+      // the last cut point before the interval, the first at or after it
+      // (a cut point exactly at the interval's start is passed over: the span
+      // then starts a GOP early, which costs time and nothing else)
       let a = 0;
       for (let k = syncs.length - 1; k >= 0; k--) {
         if (v.pts[syncs[k]] <= us0 && (await cuts.ok(syncs[k]))) {
