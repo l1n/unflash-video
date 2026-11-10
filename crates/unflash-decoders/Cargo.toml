@@ -21,5 +21,8 @@ console_error_panic_hook.workspace = true
 unflash-hevc = { path = "../unflash-hevc" }
 unflash-sound = { path = "../unflash-sound" }
 
+[dev-dependencies]
+unflash-testkit = { path = "../unflash-testkit" }
+
 [lints]
 workspace = true

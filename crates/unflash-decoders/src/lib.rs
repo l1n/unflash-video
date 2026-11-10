@@ -255,3 +255,171 @@ impl SoundDecoder {
 pub fn wasm_memory() -> JsValue {
     wasm_bindgen::memory()
 }
+
+/// The bindings natively, as a decode worker drives them (`web/softworker.js`,
+/// `web/media.js`'s `decodeBuiltIn`): no JavaScript here, so only what gives
+/// no error is called through the exported API; the errors' text is read
+/// from `open` and the decoders themselves.
+#[cfg(test)]
+mod tests {
+    use unflash_testkit::{expected, load, md5_hex, Stream as Film};
+
+    use super::*;
+
+    /// Every picture of `film` through a `SoftDecoder`: each sample goes in
+    /// under its number, each picture comes back with the number of the
+    /// sample that showed it. In the order shown: (sample, the MD5 of the
+    /// picture as packed I420, damaged).
+    fn through(codec: &str, film: &Film, shrink: Option<(u32, u32)>, mut each: impl FnMut(&SoftDecoder)) -> Vec<(u32, String, bool)> {
+        let mut dec = SoftDecoder::new(codec, &film.config).unwrap();
+        if let Some((aw, ah)) = shrink {
+            dec.set_shrink(aw, ah);
+        }
+        let mut out = Vec::new();
+        let mut take = |dec: &mut SoftDecoder, ready: u32| {
+            for left in (0..ready).rev() {
+                assert!(dec.next());
+                assert_eq!(dec.ready.len() as u32, left);
+                each(dec);
+                // (JavaScript reads the picture in this module's memory, where these point)
+                assert_eq!((dec.frame_ptr(), dec.frame_len() as usize), (dec.frame.as_ptr(), dec.frame.len()));
+                out.push((dec.frame_pts(), md5_hex(&dec.frame), dec.frame_damaged()));
+            }
+            assert!(!dec.next(), "no more pictures than it said were ready");
+            assert_eq!((dec.width(), dec.height(), dec.frame_pts(), dec.frame_damaged()), (0, 0, 0, false));
+        };
+        for (i, sample) in film.samples.iter().enumerate() {
+            let ready = dec.decode(&sample.data, i as u32).unwrap();
+            take(&mut dec, ready);
+        }
+        let ready = dec.flush().unwrap();
+        take(&mut dec, ready);
+        out.sort_by(|a, b| film.samples[a.0 as usize].pts.total_cmp(&film.samples[b.0 as usize].pts));
+        out
+    }
+
+    #[test]
+    fn each_decoder_gives_ffmpeg_s_pictures_through_the_bindings() {
+        for (codec, path) in [("hevc", "hevc/b_pyramid.mp4"), ("hevc", "hevc/odd_size.mp4"), ("vp9", "vp9/altref.ivf"), ("vp9", "vp9/odd.ivf"), ("vp8", "vp8/altref.webm"), ("vp8", "vp8/odd.ivf"), ("av1", "av1/aom_altref_tiles.mp4"), ("av1", "av1/aom_odd.mp4")] {
+            let film = load(path);
+            let dec = SoftDecoder::new(codec, &film.config).unwrap();
+            // HEVC's pictures come out in decoding order (under the samples that showed
+            // them), as many held back as the stream says; the others' in the order shown
+            match (codec, path) {
+                ("hevc", "hevc/b_pyramid.mp4") => assert!((1..=15).contains(&dec.reorder_depth()), "{path}: B pictures are reordered"),
+                ("hevc", _) => assert!(dec.reorder_depth() <= 15, "{path}"),
+                _ => assert_eq!(dec.reorder_depth(), 0, "{path}"),
+            }
+            let want = expected(path);
+            let mut sizes = std::collections::BTreeSet::new();
+            let got = through(codec, &film, None, |d| {
+                sizes.insert((d.width(), d.height(), d.frame_len()));
+            });
+            assert_eq!(got.len(), want.len(), "{path}: pictures");
+            for (i, ((_, md5, damaged), want)) in got.iter().zip(&want).enumerate() {
+                assert!(!damaged, "{path}: picture {i} damaged");
+                assert_eq!(md5, want, "{path}: picture {i} is not ffmpeg's");
+            }
+            // every sample that shows a picture shows one, and once
+            let shown: std::collections::BTreeSet<u32> = got.iter().map(|g| g.0).collect();
+            assert_eq!(shown.len(), got.len(), "{path}");
+            // packed I420: the luma, and two chroma planes of the size rounded up
+            for (w, h, len) in sizes {
+                assert_eq!(len, w * h + 2 * w.div_ceil(2) * h.div_ceil(2), "{path}: {w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn pictures_made_small_are_the_whole_ones_averaged() {
+        for (codec, path) in [("vp8", "vp8/smooth.ivf"), ("hevc", "hevc/intra.mp4"), ("av1", "av1/aom_altref_tiles.mp4")] {
+            let film = load(path);
+            // the same pictures whole, for their mean samples
+            let mut whole = Vec::new();
+            through(codec, &film, None, |d| {
+                let p = d.cur.as_ref().unwrap();
+                let mean = |plane: &[u8]| plane.iter().map(|&s| s as f64).sum::<f64>() / plane.len() as f64;
+                whole.push((mean(&p.y), mean(&p.u), mean(&p.v), p.bt709, p.full_range));
+            });
+            let (aw, ah) = (32u32, 18u32);
+            let mut small = Vec::new();
+            through(codec, &film, Some((aw, ah)), |d| {
+                assert_eq!(d.frame_len(), 0, "{path}: no whole picture is copied out beside the small one");
+                small.push(d.small());
+            });
+            assert_eq!(small.len(), whole.len(), "{path}");
+            for (i, (rgba, &(y, u, v, bt709, full))) in small.iter().zip(&whole).enumerate() {
+                assert_eq!(rgba.len(), (aw * ah * 4) as usize, "{path}: picture {i}");
+                assert!(rgba.chunks_exact(4).all(|px| px[3] == 255), "{path}: picture {i} opaque");
+                let mean = |c: usize| rgba.chunks_exact(4).map(|px| px[c] as f64).sum::<f64>() / (aw * ah) as f64;
+                // the picture's mean colour, converted as the stream says: a mean of clipped
+                // samples is not quite the clipped mean, so to within a few codes
+                let (kr, kb) = if bt709 { (0.2126, 0.0722) } else { (0.299, 0.114) };
+                let (yy, cb, cr) = if full { (y, u - 128.0, v - 128.0) } else { ((y - 16.0) * 255.0 / 219.0, (u - 128.0) * 255.0 / 224.0, (v - 128.0) * 255.0 / 224.0) };
+                let r = yy + 2.0 * (1.0 - kr) * cr;
+                let b = yy + 2.0 * (1.0 - kb) * cb;
+                let g = (yy - kr * r - kb * b) / (1.0 - kr - kb);
+                for (c, want) in [r, g, b].into_iter().enumerate() {
+                    assert!((mean(c) - want.clamp(0.0, 255.0)).abs() < 4.0, "{path}: picture {i} channel {c}: {} against {want}", mean(c));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_picture_s_colours_are_named_for_the_page() {
+        let film = load("vp8/smooth.ivf");
+        let mut dec = SoftDecoder::new("vp8", &film.config).unwrap();
+        // before any picture: the usual guess
+        assert_eq!(dec.color_json(), r#"{"fullRange":false,"matrix":"bt709","primaries":"bt709","transfer":"bt709"}"#);
+        assert_eq!(dec.decode(&film.samples[0].data, 0).unwrap(), 1);
+        assert!(dec.next());
+        // VP8 is BT.601, limited range
+        assert_eq!(dec.color_json(), r#"{"fullRange":false,"matrix":"smpte170m","primaries":"smpte170m","transfer":"smpte170m"}"#);
+    }
+
+    #[test]
+    fn what_cannot_be_decoded_says_why_in_words() {
+        assert_eq!(open("mpeg2", &[]).err().unwrap(), "there is no built-in decoder for mpeg2");
+        assert_eq!(open("", &[]).err().unwrap(), "there is no built-in decoder for ");
+        // each decoder's own error, as the page shows it
+        for codec in ["hevc", "vp9", "vp8", "av1"] {
+            // (without a configuration record: the samples' own headers will do)
+            let mut dec = open(codec, &[]).unwrap_or_else(|e| panic!("{codec}: {e}"));
+            // HEVC may reorder as far as the standard allows until a stream says less
+            assert_eq!(dec.reorder_depth(), if codec == "hevc" { 15 } else { 0 }, "{codec}");
+            assert!(dec.flush().unwrap().is_empty(), "{codec}");
+        }
+        let e = open("vp9", &[]).unwrap().decode(&[0xff, 0xff, 0xff, 0xff], 0.0).err().unwrap();
+        assert!(e.starts_with("invalid VP9 data") || e.starts_with("unsupported VP9 stream"), "{e}");
+        // (a key frame whose start code is not VP8's)
+        let e = open("vp8", &[]).unwrap().decode(&[0x10, 0x00, 0x00, 0xff, 0xff, 0xff, 0, 0, 0, 0], 0.0).err().unwrap();
+        assert!(e.starts_with("invalid VP8 data"), "{e}");
+        // a stream the AV1 decoder does not turn into pictures is turned down from its
+        // configuration record alone, which is what `probe` tells the page
+        assert_eq!(open("av1", &load("av1/aom_444.mp4").config).err().unwrap(), "unsupported AV1 stream: 4:4:4 chroma");
+        assert_eq!(open("av1", &load("av1/aom_422.mp4").config).err().unwrap(), "unsupported AV1 stream: 4:2:2 chroma");
+        assert!(open("av1", &load("av1/aom_12bit.mp4").config).err().unwrap().starts_with("unsupported AV1 stream: 12-bit"));
+        assert!(open("av1", &load("av1/aom_odd.mp4").config).is_ok());
+    }
+
+    #[test]
+    fn dolby_and_dts_sound_come_out_as_stereo_planes() {
+        for (codec, path, rate, block) in [("ac3", "ac3/ac3_stereo_44k.ac3", 44100, 1536), ("ac3", "ac3/ac3_3f2r_lfe_48k.ac3", 48000, 1536), ("ac3", "ac3/eac3_stereo_48k.eac3", 48000, 256), ("dts", "dts/dts_stereo_48k_1411k.dts", 48000, 256), ("dts", "dts/dts_5.1_48k_768k.dts", 48000, 256)] {
+            let data = unflash_testkit::read(path);
+            let mut dec = SoundDecoder::new(codec).unwrap();
+            assert_eq!((dec.samples(), dec.channels(), dec.sample_rate()), (0, 0, 0), "{path}: nothing decoded yet");
+            // (a file of whole frames is a chunk of whole frames)
+            let out = dec.decode(&data).unwrap();
+            assert_eq!(dec.channels(), 2, "{path}: mixed down to stereo");
+            assert_eq!(dec.sample_rate(), rate, "{path}");
+            assert!(dec.samples() > 0 && dec.samples().is_multiple_of(block), "{path}: {} samples", dec.samples());
+            assert_eq!(out.len() as u32, dec.samples() * dec.channels(), "{path}: one plane after the other");
+            assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 1.5), "{path}: samples in range");
+            assert!(out.iter().any(|&s| s != 0.0) || path.contains("silence"), "{path}: not silence");
+            // the next chunk starts from nothing held over in the planes
+            let again = dec.decode(&data).unwrap();
+            assert_eq!(again.len(), out.len(), "{path}");
+        }
+    }
+}

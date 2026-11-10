@@ -110,7 +110,7 @@ fn ffmpeg_md5(file: &[u8], name: &str) -> Option<Vec<String>> {
     };
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
-    Some(common::framemd5(&String::from_utf8_lossy(&out.stdout)))
+    Some(unflash_testkit::framemd5(&String::from_utf8_lossy(&out.stdout)))
 }
 
 #[test]

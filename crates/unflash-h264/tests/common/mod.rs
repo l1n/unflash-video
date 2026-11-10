@@ -12,21 +12,16 @@ use unflash_mp4::mux::dts_from_cts;
 use unflash_mp4::{Muxer, Sample, Track, TrackDesc};
 
 pub fn media(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/h264").join(name)
+    unflash_testkit::media(&format!("h264/{name}"))
 }
 
 pub fn read(name: &str) -> Vec<u8> {
-    std::fs::read(media(&format!("{name}.mp4"))).expect("run tests/media/h264/gen.sh")
+    unflash_testkit::read(&format!("h264/{name}.mp4"))
 }
 
 /// ffmpeg's per-frame MD5s of a stream, presentation order.
 pub fn expected(name: &str) -> Vec<String> {
-    framemd5(&std::fs::read_to_string(media(&format!("{name}.framemd5"))).unwrap())
-}
-
-/// The MD5s in ffmpeg's `framemd5` output.
-pub fn framemd5(text: &str) -> Vec<String> {
-    text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).map(|l| l.rsplit(',').next().unwrap().trim().to_string()).collect()
+    unflash_testkit::expected(&format!("h264/{name}.mp4"))
 }
 
 /// The bytes of a sample of a file.
@@ -44,7 +39,7 @@ pub fn md5s(dec: &mut Decoder, file: &[u8], track: &Track, what: &str, mut map: 
         if let Some(f) = dec.decode_sample(&map(sample(file, s)), s.pts as f64)? {
             assert!(!f.damaged, "{what}: damaged frame at pts {}", s.pts);
             to_i420(&f.pic, f.crop, &mut buf);
-            frames.push((s.pts, format!("{:x}", md5::compute(&buf))));
+            frames.push((s.pts, unflash_testkit::md5_hex(&buf)));
         }
     }
     frames.sort_by_key(|f| f.0);

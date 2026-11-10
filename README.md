@@ -852,6 +852,7 @@ cargo install wasm-bindgen-cli --version 0.2.128   # must match the crate versio
 | `crates/unflash-av1` | AV1 decoding (8- and 10-bit, film grain applied) into 8-bit 4:2:0 pictures: a small wrapper over rav1d, bit-exact with ffmpeg's libdav1d |
 | `third_party/rav1d` | rav1d 1.1.0, the Rust port of dav1d (BSD-2-Clause), without its assembly and patched to build for wasm32 (see its `UNFLASH.md`) |
 | `crates/unflash-wasm` | the `wasm-bindgen` API |
+| `crates/unflash-testkit` | for the decoders' tests and tools only: the test media, a file's video samples whatever holds it, a picture's MD5 as ffmpeg's `framemd5` reckons it |
 | `web/` | the app (plain ES modules, no build step beyond the WASM); `site.mjs` makes the published site from it |
 | `unflash/` | the Python reference implementation |
 
@@ -932,7 +933,11 @@ port's unit tests use, so neither can drift from the other unnoticed.
 `crates/unflash-gpu/tests/gpu_vs_cpu.rs` compares the entire per-pixel state
 of the GPU stage with the CPU kernel after every frame, and the pattern mask
 and statistics on striped frames. `crates/unflash-h264/tests/streams.rs`
-decodes the x264 test streams and requires ffmpeg's MD5 of every frame.
+decodes the x264 test streams and requires ffmpeg's MD5 of every frame;
+the tests of `crates/unflash-decoders` ask the same of HEVC, VP9, VP8 and
+AV1 through the bindings a decode worker calls (each sample under its
+number, each picture taken as packed I420 or made small), and of the
+Dolby and DTS decoders that their sound comes out as two planes.
 `crates/unflash-h264/tests/rewrite.rs` renumbers the parameter sets of
 every conformance stream and decodes it again, and splices GOPs of one
 encoding into another and checks the result in this decoder and in ffmpeg.

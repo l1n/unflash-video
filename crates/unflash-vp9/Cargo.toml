@@ -12,7 +12,7 @@ wide = { workspace = true, optional = true }
 
 [dev-dependencies]
 unflash-mp4 = { path = "../unflash-mp4" }
-md5.workspace = true
+unflash-testkit = { path = "../unflash-testkit" }
 
 [features]
 default = ["simd"]

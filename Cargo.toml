@@ -10,6 +10,7 @@ members = [
     "crates/unflash-hevc",
     "crates/unflash-mp4",
     "crates/unflash-sound",
+    "crates/unflash-testkit",
     "crates/unflash-vp8",
     "crates/unflash-vp9",
     "crates/unflash-wasm",

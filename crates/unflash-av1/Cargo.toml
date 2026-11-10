@@ -18,6 +18,7 @@ libc = "0.2"
 
 [dev-dependencies]
 unflash-mp4 = { path = "../unflash-mp4" }
+unflash-testkit = { path = "../unflash-testkit" }
 md5.workspace = true
 
 [lints]

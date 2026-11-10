@@ -1142,6 +1142,7 @@ dependencies = [
  "rav1d",
  "unflash-codec",
  "unflash-mp4",
+ "unflash-testkit",
 ]
 
 [[package]]
@@ -1169,6 +1170,7 @@ dependencies = [
  "unflash-core",
  "unflash-hevc",
  "unflash-sound",
+ "unflash-testkit",
  "unflash-vp8",
  "unflash-vp9",
  "wasm-bindgen",
@@ -1193,6 +1195,7 @@ dependencies = [
  "md5",
  "unflash-codec",
  "unflash-mp4",
+ "unflash-testkit",
  "wide",
 ]
 
@@ -1203,6 +1206,7 @@ dependencies = [
  "md5",
  "unflash-codec",
  "unflash-mp4",
+ "unflash-testkit",
  "wide",
 ]
 
@@ -1223,6 +1227,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "unflash-testkit"
+version = "0.1.0"
+dependencies = [
+ "md5",
+ "unflash-codec",
+ "unflash-mp4",
+]
+
+[[package]]
 name = "unflash-vp8"
 version = "0.1.0"
 dependencies = [
@@ -1230,6 +1243,7 @@ dependencies = [
  "md5",
  "unflash-codec",
  "unflash-mp4",
+ "unflash-testkit",
  "wide",
 ]
 
@@ -1237,9 +1251,9 @@ dependencies = [
 name = "unflash-vp9"
 version = "0.1.0"
 dependencies = [
- "md5",
  "unflash-codec",
  "unflash-mp4",
+ "unflash-testkit",
  "wide",
 ]
 

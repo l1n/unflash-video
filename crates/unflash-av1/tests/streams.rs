@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use unflash_av1::{to_8bit, Decoder, Error, Frame, RawFrame};
-use unflash_mp4::demux::parse_bytes;
+use unflash_testkit::{frame_md5 as md5_frame, framemd5_sized as parse_framemd5};
 
 fn media(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/media/av1").join(name)
+    unflash_testkit::media(&format!("av1/{name}"))
 }
 
 /// A file's video track: its codec configuration and its samples (bytes,
@@ -23,20 +23,9 @@ struct Stream {
 
 fn load(path: &Path) -> Stream {
     let data = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e} (run tests/media/av1/gen.sh)", path.display()));
-    let movie = parse_bytes(&data).unwrap();
-    let track = movie.video().unwrap();
-    assert!(track.codec.starts_with("av01"), "{}: {}", path.display(), track.codec);
-    let samples = track
-        .samples
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let mut bytes = track.prefix.clone();
-            bytes.extend_from_slice(&data[s.offset as usize..][..s.size as usize]);
-            (bytes, track.pts_secs(i), s.sync)
-        })
-        .collect();
-    Stream { config: track.description.clone().unwrap_or_default(), samples }
+    let film = unflash_testkit::stream(&data);
+    assert!(film.codec.starts_with("av01"), "{}: {}", path.display(), film.codec);
+    Stream { config: film.config, samples: film.samples.into_iter().map(|s| (s.data, s.seconds, s.sync)).collect() }
 }
 
 /// Every picture of samples `from..`, flushed at the end.
@@ -63,14 +52,6 @@ fn decode_raw(s: &Stream) -> Vec<RawFrame> {
     out
 }
 
-fn md5_frame(f: &Frame) -> String {
-    let mut c = md5::Context::new();
-    c.consume(&f.y);
-    c.consume(&f.u);
-    c.consume(&f.v);
-    format!("{:x}", c.compute())
-}
-
 /// The MD5 of a 10-bit picture as ffmpeg's yuv420p10le (little-endian words).
 fn md5_raw(f: &RawFrame) -> String {
     let mut c = md5::Context::new();
@@ -79,17 +60,6 @@ fn md5_raw(f: &RawFrame) -> String {
         c.consume(&bytes);
     }
     format!("{:x}", c.compute())
-}
-
-/// ffmpeg's frame MD5s from `framemd5` output: (picture bytes, md5).
-fn parse_framemd5(text: &str) -> Vec<(usize, String)> {
-    text.lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        .map(|l| {
-            let f: Vec<&str> = l.split(',').map(|x| x.trim()).collect();
-            (f[4].parse().unwrap(), f[5].to_string())
-        })
-        .collect()
 }
 
 fn oracle(name: &str) -> Vec<(usize, String)> {
