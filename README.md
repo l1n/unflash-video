@@ -938,6 +938,12 @@ and the fixtures are then made again on purpose), and its rules that need
 no video (marks into an edited timeline, sections around violations, the
 rate no profile can fail, frame times made sane) to the very cases the
 port's unit tests use, so neither can drift from the other unnoticed.
+The detector's own unit tests include the same film judged ten seconds
+in and 4290 seconds in, where the kernels' 32-bit microsecond clock wraps
+half way through its flashing (71.6 minutes): frame for frame the same
+areas and the same violations, by the scalar kernel and the SIMD one; and
+pictures of a cinema's proportions (1920x800) through the shrinker, whose
+rows are summed in 32 bits where the others' fit 16.
 `crates/unflash-gpu/tests/gpu_vs_cpu.rs` compares the entire per-pixel state
 of the GPU stage with the CPU kernel after every frame, and the pattern mask
 and statistics on striped frames. `crates/unflash-h264/tests/streams.rs`

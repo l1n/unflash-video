@@ -292,6 +292,60 @@ mod tests {
         d.finish()
     }
 
+    /// The kernels keep time in 32 bits of microseconds, which wrap after
+    /// 71.6 minutes: a film is judged the same across that moment as in its
+    /// first seconds. The same ten seconds of flashing, with stills before
+    /// and after, once ten seconds into a film and once 4290 seconds in
+    /// (the wrap is at 4294.967296 s, half way through the flashing): frame
+    /// for frame the same areas, and the same violations where they are, by
+    /// the scalar kernel and by the SIMD one.
+    #[test]
+    fn a_film_longer_than_the_32_bit_clock_is_judged_as_its_first_seconds_are() {
+        let (aw, ah) = (64u32, 48u32);
+        let dark = frame(aw, ah, 0.5, 20);
+        let light = frame(aw, ah, 0.5, 200);
+        // what each frame measured, and what was found, timed from the flashing's start at `t0`
+        type Measured = (u32, u32, u32, u32, u32, u32, bool);
+        type Found = (ViolationKind, i64, i64, i64, i64, f64);
+        let film = |t0: f64, simd: bool| -> (Vec<Measured>, Vec<Found>, f64) {
+            let mut d = CpuDetector::new(Profile::WcagExt.config(), aw, ah);
+            d.stage.use_simd = simd && d.stage.use_simd;
+            // stills five seconds apart (the longest step the clock takes as it is) up to the flashing
+            let mut t = 0.0;
+            while t < t0 {
+                d.feed(t, FrameInput::rgb(&dark));
+                t += 5.0;
+            }
+            assert_eq!(t, t0);
+            // 240 frames at 24 a second, four flashes a second
+            let burst = (0..240)
+                .map(|k| {
+                    let at = k as f64 / 24.0;
+                    let lit = ((at * 8.0).floor() as i64) % 2 == 1;
+                    let r = d.feed(t0 + at, FrameInput::rgb(if lit { &light } else { &dark }));
+                    (r.hazard, r.hazard_red, r.ext, r.up_area, r.down_area, r.red_area, r.held)
+                })
+                .collect();
+            // and stills again
+            for after in [10.0, 15.0, 20.0, 25.0] {
+                d.feed(t0 + after, FrameInput::rgb(&dark));
+            }
+            let r = d.finish();
+            assert_eq!(r.anomalies, 0);
+            let us = |x: f64| ((x - t0) * 1e6).round() as i64;
+            (burst, r.violations.iter().map(|v| (v.kind, us(v.start), us(v.end), us(v.onset), us(v.peak), v.count)).collect(), r.duration)
+        };
+        for simd in [false, true] {
+            let (early, found_early, _) = film(10.0, simd);
+            let (late, found_late, lasted) = film(4290.0, simd);
+            assert!(early.iter().any(|f| f.0 > 0) && found_early.iter().any(|v| v.0 == ViolationKind::Flash), "the flashing is flashing the detector counts: {found_early:?}");
+            // (the 32-bit time did wrap: the film ran past 2^32 microseconds)
+            assert!(lasted > 4314.9 && crate::time::secs_to_us(lasted) < 21_000_000, "{lasted}");
+            assert_eq!(early, late, "simd {simd}: the frames across the wrap measure what the first ones did");
+            assert_eq!(found_early, found_late, "simd {simd}");
+        }
+    }
+
     #[test]
     fn four_hz_fails_three_passes() {
         let r = square_wave(Profile::Wcag.config(), 4.0, 24.0, 4.0, 0.5, 20, 200);

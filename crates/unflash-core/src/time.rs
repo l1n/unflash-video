@@ -77,5 +77,27 @@ mod tests {
         assert_eq!(secs_to_us(0.125), 125_000);
         assert_eq!(dur_to_us(1.0 - 1e-3), 999_000);
         assert_eq!(secs_to_us(4259.0), 4_259_000_000);
+        // past 71.6 minutes the time wraps, and an age across the wrap is the same age
+        assert_eq!(secs_to_us(4300.0), 5_032_704);
+        assert_eq!(age(secs_to_us(4295.0), secs_to_us(4294.0)), 1_000_000);
+        assert_eq!(age(secs_to_us(4294.97), secs_to_us(4294.96)), 10_000);
+        // a duration is never negative and never as long as "never"
+        assert_eq!((dur_to_us(-1.0), dur_to_us(0.0), dur_to_us(1e9), dur_to_us(f64::NAN)), (0, 0, AGE_MAX - 1, 0));
+    }
+
+    /// The pass that keeps old times from coming round again: a time just
+    /// as old as "never" stays, one any older becomes "never" at that moment.
+    #[test]
+    fn old_times_are_pulled_forward() {
+        assert_eq!(saturate(AGE_MAX, 0), 0);
+        assert_eq!(saturate(AGE_MAX + 1, 0), 1);
+        assert_eq!(age(AGE_MAX + 1, saturate(AGE_MAX + 1, 0)), AGE_MAX);
+        // across the wrap: now has come round to 100, the time was set 2^31 microseconds before
+        let now = 100u32;
+        let t = now.wrapping_sub(1 << 31);
+        assert_eq!(saturate(now, t), never(now));
+        assert_eq!(saturate(now, now.wrapping_sub(5_000_000)), now.wrapping_sub(5_000_000));
+        // the passes come before a time can pass for a new one: at least every 2^29 us, and "never" is 2^30 old
+        const { assert!(SATURATE_EVERY_US as u64 + AGE_MAX as u64 <= u32::MAX as u64) };
     }
 }
