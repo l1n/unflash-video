@@ -29,7 +29,6 @@ bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 wgpu = { version = "30", default-features = false, features = ["wgsl", "std"] }
-log = "0.4"
 # the SIMD lanes of the decoders and the pixel kernel
 wide = "0.7"
 # the wasm-bindgen CLI that build.sh and the workflows run must be this version

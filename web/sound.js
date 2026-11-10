@@ -164,12 +164,16 @@ export function audioData(planes, n, start, rate) {
   return new AudioData({ format: 'f32-planar', sampleRate: rate, numberOfFrames: n, numberOfChannels: planes.length, timestamp: Math.round((start * 1e6) / rate), data });
 }
 
-/** Source second of output second `x` (the inverse of SoundRun.outTime); inside a hold's silence, the hold's moment. */
-function sourceTime(holds, x) {
+/**
+ * Source second of output second `x` (the inverse of SoundRun.outTime);
+ * inside a hold's silence, the hold's moment, or `before` seconds ahead of
+ * it (the frame that is held is the one just before the moment).
+ */
+export function sourceTime(holds, x, before = 0) {
   let held = 0;
   for (const h of holds) {
     if (x < h.at + held) break;
-    if (x < h.at + held + h.seconds) return h.at;
+    if (x < h.at + held + h.seconds) return h.at - before;
     held += h.seconds;
   }
   return x - held;

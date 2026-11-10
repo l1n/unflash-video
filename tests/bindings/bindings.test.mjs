@@ -14,6 +14,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { PROFILES } from '../../web/project.js';
 
 const glue = new URL('../../web/pkg/unflash.js', import.meta.url);
 const module = new URL('../../web/pkg/unflash_bg.wasm', import.meta.url);
@@ -40,7 +41,10 @@ const flash = (start, end, extra = {}) => ({ start, end, kind: 'flash', count: 1
 const result = (extra = {}) => JSON.stringify({ events: [], violations: [], flag_extended: true, flag_patterns: true, ...extra });
 
 it('a profile is its settings, and the settings name their profile', () => {
-  for (const name of ['wcag_ext', 'wcag', 'strict']) {
+  // (the names a kept project may hold, web/project.js: the detector's own, the default first)
+  assert.deepEqual(PROFILES, ['wcag_ext', 'wcag', 'strict']);
+  assert.equal(wasm.profile_name('{}'), PROFILES[0]);
+  for (const name of PROFILES) {
     const cfg = wasm.profile_config(name);
     assert.equal(wasm.profile_name(cfg), name);
     assert.equal(typeof JSON.parse(cfg).flash_limit, 'number');

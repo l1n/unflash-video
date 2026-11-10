@@ -3,7 +3,7 @@
 // copied from the source as they are).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { av1Level, estimateExportBytes, exportPlan, formatChoices, formatInfo, hevcLevel, vp9Level } from '../../web/export.js';
+import { av1Level, estimateExportBytes, exportPlan, formatChoices, formatInfo, hevcLevel, markedSections, vp9Level } from '../../web/export.js';
 
 test('a VP9 export names the lowest level its size and rate fit', () => {
   // (the WebM project's table: luma samples a second, samples a picture, the longer side)
@@ -201,4 +201,26 @@ test("an encoder whose format cannot share the source's track re-encodes everyth
   // and one with no frames has nothing to plan
   const none = await plan(film(0, 60), null);
   assert.deepEqual([none.pieces, none.encoded, none.copied], [[], 0, 0]);
+});
+
+test("the sections an export applies: those with marks and frame times, and never two over the same frames", () => {
+  const removed = { 0: { removed: true, extended: false, fill: 'prev' } };
+  const sec = (id, start, end, more = {}) => ({ id, start, end, edits: removed, pts: [0, 1 / 30, 2 / 30], ...more });
+  const from = (sections) => {
+    const warnings = [];
+    const kept = markedSections({ sections, sectionsSorted: () => [...sections].sort((a, b) => a.start - b.start) }, warnings);
+    return [kept.map((s) => s.id), warnings];
+  };
+  // in time order, whatever order they were made in; one without marks is not the export's business
+  assert.deepEqual(from([sec(1, 5, 6), sec(2, 1, 2), sec(3, 3, 4, { edits: {} }), sec(4, 7, 8, { edits: {}, soften: true })]), [[2, 1, 4], []]);
+  // marks made on frames the section never had (it was never prepared) cannot be applied: said, and left out
+  assert.deepEqual(from([sec(1, 1, 2), sec(2, 3, 4, { pts: null }), sec(3, 5, 6, { pts: [] })]), [[1], ['Sections #2, #3 have marks but were never prepared; their marks were not applied. Prepare them and export again.']]);
+  // one that begins where another ends is beside it
+  assert.deepEqual(from([sec(1, 1, 2), sec(2, 2, 3)]), [[1, 2], []]);
+  // two over the same frames (a project from before the page refused them): the earlier one is applied, the other named
+  assert.deepEqual(from([sec(7, 1.5, 2.5), sec(3, 1, 2)]), [[3], ['Section #7 is over section #3, which starts before it: its marks were not applied. Change the range of one of them and export again.']]);
+  // (each against the last one kept: a third that only the dropped one reached is applied)
+  assert.deepEqual(from([sec(1, 1, 2), sec(2, 1.5, 3), sec(3, 2.5, 4)])[0], [1, 3]);
+  // an unmarked section over a marked one is not in its way
+  assert.deepEqual(from([sec(1, 1, 3, { edits: {} }), sec(2, 2, 4)]), [[2], []]);
 });

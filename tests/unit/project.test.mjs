@@ -4,7 +4,7 @@
 // tests/e2e/project.mjs.)
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Project, dropCaches, matchVideo, projectFileText, projectKey, readProjectFile } from '../../web/project.js';
+import { PROFILES, Project, dropCaches, matchVideo, projectFileText, projectKey, readProjectFile } from '../../web/project.js';
 
 /** Decoded frames as a section holds them, `bytes` of them; `freed` counts the ones let go. */
 const freed = [];
@@ -20,15 +20,48 @@ test('a section is kept inside the video and timed to the microsecond', () => {
   const p = new Project('k', [1, 9], []);
   const a = p.addSection(2.00000049, 4.9999996, ['flash']);
   assert.deepEqual([a.id, a.start, a.end, a.kinds, a.custom], [1, 2, 5, ['flash'], false]);
-  const b = p.addSection(-5, 100, [], true);
-  assert.deepEqual([b.id, b.start, b.end, b.custom], [2, 1, 9, true]);
+  const b = p.addSection(-5, 1.5, [], true);
+  assert.deepEqual([b.id, b.start, b.end, b.custom], [2, 1, 1.5, true]);
   // nothing of it inside the video, or nothing at all: no section
   assert.equal(p.addSection(20, 30), null);
-  assert.equal(p.addSection(3, 3), null);
-  assert.equal(p.addSection(4, 3), null);
+  assert.equal(p.addSection(7, 7), null);
+  assert.equal(p.addSection(8, 7), null);
   assert.equal(p.sections.length, 2);
   // a new section starts without marks, frames or verdict
   assert.deepEqual([a.edits, a.keep, a.blend, a.blendStrength, a.prepared, a.check, a.soften], [{}, [], [], null, false, null, false]);
+});
+
+test('a range for a section is inside the video, is not empty, and is over no other section', () => {
+  const p = new Project('k', [0, 60], []);
+  const a = p.addSection(10, 20);
+  const b = p.addSection(30, 40);
+  // into the video, to the microsecond
+  assert.deepEqual(p.rangeFor(-3, 5.0000004), { start: 0, end: 5 });
+  assert.deepEqual(p.rangeFor(50, 99), { start: 50, end: 60 });
+  // typed past the end of the video, both ends: nothing is left of it (it used to become a section that ended before it began)
+  assert.deepEqual(p.rangeFor(70, 80), { why: 'outside' });
+  assert.deepEqual(p.rangeFor(60, 61), { why: 'outside' });
+  assert.deepEqual(p.rangeFor(-9, 0), { why: 'outside' });
+  assert.deepEqual(p.rangeFor(25, 25), { why: 'outside' });
+  assert.deepEqual(p.rangeFor(NaN, 5), { why: 'outside' });
+  assert.deepEqual(p.rangeFor(45, Infinity), { start: 45, end: 60 });
+  // over another section, by any part: the frames there can carry one section's marks only
+  assert.deepEqual(p.rangeFor(15, 25), { why: 'overlap', other: a });
+  assert.deepEqual(p.rangeFor(5, 10.5), { why: 'overlap', other: a });
+  assert.deepEqual(p.rangeFor(12, 13), { why: 'overlap', other: a });
+  assert.deepEqual(p.rangeFor(0, 60), { why: 'overlap', other: a });
+  assert.deepEqual(p.rangeFor(35, 50), { why: 'overlap', other: b });
+  // one that ends where another begins is beside it, not over it
+  assert.deepEqual(p.rangeFor(20, 30), { start: 20, end: 30 });
+  assert.deepEqual(p.rangeFor(40, 45), { start: 40, end: 45 });
+  // a section's own range is not in its way when it is given another
+  assert.deepEqual(p.rangeFor(12, 25, a), { start: 12, end: 25 });
+  assert.deepEqual(p.rangeFor(12, 35, a), { why: 'overlap', other: b });
+  // and a section is added only where a range is given for it; one refused takes no number
+  assert.equal(p.addSection(15, 25), null);
+  assert.equal(p.addSection(70, 80), null);
+  assert.equal(p.addSection(20, 30).id, 3);
+  assert.deepEqual(p.sectionsSorted().map((s) => [s.start, s.end]), [[10, 20], [20, 30], [30, 40]]);
 });
 
 test('sections are found by number, listed in time order and deleted with their frames', () => {
@@ -156,6 +189,69 @@ test('a project file is text anyone can write: what goes into the page is made s
   const q = new Project('k', [0, 100], []);
   q.restore({});
   assert.deepEqual([q.sections, q.nextId, q.scan, q.profile], [[], 1, null, 'wcag_ext']);
+});
+
+test('a project file with things of the wrong kind in it comes back as a project the page can use', () => {
+  // (each of these, kept as it was, stopped the page: at once, at the next draw, or at every later open of the video)
+  const p = new Project('k', [0, 100], []);
+  p.restore({
+    profile: 'x',
+    nextId: 'abc',
+    scan: 'yes',
+    sections: [
+      {
+        id: 1,
+        start: '1',
+        end: '2.5',
+        edits: { 3: null, 4: { removed: true, fill: 'sideways', extended: 'yes' }, x: { removed: true }, '-1': { removed: true }, 5: 7, '06': { removed: true }, 7: { extended: true, fill: 'next', more: 1 }, 8: {} },
+        keep: 5,
+        blend: [1, '2', -1, 2.5, 3, 3],
+        blendStrength: 'full',
+        pts: [0, 'a'],
+        nFrames: -3,
+        warnings: 5,
+        pattern: 'stripes',
+        check: 'safe',
+        custom: 'yes',
+        soften: 1,
+      },
+      { id: 2, start: 5, end: 5 },
+      { id: 3, start: 9, end: 8 },
+      { id: 4, start: null, end: 3 },
+      { id: 5, start: 6, end: Infinity },
+      { id: 6, start: 'soon', end: 7 },
+      { id: 1, start: 20, end: 30 },
+      { id: 8, start: 40, end: 50, edits: [1, 2], pts: new Float64Array([0, 0.04]), nFrames: 2, warnings: ['a note', 7], pattern: { period: 4 }, blendStrength: 0.5, check: { safe: false, violations: [{ kind: 'flash' }, null], after: [] } },
+      { id: 9, start: 60, end: 70, check: { safe: true, violations: [{ kind: 'flash' }], context_notes: 'none', flagged: [1, 2] } },
+      'section',
+      7,
+    ],
+  });
+  assert.deepEqual([p.profile, p.nextId, p.scan], ['wcag_ext', 10, null]);
+  // a section with no range that is one is left out, and so is a second one under a number in use
+  assert.deepEqual(p.sections.map((s) => [s.id, s.start, s.end]), [[1, 1, 2.5], [8, 40, 50], [9, 60, 70]]);
+  const [a, b, c] = p.sections;
+  // marks: frame numbers, each with what a mark can say and nothing else
+  assert.deepEqual(a.edits, { 4: { removed: true }, 7: { extended: true, fill: 'next' }, 8: {} });
+  assert.deepEqual([a.keep, a.blend, a.blendStrength, a.pts, a.nFrames, a.warnings, a.pattern, a.check, a.custom, a.soften], [[], [1, 3], null, null, 0, [], null, null, true, true]);
+  assert.deepEqual([b.edits, Array.from(b.pts), b.nFrames, b.warnings, b.pattern, b.blendStrength], [{}, [0, 0.04], 2, ['a note'], { period: 4 }, 0.5]);
+  // a verdict whose lists are not lists of findings is no verdict (the section shows as unchecked)
+  assert.equal(b.check, null);
+  assert.equal(c.check, null);
+  // and what the page keeps of the wrong kind at the top is an empty project of the default profile
+  for (const kept of [null, 7, 'project', [], { sections: 'none' }, { sections: {} }]) {
+    const q = new Project('k', [0, 100], []);
+    q.restore(kept);
+    assert.deepEqual([q.sections, q.nextId, q.scan, q.profile], [[], 1, null, 'wcag_ext'], JSON.stringify(kept));
+  }
+  // a scan comes back with the parts that are what they should be: a summary that cannot be drawn is none
+  const q = new Project('k', [0, 100], []);
+  q.restore({ profile: 'strict', scan: { sig: 'abc', safe: true, summary: { bin: 1, t0: 0, general: 'many', red: [] }, warnings: 'none' }, sections: [] });
+  assert.deepEqual([q.profile, q.scan], ['strict', { sig: 'abc', safe: true, warnings: 'none' }]);
+  q.restore({ scan: { summary: { bin: 1, t0: 0, general: [0, 2], red: [0, 0], pattern: [0, 1] } }, sections: [] });
+  assert.deepEqual(q.scan.summary, { bin: 1, t0: 0, general: [0, 2], red: [0, 0], pattern: [0, 1] });
+  // the profiles a project can name are the ones the page offers
+  assert.deepEqual(PROFILES, ['wcag_ext', 'wcag', 'strict']);
 });
 
 test('a project file carries the project and its video, arrays of numbers as they are', () => {

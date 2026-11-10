@@ -9,7 +9,7 @@
 // re-encoded with silence under each held frame (see sound.js). The WASM
 // muxer writes the file.
 
-import { decodeRange, waker } from './media.js';
+import { decodeRange, waker, shown } from './media.js';
 import { profile } from './profile.js';
 import { softenPlan, blendMarks, blendStrength, blendSources, blendWeights, hasMarks, sectionSequence } from './analysis.js';
 import { SoundRun, audioData, soundName } from './sound.js';
@@ -398,23 +398,36 @@ export function sectionRenderPlan(env, movie, s, { edited = true } = {}) {
 }
 
 /**
- * The render plans of the sections that have marks to apply (hasMarks) and
- * were prepared once (they have frame times), in order: marks were made
- * against a section's frame times, which outlive its frame cache (dropped
- * to save memory, or not rebuilt since the project was restored). A section
- * without marks is left out: its frames are copied where the export copies
- * (re-encoded as they are, they would only lose quality), and go through as
- * they are in a span re-encoded for another. Sections with marks but no
- * frame times are named in `warnings`: theirs cannot be applied.
+ * The sections whose marks an export applies, in order: those that have
+ * marks (hasMarks) and were prepared once (they have frame times: marks
+ * were made against a section's frame times, which outlive its frame cache,
+ * dropped to save memory or not rebuilt since the project was restored). A
+ * section without marks is left out: its frames are copied where the export
+ * copies (re-encoded as they are, they would only lose quality), and go
+ * through as they are in a span re-encoded for another. Named in `warnings`
+ * and left out too: sections with marks but no frame times, whose marks
+ * cannot be applied, and a section that starts before the one before it
+ * ends (the page lets none be made now; a project kept from before may
+ * hold one): the frames they share can be shown once only, and written
+ * for both, the second's came out again from its own start, the times
+ * stepping back.
  */
-function sectionPlans(env, movie, project, warnings) {
-  const sections = project
-    .sectionsSorted()
-    .filter((s) => s.pts && s.pts.length && hasMarks(s))
-    .map((s) => sectionRenderPlan(env, movie, s));
+export function markedSections(project, warnings) {
   const unprepared = project.sections.filter((s) => !(s.pts && s.pts.length) && hasMarks(s));
   if (unprepared.length) warnings.push(`Sections ${unprepared.map((s) => '#' + s.id).join(', ')} have marks but were never prepared; their marks were not applied. Prepare them and export again.`);
-  return sections;
+  const kept = [];
+  for (const s of project.sectionsSorted()) {
+    if (!(s.pts && s.pts.length && hasMarks(s))) continue;
+    const before = kept[kept.length - 1];
+    if (before && s.start < before.end - 1e-9) warnings.push(`Section #${s.id} is over section #${before.id}, which starts before it: its marks were not applied. Change the range of one of them and export again.`);
+    else kept.push(s);
+  }
+  return kept;
+}
+
+/** The render plans of the sections whose marks the export applies (`markedSections`), in order. */
+function sectionPlans(env, movie, project, warnings) {
+  return markedSections(project, warnings).map((s) => sectionRenderPlan(env, movie, s));
 }
 
 /**
@@ -679,7 +692,10 @@ export async function walkEdited(movie, piece, emit, { cancel, reader = null } =
         if (cur && (cur.ordinal >= cur.p.nOut || t >= cur.p.sec.end - 1e-9)) await endSection(cur);
         // enter a section?
         while (!cur && si < sections.length && t >= sections[si].sec.end - 1e-9) si++; // skipped entirely (empty)
-        if (!cur && si < sections.length && t >= sections[si].sec.start - 1e-9 && t < sections[si].sec.end - 1e-9) {
+        // (by the rule a section's frames were numbered with when it was
+        // prepared, `shown`: a frame within a microsecond before its start is
+        // its first. Entered a frame later, every mark landed a frame late)
+        if (!cur && si < sections.length && shown(t, sections[si].sec.start, sections[si].sec.end)) {
           cur = enterSection(sections[si]);
           si++;
         }
@@ -972,7 +988,17 @@ async function exportOnce(env, movie, project, { encoder, quality, sink = null, 
   // --- the writer: pieces in file order --------------------------------------
   const out = sink || new MemorySink();
   const mx = new wasm.Muxer();
-  await out.write(mx.start());
+  try {
+    await out.write(mx.start());
+  } catch (e) {
+    // (the pieces are encoding already: a sink that fails at its first write
+    // stops them like one that fails later, and they are waited out; they
+    // used to go on encoding the whole film for nobody)
+    failed = failed || e;
+    await Promise.allSettled(encodePieces.map((p) => p.done).filter(Boolean));
+    mx.free();
+    throw failed;
+  }
   const samples = []; // { pts, sync, size } in file order
   const reader = movie.reader;
   const v = movie.v;

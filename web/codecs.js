@@ -16,15 +16,28 @@ export function builtInFor(codec) {
   return BUILT_IN.find((b) => b.test.test(codec || '')) || null;
 }
 
-let decoders = null;
+/**
+ * `load` as something asked for any number of times and run once: its
+ * promise is kept and given to everyone who asks. But a load that failed
+ * (the network down for a moment) is not kept: the next one who asks sets
+ * off another.
+ */
+export function keptLoad(load) {
+  let kept = null;
+  return () => {
+    if (!kept) {
+      const mine = (kept = (async () => load())());
+      mine.catch(() => {
+        if (kept === mine) kept = null;
+      });
+    }
+    return kept;
+  };
+}
 
 /** The decoders module (HEVC, VP9, VP8, AV1, and the AC-3 / E-AC-3 and DTS sound decoder), loaded on first use. */
-export function loadDecoders() {
-  if (!decoders)
-    decoders = (async () => {
-      const mod = await import('./pkg-dec/unflash_decoders.js');
-      await mod.default();
-      return mod;
-    })();
-  return decoders;
-}
+export const loadDecoders = keptLoad(async () => {
+  const mod = await import('./pkg-dec/unflash_decoders.js');
+  await mod.default();
+  return mod;
+});

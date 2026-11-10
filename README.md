@@ -974,7 +974,12 @@ sound arrives), and the pool of built-in decoder workers against
 stand-in workers (the groups a range is cut into, open GOPs among them;
 every picture once and in order across groups, workers and stretches; a
 worker that fails, a damaged picture, a cancel, a pool closed under a
-pass, a worker gained during one). They run in a quarter of a second, so they
+pass, a worker gained during one), the range a section may take (inside
+the video, over no other section) and the sections an export applies, a
+project file with things of the wrong kind in it, and what the page says
+and draws from numbers alone (`web/readouts.js`: the steps between a
+timeline's ticks, how long a job took, an export's file name, the
+chart's envelope). They run in a quarter of a second, so they
 are the place for a rule's corner cases; the browser tests below are for
 what only a browser can show.
 `tests/bindings/` calls the built module (`web/pkg`) the way the page does,

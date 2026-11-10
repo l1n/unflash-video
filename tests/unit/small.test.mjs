@@ -3,7 +3,7 @@
 // reports (web/profile.js), and how many decode workers run (web/h264pool.js).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { builtInFor } from '../../web/codecs.js';
+import { builtInFor, keptLoad } from '../../web/codecs.js';
 import { stored, store } from '../../web/storage.js';
 import { profile } from '../../web/profile.js';
 import { defaultWorkerCount } from '../../web/h264pool.js';
@@ -95,4 +95,30 @@ test('decode workers: one for each core but one, six at most, or as many as the 
   // a number that is none: by the cores
   assert.equal(withCores(4, '?workers=0'), 3);
   assert.equal(withCores(4, '?workers=many'), 3);
+});
+
+test('a module is loaded once and kept, but a load that failed is tried again', async () => {
+  // (the decoders module, fetched when a film first needs it: with the network down for that one moment,
+  // every film after it used to fail the same way until the page was loaded again)
+  const outcomes = [new Error('offline'), new Error('still offline'), { name: 'the module' }];
+  let loads = 0;
+  const load = keptLoad(async () => {
+    const o = outcomes[loads++];
+    if (o instanceof Error) throw o;
+    return o;
+  });
+  // asked twice before the first load ends: one load, one promise
+  const [a, b] = [load(), load()];
+  assert.equal(a, b);
+  await assert.rejects(a, /^Error: offline$/);
+  assert.equal(loads, 1);
+  // it failed: the next one who asks sets off another
+  await assert.rejects(load(), /^Error: still offline$/);
+  assert.equal(loads, 2);
+  const mod = await load();
+  assert.deepEqual([mod, loads], [{ name: 'the module' }, 3]);
+  // and once loaded it is kept
+  assert.equal(await load(), mod);
+  assert.equal(await load(), mod);
+  assert.equal(loads, 3);
 });

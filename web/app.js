@@ -10,7 +10,8 @@ import { scanMovie, scanChunks, CHUNK_S, prepareSection, checkSection, suggestEd
 import { Project, projectKey, dropCaches, lastSavedAt, projectFileText, readProjectFile, matchVideo } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, findPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
-import { SectionSound, soundName } from './sound.js';
+import { SectionSound, soundName, sourceTime } from './sound.js';
+import { cleanExportName, fmtWait, limitRateEnvelope, niceStep } from './readouts.js';
 import { FrameViewer, MIN_GAP_MS } from './viewer.js';
 import { loadAlertSettings, saveAlertSettings, beep, askNotifyPermission, notifyState, systemNotify, titleProgress, titleMark } from './alerts.js';
 import { loadChangelog, changesSeen, markChangesSeen, hadEarlierSettings, changesSince, newestChange, renderDay, wireShots, escapeHtml } from './changes.js';
@@ -220,12 +221,14 @@ async function runJob(name, fn) {
 
 let alertSettings = loadAlertSettings();
 const CHAIN_GRACE_MS = 1500;
-const chain = { active: false, start: 0, end: 0, names: [], ok: true, cancelled: false, error: '', toast: '', timer: null };
+const chain = { active: false, start: 0, end: 0, names: [], ok: true, cancelled: false, error: '', toast: '', auto: null, timer: null };
 
 function chainStart(name) {
   clearTimeout(chain.timer);
-  if (!chain.active) Object.assign(chain, { active: true, start: performance.now(), names: [], ok: true, cancelled: false, error: '', toast: '' });
+  if (!chain.active) Object.assign(chain, { active: true, start: performance.now(), names: [], ok: true, cancelled: false, error: '', toast: '', auto: null });
   chain.names.push(name);
+  // (the auto-fix run this job is a stage of, if it is one: its summary is this wait's to tell)
+  if (state.auto && state.auto.running) chain.auto = state.auto;
 }
 
 function chainEnd(outcome, message) {
@@ -239,13 +242,6 @@ function chainEnd(outcome, message) {
   chain.timer = setTimeout(finishChain, CHAIN_GRACE_MS);
 }
 
-function fmtWait(secs) {
-  if (secs < 90) return `${Math.round(secs)} s`;
-  const m = Math.floor(secs / 60);
-  const s = Math.round(secs % 60);
-  return m < 60 ? `${m} min ${s} s` : `${Math.floor(m / 60)} h ${m % 60} min`;
-}
-
 async function finishChain() {
   // an auto-fix run ends its own wait (its stages come with gaps)
   if (!chain.active || state.job || (state.auto && state.auto.running)) return;
@@ -255,7 +251,10 @@ async function finishChain() {
   if (chain.cancelled && chain.ok) return;
   if (secs < alertSettings.after) return;
   const last = chain.names[chain.names.length - 1] || 'job';
-  const autoSummary = state.auto && state.auto.summary;
+  // (of the run these jobs were stages of: a run that ended before them is
+  // still there to read on the page, and its summary used to be told again
+  // at the end of every later wait)
+  const autoSummary = chain.auto && chain.auto.summary;
   const title = chain.ok ? `Unflash: ${chain.names.length > 1 ? chain.names.join(', then ').toLowerCase() : last.toLowerCase()} done` : `Unflash: ${last.toLowerCase()} failed`;
   // (an auto-fix run whose export still fails failed with no job failing: its summary says so)
   const body = chain.ok ? `${autoSummary || chain.toast || `Finished after ${fmtWait(secs)}.`} (${fmtWait(secs)})` : chain.error || autoSummary || '';
@@ -2124,17 +2123,17 @@ function drawTimeline(dragSpan = null) {
   }
 }
 
-function niceStep(raw) {
-  const steps = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600];
-  for (const s of steps) if (s >= raw) return s;
-  return 3600;
-}
-
 // ---- sections list ----------------------------------------------------------------
 
+/** Why the project has no range for a section (`refused`: what Project.rangeFor gave), in words. */
+function rangeRefusal(refused) {
+  return refused.why === 'overlap' ? `That range is over section #${refused.other.id} (${fmt(refused.other.start)} to ${fmt(refused.other.end)}): two sections cannot share frames. Change its range, or delete it.` : 'That range is outside the video';
+}
+
 function addSection(a, b) {
+  const range = state.project.rangeFor(a, b);
+  if (range.why) return toast(rangeRefusal(range));
   const sec = state.project.addSection(a, b, [], true);
-  if (!sec) return toast('That range is outside the video');
   state.project.save();
   renderAll();
   openSection(sec.id);
@@ -2350,15 +2349,18 @@ function wireWorkspace() {
     const s = wasm.parse_time($('secStart').value);
     const e = wasm.parse_time($('secEnd').value);
     if (s == null || e == null || e <= s) return toast('Enter valid times');
-    const [lo, hi] = state.project.bounds;
+    // (inside the video, and over no other section: a range past the video's
+    // end used to make a section that ended before it began)
+    const range = state.project.rangeFor(s, e, sec);
+    if (range.why) return toast(rangeRefusal(range));
     const ctxS = wasm.context_seconds(state.config);
     // Another range is another section: its frames go (once no check reads
     // them), and its marks and verdict with them, which were made on those
     // frames; the checks that read its edges, before and after, are stale
     await withFeeder(() => {
       state.project.invalidateNeighbours(sec, ctxS);
-      sec.start = Math.max(lo, s);
-      sec.end = Math.min(hi, e);
+      sec.start = range.start;
+      sec.end = range.end;
       dropCaches(sec);
       Object.assign(sec, { check: null, edits: {}, keep: [], blend: [], pts: null, nFrames: 0, pattern: null, warnings: [] });
       state.project.invalidateNeighbours(sec, ctxS);
@@ -3266,30 +3268,39 @@ async function runCheck(announce) {
   v.className = 'verdict';
   v.textContent = 'checking…';
   const t0 = performance.now();
+  // (the wait below can outlast the section: another video opened meanwhile,
+  // the section deleted, put away or given another range. A check of it then
+  // is nobody's: it used to run all the same, and fail over the new video)
+  let gone = false;
   try {
     // once no job is under way, and the last one's caller has taken in what
     // it made (a suggestion's marks go in as it ends): those are the marks
     // it checks, and the ones it compares with when it is done
     while (state.job) await afterJobs();
-    const marks = markSnapshot(sec);
-    const c = await withFeeder(() => checkSection(state.env, state.project, sec, null));
-    // (the marks changed while it ran: it judged the ones before, and says so)
-    if (markSnapshot(sec) !== marks) c.stale = true;
-    sec.check = c;
-    sec.checkMs = performance.now() - t0;
-    if (announce && !c.stale) toast(`${c.safe ? 'Passes' : 'Fails'} (${c.frames} frames checked in ${(sec.checkMs / 1000).toFixed(2)} s)`);
+    gone = currentSection() !== sec || !sec.prepared;
+    if (!gone) {
+      const marks = markSnapshot(sec);
+      const c = await withFeeder(() => checkSection(state.env, state.project, sec, null));
+      // (the marks changed while it ran: it judged the ones before, and says so)
+      if (markSnapshot(sec) !== marks) c.stale = true;
+      sec.check = c;
+      sec.checkMs = performance.now() - t0;
+      if (announce && !c.stale) toast(`${c.safe ? 'Passes' : 'Fails'} (${c.frames} frames checked in ${(sec.checkMs / 1000).toFixed(2)} s)`);
+    }
   } catch (e) {
     console.error(e);
     banner(`Check failed: ${e.message || e}`);
   } finally {
     state.checkRunning = false;
   }
-  renderVerdict(sec);
-  renderGridMarks();
-  renderSectionList();
-  drawTimeline();
-  drawChart();
-  await state.project.save();
+  if (!gone) {
+    renderVerdict(sec);
+    renderGridMarks();
+    renderSectionList();
+    drawTimeline();
+    drawChart();
+    await state.project.save();
+  }
   if (state.checkAgain) {
     state.checkAgain = false;
     scheduleCheck(0);
@@ -3749,34 +3760,6 @@ function drawVideoChart(g, W, H) {
   hint.innerHTML = `${lead}Bars: how much of the screen flashes faster than the limit (orange; magenta for red), as a share of the area limit (the dashed line). Blue: flashing at the limit rate, which extended flashes are made of; grey: brightness${scan && scan.flag_patterns ? '; teal: stripes' : ''}. Boxes are sections; the strip along the top is what the scan found.${closeHint} Click to play from there.`;
 }
 
-/** Seconds either side over which "flashing at the limit rate" is read: it comes in spikes, one per transition. */
-const ENVELOPE_S = 0.25;
-
-/**
- * The trace's flashing at the limit rate as an envelope, from frame `first`
- * to the last at or before `t1`: at each frame the most within
- * ENVELOPE_S either side, so a stretch of it reads as one.
- */
-function limitRateEnvelope(n, first, t1) {
-  const out = [];
-  const q = []; // frames in the window, their values falling
-  let hi = first;
-  let lo = first;
-  for (let i = first; i < n.t.length && n.t[i] <= t1; i++) {
-    while (hi < n.t.length && n.t[hi] <= n.t[i] + ENVELOPE_S) {
-      while (q.length && n.e[q[q.length - 1]] <= n.e[hi]) q.pop();
-      q.push(hi++);
-    }
-    while (lo < i && n.t[lo] < n.t[i] - ENVELOPE_S) lo++;
-    while (q.length && q[0] < lo) q.shift();
-    // (frames before `first` count too)
-    let e = q.length ? n.e[q[0]] : 0;
-    for (let j = first - 1; j >= 0 && n.t[j] >= n.t[i] - ENVELOPE_S; j--) e = Math.max(e, n.e[j]);
-    out.push(e);
-  }
-  return out;
-}
-
 /** The readout under the pointer on the whole-video chart. */
 function chartTip(e) {
   const tip = $('chartTip');
@@ -3809,9 +3792,12 @@ async function openExport() {
   $('exportSummary').innerHTML = rows.length ? `<table><tr><th>section</th><th>range</th><th>edits</th><th>status</th></tr>${rows.join('')}</table>` : '<p class="hint">No sections. The export re-encodes the video unchanged.</p>';
   const sel = $('exportCodec');
   const previous = sel.value;
-  sel.innerHTML = '';
   const cands = formatChoices(await encoderCandidates(state.movie.width, state.movie.height, state.movie.fps, +$('exportQuality').value));
   state.exportCands = cands;
+  // (emptied once the choices are known, not before the wait for them:
+  // opened twice in quick succession, each call filled the menu the other
+  // had emptied, and every format was listed twice)
+  sel.innerHTML = '';
   for (const c of cands) {
     const info = formatInfo(c, state.movie);
     const o = document.createElement('option');
@@ -3865,18 +3851,6 @@ function chosenExportName() {
   const typed = state.exportFileName;
   if (!typed || !state.movie) return state.movie ? exportName(state.movie) : '';
   return typed;
-}
-
-/** `raw` as a file name: no characters a file system refuses, no path, ending in .mp4 (null: nothing left). */
-function cleanExportName(raw) {
-  let n = String(raw || '')
-    .replace(/[\u0000-\u001f<>:"/\\|?*]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/^[.\s]+|[.\s]+$/g, '');
-  if (!n) return null;
-  if (!/\.mp4$/i.test(n)) n = n.replace(/\.(mov|m4v|mkv|webm|avi|mp4v)$/i, '') + '.mp4';
-  return n;
 }
 
 /** The name typed in the export dialog: kept for this video, and on an export already made. */
@@ -4208,18 +4182,9 @@ async function verifyBlob(blob, holds = null) {
  * added (`holds`, sorted, on the video's clock), and the section over it.
  */
 function exportToVideo(a, b, holds) {
-  const back = (t) => {
-    let shift = 0;
-    for (const h of holds) {
-      if (t < h.at + shift) break;
-      // (while a frame is held: that frame, the one just before h.at)
-      if (t < h.at + shift + h.seconds) return h.at - 0.001;
-      shift += h.seconds;
-    }
-    return t - shift;
-  };
-  const lo = back(a);
-  const hi = back(b);
+  // (while a frame is held: that frame, the one just before the hold's moment)
+  const lo = sourceTime(holds, a, 0.001);
+  const hi = sourceTime(holds, b, 0.001);
   const sec = state.project ? state.project.sectionsSorted().find((s) => s.start <= hi && s.end > lo) || null : null;
   return { lo, hi, sec };
 }
