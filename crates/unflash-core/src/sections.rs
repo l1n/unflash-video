@@ -16,6 +16,19 @@ const RATE_SAFETY_MARGIN: f64 = 0.05;
 /// Ceiling on a hand-typed target rate for "reduce FPS".
 pub(crate) const MAX_TARGET_FPS: f64 = 1000.0;
 
+/// The most parts one over-long stretch of flashing is split into. A video's
+/// bounds and a violation's times are its file's timestamps, and a damaged
+/// file's can span years: the list a span like that would be cut into is one
+/// no page can hold (and making it killed the page). Past this the parts are
+/// longer than `section_max_len` instead. (A whole day of unbroken flashing
+/// is under two thousand.)
+pub const MAX_SECTION_PARTS: usize = 1 << 12;
+
+/// The most bins a [`TimelineSummary`] has, for the same reason: past it the
+/// bins are wider than asked for. (A second each, this is three days; the
+/// heatmap they are drawn into is a thousand or so pixels wide.)
+pub const MAX_SUMMARY_BINS: usize = 1 << 18;
+
 /// How much of the run-up a detector has to have seen before its verdict at
 /// a given moment matches the verdict a pass over the whole video gives at
 /// that same moment.
@@ -146,7 +159,7 @@ pub fn violations_to_sections(
         if length <= cfg.section_max_len {
             split.push((s, e, kinds));
         } else {
-            let parts = (length / cfg.section_max_len).ceil() as usize;
+            let parts = ((length / cfg.section_max_len).ceil() as usize).min(MAX_SECTION_PARTS);
             let step = length / parts as f64;
             for k in 0..parts {
                 split.push((s + k as f64 * step, e.min(s + (k + 1) as f64 * step), kinds.clone()));
@@ -196,7 +209,9 @@ pub struct TimelineSummary {
 pub fn timeline_summary(result: &AnalysisResult, bounds: (f64, f64), bin_seconds: f64) -> TimelineSummary {
     let (ts_min, ts_max) = bounds;
     let span = (ts_max - ts_min).max(1e-6);
-    let nbins = ((span / bin_seconds).ceil() as usize).max(1);
+    let wanted = (span / bin_seconds).ceil();
+    // more bins than a summary has (a bin of no width asks for them too): wider ones
+    let (bin_seconds, nbins) = if wanted > MAX_SUMMARY_BINS as f64 { (span / MAX_SUMMARY_BINS as f64, MAX_SUMMARY_BINS) } else { (bin_seconds, (wanted as usize).max(1)) };
     let mut general = vec![0f32; nbins];
     let mut red = vec![0f32; nbins];
     let mut pattern = vec![0f32; nbins];
@@ -269,5 +284,138 @@ mod tests {
         // a 100 s violation splits into three
         let long = vec![v(0.0, 100.0, 0.0, ViolationKind::Flash)];
         assert_eq!(violations_to_sections(&long, &cfg, (0.0, 200.0), &[]).len(), 3);
+    }
+
+    fn flash(start: f64, end: f64) -> Violation {
+        Violation { start, end, kind: ViolationKind::Flash, count: 1.0, onset: start, peak: start }
+    }
+
+    fn spans(secs: &[SectionSpan]) -> Vec<(f64, f64)> {
+        secs.iter().map(|s| (s.start, s.end)).collect()
+    }
+
+    #[test]
+    fn a_section_is_no_shorter_than_the_least_and_stays_inside_the_video() {
+        let cfg = DetectorConfig { section_pad: 0.25, ..Default::default() };
+        // 0.5 s with its padding: widened about its middle to the least length
+        assert_eq!(spans(&violations_to_sections(&[flash(10.0, 10.0)], &cfg, (0.0, 100.0), &[])), [(9.0, 11.0)]);
+        // at the video's start it cannot widen backwards: the least length from there
+        assert_eq!(spans(&violations_to_sections(&[flash(0.1, 0.2)], &cfg, (0.0, 100.0), &[])), [(0.0, 2.0)]);
+        // nor past its end: widened about its middle, and cut where the video ends
+        assert_eq!(spans(&violations_to_sections(&[flash(99.9, 100.0)], &cfg, (0.0, 100.0), &[])), [(98.825, 100.0)]);
+        // a video shorter than the least length: all of it
+        assert_eq!(spans(&violations_to_sections(&[flash(0.5, 0.6)], &cfg, (0.0, 1.0), &[])), [(0.0, 1.0)]);
+        // flashing outside the bounds altogether has no section
+        assert_eq!(violations_to_sections(&[flash(200.0, 201.0)], &cfg, (0.0, 100.0), &[]), []);
+        assert_eq!(violations_to_sections(&[], &cfg, (0.0, 100.0), &[]), []);
+    }
+
+    #[test]
+    fn a_pattern_has_a_section_only_under_a_profile_that_reports_patterns() {
+        let pattern = Violation { kind: ViolationKind::Pattern, ..flash(10.0, 14.0) };
+        let on = Profile::WcagExt.config();
+        assert!(on.flag_patterns());
+        let secs = violations_to_sections(&[pattern.clone(), flash(11.0, 12.0)], &on, (0.0, 100.0), &[]);
+        assert_eq!(secs.len(), 1);
+        // (by name, as the reference has them)
+        assert_eq!(secs[0].kinds, [ViolationKind::Flash, ViolationKind::Pattern]);
+        let off = DetectorConfig { pattern_mode: crate::config::ExtendedMode::Off, ..on };
+        let secs = violations_to_sections(&[pattern, flash(11.0, 12.0)], &off, (0.0, 100.0), &[]);
+        assert_eq!((spans(&secs), &secs[0].kinds[..]), (vec![(9.5, 13.5)], &[ViolationKind::Flash][..]));
+    }
+
+    #[test]
+    fn sections_snapped_to_keyframes_that_meet_become_one() {
+        let cfg = DetectorConfig::default();
+        let keyframes: Vec<f64> = (0..10).map(|k| k as f64 * 10.0).collect();
+        // 5 s apart once padded (more than the merge gap): two sections...
+        let vs = [flash(12.0, 13.0), flash(21.0, 22.0)];
+        assert_eq!(spans(&violations_to_sections(&vs, &cfg, (0.0, 100.0), &[])), [(10.5, 14.5), (19.5, 23.5)]);
+        // ...that grow to the keyframes around them, 10-20 and 10-30: one
+        let red = Violation { kind: ViolationKind::Red, ..flash(21.0, 22.0) };
+        let snapped = violations_to_sections(&[flash(12.0, 13.0), red], &cfg, (0.0, 100.0), &keyframes);
+        assert_eq!(spans(&snapped), [(10.0, 30.0)]);
+        assert_eq!(snapped[0].kinds, [ViolationKind::Flash, ViolationKind::Red]);
+        // sections that only touch stay two
+        let vs = [flash(12.0, 13.0), flash(32.0, 33.0)];
+        assert_eq!(spans(&violations_to_sections(&vs, &cfg, (0.0, 100.0), &keyframes)), [(10.0, 20.0), (30.0, 40.0)]);
+    }
+
+    /// A damaged file's timestamps can span years (a 32-bit sample duration
+    /// at a timescale of one is 4.3e9 s), and what is made from the video's
+    /// bounds was sized by them: a list or a table of a size that killed the
+    /// page it was made for.
+    #[test]
+    fn a_span_no_video_has_makes_nothing_a_page_cannot_hold() {
+        let cfg = DetectorConfig::default();
+        let far = 4.3e9;
+        let secs = violations_to_sections(&[flash(10.0, far - 10.0)], &cfg, (0.0, far), &[]);
+        assert_eq!(secs.len(), MAX_SECTION_PARTS);
+        // still all of it, in order, each part beginning where the last ended
+        assert_eq!(secs[0].start, 8.5);
+        assert!((secs.last().unwrap().end - (far - 8.5)).abs() < 1e-3);
+        assert!(secs.windows(2).all(|w| w[0].end == w[1].start && w[0].start < w[0].end));
+        // a day of unbroken flashing is cut as it ever was: 45 s at most each
+        let day = violations_to_sections(&[flash(10.0, 86_390.0)], &cfg, (0.0, 86_400.0), &[]);
+        assert_eq!(day.len(), 1920);
+        assert!(day.iter().all(|s| s.end - s.start <= cfg.section_max_len + 1e-6));
+
+        let event = |t: f64, kind| crate::temporal::TransitionEvent { t, tc: t, kind, area: 1, bbox: [0, 0, 2, 2] };
+        let r = AnalysisResult { events: vec![event(5.5, EventKind::General), event(far - 0.5, EventKind::General), event(far / 2.0, EventKind::Red)], ..Default::default() };
+        let sum = timeline_summary(&r, (0.0, far), 1.0);
+        assert_eq!((sum.general.len(), sum.red.len(), sum.pattern.len()), (MAX_SUMMARY_BINS, MAX_SUMMARY_BINS, MAX_SUMMARY_BINS));
+        // the bins are as wide as it takes to cover the span, and each flash is in its own
+        assert_eq!(sum.bin, far / MAX_SUMMARY_BINS as f64);
+        assert_eq!((sum.general[0], sum.general[MAX_SUMMARY_BINS - 1], sum.red[MAX_SUMMARY_BINS / 2]), (1.0, 1.0, 1.0));
+        assert_eq!(sum.general.iter().chain(&sum.red).sum::<f32>(), 3.0);
+        // three days at a bin a second is the most that keeps its second
+        let most = MAX_SUMMARY_BINS as f64;
+        assert_eq!(timeline_summary(&r, (0.0, most), 1.0).bin, 1.0);
+        assert_eq!(timeline_summary(&r, (0.0, most + 1.0), 1.0).general.len(), MAX_SUMMARY_BINS);
+        // a bin of no width asks for more than any: the widened ones
+        let sum = timeline_summary(&r, (0.0, 100.0), 0.0);
+        assert_eq!((sum.general.len(), sum.bin), (MAX_SUMMARY_BINS, 100.0 / most));
+        // and no numbers at all are still no panic
+        for bounds in [(f64::NAN, 1.0), (0.0, f64::NAN), (0.0, f64::INFINITY), (f64::NEG_INFINITY, 0.0), (5.0, -5.0)] {
+            for bin in [1.0, 0.0, -1.0, f64::NAN, f64::INFINITY] {
+                assert!(timeline_summary(&r, bounds, bin).general.len() <= MAX_SUMMARY_BINS);
+                assert!(violations_to_sections(&[flash(1.0, 2.0)], &cfg, bounds, &[]).len() <= MAX_SECTION_PARTS);
+            }
+        }
+    }
+
+    #[test]
+    fn the_summary_counts_each_second_s_flashes_and_marks_where_a_pattern_is() {
+        let event = |t: f64, kind| crate::temporal::TransitionEvent { t, tc: t, kind, area: 1, bbox: [0, 0, 2, 2] };
+        let pattern = |start: f64, end: f64, count: f64| Violation { kind: ViolationKind::Pattern, count, ..flash(start, end) };
+        let r = AnalysisResult {
+            events: vec![
+                event(2.0, EventKind::General),
+                event(2.99, EventKind::General),
+                event(3.0, EventKind::Red),
+                event(3.5, EventKind::General),
+                // outside the bounds: counted in the bin at that end
+                event(0.5, EventKind::Red),
+                event(99.0, EventKind::General),
+            ],
+            violations: vec![pattern(4.2, 6.9, 1.5), pattern(6.0, 7.1, 2.5), flash(8.0, 9.0)],
+            flag_patterns: true,
+            ..Default::default()
+        };
+        // 2.0 to 12.5: eleven bins, the last one half a second
+        let sum = timeline_summary(&r, (2.0, 12.5), 1.0);
+        assert_eq!((sum.bin, sum.t0), (1.0, 2.0));
+        assert_eq!(sum.general, [2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(sum.red, [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        // a pattern's severity over every bin it is in, the worst where two are
+        assert_eq!(sum.pattern, [0.0, 0.0, 1.5, 1.5, 2.5, 2.5, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        // (only what the profile reports)
+        let quiet = AnalysisResult { flag_patterns: false, ..r.clone() };
+        assert!(timeline_summary(&quiet, (2.0, 12.5), 1.0).pattern.iter().all(|&p| p == 0.0));
+        // a video of no length still has a bin
+        let none = timeline_summary(&AnalysisResult::default(), (0.0, 0.0), 1.0);
+        assert_eq!((none.general, none.red, none.pattern), (vec![0.0], vec![0.0], vec![0.0]));
+        // wider bins
+        assert_eq!(timeline_summary(&r, (2.0, 12.5), 5.0).general, [3.0, 0.0, 1.0]);
     }
 }
