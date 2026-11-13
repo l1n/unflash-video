@@ -1083,6 +1083,9 @@ export async function prepareSection(env, movie, sec, { onProgress, cancel, span
   if (sec.prepared && Object.keys(sec.edits || {}).length && was && was !== relPts.length) {
     warnings.push(`Re-prepared with ${relPts.length} frames where the marks were made against ${was}. They were kept, but they now sit on different frames, so check them before exporting.`);
   }
+  if (Array.isArray(sec.order) && was && was !== relPts.length) {
+    warnings.push(`Re-prepared with ${relPts.length} frames where the frames were reordered among ${was}. That order no longer fits and is not applied: group or move the frames again.`);
+  }
   dropCaches(sec);
   sec.prepared = true;
   sec.nFrames = relPts.length;
@@ -1269,9 +1272,162 @@ export function blendMarks(sec, blend = null) {
   return [...new Set(marks || [])].filter((i) => i >= 0 && i < n).sort((a, b) => a - b);
 }
 
-/** Whether a section has marks that change what it shows (stripes softened, frames blended, removed or held). */
+/** Whether a section has marks that change what it shows (stripes softened, frames reordered, blended, removed or held). */
 export function hasMarks(sec) {
-  return !!sec.soften || blendMarks(sec).length > 0 || Object.values(sec.edits || {}).some((e) => e.removed || e.extended);
+  return !!sec.soften || !!sectionOrder(sec) || blendMarks(sec).length > 0 || Object.values(sec.edits || {}).some((e) => e.removed || e.extended);
+}
+
+// ---- frames reordered ------------------------------------------------------------
+//
+// A section's `order`, when it has one, says which of its decoded frames
+// each place in it shows: place k shows frame order[k]. Every other mark (a
+// removal, a hold, a blend, keep) is on a place, as are the grid's tiles,
+// the check's frames and the suggestions' choices: the section is read as
+// though its frames had been decoded in that order. Only where the decoded
+// pictures themselves are fetched (the export and the section player, the
+// frame at full size) is a place turned back into the frame it shows.
+
+/**
+ * `order` if it is a reorder of `n` frames (each of 0..n-1 once) that moves
+ * something, else null: an order made for another count of frames (the
+ * section prepared again and found otherwise) is not applied.
+ */
+export function validOrder(order, n) {
+  if (!Array.isArray(order) || order.length !== n || !n) return null;
+  const seen = new Uint8Array(n);
+  let moved = false;
+  for (let k = 0; k < n; k++) {
+    const i = order[k];
+    if (!Number.isInteger(i) || i < 0 || i >= n || seen[i]) return null;
+    seen[i] = 1;
+    if (i !== k) moved = true;
+  }
+  return moved ? order : null;
+}
+
+/** How many frames a section shows: its cache's, once prepared, else as many as it had when it was. */
+function frameCount(sec) {
+  return sec.cache ? sec.cache.len() : sec.nFrames || 0;
+}
+
+/** A section's reorder that applies (validOrder), or null. */
+export function sectionOrder(sec) {
+  return validOrder(sec.order, frameCount(sec));
+}
+
+/** The decoded frame place `k` of a section shows. */
+export function orderedFrame(sec, k) {
+  const order = sectionOrder(sec);
+  return order ? order[k] : k;
+}
+
+/**
+ * A section's small copies of its frames in the order its reorder shows
+ * them (its own cache when it has none): what its tiles, blends, checks and
+ * suggestions read. One copy is kept, for the order it was last asked for.
+ */
+export function orderedFrames(sec) {
+  if (!sec.cache) return sec.cache;
+  const order = sectionOrder(sec);
+  if (!order) {
+    if (sec.orderCache) sec.orderCache.free();
+    sec.orderCache = null;
+    sec.orderKey = null;
+    return sec.cache;
+  }
+  const key = `${sec.preparedAt}:${order.join(',')}`;
+  if (sec.orderCache && sec.orderKey === key) return sec.orderCache;
+  if (sec.orderCache) sec.orderCache.free();
+  sec.orderCache = sec.cache.reordered(Uint32Array.from(order));
+  sec.orderKey = key;
+  return sec.orderCache;
+}
+
+/** A small picture's signature for telling scenes apart: the mean colour of each cell of a grid laid over it. */
+const SCENE_GRID = 8;
+
+function sceneSignature(rgba, w, h) {
+  const g = SCENE_GRID;
+  const sig = new Float64Array(g * g * 3);
+  const count = new Float64Array(g * g);
+  for (let y = 0; y < h; y++) {
+    const cy = Math.min(g - 1, Math.floor((y * g) / h));
+    for (let x = 0; x < w; x++) {
+      const c = cy * g + Math.min(g - 1, Math.floor((x * g) / w));
+      const p = (y * w + x) * 4;
+      sig[c * 3] += rgba[p];
+      sig[c * 3 + 1] += rgba[p + 1];
+      sig[c * 3 + 2] += rgba[p + 2];
+      count[c]++;
+    }
+  }
+  for (let c = 0; c < g * g; c++) for (let j = 0; j < 3; j++) sig[c * 3 + j] /= Math.max(1, count[c]);
+  return sig;
+}
+
+/** The mean difference, in 8-bit codes, between two signatures. */
+function sceneDistance(a, b) {
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d += Math.abs(a[i] - b[i]);
+  return d / a.length;
+}
+
+/** Scenes whose signatures are no further apart than this (in 8-bit codes, on average) are one scene. */
+export const SCENE_APART = 12;
+
+/**
+ * Two scenes cut together frame by frame, told apart and put back one after
+ * the other. `sigs` are the signatures of the pictures in a run of places,
+ * in order. They are split in two (k-means, from the first picture and the
+ * picture least like it), and the result is the run's places in their new
+ * order: the scene of the run's first picture, in its own order, then the
+ * other, in its own order. `apart` is how far apart the two scenes are
+ * (their centres' sceneDistance); under SCENE_APART, or with every picture
+ * in one scene, `order` is null: there is nothing to put together.
+ */
+export function groupScenes(sigs) {
+  const n = sigs.length;
+  if (n < 3) return { order: null, apart: 0, first: n, second: 0 };
+  let far = 0;
+  for (let i = 1; i < n; i++) if (sceneDistance(sigs[0], sigs[i]) > sceneDistance(sigs[0], sigs[far])) far = i;
+  let centres = [Float64Array.from(sigs[0]), Float64Array.from(sigs[far])];
+  let side = new Uint8Array(n);
+  for (let round = 0; round < 20; round++) {
+    const next = new Uint8Array(n);
+    for (let i = 0; i < n; i++) next[i] = sceneDistance(sigs[i], centres[1]) < sceneDistance(sigs[i], centres[0]) ? 1 : 0;
+    const same = round > 0 && next.every((s, i) => s === side[i]);
+    side = next;
+    const sums = [new Float64Array(sigs[0].length), new Float64Array(sigs[0].length)];
+    const counts = [0, 0];
+    for (let i = 0; i < n; i++) {
+      counts[side[i]]++;
+      for (let j = 0; j < sigs[i].length; j++) sums[side[i]][j] += sigs[i][j];
+    }
+    if (!counts[0] || !counts[1]) return { order: null, apart: 0, first: n, second: 0 };
+    centres = sums.map((s, c) => s.map((v) => v / counts[c]));
+    if (same) break;
+  }
+  const apart = sceneDistance(centres[0], centres[1]);
+  const own = side[0];
+  const first = [];
+  const second = [];
+  for (let i = 0; i < n; i++) (side[i] === own ? first : second).push(i);
+  if (apart < SCENE_APART || !second.length) return { order: null, apart, first: first.length, second: second.length };
+  const order = [...first, ...second];
+  // (already one after the other: nothing to move)
+  const already = order.every((v, i) => v === i);
+  return { order: already ? null : order, apart, first: first.length, second: second.length, already };
+}
+
+/**
+ * The signatures (sceneSignature) of the pictures at `places` of a
+ * prepared section, as its reorder shows them.
+ */
+export function sceneSignatures(sec, places) {
+  const frames = orderedFrames(sec);
+  const w = frames.width();
+  const h = frames.height();
+  return places.map((k) => sceneSignature(frames.frame(k), w, h));
 }
 
 /**
@@ -1321,26 +1477,37 @@ export function blendWeights(src, s) {
  */
 export function blendedFrames(sec, blend = null) {
   if (!sec.cache) return sec.cache;
+  // (blended in the order the section shows its frames: a blend mark is on a place)
+  const base = orderedFrames(sec);
   const marks = blendMarks(sec, blend);
   if (!marks.length) {
     if (sec.blendCache) sec.blendCache.free();
     sec.blendCache = null;
     sec.blendKey = null;
-    return sec.cache;
+    return base;
   }
   const s = blendOf(sec, blend).strength;
-  const key = `${sec.preparedAt}:${s}:${marks.join(',')}`;
+  const key = `${sec.orderKey || sec.preparedAt}:${s}:${marks.join(',')}`;
   if (sec.blendCache && sec.blendKey === key) return sec.blendCache;
   if (sec.blendCache) sec.blendCache.free();
-  const mask = new Uint8Array(sec.cache.len());
+  const mask = new Uint8Array(base.len());
   for (const i of marks) mask[i] = 1;
-  sec.blendCache = sec.cache.blended(mask, s);
+  sec.blendCache = base.blended(mask, s);
   sec.blendKey = key;
   return sec.blendCache;
 }
 
+/** The places of a section that show the frames a soften plan blurs (decoded frames), in order. */
+export function softPlaces(sec, plan) {
+  const order = sectionOrder(sec);
+  if (!order) return [...plan.frames].sort((a, b) => a - b);
+  const out = [];
+  for (let k = 0; k < order.length; k++) if (plan.frames.has(order[k])) out.push(k);
+  return out;
+}
+
 /**
- * The frames a check or suggestion should read: blended and softened as
+ * The frames a check or suggestion should read: reordered, blended and softened as
  * marked (blended as `blend` says, a suggestion's trial, when given).
  */
 function sectionFrames(sec, blend = null) {
@@ -1348,15 +1515,18 @@ function sectionFrames(sec, blend = null) {
   if (!frames || !sec.soften) return frames;
   const plan = softenPlan(sec);
   if (!plan) return frames;
-  // (blendKey names the marks and strength the frames were blended with, whoever asked)
-  const key = `${plan.radius}:${sec.blendKey || sec.preparedAt}:${[...plan.frames].join(',')}`;
+  // (blendKey names the marks and strength the frames were blended with,
+  // whoever asked, and orderKey the order; the plan's frames are decoded
+  // frames, softened wherever the reorder puts them: the places that show them)
+  const places = softPlaces(sec, plan);
+  const key = `${plan.radius}:${sec.blendKey || sec.orderKey || sec.preparedAt}:${places.join(',')}`;
   if (sec.softCache && sec.softKey === key) return sec.softCache;
   if (sec.softCache) sec.softCache.free();
   const mask = new Uint8Array(sec.cache.len());
-  for (const i of plan.frames) if (i < mask.length) mask[i] = 1;
+  for (const k of places) if (k < mask.length) mask[k] = 1;
   sec.softCache = frames.blurred(plan.radius, mask);
   sec.softKey = key;
-  sec.softPlan = plan;
+  sec.softPlan = { ...plan, places };
   return sec.softCache;
 }
 
@@ -1531,7 +1701,7 @@ export async function checkSection(env, project, sec, edits, { onProgress, cance
     flag_patterns: result.flag_patterns,
     pattern_thresh: result.pattern_thresh,
     soften: !!sec.soften,
-    soft_frames: soft ? [...soft.frames] : [],
+    soft_frames: soft ? soft.places : [],
     soft_sigma: soft ? soft.sigma : 0,
     violations,
     // close calls over the section's own frames (shown, never counted)
@@ -1689,7 +1859,7 @@ export async function suggestBlend(env, project, sec, only, { onProgress, cancel
     if (onProgress) onProgress(checks++);
     return checkSection(env, project, sec, edits, { cancel, blend: { marks, strength } });
   };
-  const candidates = (verdict) => JSON.parse(wasm.blend_candidates(shown, JSON.stringify(verdict.raw), sec.cache, only ? JSON.stringify(only) : undefined, keepJson(sec), false)).frames;
+  const candidates = (verdict) => JSON.parse(wasm.blend_candidates(shown, JSON.stringify(verdict.raw), orderedFrames(sec), only ? JSON.stringify(only) : undefined, keepJson(sec), false)).frames;
   const pct = (s) => `${Math.round(s * 100)}%`;
   const removed = Object.keys(sec.edits || {}).length - Object.keys(edits).length;
   const s0 = blendStrength(sec);

@@ -36,6 +36,10 @@ closecall.mp4  close calls, which pass: 3 Hz flashing from 2 to 4 s (at the
 bursts.mp4   three bursts of five quick flashes (white and near-white,
              0.3 s), a second apart, from 3 s: each burst fails by itself,
              so every one has to go.
+cutback.mp4  (and cutback_h264.mp4) two scenes cut together frame by frame: the pan, and from 3 to
+             5 s a bright warm scene panning the other way swapped in every
+             other pair of frames (a flash that grouping by scene, G, takes
+             out: one scene, then the other).
 flash.ts     flash_h264.mp4 as an MPEG transport stream (H.264 + AAC,
              copied), and flash_ts.mp4, ffmpeg's MP4 of it (-c copy): the
              same samples, for checking how the app reads the stream.
@@ -184,6 +188,27 @@ def closecall_frames(secs=10.0):
         yield f
 
 
+def other_scene(i):
+    """A second scene, bright and warm, panning the other way: a cut to it
+    from the pan is a jump in brightness and in colour."""
+    yy, xx = np.mgrid[0:H, 0:W]
+    shift = (i * 3) % W
+    tex = ((xx - shift) // 32 + yy // 32) % 2
+    f = np.empty((H, W, 3), np.uint8)
+    # (a gentle texture: the pan's contrast in it would be a stripe pattern)
+    f[..., 0] = np.where(tex == 1, 245, 236)
+    f[..., 1] = np.where(tex == 1, 206, 197)
+    f[..., 2] = np.where(tex == 1, 140, 133)
+    return f
+
+
+def cutback_frames(secs=8.0):
+    n = int(secs * FPS)
+    for i in range(n):
+        t = i / FPS
+        yield other_scene(i) if 3.0 <= t < 5.0 and (i // 2) % 2 == 1 else scene(i)
+
+
 def stripes_frames(secs=10.0):
     """Stationary high-contrast gratings: 8 px light / 8 px dark bars, so
     well over five pairs cover the whole picture and the bars survive the
@@ -221,6 +246,8 @@ if __name__ == "__main__":
     encode("bursts.mp4", bursts_frames(), "vp9", 8)
     encode("closecall.mp4", closecall_frames(), "vp9", 10)
     encode("closecall_h264.mp4", closecall_frames(), "h264", 10)
+    encode("cutback.mp4", cutback_frames(), "vp9", 8)
+    encode("cutback_h264.mp4", cutback_frames(), "h264", 8)
     # the same pictures in Matroska / WebM, in transport streams, with their
     # sound as E-AC-3, PCM and DTS, and with two sound tracks
     for src, dst, args in [

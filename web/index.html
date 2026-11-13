@@ -197,7 +197,7 @@
           <span class="group">
             <button id="btnUndo" class="small" title="Undo the last change to this section's marks (Ctrl+Z)" disabled>↶ undo</button>
             <button id="btnRedo" class="small" title="Redo (Ctrl+Shift+Z or Ctrl+Y)" disabled>↷ redo</button>
-            <button id="btnClearEdits" class="small" title="Take off every R, F, E and B mark in this section. K marks stay (select frames and press U to take those off).">clear all marks</button>
+            <button id="btnClearEdits" class="small" title="Take off every R, F, E and B mark in this section, and put its frames back in their own order. K marks stay (select frames and press U to take those off).">clear all marks</button>
           </span>
           <span class="group hidden" id="blendWrap">
             <label class="toggle" title="How far the frames marked B are blended with the frames either side of them: at 100% a flash is gone (a crossfade between its neighbours); less leaves some of it, and more of what it shows. The check, the section player and the export all use this.">blend <input type="range" id="blendStrength" min="5" max="100" step="5" value="80"> <span id="blendValue" class="rate">80%</span></label>
@@ -217,6 +217,7 @@
             <span class="chip removed" title="Removed. The badge says which frame shows in its place.">removed</span>
             <span class="chip extended" title="Held on screen for 1 second">held 1s</span>
             <span class="chip kept" title="Marked keep: the suggestions never remove or blend it (a subtitle, an image that matters)">keep</span>
+            <span class="chip moved" title="Moved: this place shows another frame of the section (G or [ ]). The badge says which">moved</span>
             <span class="chip blended" title="Blended with the frames either side of it (the flash toned down, nothing removed); the thumbnail shows the result">blended</span>
             <span class="chip flagged">in flash event</span>
             <span class="chip flagged-red">in red-flash event</span>
@@ -232,11 +233,15 @@
             <button id="btnMarkKeep" class="small" title="Keep the selected frames: the suggestions leave them alone">K: keep</button>
             <button id="btnMarkBlend" class="small" title="Lower the contrast of the selected frames: blend them with the frames either side of them (by the blend strength above), which takes a flash down without taking a frame out">B: blend</button>
             <button id="btnUnmark" class="small">U: unmark</button>
+            <button id="btnGroupScenes" class="small" title="For a stretch that cuts back and forth between two scenes, frame by frame: put its frames back as one scene and then the other (the scene of its first frame first), so the flashing between them becomes a single cut. Every frame stays and the stretch takes as long as it did; the marks go with their frames. Select the stretch first.">G: group by scene</button>
+            <button id="btnMoveEarlier" class="small" title="Move the selected frames one place earlier: the frame before them goes after them">[ move earlier</button>
+            <button id="btnMoveLater" class="small" title="Move the selected frames one place later: the frame after them goes before them">move later ]</button>
+            <button id="btnOriginalOrder" class="small hidden" title="Put every frame of this section back where it was decoded, its marks going with it">original order</button>
             <button id="btnViewFrame" class="small" title="The selected frame at full size, decoded from the file, to read a subtitle or look closer (also Z, or double-click a frame). ← → step through the frames.">view frame (Z)</button>
             <button id="btnSelectUnsafe" class="small danger hidden" title="Select the frames inside whatever is still failing">select unsafe frames</button>
           </div>
         </div>
-        <div class="grid-hint">Click to select · shift-click for everything in between · ctrl-click adds or removes one · Esc clears · <b>double-click</b> (or <b>Z</b>) shows a frame at full size, decoded from the file, to read a subtitle; S to XL above make the thumbnails bigger. <b>R</b> removes a frame and shows the one before it, <b>F</b> shows the one after, <b>E</b> holds a frame for a second, <b>K</b> keeps it out of the suggestions' reach, <b>B</b> blends it with the frames either side (the flash toned down, nothing removed); press the same key again to take the mark off (<b>U</b> clears every mark). <b>Ctrl+Z</b> undoes. Every change is checked as you make it, and <b>▶ play</b> shows it.</div>
+        <div class="grid-hint">Click to select · shift-click for everything in between · ctrl-click adds or removes one · Esc clears · <b>double-click</b> (or <b>Z</b>) shows a frame at full size, decoded from the file, to read a subtitle; S to XL above make the thumbnails bigger. <b>R</b> removes a frame and shows the one before it, <b>F</b> shows the one after, <b>E</b> holds a frame for a second, <b>K</b> keeps it out of the suggestions' reach, <b>B</b> blends it with the frames either side (the flash toned down, nothing removed); <b>G</b> puts a stretch that cuts back and forth between two scenes back as one scene then the other, and <b>[</b> <b>]</b> move frames a place earlier or later; press the same key again to take the mark off (<b>U</b> clears every mark). <b>Ctrl+Z</b> undoes. Every change is checked as you make it, and <b>▶ play</b> shows it.</div>
         <div id="frameGrid" class="frame-grid" tabindex="0"></div>
       </div>
     </section>
@@ -261,6 +266,8 @@
         <tr><td><kbd>E</kbd></td><td>hold a frame on screen a second</td></tr>
         <tr><td><kbd>K</kbd></td><td>keep: the suggestions leave it alone</td></tr>
         <tr><td><kbd>B</kbd></td><td>blend with the frames either side</td></tr>
+        <tr><td><kbd>G</kbd></td><td>group by scene: a stretch cutting back and forth between two scenes becomes one scene, then the other</td></tr>
+        <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>move the selected frames a place earlier or later</td></tr>
         <tr><td><kbd>U</kbd></td><td>take every mark off (the same key again takes that one off)</td></tr>
         <tr><td><kbd>Z</kbd>, double-click</td><td>the frame at full size</td></tr>
         <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>step through the frames (with Shift, ten at a time)</td></tr>
@@ -299,6 +306,7 @@
       <tr><td><b>extended</b></td><td title="3 flashes a second for 8 s: passes WCAG, flagged as an extended flash by the default profile">3 flashes a second for 8 s</td><td><button class="small" data-clip="extended.mp4">open</button></td><td><a href="clips/extended.mp4" download>VP9</a> · <a href="clips/extended_h264.mp4" download>H.264</a></td></tr>
       <tr><td><b>closecall</b></td><td title="3 flashes a second for 2 s, then 3 a second at a contrast only the stricter profile counts: passes, two close calls">flashing that only just passes</td><td><button class="small" data-clip="closecall.mp4">open</button></td><td><a href="clips/closecall.mp4" download>VP9</a> · <a href="clips/closecall_h264.mp4" download>H.264</a></td></tr>
       <tr><td><b>redflash</b></td><td title="The pan, then saturated red swapped for a grey of the same brightness 5 times a second from 2 s: no brightness flash at all, one red-flash failure">red against grey, same brightness</td><td><button class="small" data-clip="redflash.mp4">open</button></td><td><a href="clips/redflash.mp4" download>VP9</a> · <a href="clips/redflash_h264.mp4" download>H.264</a></td></tr>
+      <tr><td><b>cutback</b></td><td title="The pan, and from 3 to 5 s a bright scene cut in every other pair of frames: one flash failure, which group by scene (G) takes out without losing a frame">two scenes cut back and forth</td><td><button class="small" data-clip="cutback.mp4">open</button></td><td><a href="clips/cutback.mp4" download>VP9</a> · <a href="clips/cutback_h264.mp4" download>H.264</a></td></tr>
       <tr><td><b>steady</b></td><td title="The pan alone: nothing to find">nothing to find</td><td><button class="small" data-clip="steady.mp4">open</button></td><td><a href="clips/steady.mp4" download>VP9</a> · <a href="clips/steady_h264.mp4" download>H.264</a></td></tr>
     </table>
     <p id="support" class="support"></p>

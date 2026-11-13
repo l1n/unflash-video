@@ -136,7 +136,7 @@ test('what is kept of a project leaves out the frames, and the scan trace unless
   assert.ok(p.scan.trace, "the project's own scan keeps its trace");
   assert.deepEqual(p.toSaved({ trace: true }).scan.trace.t, new Float64Array([1, 2]));
   const k = kept.sections[0];
-  assert.deepEqual(Object.keys(k).sort(), ['blend', 'blendStrength', 'check', 'custom', 'edits', 'end', 'id', 'keep', 'kinds', 'nFrames', 'pattern', 'pts', 'soften', 'start', 'warnings']);
+  assert.deepEqual(Object.keys(k).sort(), ['blend', 'blendStrength', 'check', 'custom', 'edits', 'end', 'id', 'keep', 'kinds', 'nFrames', 'order', 'pattern', 'pts', 'soften', 'start', 'warnings']);
   assert.deepEqual([k.edits, k.keep, k.blend, k.blendStrength, k.soften, k.nFrames, k.pts], [{ 3: { removed: 'prev' } }, [5], [7], 0.6, true, 300, [0, 0.04]]);
   // of a verdict, what the page can show again without the frames
   assert.equal(k.check.safe, false);
@@ -214,6 +214,7 @@ test('a project file with things of the wrong kind in it comes back as a project
         check: 'safe',
         custom: 'yes',
         soften: 1,
+        order: [0, 1, 1],
       },
       { id: 2, start: 5, end: 5 },
       { id: 3, start: 9, end: 8 },
@@ -221,8 +222,8 @@ test('a project file with things of the wrong kind in it comes back as a project
       { id: 5, start: 6, end: Infinity },
       { id: 6, start: 'soon', end: 7 },
       { id: 1, start: 20, end: 30 },
-      { id: 8, start: 40, end: 50, edits: [1, 2], pts: new Float64Array([0, 0.04]), nFrames: 2, warnings: ['a note', 7], pattern: { period: 4 }, blendStrength: 0.5, check: { safe: false, violations: [{ kind: 'flash' }, null], after: [] } },
-      { id: 9, start: 60, end: 70, check: { safe: true, violations: [{ kind: 'flash' }], context_notes: 'none', flagged: [1, 2] } },
+      { id: 8, start: 40, end: 50, order: [1, 0], edits: [1, 2], pts: new Float64Array([0, 0.04]), nFrames: 2, warnings: ['a note', 7], pattern: { period: 4 }, blendStrength: 0.5, check: { safe: false, violations: [{ kind: 'flash' }, null], after: [] } },
+      { id: 9, start: 60, end: 70, order: [2, 'x'], check: { safe: true, violations: [{ kind: 'flash' }], context_notes: 'none', flagged: [1, 2] } },
       'section',
       7,
     ],
@@ -235,6 +236,8 @@ test('a project file with things of the wrong kind in it comes back as a project
   assert.deepEqual(a.edits, { 4: { removed: true }, 7: { extended: true, fill: 'next' }, 8: {} });
   assert.deepEqual([a.keep, a.blend, a.blendStrength, a.pts, a.nFrames, a.warnings, a.pattern, a.check, a.custom, a.soften], [[], [1, 3], null, null, 0, [], null, null, true, true]);
   assert.deepEqual([b.edits, Array.from(b.pts), b.nFrames, b.warnings, b.pattern, b.blendStrength], [{}, [0, 0.04], 2, ['a note'], { period: 4 }, 0.5]);
+  // a reorder: frame numbers, each once (a frame shown twice, or a number that is none, is no reorder)
+  assert.deepEqual([a.order, b.order, c.order], [null, [1, 0], null]);
   // a verdict whose lists are not lists of findings is no verdict (the section shows as unchecked)
   assert.equal(b.check, null);
   assert.equal(c.check, null);

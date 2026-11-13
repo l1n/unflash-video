@@ -209,7 +209,7 @@ jobs:
       - name: Transport streams, PCM and DTS sound, and the choice of sound track (headless Chromium)
         if: matrix.part == 'files'
         run: node tests/e2e/streams.mjs
-      - name: Smart-cut splice, MKV and WebM, the sound of held frames, project files, the guided tour, the page while a job runs, the built-in HEVC, VP9, VP8 and AV1 decoders (headless Chromium), the shrink in WebAssembly, What's new's films, the site as published
+      - name: Smart-cut splice, MKV and WebM, the sound of held frames, project files, frames reordered, the guided tour, the page while a job runs, the built-in HEVC, VP9, VP8 and AV1 decoders (headless Chromium), the shrink in WebAssembly, What's new's films, the site as published
         if: matrix.part == 'others'
         run: |
           node tests/e2e/whatsnew-check.mjs
@@ -218,6 +218,7 @@ jobs:
           node tests/e2e/mkv.mjs
           node tests/e2e/sound.mjs
           node tests/e2e/project.mjs
+          node tests/e2e/reorder.mjs
           node tests/e2e/tour.mjs
           node tests/e2e/busy.mjs
           node tests/e2e/decoders.mjs

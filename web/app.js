@@ -6,7 +6,7 @@ import { builtInFor } from './codecs.js';
 import { Movie, decodeRange } from './media.js';
 import { createDetector, gpuAdapter } from './detector.js';
 import { profile } from './profile.js';
-import { scanMovie, scanChunks, CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, hasMarks, BLEND_DEFAULT } from './analysis.js';
+import { scanMovie, scanChunks, CHUNK_S, prepareSection, checkSection, suggestEdits, suggestFrameRate, searchFrameRate, suggestBlend, rateLadder, keepJson, shownPts, softenPlan, blendMarks, blendStrength, blendedFrames, hasMarks, BLEND_DEFAULT, orderedFrames, orderedFrame, sectionOrder, validOrder, groupScenes, sceneSignatures, SCENE_APART } from './analysis.js';
 import { Project, projectKey, dropCaches, lastSavedAt, projectFileText, readProjectFile, matchVideo } from './project.js';
 import { exportMovie, exportPlan, encoderCandidates, formatChoices, formatInfo, pickSaveSink, privateFileSink, privateStorageAvailable, discardPrivateExport, findPrivateExport, estimateExportBytes } from './export.js';
 import { SectionPlayer } from './preview.js';
@@ -2362,7 +2362,7 @@ function wireWorkspace() {
       sec.start = range.start;
       sec.end = range.end;
       dropCaches(sec);
-      Object.assign(sec, { check: null, edits: {}, keep: [], blend: [], pts: null, nFrames: 0, pattern: null, warnings: [] });
+      Object.assign(sec, { check: null, edits: {}, keep: [], blend: [], order: null, pts: null, nFrames: 0, pattern: null, warnings: [] });
       state.project.invalidateNeighbours(sec, ctxS);
     });
     state.history.delete(sec.id);
@@ -2389,6 +2389,7 @@ function wireWorkspace() {
     pushHistory(sec);
     sec.edits = {};
     sec.blend = [];
+    sec.order = null;
     afterEdit(sec);
   });
   $('blendStrength').addEventListener('input', () => {
@@ -2433,6 +2434,10 @@ function wireWorkspace() {
   $('btnMarkKeep').addEventListener('click', () => markSelection('K'));
   $('btnMarkBlend').addEventListener('click', () => markSelection('B'));
   $('btnUnmark').addEventListener('click', () => markSelection('U'));
+  $('btnGroupScenes').addEventListener('click', () => groupSelection());
+  $('btnMoveEarlier').addEventListener('click', () => moveSelection(-1));
+  $('btnMoveLater').addEventListener('click', () => moveSelection(1));
+  $('btnOriginalOrder').addEventListener('click', () => originalOrder());
   $('btnSelectUnsafe').addEventListener('click', () => {
     const sec = currentSection();
     if (!sec || !sec.check) return;
@@ -2529,6 +2534,16 @@ function onKey(e) {
     e.preventDefault();
     markSelection(k.toUpperCase());
     renderViewerInfo();
+    return;
+  }
+  if (k === 'g') {
+    e.preventDefault();
+    groupSelection();
+    return;
+  }
+  if (k === '[' || k === ']') {
+    e.preventDefault();
+    moveSelection(k === '[' ? -1 : 1);
     return;
   }
   if (k === 'z') {
@@ -2883,7 +2898,8 @@ function openViewer(i) {
   $('viewerCanvas').classList.toggle('dim', $('dimToggle').checked);
   $('frameViewer').classList.remove('hidden');
   renderViewerInfo();
-  frameViewer.show(state.movie, sec, i);
+  // (the decoded frame this place shows: with a reorder, another's)
+  frameViewer.show(state.movie, sec, orderedFrame(sec, i));
   renderGridMarks();
   const tile = $('frameGrid').children[i];
   if (tile) tile.scrollIntoView({ block: 'nearest' });
@@ -2906,6 +2922,7 @@ function renderViewerInfo() {
   if (e.extended) marks.push('held for 1 s');
   if ((sec.keep || []).includes(i)) marks.push('keep');
   if ((sec.blend || []).includes(i)) marks.push(`blended ${Math.round(blendStrength(sec) * 100)}% with the frames around it in the export (shown here as it is)`);
+  if (orderedFrame(sec, i) !== i) marks.push(`moved: this place shows frame ${orderedFrame(sec, i)} (at ${fmt(frameVideoTime(sec, orderedFrame(sec, i)))} in the video)`);
   $('viewerInfo').textContent = `Section #${sec.id}, frame ${i} of ${shownCount(sec)} · ${fmt(frameVideoTime(sec, i))} in the video, ${(sec.pts[i] - sec.pts[0]).toFixed(3)} s into the section${marks.length ? ' · ' + marks.join(' · ') : ''} · ${state.movie.width}×${state.movie.height}`;
 }
 
@@ -2919,7 +2936,8 @@ function drawTile(sec, tile) {
   const want = tile.dataset.want || '';
   const canvas = tile.querySelector('canvas');
   try {
-    const cache = want ? blendedFrames(sec) : sec.cache;
+    // (in the order the section shows its frames: a tile is a place)
+    const cache = want ? blendedFrames(sec) : orderedFrames(sec);
     const aw = cache.width();
     const ah = cache.height();
     if (!scratch || scratch.width !== aw || scratch.height !== ah) scratch = new OffscreenCanvas(aw, ah);
@@ -3058,6 +3076,11 @@ function renderGridMarks() {
   const blendKey = blendSet.size && sec.cache && blendedFrames(sec) !== sec.cache ? sec.blendKey : '';
   const blendPct = Math.round(blendStrength(sec) * 100);
   const softBlur = soft.size && sec.cache ? `blur(${((sec.check.soft_sigma || 1) * THUMB_W) / sec.cache.width()}px)` : '';
+  // the tiles are drawn again when the order changes (their pictures move)
+  const order = sectionOrder(sec);
+  // (orderedFrames makes the reordered copy the tiles draw from, and names it)
+  const orderKey = order && sec.cache && orderedFrames(sec) !== sec.cache ? sec.orderKey : '';
+  $('btnOriginalOrder').classList.toggle('hidden', !order);
   for (let i = 0; i < grid.children.length; i++) {
     const tile = grid.children[i];
     const e = (sec.edits || {})[i] || {};
@@ -3072,20 +3095,17 @@ function renderGridMarks() {
     tile.classList.toggle('kept', kept.has(i));
     const blended = blendSet.has(i) && !e.removed;
     tile.classList.toggle('blended', blended);
-    tile.dataset.want = blended ? blendKey : '';
+    const moved = !!order && order[i] !== i;
+    tile.classList.toggle('moved', moved);
+    tile.dataset.want = blended ? blendKey : moved ? orderKey : '';
     if (tile.dataset.drawn && (tile.dataset.drawnKey || '') !== tile.dataset.want) drawTile(sec, tile);
     tile.querySelector('canvas').style.filter = soft.has(i) ? softBlur : '';
     const fb = tile.querySelector('.fb');
-    if (e.removed) {
-      fb.textContent = `shows ${rep[i]}`;
-      fb.classList.remove('hidden');
-    } else if (e.extended) {
-      fb.textContent = blended ? `held 1 s · blend ${blendPct}%` : 'held 1 s';
-      fb.classList.remove('hidden');
-    } else if (blended) {
-      fb.textContent = `blend ${blendPct}%`;
-      fb.classList.remove('hidden');
-    } else fb.classList.add('hidden');
+    // (a moved tile says which decoded frame it shows)
+    const from = moved ? `frame ${order[i]}` : '';
+    const badge = e.removed ? `shows ${rep[i]}` : [from, e.extended ? 'held 1 s' : '', blended ? `blend ${blendPct}%` : ''].filter(Boolean).join(' · ');
+    fb.textContent = badge;
+    fb.classList.toggle('hidden', !badge);
   }
 }
 
@@ -3188,6 +3208,123 @@ function replayEdited(sec, ms = 0) {
   state.player.restartTimer = setTimeout(() => playSection(Math.max(0, sectionPlayer.slot)), ms);
 }
 
+// ---- frames reordered ---------------------------------------------------------------
+
+/**
+ * Give the open section the reorder `next` (place k shows decoded frame
+ * next[k]), the marks going with their pictures: a frame removed, held,
+ * kept or blended before is so wherever it goes. Returns false (and
+ * changes nothing) for an order that is no reorder of its frames.
+ */
+function setOrder(sec, next) {
+  const n = sec.cache ? sec.cache.len() : sec.nFrames || 0;
+  if (next.length !== n || (!validOrder(next, n) && !next.every((v, k) => v === k))) return false;
+  const was = sectionOrder(sec) || Array.from({ length: n }, (_, k) => k);
+  // where each decoded frame was, and so where its marks were
+  const placeOf = new Array(n);
+  was.forEach((f, k) => (placeOf[f] = k));
+  const edits = {};
+  const keep = new Set(sec.keep || []);
+  const blend = new Set(sec.blend || []);
+  const keepNext = [];
+  const blendNext = [];
+  next.forEach((f, k) => {
+    const from = placeOf[f];
+    const e = (sec.edits || {})[from];
+    if (e) edits[k] = e;
+    if (keep.has(from)) keepNext.push(k);
+    if (blend.has(from)) blendNext.push(k);
+  });
+  sec.edits = edits;
+  sec.keep = keepNext.sort((a, b) => a - b);
+  sec.blend = blendNext.sort((a, b) => a - b);
+  sec.order = validOrder(next, n) ? next : null;
+  return true;
+}
+
+/** The section's current order, every place's frame (the decoded order where there is no reorder). */
+function currentOrder(sec) {
+  const order = sectionOrder(sec);
+  return order ? [...order] : Array.from({ length: sec.cache ? sec.cache.len() : sec.nFrames || 0 }, (_, k) => k);
+}
+
+/** The selection as one run of places, first to last (whatever lies between them included). */
+function selectedRun(sec) {
+  const sel = [...state.selection].sort((a, b) => a - b);
+  if (!sel.length) return null;
+  const n = shownCount(sec);
+  return { lo: Math.max(0, sel[0]), hi: Math.min(n - 1, sel[sel.length - 1]) };
+}
+
+/**
+ * G: a stretch that cuts back and forth between two scenes, frame by
+ * frame, put back as one scene and then the other. The selected run's
+ * pictures are told apart by what they show (groupScenes), and the scene of
+ * its first picture comes first, then the other, each in its own order: the
+ * flashing between them becomes a single cut, every frame stays and the run
+ * takes as long as it did. Pressed on a run already grouped it says so.
+ */
+function groupSelection() {
+  const sec = currentSection();
+  if (!sec || !sec.prepared) return;
+  const run = selectedRun(sec);
+  if (!run || run.hi - run.lo < 2) return toast('Select the stretch that cuts between two scenes first (click its first frame, shift-click its last): at least three frames');
+  const places = Array.from({ length: run.hi - run.lo + 1 }, (_, k) => run.lo + k);
+  const g = groupScenes(sceneSignatures(sec, places));
+  if (!g.order) {
+    if (g.already) return toast('These frames are one scene and then the other already: nothing to move.');
+    return toast(`These frames look like one scene (the two most different groups of them are ${g.apart.toFixed(1)} apart, where ${SCENE_APART} would make two): nothing to group. Move frames by hand with [ and ].`, 6000);
+  }
+  pushHistory(sec);
+  const order = currentOrder(sec);
+  const next = order.slice();
+  g.order.forEach((from, k) => (next[run.lo + k] = order[run.lo + from]));
+  setOrder(sec, next);
+  state.selection = new Set(places);
+  afterEdit(sec);
+  toast(`Grouped by scene: ${g.first} frames of the first scene, then ${g.second} of the other. Ctrl+Z puts them back.`, 5000);
+}
+
+/**
+ * [ and ]: the selected run of frames one place earlier or later, the frame
+ * it passes going to its other end: to put right by hand what a grouping
+ * got wrong, or to reorder without one.
+ */
+function moveSelection(dir) {
+  const sec = currentSection();
+  if (!sec || !sec.prepared) return;
+  const run = selectedRun(sec);
+  if (!run) return toast('Select frames first (click, or shift-click for a range)');
+  const n = shownCount(sec);
+  if ((dir < 0 && run.lo === 0) || (dir > 0 && run.hi >= n - 1)) return toast(dir < 0 ? 'Already at the start of the section' : 'Already at the end of the section');
+  pushHistory(sec);
+  const order = currentOrder(sec);
+  const next = order.slice();
+  if (dir < 0) {
+    for (let k = run.lo; k <= run.hi; k++) next[k - 1] = order[k];
+    next[run.hi] = order[run.lo - 1];
+  } else {
+    for (let k = run.lo; k <= run.hi; k++) next[k + 1] = order[k];
+    next[run.lo] = order[run.hi + 1];
+  }
+  setOrder(sec, next);
+  state.selection = new Set(Array.from({ length: run.hi - run.lo + 1 }, (_, k) => run.lo + k + dir));
+  state.anchor = state.anchor == null ? null : state.anchor + dir;
+  if (viewerOpen() && state.viewerAt != null) openViewer(state.viewerAt + dir);
+  afterEdit(sec);
+  const tile = $('frameGrid').children[dir < 0 ? run.lo - 1 : run.hi + 1];
+  if (tile) tile.scrollIntoView({ block: 'nearest' });
+}
+
+/** Every frame of the open section back in the order it was decoded in, its marks going with it. */
+function originalOrder() {
+  const sec = currentSection();
+  if (!sec || !sec.prepared || !sectionOrder(sec)) return;
+  pushHistory(sec);
+  setOrder(sec, Array.from({ length: sec.cache.len() }, (_, k) => k));
+  afterEdit(sec);
+}
+
 // ---- undo / redo of a section's marks --------------------------------------------------
 
 function historyOf(sec) {
@@ -3200,7 +3337,7 @@ function historyOf(sec) {
 }
 
 function markSnapshot(sec) {
-  return JSON.stringify({ edits: sec.edits || {}, keep: sec.keep || [], soften: !!sec.soften, blend: sec.blend || [], blendStrength: sec.blendStrength == null ? null : sec.blendStrength });
+  return JSON.stringify({ edits: sec.edits || {}, keep: sec.keep || [], soften: !!sec.soften, blend: sec.blend || [], blendStrength: sec.blendStrength == null ? null : sec.blendStrength, order: sec.order || null });
 }
 
 /** Remember a section's marks before a change, for undo. */
@@ -3220,6 +3357,7 @@ function restoreMarks(sec, snap) {
   sec.soften = !!o.soften;
   sec.blend = o.blend || [];
   sec.blendStrength = o.blendStrength == null ? null : o.blendStrength;
+  sec.order = o.order || null;
 }
 
 /** Take the open section's marks a step back through its history (`back`: undo) or forward again (redo). */

@@ -145,6 +145,7 @@ export function dropCaches(sec) {
   if (sec.cache) sec.cache.free();
   if (sec.softCache) sec.softCache.free();
   if (sec.blendCache) sec.blendCache.free();
+  if (sec.orderCache) sec.orderCache.free();
   if (sec.ctx) {
     sec.ctx.lead.free();
     sec.ctx.tail.free();
@@ -154,6 +155,8 @@ export function dropCaches(sec) {
   sec.softKey = null;
   sec.blendCache = null;
   sec.blendKey = null;
+  sec.orderCache = null;
+  sec.orderKey = null;
   sec.ctx = null;
   sec.prepared = false;
 }
@@ -279,6 +282,7 @@ export class Project {
       keep: s.keep || [],
       blend: s.blend || [],
       blendStrength: s.blendStrength == null ? null : s.blendStrength,
+      order: s.order || null,
       check: s.check ? summarizeCheck(s.check) : null,
       nFrames: s.nFrames || 0,
       pts: s.pts || null,
@@ -334,6 +338,7 @@ export class Project {
       keep: [],
       blend: [],
       blendStrength: null,
+      order: null,
       prepared: false,
       cache: null,
       softCache: null,
@@ -372,6 +377,7 @@ export class Project {
       if (s.cache) b += s.cache.byte_length();
       if (s.softCache) b += s.softCache.byte_length();
       if (s.blendCache) b += s.blendCache.byte_length();
+      if (s.orderCache) b += s.orderCache.byte_length();
       if (s.ctx) b += s.ctx.lead.byte_length() + s.ctx.tail.byte_length();
     }
     return b;
@@ -413,6 +419,17 @@ function restoredMarks(edits) {
   return marks;
 }
 
+/**
+ * A section's reorder as kept: a list of frame numbers, each once, or null.
+ * (Whether it fits the section's frames is asked where it is used:
+ * `validOrder`, in analysis.js.)
+ */
+function restoredOrder(order) {
+  if (!Array.isArray(order) || !order.length) return null;
+  if (!order.every((i) => Number.isInteger(i) && i >= 0)) return null;
+  return new Set(order).size === order.length ? order : null;
+}
+
 /** A check's verdict as kept (`summarizeCheck`), or null where its lists are not lists of findings. */
 function restoredCheck(c) {
   if (!plain(c) || !findings(c.violations) || !findings(c.after) || !findings(c.elsewhere)) return null;
@@ -442,12 +459,14 @@ function restoredSection(s) {
     cache: null,
     softCache: null,
     blendCache: null,
+    orderCache: null,
     ctx: null,
     check: restoredCheck(s.check),
     edits: restoredMarks(s.edits),
     keep: frameNumbers(s.keep),
     blend: frameNumbers(s.blend),
     blendStrength: typeof s.blendStrength === 'number' && Number.isFinite(s.blendStrength) ? s.blendStrength : null,
+    order: restoredOrder(s.order),
     nFrames: Number.isInteger(s.nFrames) && s.nFrames >= 0 ? s.nFrames : 0,
     pts: finiteNumbers(s.pts) ? s.pts : null,
     warnings: Array.isArray(s.warnings) ? s.warnings.filter((w) => typeof w === 'string') : [],

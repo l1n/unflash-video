@@ -248,6 +248,14 @@ it("a section's cached frames: kept, joined, blended and blurred", () => {
   const other = new wasm.FrameCache(2, 2);
   assert.equal(refusal(() => cache.append(other)), 'cannot join a 2×2 cache onto a 4×2 one');
 
+  // reordered: frame k of the copy is frame order[k]; a frame that is none is refused, the cache left as it was
+  const reordered = cache.reordered(Uint32Array.of(2, 0, 1));
+  assert.deepEqual([0, 1, 2].map((k) => reordered.frame(k)[0]), [100, 10, 200]);
+  assert.equal(reordered.byte_length(), cache.byte_length());
+  assert.equal(refusal(() => cache.reordered(Uint32Array.of(0, 3))), 'no frame 3 to reorder: the cache has 3');
+  assert.equal(cache.reordered(new Uint32Array()).len(), 0);
+  reordered.free();
+
   // the middle frame, blended all the way, is the frames either side of it, half and half
   const blended = cache.blended(Uint8Array.of(0, 1, 0), 1);
   assert.deepEqual(Array.from(blended.frame(1).subarray(0, 4)), [55, 60, 65, 255]);

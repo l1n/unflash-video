@@ -349,6 +349,18 @@
    "violations": 0
   }
  },
+ "group-scenes": {
+  "w": 720,
+  "h": 450,
+  "seconds": 19.1,
+  "alt": "A section that cuts back and forth between two scenes, two frames at a time, fails: the grid shows the grey scene and the bright one taking turns. The stretch is selected and G pressed: its frames are put back as the grey scene, then the bright one, every frame kept and each tile saying which frame it shows; the check passes. ] moves a frame a place later, [ back; Ctrl+Z puts every frame back where it was, and Ctrl+Shift+Z groups them again.",
+  "sha256": "813d9dc45dcc1475c892733900eef54725f3b415fb09b37c69729ad85ba0916f",
+  "checked": {
+   "profile": "strict",
+   "frames": 576,
+   "violations": 0
+  }
+ },
  "guide-beside": {
   "w": 720,
   "h": 450,

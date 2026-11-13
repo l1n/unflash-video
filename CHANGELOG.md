@@ -14,6 +14,10 @@ it with node tests/e2e/whatsnew.mjs NAME (it is checked for flashing
 there, and tests/e2e/whatsnew-check.mjs holds every change to having
 one); tour:ID names a tour of it (web/tours.js). -->
 
+## 2026-11-13
+
+- <!-- 04:00 shot:group-scenes --> **Reorder frames: a stretch that cuts back and forth between two scenes becomes one scene, then the other.** Flashing made of quick cuts between two shots used to leave two ways out: remove one shot's frames (and freeze the other), or blend them. Now select the stretch and press **G** (*group by scene*): Unflash tells the two scenes apart by what they show and puts every frame of the first back to back, then every frame of the second, each in its own order. The cutting becomes a single cut, no frame is lost and the stretch takes as long as it did. **[** and **]** move the selected frames a place earlier or later, to put right by hand what the grouping got wrong, or to reorder without it. A moved frame says which frame it shows, marks go with their frames, the check, the section player and the export all show the new order, and *original order* (or Ctrl+Z) puts every frame back. The sound is not moved: over a reordered stretch it plays as it was.
+
 ## 2026-11-10
 
 - <!-- 22:00 shot:sound-in-step --> **An export starts its picture and its sound as far apart as your video does.** In an export the two always started together, whatever your video had: where its sound starts before its picture, the export's sound ran that much behind the picture, from the first frame to the last. A recording that begins part-way through a scene has sound before its first whole picture, often most of a second of it (0.7 s in the film here); a transport stream or an MKV with AAC sound usually has about a fiftieth of a second, and some MP4s have more. An export now keeps the gap, to the millisecond, and the debug report says how far apart the two start in the video that is open. And MP3 sound that an MP4 holds as MPEG-4 audio is called MP3 in an export's notes, where it was called AAC.

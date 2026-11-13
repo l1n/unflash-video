@@ -9,7 +9,7 @@
   --bg: #0d0d0d; --bg2: #141414; --bg3: #1e1e1e; --line: #2e2e2e; --line2: #4a4a4a;
   --fg: #e4e4e4; --fg2: #8f8f8f; --lit: #e4e4e4; --lit-fg: #0d0d0d;
   /* what the detector found, and what a mark does */
-  --flash: #e8a33c; --red: #e04fb0; --pat: #3fc1c9; --ext: #7f9bff; --held: #4f8cff; --blend: #a782ff; --sel: #ffd84f;
+  --flash: #e8a33c; --red: #e04fb0; --pat: #3fc1c9; --ext: #7f9bff; --held: #4f8cff; --blend: #a782ff; --moved: #63d39b; --sel: #ffd84f;
   /* close calls: flashing that passes, but only just */
   --close: #c8b88a;
   /* tallies */
@@ -214,6 +214,7 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 .chip.selected { border-color: var(--sel); color: var(--sel); }
 .chip.kept { border-color: var(--ok); color: var(--ok); }
 .chip.blended { border-color: var(--blend); color: var(--blend); }
+.chip.moved { border-color: var(--moved); color: var(--moved); }
 .grid-actions { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
 .grid-hint { color: var(--fg2); font-size: 11px; margin: 6px 0; }
 .frame-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--thumb-min, 146px), 1fr)); gap: 6px; outline: none; }
@@ -235,6 +236,10 @@ aside#sections { width: 264px; border-right: 1px solid var(--line); background: 
 .frame.extended { border-color: var(--held); }
 .frame.blended { border-color: var(--blend); }
 .frame.blended .fb { background: var(--blend); color: var(--lit-fg); }
+/* moved by a reorder: the badge names the frame it shows */
+.frame.moved { border-color: var(--moved); }
+.frame.moved .fb { background: var(--moved); color: var(--lit-fg); }
+.frame.moved.removed .fb { background: var(--bad); }
 #blendStrength { width: 110px; accent-color: var(--blend); }
 .frame.selected { outline: 2px solid var(--sel); outline-offset: -1px; }
 .frame.kept .fno { background: var(--ok); color: var(--lit-fg); }
