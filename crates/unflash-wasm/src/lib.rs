@@ -322,6 +322,20 @@ impl FrameCache {
         Ok(())
     }
 
+    /// A new cache whose frame `k` is this cache's frame `order[k]`: a
+    /// section's frames in the order its reorder shows them, which the
+    /// marks, the check and the suggestions then read in place of the
+    /// order they were decoded in.
+    pub fn reordered(&self, order: &[u32]) -> Result<FrameCache, JsValue> {
+        let px = (self.width * self.height) as usize * 3;
+        let mut data = Vec::with_capacity(order.len() * px);
+        for &i in order {
+            let f = self.frame_ref(i as usize).ok_or_else(|| js_err(format!("no frame {i} to reorder: the cache has {}", self.n)))?;
+            data.extend_from_slice(f);
+        }
+        Ok(FrameCache { width: self.width, height: self.height, data, n: order.len() })
+    }
+
     /// A copy of this cache with the frames whose `mask` entry is non-zero
     /// blended with their unmarked neighbours at `strength` (0 to 1; see
     /// `unflash_core::blend`).

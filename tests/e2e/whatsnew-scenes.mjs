@@ -84,6 +84,38 @@ const RACE = {
 };
 
 export const SCENES = [
+  // ======== 2026-11-13 ==========================================================
+  {
+    name: 'group-scenes',
+    alt: 'A section that cuts back and forth between two scenes, two frames at a time, fails: the grid shows the grey scene and the bright one taking turns. The stretch is selected and G pressed: its frames are put back as the grey scene, then the bright one, every frame kept and each tile saying which frame it shows; the check passes. ] moves a frame a place later, [ back; Ctrl+Z puts every frame back where it was, and Ctrl+Shift+Z groups them again.',
+    query: Q,
+    async setup(d) {
+      await inSection(d, 'cutback.mp4');
+      await toTop(d, '#frameGrid .frame[data-i="40"]');
+    },
+    view: (d) => d.from('#frameGrid .frame[data-i="40"]', 20),
+    async play(d) {
+      await d.wait(900);
+      await d.click('#frameGrid .frame[data-i="44"]', { after: 300 });
+      await d.click('#frameGrid .frame[data-i="112"]', { modifiers: ['Shift'], after: 700 });
+      await d.press('G', { after: 300 });
+      await d.verdict(/^passes/);
+      await d.wait(1600);
+      await toTop(d, '.ws-head');
+      await d.camera('.ws-head', { anchor: true, ms: 700 });
+      await d.wait(1400);
+      await toTop(d, '#frameGrid .frame[data-i="40"]');
+      await d.camera(await d.from('#frameGrid .frame[data-i="40"]', 20), { ms: 700 });
+      await d.click('#frameGrid .frame[data-i="60"]', { after: 500 });
+      await d.press(']', { after: 900 });
+      await d.press('[', { after: 900 });
+      await d.press('Control+Z', { after: 1400 });
+      await d.press('Control+Shift+Z', { after: 300 });
+      await d.verdict(/^passes/);
+      await d.wait(1200);
+    },
+  },
+
   // ======== 2026-11-10 ==========================================================
   {
     name: 'sound-in-step',

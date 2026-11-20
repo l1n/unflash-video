@@ -200,6 +200,7 @@ Files it reads:
    pressing the same key again takes the mark off, as in the original tool,
    and the keys work with the focus anywhere but a text field. **Ctrl+Z**
    undoes (and **Ctrl+Shift+Z** redoes) any change to the section's marks,
+   reorders included,
    suggestions included. The section is re-checked after every change, in
    well under a second. Thumbnails come in four sizes (S to XL); **Z**, a
    double-click or *view frame* shows the selected frame at full size,
@@ -246,6 +247,29 @@ Files it reads:
 6. A stripe pattern can't be removed a frame at a time; tick **soften
    stripes** and the frames that carry it are blurred just enough to take
    it under the threshold, in the check, the player and the export alike.
+
+**Reorder frames.** Flashing that is two shots cut together a frame or
+two at a time (a fight, a music video) is a different problem: every frame
+is a good picture, they are only in a bad order. Select the stretch and
+press **G** (*group by scene*): each picture gets a signature (the mean
+colour of each cell of an 8×8 grid laid over it), the stretch's pictures
+are split in two by k-means (from its first picture and the picture least
+like it), and every picture of the first one's scene goes back to back,
+then every picture of the other, each in its own order. The cutting
+becomes one cut; no frame is lost and the stretch takes as long as it did.
+Pictures less than 12 codes apart on average are taken for one scene, and
+nothing moves. **[** and **]** move the selected frames a place earlier or
+later, to put right what the grouping got wrong or to reorder by hand. A
+reorder is kept per section as the frame each place shows (`order` in the
+project); every other mark (a removal, a hold, a blend, keep) is on a
+place, and moves with its picture when frames move. The check, the
+suggestions and the tiles read the section's small copies in that order
+(`FrameCache.reordered`), and the section player and the export turn each
+place back into the frame it shows; a frame decoded before its place
+comes waits as a copy of its own, since a decoder stops while its
+pictures are held. Each tile that moved says which frame it shows;
+*original order*, or Ctrl+Z, puts them back. The sound is left where it
+was.
 
 **Blend frames** (Kel's "get rid of flashing by reducing contrast rather
 than removing frames"). What it lowers is the contrast of the flash, from
@@ -333,6 +357,7 @@ other checker).
 | extended | 3 flashes/s for 8 s: passes WCAG, an extended flash under the default profile | [extended.mp4](https://l1n.github.io/unflash-video/clips/extended.mp4) | [extended_h264.mp4](https://l1n.github.io/unflash-video/clips/extended_h264.mp4) |
 | closecall | 3 flashes/s for 2 s at 2–4 s, then 3 flashes/s at a contrast only the stricter profile counts at 6.5–8.5 s: passes, two close calls | [closecall.mp4](https://l1n.github.io/unflash-video/clips/closecall.mp4) | [closecall_h264.mp4](https://l1n.github.io/unflash-video/clips/closecall_h264.mp4) |
 | redflash | the pan, then saturated red swapped for a grey of the same luminance 5 times a second from 2 s: no luminance flash, one red-flash failure | [redflash.mp4](https://l1n.github.io/unflash-video/clips/redflash.mp4) | [redflash_h264.mp4](https://l1n.github.io/unflash-video/clips/redflash_h264.mp4) |
+| cutback | the pan, and from 3 to 5 s a bright scene cut in every other pair of frames: one flash failure, which *group by scene* (G) takes out without losing a frame | [cutback.mp4](https://l1n.github.io/unflash-video/clips/cutback.mp4) | [cutback_h264.mp4](https://l1n.github.io/unflash-video/clips/cutback_h264.mp4) |
 | steady | the pan alone | [steady.mp4](https://l1n.github.io/unflash-video/clips/steady.mp4) | [steady_h264.mp4](https://l1n.github.io/unflash-video/clips/steady_h264.mp4) |
 
 All are 640×360, 30 fps, with a tone on the audio track, made by
@@ -927,6 +952,7 @@ node --test --test-force-exit "tests/unit/*.test.mjs"   # the page's own logic i
 node --test tests/bindings/bindings.test.mjs   # the WebAssembly module as the page calls it, in Node (after ./build.sh; SKIPPED without the build)
 python3 tests/media/gen_e2e.py            # synthetic flashing / striped videos for the browser test (and the site's test clips)
 node tests/e2e/run.mjs                    # the whole app in headless Chromium with WebGPU (needs playwright)
+node tests/e2e/reorder.mjs                # frames reordered: grouped by scene, moved, undone, played and exported
 node tests/e2e/tour.mjs                   # the guided tour, on a first visit and after an update
 node tests/e2e/busy.mjs                   # the page while a job runs: a second start turned away, never a long freeze
 node tests/e2e/streams.mjs                # transport streams read as ffmpeg reads them, scanned and exported; PCM and DTS sound; the sound track that plays

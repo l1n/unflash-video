@@ -11,7 +11,7 @@
 
 import { decodeRange, waker, shown } from './media.js';
 import { profile } from './profile.js';
-import { softenPlan, blendMarks, blendStrength, blendSources, blendWeights, hasMarks, sectionSequence } from './analysis.js';
+import { softenPlan, blendMarks, blendStrength, blendSources, blendWeights, hasMarks, sectionSequence, validOrder } from './analysis.js';
 import { SoundRun, audioData, soundName } from './sound.js';
 import { noSoundDecoder, soundChunk, soundConfig, soundDecoderFor } from './audiodec.js';
 import { builtInFor } from './codecs.js';
@@ -360,7 +360,13 @@ class FileSink {
  * player's "original").
  */
 export function sectionRenderPlan(env, movie, s, { edited = true } = {}) {
-  const { tl, shown, seq, holds: sectionHolds } = sectionSequence(env.wasm, s, edited ? s.edits : null);
+  const { tl, shown, seq: places, holds: sectionHolds } = sectionSequence(env.wasm, s, edited ? s.edits : null);
+  // the marks, and the edited sequence made from them, are on the section's
+  // places; with a reorder, place k shows decoded frame order[k], and from
+  // here on everything is in decoded frames, as they come out of the decoder
+  const order = edited ? validOrder(s.order, s.pts.length) : null;
+  const pic = (k) => (order ? order[k] : k);
+  const seq = order ? { ...places, src: places.src.map(pic) } : places;
   // where the section waits for its held frames, in source seconds: the
   // frame times above come from the same list, and so does the silence the
   // export puts into the sound, so the two cannot disagree
@@ -376,7 +382,16 @@ export function sectionRenderPlan(env, movie, s, { edited = true } = {}) {
   if (marks.length) {
     const marked = new Array(shown.length).fill(false);
     for (const i of marks) if (i < marked.length) marked[i] = true;
-    const sources = blendSources(marked);
+    // (the blend marks are on places too: who is mixed with whom goes by
+    // place, and is then said of the decoded frames the places show)
+    const byPlace = blendSources(marked);
+    let sources = byPlace;
+    if (order) {
+      sources = new Array(byPlace.length).fill(null);
+      byPlace.forEach((b, k) => {
+        if (b) sources[order[k]] = { ...b, prev: b.prev === null ? null : order[b.prev], next: b.next === null ? null : order[b.next] };
+      });
+    }
     blend = { sources, strength: blendStrength(s) };
     for (const src of seq.src) {
       const b = sources[src];
@@ -394,7 +409,7 @@ export function sectionRenderPlan(env, movie, s, { edited = true } = {}) {
   }
   // where the section ends on the source's clock (where its next frame would come)
   const end = s.start + tl.base + tl.total;
-  return { sec: s, base: tl.base, seq, nOut: tl.n_out, needCount, holds, extra, end, soft, blend };
+  return { sec: s, base: tl.base, seq, nOut: tl.n_out, needCount, holds, extra, end, soft, blend, reordered: !!order };
 }
 
 /**
@@ -630,7 +645,7 @@ export async function walkEdited(movie, piece, emit, { cancel, reader = null } =
   const sections = piece.sections;
   let si = 0;
   let cur = null;
-  const enterSection = (p) => ({ p, ordinal: 0, next: 0, frames: new Map(), need: new Map(p.needCount) });
+  const enterSection = (p) => ({ p, ordinal: 0, next: 0, frames: new Map(), need: new Map(p.needCount), copied: new Set() });
   const release = (st, i) => {
     const left = st.need.get(i) - 1;
     st.need.set(i, left);
@@ -704,6 +719,18 @@ export async function walkEdited(movie, piece, emit, { cancel, reader = null } =
           if (cur.need.has(j) && cur.need.get(j) > 0) cur.frames.set(j, frame);
           else frame.close();
           await flushSection(cur);
+          // a reordered section's frames can wait a long while for their
+          // place: held as they came, they would stop the decoder (whose
+          // pictures are few and its own), so those still waiting are kept
+          // as copies of their own
+          if (cur.p.reordered) {
+            for (const [i, f] of cur.frames) {
+              if (cur.copied.has(i)) continue;
+              cur.frames.set(i, heldCopy(f));
+              cur.copied.add(i);
+              f.close();
+            }
+          }
           return;
         }
         try {
@@ -1359,6 +1386,23 @@ async function reencodeAudio(wasm, movie, reader, mx, out, { cancel, holds = [],
 
 let blurCanvas = null;
 let blendCanvas = null;
+let holdCanvas = null;
+
+/**
+ * A copy of a frame that is the page's, not its decoder's: a decoder has a
+ * few pictures of its own to hand out and stops when they are all held, so a
+ * frame that has to wait (for its place in a reordered section) waits as a
+ * copy. Made on a canvas, in 8-bit sRGB values, as a blended frame is.
+ */
+function heldCopy(frame) {
+  const width = frame.displayWidth || frame.codedWidth;
+  const height = frame.displayHeight || frame.codedHeight;
+  if (!holdCanvas || holdCanvas.width !== width || holdCanvas.height !== height) holdCanvas = new OffscreenCanvas(width, height);
+  holdCanvas.getContext('2d').drawImage(frame, 0, 0, width, height);
+  const init = { timestamp: frame.timestamp || 0 };
+  if (frame.duration) init.duration = frame.duration;
+  return new VideoFrame(holdCanvas, init);
+}
 
 /**
  * A frame mixed with the frames either side of it, by weights `w` (the
